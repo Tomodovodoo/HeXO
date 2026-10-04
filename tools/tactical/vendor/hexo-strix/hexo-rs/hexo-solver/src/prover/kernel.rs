@@ -186,15 +186,24 @@ impl KernelCtx {
 
     /// Exact graph outcomes close both OR and AND nodes. A win bound exceeding
     /// a bounded probe's horizon says nothing about that shorter horizon.
-    pub(crate) fn exact(&self, node: Node, horizon: Option<u8>) -> Option<(u32, bool, u32)> {
+    pub(crate) fn exact(&self, node: Node, horizon: Option<u8>) -> Option<(super::certificate::Terminal, bool, u32)> {
+        use super::certificate::{Terminal, lookup_exact, lookup_stamp};
         let (player, remaining) = match node {
             Node::Or { placements } => (self.atk, placements),
             Node::And => (self.dfn, 2),
         };
-        let (id, fact) = super::certificate::lookup_exact(self.hash(), player, remaining, || self.canonical_stones())?;
-        let won = fact.winner == self.atk;
-        if won && horizon.is_some_and(|n| u32::from(n) < fact.turns) { return None; }
-        Some((id, won, fact.turns))
+        let (terminal, winner, turns) = if let Some((id, fact))=lookup_exact(self.hash(), player, remaining, || self.canonical_stones()) {
+            (Terminal::Graph(id),fact.winner,fact.turns)
+        } else { lookup_stamp(self.hash(), &self.board.stones, &|p|self.board.get(p), player, remaining)? };
+        let won = winner == self.atk;
+        if won && horizon.is_some_and(|n| u32::from(n) < turns) { return None; }
+        Some((terminal, won, turns))
+    }
+
+    pub(crate) fn stamp(&self, source: &super::certificate::StampSource, node: Node) -> Option<u32> {
+        if source.winner != if self.atk == Player::P1 {0} else {1} {return None;}
+        let (player,remaining)=match node {Node::Or{placements}=>(self.atk,placements),Node::And=>(self.dfn,2)};
+        super::certificate::verify_stamp(source,&|p|self.board.get(p),&self.board.stones,player,remaining)
     }
 
     /// Canonical exact board snapshot used only by the proof-certificate

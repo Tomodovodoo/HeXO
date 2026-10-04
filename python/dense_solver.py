@@ -77,7 +77,8 @@ POINTS = ('root', 'threat', 'finalist', 'deep', 'defence')
 # no forcing continuation within its budget.
 VERDICTS = {'no verified strategy', 'quiet defender unsupported', 'defender counterwin',
             'candidate has unproved defender continuation', 'candidate defense expansion budget',
-            'candidate certificate size limit', 'free-second coverage work limit'}
+            'candidate certificate size limit', 'free-second coverage work limit', 'no fallback strategy',
+            'zone proof budget', 'zone certificate byte limit', 'proof zone size limit'}
 GUARD_MS = 50.          # lead time kept free of solver work
 LEAD_QUANTILE = .2      # of the measured leads per point
 OVERHEAD_MS = .5        # fixed solver cost plus pipe per query
@@ -493,6 +494,35 @@ def defence_hit(result):
     return result['status'] == 'UNKNOWN' and result.get('reason') in VERDICTS
 
 
+def certificate_nodes(certificate):
+    """One arena for a checked strategy and its shared local proof sources."""
+    if not any(n['kind'] in ('stamp', 'stamp_link') for n in certificate['nodes']):
+        return certificate['nodes'], certificate['root']
+    nodes = []
+    def append(document, depth=0):
+        if depth > 8 or len(nodes)+len(document['nodes']) > 200000:
+            raise ValueError('Proof source expansion limit')
+        offset = len(nodes)
+        nodes.extend(dict(n) for n in document['nodes'])
+        for i, original in enumerate(document['nodes']):
+            node = nodes[offset+i]
+            if node['kind'] == 'stamp':
+                nodes[offset+i] = dict(kind='link', child=append(node['source']['certificate'], depth+1))
+            elif node['kind'] == 'stamp_link':
+                nodes[offset+i] = dict(kind='link', child=offset+node['source'])
+            else:
+                if 'child' in node:
+                    node['child'] += offset
+                if 'fallback' in node:
+                    node['fallback'] += offset
+                for field in ('responses', 'alternatives'):
+                    if field in node:
+                        node[field] = [dict(r, child=r['child']+offset) for r in original[field]]
+        return offset+document['root']
+    root = append(certificate)
+    return nodes, root
+
+
 def defence_turns(history, certificate, limit):
     """Rank complete turns from certificate actions, covered replies and winning completions.
 
@@ -512,7 +542,8 @@ def defence_turns(history, certificate, limit):
         gaps = set(segment)-attacker
         if 0 < len(gaps) <= 2 and not gaps & defender:
             groups.add(tuple(sorted(gaps)))
-    for node in certificate['nodes']:
+    nodes, root = certificate_nodes(certificate)
+    for node in nodes:
         actions = [node['action']] if 'action' in node else []
         actions += [r['action'] for r in node.get('responses', ())]
         actions += [r['action'] for r in node.get('alternatives', ())]
@@ -539,7 +570,9 @@ def defence_turns(history, certificate, limit):
     for i, group in enumerate(sorted(groups)):
         for c in group:
             masks[c] |= 1 << i
-    first = tuple(sorted(map(tuple, certificate['nodes'][certificate['root']].get('action', ()))))
+    while nodes[root]['kind'] == 'link':
+        root = nodes[root]['child']
+    first = tuple(sorted(map(tuple, nodes[root].get('action', ()))))
     rank = lambda p: (p != first, -(masks[p[0]] | masks[p[1]]).bit_count(), -sum(counts[c] for c in p), p)
     game, turns = Game(history), []
     try:
@@ -580,7 +613,8 @@ class Proof:
     left open. `first_turn_only` ends the walk with the certificate's first turn."""
 
     def __init__(self, base, certificate, first_turn_only=False):
-        self.base, self.nodes, self.root = tuple(base), certificate['nodes'], certificate['root']
+        self.base = tuple(base)
+        self.nodes, self.root = certificate_nodes(certificate)
         self.first_turn_only, self.depth = first_turn_only, {}
         self.replies = {i: {tuple(sorted(map(tuple, r['action']))): r['child'] for r in n['responses']}
                         for i, n in enumerate(self.nodes) if n['kind'] == 'defender_replies'}
@@ -588,7 +622,10 @@ class Proof:
     def turns(self, index):
         if index not in self.depth:
             node = self.nodes[index]
-            self.depth[index] = (1+self.turns(node['child']) if node['kind'] == 'attacker_move' else
+            self.depth[index] = (self.turns(node['child']) if node['kind'] == 'link' else
+                                 max([self.turns(node['fallback']), *(self.turns(r['child']) for r in node['responses'])])
+                                 if node['kind'] == 'zone_replies' else
+                                 1+self.turns(node['child']) if node['kind'] == 'attacker_move' else
                                  max(map(self.turns, self.replies[index].values())) if index in self.replies else 1)
         return self.depth[index]
 
@@ -627,6 +664,23 @@ class Proof:
         labels, index, first = [], self.root, True
         while True:
             node, turns = self.nodes[index], self.turns(index)
+            if node['kind'] == 'link':
+                index = node['child']
+                continue
+            if node['kind'] == 'zone_replies':
+                remaining = 2 if i % 2 else 1
+                labels += [(p, -1, turns) for p in range(i, min(i+remaining, len(history)))]
+                reply = history[i:i+remaining]
+                if len(reply) < remaining:
+                    return labels, ([], turns), node, reply
+                branch = next((r for r in node['responses'] if tuple(r['action'][0]) in reply), None)
+                if branch is None:
+                    index, i = node['fallback'], i+remaining
+                else:
+                    point = tuple(branch['action'][0])
+                    history = history[:i] + (point,) + tuple(p for p in reply if p != point) + history[i+remaining:]
+                    index, i = branch['child'], i+1
+                continue
             if node['kind'] in ('defender_replies', 'unstoppable'):
                 labels += [(p, -1, turns) for p in range(i, min(i+2, len(history)))]
                 reply = history[i:i+2]

@@ -917,7 +917,8 @@ pub(crate) fn solve_mode_at_guided(
         // proven inside a *discarded* level-2 PN tree, so their children aren't in
         // the proven set and this walk can come up short — fall back to the kernel
         // solver's own PV, which is guaranteed valid for a genuinely forced win.
-        let external = res.certificate.as_ref().is_some_and(|c| c.nodes.iter().any(|n| matches!(n, super::certificate::ProofNode::Exact { .. })));
+        let external = res.certificate.as_ref().is_some_and(|c| c.nodes.iter().any(|n| matches!(n,
+            super::certificate::ProofNode::Exact { .. } | super::certificate::ProofNode::Stamp { .. })));
         if res.pv.is_empty() && !external && !ctl.expired()
             && let Some(pv_ctx) = KernelCtx::new_wide(
             &pos.stones,

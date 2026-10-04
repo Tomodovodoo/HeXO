@@ -37,6 +37,69 @@ class NativeStrategy(unittest.TestCase):
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
 
+    def test_local_stamp_reuses_changed_positions_and_checks_interference(self):
+        learned = self.engine.history(OPEN_THREE, stamps=True, nodes=20000, ms=5000)
+        self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
+        history = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+        for sym in range(12):
+            def rotate(p):
+                q, r = p
+                if sym >= 6:
+                    q, r = r, q
+                for _ in range(sym % 6):
+                    q, r = -r, q+r
+                return [q, r]
+            transformed = list(map(rotate, history))
+            result = self.engine.history(transformed, stamps=True, nodes=1, ms=3000)
+            self.assertEqual(result['status'], 'PROVEN_WIN', (sym, result['reason']))
+            self.assertEqual(result['nodes_fresh'], 1)
+            self.assertEqual(independent_verify(result['certificate'], transformed), 'PROVEN_WIN')
+        warm = self.engine.history(history, stamps=True, nodes=1, ms=3000)
+        certificate = warm['certificate']
+        # A relevant blocker and a distant immediate counter-threat must both
+        # invalidate this particular strategy. Changed tempo also matters.
+        cases = [OPEN_THREE + [[8,8],[10,8],warm['moves'][0],[9,10]],
+                 OPEN_THREE + [[8,8],[10,8],[1,8],[3,8]], history + [[11,10]]]
+        for changed in cases:
+            result = self.engine.history(changed, certificate=certificate, stamps=True, nodes=1, ms=3000)
+            self.assertEqual(result['status'], 'UNKNOWN', result)
+            with self.assertRaises(ValueError):
+                independent_verify(certificate, changed)
+        # Enabling stamps does not populate the reference query's exact cache.
+        reference = self.engine.history(history, nodes=1, ms=3000)
+        self.assertEqual(reference['status'], 'UNKNOWN')
+        other_colour = [[0,0],[0,8],[1,8],[8,0],[-8,0],[2,8],[10,-2],[0,-8],[-8,8]]
+        result = self.engine.history(other_colour, stamps=True, nodes=1, ms=3000)
+        self.assertEqual(result['status'], 'PROVEN_WIN', result['reason'])
+        self.assertEqual(independent_verify(result['certificate'], other_colour), 'PROVEN_WIN')
+
+    def test_imported_stamp_requires_a_complete_checked_strategy(self):
+        learned = self.engine.history(OPEN_THREE, stamps=True, nodes=20000, ms=5000)
+        warm = self.engine.history(OPEN_THREE, stamps=True, nodes=1, ms=3000)
+        source = warm['certificate']['nodes'][warm['certificate']['root']]['source']
+        broken = copy.deepcopy(source)
+        response = next(n for n in broken['certificate']['nodes'] if n['kind'] == 'defender_replies')
+        response['responses'].pop()
+        rejected = self.engine.history(OPEN_THREE, stamps=True, library=[broken], nodes=1, ms=3000)
+        self.assertEqual(rejected['status'], 'UNKNOWN')
+        self.assertEqual(learned['status'], 'PROVEN_WIN')
+
+    def test_quiet_defender_zone_covers_every_placement(self):
+        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8],[-8,8]]
+        reference = self.engine.history(history, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(reference['status'], 'UNKNOWN')
+        result = self.engine.history(history, attacker='defender', stamps=True, nodes=20000, ms=10000)
+        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
+        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender'), 'PROVEN_LOSS')
+        certificate = copy.deepcopy(result['certificate'])
+        root = certificate['nodes'][certificate['root']]
+        self.assertEqual(root['kind'], 'zone_replies')
+        root['responses'].pop()
+        self.assertEqual(self.engine.history(history, attacker='defender', certificate=certificate,
+                                            stamps=True, nodes=20000, ms=5000)['status'], 'UNKNOWN')
+        with self.assertRaises(ValueError):
+            independent_verify(certificate, history, attacker='defender')
+
     def test_open_three_wide_builder_full_strategy(self):
         result = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
         self.assertEqual(result['status'], 'PROVEN_WIN', result)

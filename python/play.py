@@ -531,6 +531,9 @@ def principal_variation(history, certificate, *, attacker=None, known=()):
         near = lambda reply: sum(hex_distance(cell, stones[-1] if stones else history[-1]) for cell in reply['action'])
         while local.winner < 0:
             node = proof.nodes[index]
+            if node['kind'] == 'link':
+                index = node['child']
+                continue
             if node['kind'] == 'exact':
                 fact = known[node['fact']]
                 after, line = node.get('after', []), fact.get('pv', [])
@@ -544,8 +547,12 @@ def principal_variation(history, certificate, *, attacker=None, known=()):
                     stones += [[int(q), int(r), attacker, plies + local.remaining + 1 + i] for i, (q, r) in enumerate(threat)]
                     plies += local.remaining + len(threat)
                 break
-            if node['kind'] == 'defender_replies':
-                reply = min(node['responses'], key=lambda r: (-proof.turns(r['child']), near(r)))
+            if node['kind'] in ('defender_replies', 'zone_replies'):
+                responses = node['responses'] if node['kind'] == 'defender_replies' else [
+                    r for r in node['responses'] if local.legal(*r['action'][0])]
+                if not responses:
+                    break
+                reply = min(responses, key=lambda r: (-proof.turns(r['child']), near(r)))
                 action, index = reply['action'], reply['child']
             else:
                 action, index = node['action'], node.get('child')
@@ -685,7 +692,10 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     if verified(mine) and mine['moves']:
         cert = mine.get('certificate') or json.loads(mine['certificate_json'])
         pv, plies = principal_variation(history, cert, known=mine_known)
-        evidence = proof_evidence(mine, cert) if mine.get('dependencies') else {}
+        reused = any(n['kind'] in ('stamp', 'stamp_link', 'zone_replies') for n in cert['nodes'])
+        if reused:
+            plies = remaining + 4*(mine['proof_turns']-1)
+        evidence = proof_evidence(mine, cert) if mine.get('dependencies') or reused else {}
         found.update(moves=[list(m) for m in mine['moves']], pv=pv,
                      proof=dict(winner=player, turns=mine['proof_turns'], plies=plies, **evidence))
         return found
@@ -1180,7 +1190,8 @@ class SearchChild:
 class Engines:
     """Loaded engines, used only from the worker thread. Keeps the three most recent Bubble exports."""
 
-    def __init__(self, device, tactical_package=None, seal=None):
+    def __init__(self, device, tactical_package=None, seal=None, *, proof_stamps=False):
+        self.proof_stamps = proof_stamps
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
         self.helpers, self.kept, self.graphs, self.graph_ids = [], None, OrderedDict(), itertools.count(1)
@@ -1212,7 +1223,8 @@ class Engines:
                 old.abort()
                 threading.Thread(target=old.close, daemon=True).start()
             package = self.tactical_package or tactical_proof.PACKAGE
-            self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal'), build
+            self.prover, self.prover_build = tactical_proof.IsolatedTactics(package, priority='below_normal',
+                                                                           **(dict(stamps=True) if self.proof_stamps else {})), build
         return self.prover, build
 
     def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, line=None,
@@ -1294,7 +1306,8 @@ class Engines:
             self.helpers = []
         package = self.tactical_package or tactical_proof.PACKAGE
         while len(self.helpers) < count - 1:
-            self.helpers.append((tactical_proof.IsolatedTactics(package, priority='below_normal'), build))
+            self.helpers.append((tactical_proof.IsolatedTactics(package, priority='below_normal',
+                                                               **(dict(stamps=True) if self.proof_stamps else {})), build))
         return [prover, *(helper for helper, _ in self.helpers[:count - 1])], build
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None, known=None):
@@ -1326,7 +1339,8 @@ class Engines:
         binary = tactical_proof.library(package)
         record = binary.with_name(binary.name + '.json')
         try:
-            return file_build(str(package), file_identity(record), file_identity(binary))
+            build = file_build(str(package), file_identity(record), file_identity(binary))
+            return build + (':stamps' if self.proof_stamps else '')
         except OSError:
             return 'none'
 
@@ -2421,8 +2435,9 @@ class Session:
             if self.study is None:
                 # Analysis has its own queue and CPU model; it cannot spend a live game's clock.
                 package = getattr(self.engines, 'tactical_package', None)
-                self.study = Session(dict(self.entries), Engines('cpu', package), Evaluations(self.study_store),
-                                     self.rescan_entries, archive=self.archive, analysis_engines=Engines('cpu', package),
+                options = dict(proof_stamps=getattr(self.engines, 'proof_stamps', False))
+                self.study = Session(dict(self.entries), Engines('cpu', package, **options), Evaluations(self.study_store),
+                                     self.rescan_entries, archive=self.archive, analysis_engines=Engines('cpu', package, **options),
                                      save_initial=False)
             study = self.study
         with study.lock:
@@ -3776,6 +3791,7 @@ def main():
     parser.add_argument('--evaluations', type=Path,
                         help='saved evaluations file; default play-evaluations.jsonl in the run or models folder')
     parser.add_argument('--tactical-package', type=Path, help='directory with the built tactical solver')
+    parser.add_argument('--proof-stamps', action='store_true', help='reuse checked local strategies and test quiet defender turns')
     parser.add_argument('--device', default='auto', help='cuda, cpu, or auto: cuda when a GPU is available')
     parser.add_argument('--idle', action='store_true', help='start paused, without automatic analysis, for API clients')
     parser.add_argument('--list-engines', action='store_true', help='list engine ids, names and checkpoints, then exit')
@@ -3826,11 +3842,11 @@ def main():
         store_path.parent.mkdir(parents=True, exist_ok=True)
     # Bind before starting any engine work: a busy port must not leave a hidden match running.
     with ThreadingHTTPServer(('127.0.0.1', args.port), Handler) as server:
-        Handler.session = Session(entries, Engines(args.device, args.tactical_package),
+        Handler.session = Session(entries, Engines(args.device, args.tactical_package, proof_stamps=args.proof_stamps),
                                   Evaluations(None if args.match else store_path), find, book,
                                   archive=ROOT / 'artifacts' / 'play' / 'matches',
                                   study_store=ROOT / 'artifacts' / 'play' / f'study-{args.port}.jsonl',
-                                  analysis_engines=Engines(args.device, args.tactical_package), save_initial=not args.match)
+                                  analysis_engines=Engines(args.device, args.tactical_package, proof_stamps=args.proof_stamps), save_initial=not args.match)
         Handler.session.models_folder = str(args.models.resolve())
         Handler.setups = Setups(args.models, Handler.session.rescan, lambda: Handler.session.entries)
         try:

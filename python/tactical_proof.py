@@ -132,7 +132,8 @@ class NativeTactics:
 
     accepts_cancel_event = True
 
-    def __init__(self, package=PACKAGE):
+    def __init__(self, package=PACKAGE, *, stamps=False):
+        self.stamps = bool(stamps)
         package = Path(package)
         binary = library(package)
         self.metadata = json.loads(binary.with_suffix(binary.suffix+'.json').read_text(encoding='utf-8'))
@@ -168,7 +169,8 @@ class NativeTactics:
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
                 certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None,
-                bounds=False, resume=False, known=()):
+                bounds=False, resume=False, known=(), stamps=None, library=None):
+        stamps = self.stamps if stamps is None else stamps
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
             raise ValueError('Solver resume requires a positive table_mb')
@@ -187,6 +189,10 @@ class NativeTactics:
                            attacker=attacker, table_mb=table_mb)
             if known:
                 request['known'] = known
+            if stamps:
+                request['stamps'] = True
+            if library is not None:
+                request['library'] = library
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -258,7 +264,8 @@ class IsolatedTactics:
     """
 
     def __init__(self, package=PACKAGE, *, grace_ms=100, memory_mb=1536, startup_ms=10000,
-                 engine='tactical_proof:NativeTactics', priority=None):
+                 engine='tactical_proof:NativeTactics', priority=None, stamps=False):
+        self.stamps = bool(stamps)
         if priority not in PRIORITIES:
             raise ValueError(f'Unknown worker priority {priority!r}')
         self.command = [sys.executable, str(Path(__file__).resolve()), 'serve', engine, str(Path(package).resolve()),
@@ -315,7 +322,9 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False, known=()):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False, known=(),
+                stamps=None, library=None):
+        stamps = self.stamps if stamps is None else stamps
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
             raise ValueError('Solver resume requires a positive table_mb')
@@ -353,6 +362,10 @@ class IsolatedTactics:
                            table_mb=table_mb, shortest=shortest)
             if known:
                 request['known'] = known
+            if stamps:
+                request['stamps'] = True
+            if library is not None:
+                request['library'] = library
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -580,7 +593,15 @@ def threat_cells(certificate):
     For a verified attacker='opponent' certificate these are the placements of the
     opponent's forced win if it moved now; they equal the result's `moves`.
     """
-    node = certificate['nodes'][certificate['root']]
+    index = certificate['root']
+    node = certificate['nodes'][index]
+    while node['kind'] in ('stamp', 'stamp_link'):
+        if node['kind'] == 'stamp':
+            certificate = node['source']['certificate']
+            index = certificate['root']
+        else:
+            index = node['source']
+        node = certificate['nodes'][index]
     if node['kind'] not in ('immediate_win', 'attacker_move'):
         raise ValueError('Certificate root is not an attacking turn')
     return [tuple(cell) for cell in node['action']]
@@ -598,26 +619,43 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     from proof import verify, VerificationTimeout
     deadline = time.perf_counter()+deadline_seconds
     work = 0
-    def expand(index, stack):
+    def expand(index, stack, document=certificate, nesting=0):
         nonlocal work
         if time.perf_counter() >= deadline:
             raise VerificationTimeout('Certificate conversion deadline')
         work += 1
-        if (type(index) is not int or not 0 <= index < len(certificate['nodes']) or
+        if (type(index) is not int or not 0 <= index < len(document['nodes']) or
                 index in stack or len(stack) >= 128 or work > 200000):
             raise ValueError('Invalid certificate edge, cycle, depth or work limit')
-        node = certificate['nodes'][index]
+        node = document['nodes'][index]
         stack = stack | {index}
+        if node['kind'] == 'stamp_link':
+            target = node['source']
+            if type(target) is not int or not 0 <= target < len(document['nodes']) or document['nodes'][target]['kind'] != 'stamp':
+                raise ValueError('Invalid stamp link')
+            return expand(target, stack, document, nesting)
+        if node['kind'] == 'stamp':
+            source = node['source']
+            strategy = source['certificate']
+            if (strategy['version'] != 1 or strategy['width'] != 'wide' or len(strategy['nodes']) > 4096 or
+                    nesting >= 8 or any(n['kind'] == 'exact' for n in strategy['nodes'])):
+                raise ValueError('A stamp needs an independent ordinary strategy')
+            return dict(kind='reuse', player=source['player'], remaining=source['remaining'], winner=source['winner'],
+                        child=expand(strategy['root'], set(), strategy, nesting+1))
         if node['kind'] == 'exact':
             return dict(kind='exact', fact=node['fact'], after=node.get('after', []))
+        if node['kind'] == 'zone_replies':
+            return dict(kind='zone', zone=node['zone'], fallback=expand(node['fallback'], stack, document, nesting),
+                        branches=[dict(moves=r['action'], child=expand(r['child'], stack, document, nesting))
+                                  for r in node['responses']])
         if node['kind'] == 'immediate_win':
             return dict(kind='move', moves=node['action'], child=dict(kind='terminal'))
         if node['kind'] == 'attacker_move':
-            return dict(kind='move', moves=node['action'], child=expand(node['child'], stack))
+            return dict(kind='move', moves=node['action'], child=expand(node['child'], stack, document, nesting))
         if node['kind'] == 'unstoppable':
             return dict(kind='uncovered')
         if node['kind'] == 'defender_replies':
-            return dict(kind='defenses_all', branches=[dict(moves=r['action'], child=expand(r['child'], stack))
+            return dict(kind='defenses_all', branches=[dict(moves=r['action'], child=expand(r['child'], stack, document, nesting))
                                                    for r in node['responses']])
         raise ValueError('Unknown certificate node')
     if certificate['version'] != 1 or certificate['width'] != 'wide':

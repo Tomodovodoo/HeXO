@@ -85,6 +85,7 @@ def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
     paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
+    paths.append(TACTICAL/'stamps.json')
     paths += sorted(p for p in SHRIMP.rglob('*') if (p.suffix in ('.rs', '.lock') or p.name == 'Cargo.toml')
                     and 'target' not in p.parts)
     paths += sorted(p for p in SIX.rglob('*') if p.suffix in ('.cpp', '.hpp'))

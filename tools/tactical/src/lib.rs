@@ -1,4 +1,5 @@
 mod check;
+mod stamps;
 use std::collections::BTreeMap;
 use std::ffi::{CStr,CString,c_char};
 use std::sync::{Arc,Mutex,OnceLock};
@@ -10,7 +11,7 @@ use hexo_engine::types::Player;
 use hexo_solver::forcing::Meter;
 use hexo_solver::prover::{self,Ctl,DriverKind,ProverConfig};
 use hexo_solver::prover::io::{Position,PosConfig,Verdict};
-use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse,ExactFact,ExactScope,exact_at};
+use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse,ExactFact,ExactScope,exact_at,StampSource,StampScope};
 use serde::Deserialize;
 use serde_json::{json,Value};
 
@@ -56,16 +57,103 @@ struct Request {
     /// Carry resident entries and proven witnesses through table resizes.
     #[serde(default)] resume:bool,
     #[serde(default)] known:Vec<Known>,
+    #[serde(default)] stamps:bool,
+    #[serde(default)] library:Option<Vec<StampSource>>,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
         attacker:if side==0{Player::P1}else{Player::P2},placements_remaining:remaining,
         config:PosConfig{win_length:6,placement_radius:8,max_moves:u32::MAX}}
 }
+fn append(cert:&mut ProofCertificate,mut child:ProofCertificate,limit:usize)->Result<u32,String> {
+    let _time=stamps::measure("assemble");
+    if cert.nodes.len()+child.nodes.len()>limit {return Err("proof certificate size limit".into());}
+    let offset=cert.nodes.len() as u32;
+    for node in &mut child.nodes {match node {
+        ProofNode::AttackerMove{child,alternatives,..}=>{*child+=offset;for r in alternatives {r.child+=offset;}}
+        ProofNode::DefenderReplies{responses}=>for r in responses {r.child+=offset;},
+        ProofNode::ZoneReplies{fallback,responses,..}=>{*fallback+=offset;for r in responses {r.child+=offset;}},
+        ProofNode::StampLink{source}=>*source+=offset,
+        _=>{},
+    }}
+    let root=offset+child.root;
+    for node in child.nodes {
+        if let ProofNode::Stamp{source}=&node {
+            if let Some(id)=cert.nodes.iter().position(|n|matches!(n,ProofNode::Stamp{source:prior} if prior==source)) {
+                cert.nodes.push(ProofNode::StampLink{source:id as u32});continue;
+            }
+        }
+        cert.nodes.push(node);
+    }
+    // Remapping a child may have turned the target of one of its links into an
+    // alias. Keep links direct so raw verification never follows an alias chain.
+    for id in offset as usize..cert.nodes.len() {
+        if let ProofNode::StampLink{source}=cert.nodes[id] {
+            let mut target=source;
+            while let ProofNode::StampLink{source}=cert.nodes[target as usize] {target=source;}
+            cert.nodes[id]=ProofNode::StampLink{source:target};
+        }
+    }
+    Ok(root)
+}
+
+struct ZoneWork {sources:Vec<StampSource>,bytes:usize}
+
+/// Quiet defender turns are universal, not ordinary forcing-search negatives.
+/// Split only on relevant stones; a verified local strategy covers every turn
+/// outside its derived boundary. Repeat after the first relevant stone.
+fn defend_zone(board:&check::Board,ply:usize,attacker:u8,req:&Request,ctl:&Ctl,meter:&Meter,work:&mut ZoneWork)->Result<ProofCertificate,String> {
+    if ctl.expired() || meter.spent()>=req.nodes {return Err("zone proof budget".into());}
+    meter.add(1);
+    let (mover,remaining)=check::phase(ply);
+    let here=position(board,mover,remaining);
+    if let Some((fact,known))=exact_at(&here.stones,here.attacker,remaining) {
+        if known.winner!=if attacker==0 {Player::P1}else{Player::P2} {return Err("defender root is exact won".into());}
+        return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Exact{fact,after:vec![]}]});
+    }
+    if mover!=attacker && !check::completions(board,mover,remaining,ctl)?.is_empty() {return Err("defender counterwin".into());}
+    let oracle=stamps::Oracle::new(ctl,board);
+    let _scope=StampScope::new(oracle);
+    let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,node_budget:req.nodes,
+        tt_mb:(req.nodes/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
+    let proof={let _time=stamps::measure("forcing");
+        prover::pdspn::solve(&position(board,attacker,2),&cfg,ctl).certificate.ok_or("no fallback strategy")?};
+    let source=if let ProofNode::Stamp{source}=&proof.nodes[proof.root as usize] {(**source).clone()} else {
+        stamps::remember(StampSource{stones:board.iter().map(|(&p,&s)|(p,s)).collect(),player:attacker,remaining:2,winner:attacker,certificate:proof},ctl)?.source.clone()
+    };
+    if !work.sources.contains(&source) {
+        work.bytes+=serde_json::to_vec(&source).map_err(|e|e.to_string())?.len();
+        if work.bytes>8*1024*1024 {return Err("zone certificate byte limit".into());}
+        work.sources.push(source.clone());
+    }
+    let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Stamp{source:Box::new(source.clone())}]};
+    if mover==attacker {return Ok(cert);}
+    let stamp=stamps::remember(source,ctl)?;
+    let zone=stamp.danger(board,remaining,ctl)?;
+    if zone.len()>256 {return Err("proof zone size limit".into());}
+    let root=cert.nodes.len() as u32;
+    cert.nodes.push(ProofNode::Unstoppable{threats:vec![]});
+    let mut responses=vec![];
+    for &p in &zone {
+        let mut next=board.clone();next.insert(p,mover);
+        let child=defend_zone(&next,ply+1,attacker,req,ctl,meter,work)?;
+        responses.push(ProofResponse{action:vec![p],child:append(&mut cert,child,check_nodes(req.nodes))?});
+    }
+    cert.nodes[root as usize]=ProofNode::ZoneReplies{zone:zone.into_iter().collect(),fallback:0,responses};
+    cert.root=root;Ok(cert)
+}
 fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Request,ctl:&Ctl,meter:&Meter)->Result<ProofCertificate,String> {
     let side=check::phase(start).0;
     let (post,ply,terminal)=check::apply(board,start,moves)?;
     if terminal {return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::ImmediateWin{action:moves.to_vec()}]});}
+    if req.stamps {
+        let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![
+            ProofNode::AttackerMove{action:moves.to_vec(),child:1,alternatives:vec![]}]};
+        let child=defend(&post,ply,req,ctl,meter)?;
+        let child=append(&mut cert,child,check_nodes(req.nodes))?;
+        if let ProofNode::AttackerMove{child:id,..}=&mut cert.nodes[0] {*id=child;}
+        return Ok(cert);
+    }
     let defenses=check::defenses(&post,side,ctl)?;
     let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![
         ProofNode::AttackerMove{action:moves.to_vec(),child:1,alternatives:vec![]},
@@ -105,6 +193,16 @@ fn defend(board:&check::Board,ply:usize,req:&Request,ctl:&Ctl,meter:&Meter)->Res
     if let Some((fact,known))=exact_at(&root.stones,root.attacker,remaining) {
         if known.winner==root.attacker {return Err("defender root is exact won".into());}
         return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Exact{fact,after:vec![]}]});
+    }
+    if req.stamps {
+        if let Some((node,winner))=prover::certificate::stamp_at(&root) {
+            if winner==root.attacker {return Err("defender root is exact won".into());}
+            return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![node]});
+        }
+        let threats=check::completions(board,attacker,2,ctl)?;
+        if threats.is_empty() || check::covers(&threats,ctl)?.iter().any(|c|c.len()<remaining as usize) {
+            return defend_zone(board,ply,attacker,req,ctl,meter,&mut ZoneWork{sources:vec![],bytes:0});
+        }
     }
     let defenses=check::defenses_at(board,attacker,remaining,ctl)?;
     let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Unstoppable{threats:vec![]}]};
@@ -178,6 +276,14 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     let meter=Meter::new(req.nodes);
     let ctl=Ctl{deadline:Some(deadline),cancel,meter:Some(meter.clone())};
     if ctl.expired() {return Err("cancelled or deadline".into());}
+    stamps::reset_timings(req.stamps && req.bounds);
+    let board=check::replay_controlled(&req.history,&ctl)?;
+    if req.stamps {stamps::prune(&board);}
+    if req.library.as_ref().is_some_and(|l|l.len()>32 || !req.stamps) {return Err("invalid stamp library request".into());}
+    if let Some(library)=&req.library {for source in library {stamps::remember(source.clone(),&ctl)?.portable.set(true);}}
+    else if req.stamps {stamps::seed(&ctl)?;}
+    let stamp_oracle=req.stamps.then(||stamps::Oracle::new(&ctl,&board));
+    let _stamps=stamp_oracle.as_ref().map(|oracle|StampScope::new(oracle.clone()));
     let mut facts=Vec::new();
     let mut identities=BTreeMap::new();
     for known in &req.known {
@@ -196,20 +302,20 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     }
     let _facts=ExactScope::new(facts);
     // Premise-dependent search state must never serve another snapshot.
-    if !req.known.is_empty() {prover::dfpn::set_resident(0);}
+    if !req.known.is_empty() || req.stamps {prover::dfpn::set_resident(0);}
     else if req.resume {prover::dfpn::set_resident_resume(req.table_mb as usize);}
     else {prover::dfpn::set_resident(req.table_mb as usize);}
-    let board=check::replay_controlled(&req.history,&ctl)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
     let (mover,remaining)=check::phase(ply);
     let side=if req.attacker==Attacker::Defender {1-mover} else {mover};
-    let cacheable=req.known.is_empty() && req.attacker!=Attacker::Defender;
+    let cacheable=req.known.is_empty() && !req.stamps && req.attacker!=Attacker::Defender;
     let fresh=req.certificate.is_none() && req.root_moves.is_none();
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
         if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0,req.shortest && fresh);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
-        "defenses":"all legal covers for the remaining stones including complete free-second frontier; quiet defender nodes unsupported",
-        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":4,
+        "defenses":if req.stamps {"all legal covers; checked relevance zones for quiet and free-placement defender turns"}
+            else {"all legal covers for the remaining stones including complete free-second frontier; quiet defender nodes unsupported"},
+        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":5,
         "exact_premises":req.known.len(),
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
             "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
@@ -221,8 +327,9 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     let mut exact=false;
     let mut proof_numbers=None;
     let mut resident_reused=false;
+    let mut incomplete=None;
     let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if req.attacker==Attacker::Defender {
-        defend(&board,ply,&req,&ctl,&meter).ok()
+        match defend(&board,ply,&req,&ctl,&meter) {Ok(cert)=>Some(cert),Err(reason)=>{incomplete=Some(reason);None}}
     } else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
     } else {
@@ -249,7 +356,7 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
                 found.certificate
             };
             match found {
-                Some(cert) if req.shortest && req.known.is_empty() =>
+                Some(cert) if req.shortest && req.known.is_empty() && !req.stamps =>
                     match shorten(&pos,&cert,&req,&ctl,&meter) {
                         Some((tight,minimal)) if check::verify(&req.history,ply,&tight,&ctl,check_nodes(req.nodes)).is_ok() =>
                             {exact=minimal;Some(tight)}
@@ -262,7 +369,7 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     let mut response=json!({"status":"UNKNOWN","native_verified":false,"moves":[],"certificate":null,
         "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict.clone(),
         "attacker":match req.attacker {Attacker::Opponent=>"opponent",Attacker::Defender=>"defender",Attacker::Mover=>"mover"},
-        "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
+        "reason":incomplete.unwrap_or_else(||"no verified strategy".into()),"nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
         "nodes_fresh":meter.spent().min(req.nodes),
         "shortest":false});
     if req.bounds {
@@ -283,6 +390,8 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
                         match &mut node {
                             ProofNode::AttackerMove{child,alternatives,..}=>{*child=indices[child];alternatives.clear();}
                             ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=indices[&reply.child];},
+                            ProofNode::ZoneReplies{fallback,responses,..}=>{*fallback=indices[fallback];for reply in responses {reply.child=indices[&reply.child];}},
+                            ProofNode::StampLink{source}=>*source=indices[source],
                             _=>{},
                         }
                         node
@@ -301,6 +410,13 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
                 let used:std::collections::BTreeSet<_>=cert.nodes.iter().filter_map(|n|if let ProofNode::Exact{fact,..}=n {Some(*fact)} else {None}).collect();
                 response["dependencies"]=json!(used.into_iter().map(|id|json!({"fact":id,"outcome":req.known[id as usize]})).collect::<Vec<_>>());
                 response["moves"]=json!(moves);response["proof_turns"]=json!(turns);response["shortest"]=json!(exact);
+                if req.stamps {
+                    let source=StampSource{stones:board.iter().map(|(&p,&s)|(p,s)).collect(),player:mover,remaining,winner:side,certificate:cert.clone()};
+                    if !matches!(&cert.nodes[cert.root as usize],ProofNode::Stamp{..}) {if let Ok(stamp)=stamps::remember(source,&ctl) {
+                        response["stamp_learned"]=json!({"required":stamp.required,"empty":stamp.empty,"turns":stamp.turns,"key":stamp.key()});
+                    }}
+                    response["stamp_hits"]=json!(cert.nodes.iter().filter(|n|matches!(n,ProofNode::Stamp{..})).count());
+                }
                 response["certificate"]=serde_json::to_value(cert).map_err(|e|e.to_string())?;
                 response["reason"]=json!(if req.known.is_empty() {"independent raw-board strategy verification"} else {"raw-board strategy verified against supplied exact graph premises"});
             }
@@ -315,6 +431,11 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
         response["reason"]=json!(if ctl.cancel.load(Ordering::Acquire) {"cancelled"} else {"deadline"});
     }
     response["elapsed_ms"]=json!(start.elapsed().as_secs_f64()*1000.0);
+    if req.stamps {
+        let (entries,bytes)=stamps::stats();
+        response["stamp_matches"]=json!(stamp_oracle.as_ref().unwrap().hits.get());response["stamp_entries"]=json!(entries);response["stamp_bytes"]=json!(bytes);
+        if req.bounds {response["stamp_timings"]=stamps::timings();}
+    }
     Ok(response)
 }
 

@@ -14,7 +14,7 @@ import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proo
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
-  'free-second coverage work limit']);
+  'free-second coverage work limit', 'no fallback strategy', 'zone proof budget', 'zone certificate byte limit', 'proof zone size limit']);
 let native, ort, network, cache, games, device, solver = null, solverCalls = 0;
 /** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
  * another turn advances, searches or evicts a game tree. */
@@ -116,7 +116,7 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, proofStamps = false}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -152,7 +152,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     if (!leafNodes || ms < 1) return null;
     check();
     const before = performance.now();
-    const found = note(await solve(id, leaves, {nodes: Math.min(2048, leafNodes), ms}));
+    const found = note(await solve(id, leaves, {nodes: Math.min(2048, leafNodes), ms, stamps: proofStamps}));
     const used = found.nodes_used || 0;
     leafNodes = Math.max(0, leafNodes - used);
     leafMs -= performance.now() - before;
@@ -164,6 +164,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     if (solverNodes) {
       const mineFacts = facts.filter(f => f.history.length !== history.length || f.winner !== player);
       const mine = note(await solve(id, history, {attacker: 'mover', nodes: solverNodes, ms: solverMs(), shortest: true,
+        stamps: proofStamps,
         known: mineFacts.map(({history, winner, plies}) => ({history, winner, plies}))}));
       check();
       solved = searched(mine);
@@ -172,16 +173,17 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         moves = mine.moves.map(m => [...m]);
         const found = principalVariation(native, history, mine.certificate, {known: mineFacts});
         pv = found.pv;
-        proof = {winner: player, turns: mine.proof_turns, plies: found.plies, ...(mine.dependencies?.length ? proofEvidence(mine) : {})};
+        proof = {winner: player, turns: mine.proof_turns, plies: proofStamps ? state.remaining + 4 * (mine.proof_turns - 1) : found.plies,
+          ...(mine.dependencies?.length || proofStamps ? proofEvidence(mine) : {})};
         top = [[...moves[0], 1, 1, 1]];
       } else {
-        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises}));
+        const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
         check();
         solved = solved && searched(theirs);
         solverUsed += theirs.nodes_used || 0;
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
         if ((verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
-          const defended = note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises}));
+          const defended = note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
           check();
           const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
           solved = solved && (lost || searched(defended));
