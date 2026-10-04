@@ -129,6 +129,8 @@ class ActorSettings:
             raise ValueError('native_scheduler requires game_graph and frontier slices instead of legacy solver budgets or PV checks')
         if self.native_scheduler and self.historical_fraction and self.native_producers<2:
             raise ValueError('Native historical games require at least two host workers')
+        if self.native_scheduler and (not 1<=self.games_in_flight<=1024 or not 1<=self.leaf_batch<=1024):
+            raise ValueError('Native game slots and inference batches must lie in [1, 1024]')
         if self.native_packing and not self.native_feed:
             raise ValueError('native_packing requires native_feed')
         if self.native_feed and self.solver_leaf_nodes:

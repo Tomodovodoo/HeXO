@@ -34,6 +34,8 @@ for name, result, args in (
     ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
+    ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
+    ('reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
     ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
@@ -446,6 +448,16 @@ class InferenceService:
         """Resize host workers on their owner thread between joined phases."""
         checked(native.hxb_workers(self.ptr,producer,count))
 
+    def reclaim_ready(self):
+        return bool(native.hxb_reclaim_ready(self.ptr))
+
+    def reclaim(self, pool):
+        """Transfer a joined, drained pool to bounded native background cleanup."""
+        if pool.proofs is not None:
+            pool.proofs.close()
+        checked(native.hxb_reclaim(self.ptr,pool.ptr))
+        pool._ptr = None
+
     def take(self, wait_ms=0):
         from native_dense import PackedRows
         token, model, pointer = C.c_uint64(), C.c_int(), ptr()
@@ -572,6 +584,9 @@ class InferenceService:
         # Native feed messages installed, including retired/empty messages.
         # This is not a neural-row or search-visit count.
         result['installed_message_rows'] = int(native.hxb_installed(self.ptr))
+        retired = np.empty(4,np.uint64)
+        native.hxb_reclaim_stats(self.ptr,retired.ctypes.data)
+        result.update(zip(('reclaim_queued','reclaim_active','reclaimed_pools','reclaim_ns'),map(int,retired)))
         return result
 
     def cancel(self):

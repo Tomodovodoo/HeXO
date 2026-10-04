@@ -73,6 +73,8 @@ struct Broker {
  std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
+ std::deque<std::unique_ptr<owner::Pool>> garbage;std::thread reclaimer;
+ bool reclaiming=false,reclaim_stop=false;uint64_t reclaimed=0,reclaim_ns=0;
  struct Event {Producer* producer;int game;std::string text;};
  std::deque<Event> events;std::string last_event;
  Broker(int q,int p,int merge,double latency):quantum(q),pending(p),merge_cells(merge),latency_ms(latency){
@@ -119,6 +121,33 @@ struct Broker {
   std::lock_guard lock(mutex);
   return std::any_of(producers.begin(),producers.end(),[&](const auto& p){return p && p->model==model;}) ||
          std::any_of(tasks.begin(),tasks.end(),[&](const auto& task){return task.second->model==model;});
+ }
+ bool reclaim_ready(){std::lock_guard lock(mutex);return continuous && started && !joined && garbage.size()+reclaiming<2 && !reclaim_stop && !cancelled;}
+ void reclaim(owner::Pool* pool){
+  std::lock_guard lock(mutex);
+  if(!continuous || !started || joined || garbage.size()+reclaiming>=2 || reclaim_stop || cancelled || pool->inference_owner || pool->proof_owner)
+   throw std::runtime_error("Retired pool reclamation is unavailable");
+  int64_t feed[6];hxgf_stats(pool->feed,feed);
+  if(feed[4])throw std::runtime_error("Drain retired neural work before reclamation");
+  for(auto& game:pool->games){
+   if(!game->stopped || std::any_of(game->game->pins.begin(),game->game->pins.end(),[&](const auto& pin){
+      return std::none_of(game->views.begin(),game->views.end(),[&](const auto& view){return pin.first==view.tree.get();});}))
+    throw std::runtime_error("Close retired caller trees before reclamation");
+  }
+  if(!reclaimer.joinable())reclaimer=std::thread([this]{
+   for(;;){std::unique_ptr<owner::Pool> pool;
+    {std::unique_lock lock(mutex);wake.wait(lock,[&]{return reclaim_stop || !garbage.empty();});
+     if(garbage.empty() && reclaim_stop)return;
+     pool=std::move(garbage.front());garbage.pop_front();reclaiming=true;
+    }
+    auto start=Clock::now();pool.reset();
+    {std::lock_guard lock(mutex);reclaiming=false;++reclaimed;
+     reclaim_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());wake.notify_all();}
+   }
+  });
+  // Allocate the queue entry before taking ownership, preserving the caller's
+  // pool if deque growth throws.
+  garbage.emplace_back();garbage.back().reset(pool);wake.notify_all();
  }
  void workers(int index,int count){
   std::unique_lock lock(mutex);
@@ -319,7 +348,9 @@ struct Broker {
  }
  void join(){
   cancel();for(auto& p:producers)if(p && p->thread.joinable())p->thread.join();
-  std::lock_guard lock(mutex);if(!flights.empty())throw std::runtime_error("Fence and complete service batches before joining");joined=true;
+  {std::lock_guard lock(mutex);if(!flights.empty())throw std::runtime_error("Fence and complete service batches before joining");reclaim_stop=true;wake.notify_all();}
+  if(reclaimer.joinable())reclaimer.join();
+  std::lock_guard lock(mutex);joined=true;
  }
 };
 inline void Producer::run()noexcept{
@@ -447,6 +478,9 @@ HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<infer
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_model_pending(void* p,int model){return static_cast<inference::Broker*>(p)->model_pending(model);}
 HX_API int hxb_workers(void* p,int producer,int count){try{static_cast<inference::Broker*>(p)->workers(producer,count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_reclaim_ready(void* p){return static_cast<inference::Broker*>(p)->reclaim_ready();}
+HX_API int hxb_reclaim(void* p,void* pool){try{static_cast<inference::Broker*>(p)->reclaim(static_cast<owner::Pool*>(pool));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API void hxb_reclaim_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);std::array<uint64_t,4> values{uint64_t(b.garbage.size()),uint64_t(b.reclaiming),b.reclaimed,b.reclaim_ns};std::copy(values.begin(),values.end(),out);}
 HX_API int hxb_start(void* p,double ms){try{static_cast<inference::Broker*>(p)->start(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started){gumbel::error="Configure continuous mode before starting";return 0;}b.continuous=true;return 1;}
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

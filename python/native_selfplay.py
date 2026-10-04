@@ -222,12 +222,14 @@ class NativeGames:
             producer,model_id = group['producer'],group['model_id']
             if sha in needed or len(group['free'])!=len(self.games):
                 continue
+            if not self.service.reclaim_ready():
+                continue
             self.service.detach(producer)
             loop = self.proof_loops[producer]
             if loop:
                 self.archived_stats.append(dict(loop.stats(),model=sha))
                 self.archived_proofs.extend(dict(r,model=sha) for r in loop.records())
-            self.pools[producer].close()
+            self.service.reclaim(self.pools[producer])
             self.pools[producer],self.proof_loops[producer] = None,None
             del self.groups[sha]
         for model_id,model in enumerate(self.models):
@@ -423,7 +425,8 @@ class ActorEngine:
 
     def add(self, game):
         if self.engine is not None:
-            self.engine.replace(self.free.popleft(),game)
+            self.engine.replace(self.free[0],game)
+            self.free.popleft()
         self.slots.append(game)
 
     def progress(self, index, event):
@@ -437,9 +440,10 @@ class ActorEngine:
         self.accounted = current
 
     def summary(self):
+        running = self.engine is not None and bool(self.engine.service._ptr)
         return dict(inference=self.engine.service.stats() if self.engine else None,
-                    producers=sum(p is not None for p in self.engine.pools) if self.engine else 0,
-                    host_workers=sum(g['workers'] for g in self.engine.groups.values()) if self.engine else 0,
+                    producers=sum(p is not None for p in self.engine.pools) if running else 0,
+                    host_workers=sum(g['workers'] for g in self.engine.groups.values()) if running else 0,
                     waiting_games=len(self.engine.waiting) if self.engine else 0,
                     retired_fresh_nodes=self.fresh_nodes,retired_queries=self.queries,
                     retired_missing_fresh=self.missing_fresh)

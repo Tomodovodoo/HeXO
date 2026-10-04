@@ -3747,6 +3747,36 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_rejected_model_pair_does_not_consume_the_retired_slot(self):
+        from native_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'one-host-{k}','fixed','cpu',64,128) for k in range(2)]
+        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=1,game_graph=192,
+            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=2,
+            opening_random_plies=0.)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30,native_owner=True))
+        end = time.monotonic()+5
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                game.episode()
+        self.assertFalse(engine.slots)
+        pair = dense_selfplay.SelfPlayGame(models,settings,40,opponent='other',native_owner=True)
+        self.addCleanup(pair.game.close)
+        for tree in pair.trees.values():
+            self.addCleanup(tree.close)
+        with self.assertRaisesRegex(ValueError,'model set exceeds'):
+            engine.add(pair)
+        self.assertEqual(len(engine.free),1)
+        engine.add(dense_selfplay.SelfPlayGame([models[1]]*2,settings,41,native_owner=True))
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                game.episode()
+        self.assertFalse(engine.slots)
+        engine.drain()
+        self.assertEqual(engine.summary()['host_workers'],0)
+
     def test_native_model_admission_waits_without_deadlocking_disjoint_historical_pairs(self):
         from native_selfplay import ActorEngine
         torch.set_num_threads(2)
@@ -3829,7 +3859,9 @@ class EngineTests(unittest.TestCase):
             service.detach(0)
         old.close()
         service.detach(0)
-        pool.close()
+        self.assertTrue(service.reclaim_ready())
+        service.reclaim(pool)
+        self.assertFalse(pool._ptr)
         self.assertTrue(service.model_pending(0))
         fresh = NativeScheduler.graph(self,version='next-model')
         other = NativeScheduler.pool(self,[fresh],views=1,work=16)
@@ -3848,6 +3880,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((event['model'],event['token'],event['root_completed']),(1,1,16))
         service.close()
         self.assertEqual(service.stats()['active_producers'],0)
+        self.assertEqual(service.stats()['reclaimed_pools'],1)
+        self.assertEqual((service.stats()['reclaim_queued'],service.stats()['reclaim_active']),(0,0))
 
     def test_native_actor_attaches_new_checkpoint_while_old_game_keeps_its_model(self):
         from native_selfplay import ActorEngine
