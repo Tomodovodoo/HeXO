@@ -147,6 +147,9 @@ if (job.kind === 'encode') {
     const again = await graph.search({simulations: 32, rootSamples: 8, batchSize: 8, cache: new EvaluationCache(), evaluate});
     answer = {first: pick(first), back: pick(back), again: pick(again)};
   } finally { graph.close(); }
+} else if (job.kind === 'tactical') {
+  const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
+  answer = job.queries.map(({history, options}) => solver.history(history, options));
 } else if (job.kind === 'proof-search') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const tree = new NeuralSearch(native, {tactics: true, graph: true, history: job.history});
@@ -194,7 +197,7 @@ if (job.kind === 'encode') {
   for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
-      known: job.known || null}});
+      known: job.known || null, proofStamps: job.proofStamps || false}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);

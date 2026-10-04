@@ -373,6 +373,32 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_local_proofs_reach_browser_search_and_saved_lines(self):
+        from tests.test_tactical_proof import OPEN_THREE
+        history = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+        query = dict(history=history, options=dict(nodes=1, ms=10000, stamps=True))
+        reference, reused = node(dict(kind='tactical', queries=[dict(history=history, options=dict(nodes=1, ms=10000)), query]))
+        self.assertEqual(reference['status'], 'UNKNOWN')
+        self.assertEqual(reused['status'], 'PROVEN_WIN', reused)
+        self.assertEqual(tactical_proof.independent_verify(reused['certificate'], history), 'PROVEN_WIN')
+        local = play.principal_variation(history, reused['certificate'])
+        self.assertEqual(node(dict(kind='pv', history=history, certificate=reused['certificate'])),
+                         dict(pv=local[0], plies=local[1]))
+        self.assertTrue(local[0])
+        turn = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1, proofStamps=True))
+        self.assertEqual((turn['proof']['winner'], turn['value']), (0, 1.))
+        self.assertEqual(tactical_proof.independent_verify(turn['proof']['certificate'], history), 'PROVEN_WIN')
+
+    def test_quiet_defender_certificate_has_the_same_browser_line(self):
+        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8],[-8,8]]
+        [result] = node(dict(kind='tactical', queries=[dict(history=history,
+            options=dict(nodes=20000, ms=20000, stamps=True, attacker='defender'))]))
+        self.assertEqual(result['status'], 'PROVEN_LOSS', result)
+        self.assertEqual(tactical_proof.independent_verify(result['certificate'], history, attacker='defender'), 'PROVEN_LOSS')
+        local = play.principal_variation(history, result['certificate'], attacker=0)
+        self.assertEqual(node(dict(kind='pv', history=history, certificate=result['certificate'], options=dict(attacker=0))),
+                         dict(pv=local[0], plies=local[1]))
+
     def test_worker_proves_a_defender_root_from_saved_exact_replies(self):
         from tests.test_tactical_proof import OPEN_THREE
         history = OPEN_THREE + [[-1, 0], [2, 1]]

@@ -100,7 +100,8 @@ export async function loadTactical(source) {
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
-                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, known = [] } = {}) {
+                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, known = [],
+                               stamps = false, library = null } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     if (resume && !table_mb) throw new RangeError('Solver resume requires a positive table_mb');
     const start = performance.now();
@@ -113,6 +114,8 @@ export async function loadTactical(source) {
     if (remaining < 1) return unknown('deadline');
     const request = { history, ms: remaining, nodes, idtt_nodes, depth, attacker, table_mb };
     if (known.length) request.known = known;
+    if (stamps) request.stamps = true;
+    if (library !== null) request.library = library;
     if (certificate != null) request.certificate = certificate;
     if (root_moves != null) request.root_moves = root_moves;
     if (shortest) request.shortest = true;

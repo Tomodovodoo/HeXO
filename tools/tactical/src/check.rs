@@ -50,7 +50,7 @@ fn check(ctl: &Ctl) -> Result<(),String> {
     if ctl.cancel.load(std::sync::atomic::Ordering::Acquire) {Err("verification cancelled".into())}
     else if ctl.expired() {Err("verification deadline".into())} else {Ok(())}
 }
-fn completions(b:&Board, side:u8, allowance:u8, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
+pub(crate) fn completions(b:&Board, side:u8, allowance:u8, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
     let mut segments=BTreeSet::new();
     for (&(q,r),&owner) in b {
         check(ctl)?;
@@ -70,7 +70,7 @@ fn completions(b:&Board, side:u8, allowance:u8, ctl:&Ctl) -> Result<BTreeSet<Vec
     }
     Ok(out)
 }
-fn covers(threats:&BTreeSet<Vec<Point>>, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
+pub(crate) fn covers(threats:&BTreeSet<Vec<Point>>, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
     let endpoints:Vec<_>=threats.iter().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
     let hits=|p:&[Point]| threats.iter().all(|t|p.iter().any(|x|t.contains(x)));
     let mut result=BTreeSet::new();
@@ -138,9 +138,13 @@ pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, ctl:&Ctl, m
 }
 pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32,BTreeSet<u32>),String> {
     check(ctl)?;
-    if cert.version!=1 || cert.width!="wide" || cert.nodes.len()>max_nodes {return Err("certificate format/size".into());}
     if start!=history.len() && start!=flip(history.len()) {return Err("invalid certificate root phase".into());}
     let board=replay_controlled(history,ctl)?;
+    verify_board(&board,start,attacker,cert,ctl,max_nodes)
+}
+pub(crate) fn verify_board(board:&Board, start:usize, attacker:u8, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32,BTreeSet<u32>),String> {
+    check(ctl)?;
+    if cert.version!=1 || cert.width!="wide" || cert.nodes.len()>max_nodes {return Err("certificate format/size".into());}
     struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, ctl:&'a Ctl, left:usize, stack:BTreeSet<u32>, used:BTreeSet<u32>}
     impl Checker<'_> {
         fn walk(&mut self,id:u32,b:&Board,n:usize) -> Result<u32,String> {
@@ -150,6 +154,45 @@ pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertifi
             let node=self.cert.nodes.get(id as usize).ok_or("invalid certificate edge")?;
             let (side,remaining)=phase(n);
             let turns=match node {
+                ProofNode::StampLink{source}=>{
+                    if !matches!(self.cert.nodes.get(*source as usize),Some(ProofNode::Stamp{..})) {
+                        return Err("stamp link does not name a strategy".into());
+                    }
+                    self.walk(*source,b,n)?
+                }
+                ProofNode::ZoneReplies{zone,fallback,responses}=>{
+                    if side==self.attacker || !completions(b,side,remaining,self.ctl)?.is_empty() {
+                        return Err("zone defender phase or counterwin".into());
+                    }
+                    let entry=match self.cert.nodes.get(*fallback as usize) {
+                        Some(ProofNode::StampLink{source})=>self.cert.nodes.get(*source as usize),
+                        entry=>entry,
+                    };
+                    let source=match entry {
+                        Some(ProofNode::Stamp{source})=>source,
+                        _=>return Err("zone fallback must be a checked stamp".into()),
+                    };
+                    let stamp=crate::stamps::remember((**source).clone(),self.ctl)?;
+                    let required=stamp.danger(b,remaining,self.ctl)?;
+                    let region:BTreeSet<_>=zone.iter().copied().collect();
+                    if region.len()!=zone.len() || region.len()>256 || !required.is_subset(&region)
+                        || region.iter().any(|p|b.contains_key(p)||p.0.unsigned_abs()>LIMIT as u32||p.1.unsigned_abs()>LIMIT as u32)
+                        || responses.len()!=region.len() {return Err("invalid or incomplete proof zone".into());}
+                    let mut deepest=self.walk(*fallback,b,crate::stamps::ply(self.attacker,2))?;
+                    let mut seen=BTreeSet::new();
+                    for r in responses {
+                        if r.action.len()!=1 || !region.contains(&r.action[0]) || !seen.insert(r.action[0]) {
+                            return Err("missing/duplicate relevant defense".into());
+                        }
+                        // Overapproximate the defender's reach. If a legal pair
+                        // has its relevant stone second, commute it to first.
+                        let mut next=b.clone();next.insert(r.action[0],side);
+                        if won(&next,r.action[0],side) {return Err("defender wins in zone".into());}
+                        deepest=deepest.max(self.walk(r.child,&next,n+1)?);
+                    }
+                    deepest
+                }
+                ProofNode::Stamp{source}=>crate::stamps::verify(source,b,n,self.attacker,self.ctl)?,
                 ProofNode::Exact{fact,after} => {
                     use hexo_solver::prover::certificate::exact_fact;
                     use hexo_engine::types::Player;
@@ -209,10 +252,11 @@ pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertifi
         }
     }
     let mut checker=Checker{cert,attacker,ctl,left:max_nodes,stack:BTreeSet::new(),used:BTreeSet::new()};
-    let turns=checker.walk(cert.root,&board,start)?;
+    let turns=checker.walk(cert.root,board,start)?;
     check(ctl)?;
     match &cert.nodes[cert.root as usize] {
         ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok((action.clone(),turns,checker.used)),
+        ProofNode::Stamp{source}=>Ok((crate::stamps::moves(source,board,start)?,turns,checker.used)),
         _ if phase(start).0!=attacker=>Ok((vec![],turns,checker.used)),
         ProofNode::Exact{..}=>Ok((vec![],turns,checker.used)),
         _=>Err("root must be attacker action".into())

@@ -18,7 +18,8 @@ def main():
     parser.add_argument('--cargo', default='cargo')
     args = parser.parse_args()
     vendored = sorted(path for path in (PACKAGE/'vendor').rglob('*') if path.suffix in ('.rs', '.toml'))
-    paths = ['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/check.rs'] + [path.relative_to(PACKAGE).as_posix() for path in vendored]
+    paths = ['Cargo.toml', 'Cargo.lock', 'stamps.json'] + [path.relative_to(PACKAGE).as_posix()
+                                         for path in sorted((PACKAGE/'src').glob('*.rs')) + vendored]
     before = {p: digest(PACKAGE/p) for p in paths}
     command = [args.cargo, 'build', '--release', '--locked', '--manifest-path', str(PACKAGE/'Cargo.toml')]
     subprocess.run(command, check=True)

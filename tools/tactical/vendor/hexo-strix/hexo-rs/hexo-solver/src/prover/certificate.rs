@@ -22,6 +22,60 @@ use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A complete, ordinary proof from which the raw checker derives a local stamp.
+/// Its footprint and counter-threat conditions are recomputed, never trusted input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StampSource {
+    pub stones: Vec<(Coord, u8)>,
+    pub player: u8,
+    pub remaining: u8,
+    pub winner: u8,
+    pub certificate: ProofCertificate,
+}
+
+pub type StoneAt<'a> = &'a dyn Fn(Coord) -> Option<Player>;
+pub trait StampOracle {
+    fn lookup(&self, hash: u64, stones: &[(Coord, Player)], get: StoneAt<'_>, player: Player, remaining: u8)
+        -> Option<(usize, Player, u32)>;
+    fn source(&self, id: usize) -> StampSource;
+    fn verify(&self, source: &StampSource, get: StoneAt<'_>, stones: &[(Coord, Player)], player: Player, remaining: u8)
+        -> Option<u32>;
+}
+thread_local! { static STAMPS: RefCell<Option<Rc<dyn StampOracle>>> = RefCell::new(None); }
+pub struct StampScope(Option<Rc<dyn StampOracle>>);
+impl StampScope {
+    pub fn new(oracle: Rc<dyn StampOracle>) -> Self { Self(STAMPS.with(|s| s.borrow_mut().replace(oracle))) }
+}
+impl Drop for StampScope { fn drop(&mut self) { STAMPS.with(|s| *s.borrow_mut()=self.0.take()); } }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Terminal { Graph(u32), Stamp(usize) }
+impl Terminal {
+    fn proof(self) -> ProofNode {
+        match self {
+            Self::Graph(fact) => ProofNode::Exact { fact, after: vec![] },
+            Self::Stamp(id) => STAMPS.with(|s| ProofNode::Stamp { source: Box::new(s.borrow().as_ref().unwrap().source(id)) }),
+        }
+    }
+}
+pub(crate) fn lookup_stamp(hash: u64, stones: &[(Coord, Player)], get: StoneAt<'_>, player: Player, remaining: u8)
+    -> Option<(Terminal, Player, u32)> {
+    STAMPS.with(|s| s.borrow().as_ref()?.lookup(hash,stones,get,player,remaining))
+        .map(|(id,winner,turns)|(Terminal::Stamp(id),winner,turns))
+}
+pub(crate) fn verify_stamp(source: &StampSource, get: StoneAt<'_>, stones: &[(Coord, Player)], player: Player, remaining: u8)
+    -> Option<u32> {
+    STAMPS.with(|s| s.borrow().as_ref()?.verify(source,get,stones,player,remaining))
+}
+
+pub fn stamp_at(pos:&Position)->Option<(ProofNode,Player)> {
+    let mut board=crate::forcing::SolverBoard::new();
+    for &(p,s) in &pos.stones {board.place(p,s);}
+    let (terminal,winner,_)=lookup_stamp(board.hash,&board.stones,&|p|board.get(p),pos.attacker,pos.placements_remaining)?;
+    Some((terminal.proof(),winner))
+}
 
 /// An exact game outcome supplied by the caller's proof graph. These are
 /// premises, never neural estimates or scoped forcing-search negatives.
@@ -99,6 +153,13 @@ pub struct ProofResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofNode {
+    /// Reuse a verified local strategy under its derived footprint and tempo guards.
+    Stamp { source: Box<StampSource> },
+    /// Another node in this certificate already carries this stamp's strategy.
+    StampLink { source: u32 },
+    /// A defender turn split on its first relevant stone. The fallback stamp
+    /// proves all turns outside `zone`; the raw checker derives that boundary.
+    ZoneReplies { zone: Vec<Coord>, fallback: u32, responses: Vec<ProofResponse> },
     /// Reference into the caller's trusted, query-local exact-outcome snapshot.
     /// A standalone verifier without that snapshot rejects this leaf.
     Exact { fact: u32, #[serde(default, skip_serializing_if = "Vec::is_empty")] after: Vec<Coord> },
@@ -278,8 +339,8 @@ impl ProofBuilder<'_> {
             return Err(format!("missing proved node {key:016x}"));
         }
 
-        let (proof_node, depth) = if let Some((fact, true, turns)) = self.k.exact(node, remaining) {
-            (ProofNode::Exact { fact, after: Vec::new() }, turns)
+        let (proof_node, depth) = if let Some((terminal, true, turns)) = self.k.exact(node, remaining) {
+            (terminal.proof(), turns)
         } else { match node {
             Node::Or { placements } => match self.k.or_eval(placements) {
                 OrEval::WinNow if remaining != Some(0) => {
@@ -472,11 +533,18 @@ fn replay_pv(
             .get(id as usize)
             .ok_or_else(|| format!("proof node {id} is out of range"))?;
         let value = match node {
+            ProofNode::Stamp { source } => depth(&source.certificate, source.certificate.root, &mut FxHashMap::default(), ctl)?,
+            ProofNode::StampLink { source } => depth(certificate, *source, memo, ctl)?,
             ProofNode::Exact { fact, .. } => exact_fact(*fact).ok_or("missing exact premise")?.turns,
             ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => 1,
             ProofNode::AttackerMove { child, .. } => {
                 1u32.saturating_add(depth(certificate, *child, memo, ctl)?)
             }
+            ProofNode::ZoneReplies { fallback, responses, .. } => {
+                let mut bound = depth(certificate, *fallback, memo, ctl)?;
+                for r in responses { bound=bound.max(depth(certificate, r.child, memo, ctl)?); }
+                bound
+            },
             ProofNode::DefenderReplies { responses } => responses
                 .iter()
                 .map(|response| depth(certificate, response.child, memo, ctl))
@@ -508,7 +576,7 @@ fn replay_pv(
             .get(id as usize)
             .ok_or_else(|| format!("proof node {id} is out of range"))?;
         match node {
-            ProofNode::Exact { .. } => break,
+            ProofNode::Exact { .. } | ProofNode::Stamp { .. } | ProofNode::StampLink { .. } | ProofNode::ZoneReplies { .. } => break,
             ProofNode::ImmediateWin { action } => {
                 let cells = CellSet2::from_cells(action);
                 k.place_attacker(&cells);
@@ -709,9 +777,12 @@ impl ProofVerifier<'_> {
             (_, ProofNode::Exact { fact, after }) => {
                 if !after.is_empty() { return Err("continued premise needs the raw-board checker".into()); }
                 let (actual, won, turns) = self.k.exact(expected, None).ok_or("missing or mismatched exact premise")?;
-                if actual != fact || !won { return Err("exact premise does not prove this attacker".into()); }
+                if actual != Terminal::Graph(fact) || !won { return Err("exact premise does not prove this attacker".into()); }
                 turns
             }
+            (_, ProofNode::Stamp { source }) => self.k.stamp(&source, expected).ok_or("invalid local proof stamp")?,
+            (_, ProofNode::ZoneReplies { .. }) => return Err("zone proof requires the raw checker".into()),
+            (_, ProofNode::StampLink { .. }) => return Err("stamp link requires the raw checker".into()),
             (Node::Or { placements }, ProofNode::ImmediateWin { action }) => {
                 let claimed = parse_action(&action)?;
                 let actual = self
@@ -891,7 +962,11 @@ fn primary_reachable(certificate: &ProofCertificate, ctl: &Ctl) -> Result<FxHash
             ProofNode::DefenderReplies { responses } => {
                 pending.extend(responses.iter().map(|response| response.child));
             }
-            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } | ProofNode::Exact { .. } => {}
+            ProofNode::ZoneReplies { fallback, responses, .. } => {
+                pending.push(*fallback);pending.extend(responses.iter().map(|r|r.child));
+            }
+            ProofNode::StampLink { source } => pending.push(*source),
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } | ProofNode::Exact { .. } | ProofNode::Stamp { .. } => {}
         }
     }
     Ok(reached)

@@ -508,6 +508,31 @@ class Proofs(unittest.TestCase):
         cls.opening = [tuple(m) for m in FIXTURE['positions'][PROOF]]
         cls.result = engine.history(cls.opening, nodes=NODES)
 
+    def test_a_local_stamp_can_be_followed_to_the_winning_stone(self):
+        from tests.test_tactical_proof import OPEN_THREE
+        base = list(map(tuple, OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]))
+        result = NativeTactics().history(base, stamps=True, nodes=1, ms=5000)
+        self.assertEqual(result['status'], 'PROVEN_WIN')
+        proof = Proof(base, result['certificate'])
+        game, history = Game(base), list(base)
+        self.addCleanup(game.close)
+        for _ in range(20):
+            if game.winner >= 0:
+                break
+            if game.player == 0:
+                moves = proof.action(history)
+                self.assertTrue(moves)
+            else:
+                moves = proof.reply(history) or [max(game.legal_moves())]
+            for p in moves:
+                game.play(*p)
+                history.append(tuple(p))
+                if game.winner >= 0:
+                    break
+        self.assertEqual(game.winner, 0)
+        labels, _ = proof.path(history)
+        self.assertEqual([p for p, _, _ in labels], list(range(len(base), len(history))))
+
     def test_seeded_replies_complete_only_covered_defender_turns(self):
         base = [tuple(m) for m in FIXTURE['positions']['1790600287230040:25:213']]
         result = NativeTactics().history(base, nodes=5000)

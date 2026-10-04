@@ -65,6 +65,7 @@ export class BubbleEngine extends EngineWorker {
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
+      proofStamps: options.proofStamps ?? false,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
       ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null}, options);
   }

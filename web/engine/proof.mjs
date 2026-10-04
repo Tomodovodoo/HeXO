@@ -3,12 +3,39 @@
  * (python/play.py Proofs). */
 
 /** Most attacker turns on any path of `certificate` from each node, the completing turn included. */
+function proofArena(certificate) {
+  if (!certificate.nodes.some(n => n.kind === 'stamp' || n.kind === 'stamp_link')) return certificate;
+  const nodes = [];
+  const append = (document, depth = 0) => {
+    if (depth > 8 || nodes.length + document.nodes.length > 200000) throw new Error('Proof source expansion limit');
+    const offset = nodes.length;
+    for (const node of document.nodes) nodes.push({...node});
+    document.nodes.forEach((original, i) => {
+      const node = nodes[offset + i];
+      if (node.kind === 'stamp') nodes[offset + i] = {kind: 'link', child: append(node.source.certificate, depth + 1)};
+      else if (node.kind === 'stamp_link') nodes[offset + i] = {kind: 'link', child: offset + node.source};
+      else {
+        if (node.child !== undefined) node.child += offset;
+        if (node.fallback !== undefined) node.fallback += offset;
+        for (const field of ['responses', 'alternatives']) {
+          if (node[field]) node[field] = original[field].map(r => ({...r, child: r.child + offset}));
+        }
+      }
+    });
+    return offset + document.root;
+  };
+  const root = append(certificate);
+  return {nodes, root};
+}
+
 function depths(certificate, known = []) {
   const memo = new Map();
   const turns = index => {
     if (!memo.has(index)) {
       const node = certificate.nodes[index];
-      memo.set(index, node.kind === 'attacker_move' ? 1 + turns(node.child)
+      memo.set(index, node.kind === 'link' ? turns(node.child)
+        : node.kind === 'zone_replies' ? Math.max(turns(node.fallback), ...node.responses.map(r => turns(r.child)))
+        : node.kind === 'attacker_move' ? 1 + turns(node.child)
         : node.kind === 'defender_replies' ? Math.max(...node.responses.map(r => turns(r.child)))
         : node.kind === 'exact' ? proofTurns(known[node.fact].plies, known[node.fact].history.length % 2 ? 2 : 1,
           sideAt(known[node.fact].history.length) === known[node.fact].winner) : 1);
@@ -32,11 +59,13 @@ function distance(a, b) {
  * defender's two stones are left out, their plies skipped, and the shortest threat completes.
  */
 export function principalVariation(native, history, certificate, {attacker = native.game(history).player, known = []} = {}) {
+  certificate = proofArena(certificate);
   const turns = depths(certificate, known), current = history.map(p => [...p]), pv = [];
   const near = reply => reply.action.reduce((sum, cell) => sum + distance(cell, pv.at(-1) || history.at(-1)), 0);
   let plies = 0, index = certificate.root;
   while (native.game(current).winner < 0) {
     const node = certificate.nodes[index];
+    if (node.kind === 'link') { index = node.child; continue; }
     if (node.kind === 'exact') {
       const fact = known[node.fact];
       const after = node.after || [], line = fact.pv || [];
@@ -56,9 +85,12 @@ export function principalVariation(native, history, certificate, {attacker = nat
       break;
     }
     let action;
-    if (node.kind === 'defender_replies') {
+    if (node.kind === 'defender_replies' || node.kind === 'zone_replies') {
       const longer = (a, b) => turns(b.child) - turns(a.child) || near(a) - near(b);
-      const reply = node.responses.reduce((a, b) => longer(a, b) > 0 ? b : a);
+      const legal = node.kind === 'zone_replies' ? new Set(native.legal(current).map(p => p.join(','))) : null;
+      const responses = legal ? node.responses.filter(r => legal.has(r.action[0].join(','))) : node.responses;
+      if (!responses.length) break;
+      const reply = responses.reduce((a, b) => longer(a, b) > 0 ? b : a);
       [action, index] = [reply.action, reply.child];
     } else [action, index] = [node.action, node.child];
     for (const [q, r] of action) {

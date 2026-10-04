@@ -1695,9 +1695,11 @@ class Matches(unittest.TestCase):
     def test_timed_bubble_uses_the_selected_tactical_package(self):
         package = Path(self.directory.name) / 'solver'
         self.engines.tactical_package = package
+        self.engines.proof_stamps = True
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         config = self.session.timed_config(seat)
         self.assertEqual(config['tactical_package'], str(package))
+        self.assertTrue(config['solver']['stamps'])
         from timed_engine import _worker
         with unittest.mock.patch('dense_player.DensePlayer') as player:
             player.return_value.prover = None
