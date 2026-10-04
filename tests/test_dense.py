@@ -3747,6 +3747,153 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_pause_installs_a_partial_native_job_without_launching_the_rest(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        histories = [[[0,0],[1,r],[2,s]] for r in range(-2,2) for s in range(-4,4)]
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,h) for h in histories],views=1,work=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=16)
+        service = InferenceService([pool],[evaluator],batch_size=8,quantum=64)
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.pause()
+        for index, history in enumerate(histories):
+            service.retarget(0,index,history,work=8,views=1)
+        service.resume()
+        token, _, rows = service.take(100.)
+        self.assertEqual(rows.count,8)
+        service.pending.append((token,native_dense.submit(evaluator,rows)))
+        service.pause()
+        stats = service.stats()
+        self.assertEqual(stats['launched_rows'],8)
+        self.assertEqual(stats['subscriber_deliveries'],8)
+        self.assertEqual(stats['installed_message_rows'],8)
+        self.assertGreater(stats['pending_rows'],0)
+        self.assertIsNone(service.take(2.))
+        service.resume()
+        events, end = [], time.monotonic()+10
+        while len(events)<len(histories) and time.monotonic()<end:
+            service.pump()
+            while (event:=service.event()) is not None:
+                events.append(event)
+        self.assertEqual({e['game'] for e in events},set(range(len(histories))))
+        self.assertTrue(all(e['completed']==8 for e in events))
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
+
+    def test_continuous_pause_fences_forwards_then_resumes_every_game(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pools = [NativeScheduler.pool(self,[NativeScheduler.graph(self,h)],views=4,work=128)
+                 for h in ([[0,0]],[[0,0],[1,0],[2,0]])]
+        service = InferenceService(pools,[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        for index, history in enumerate(([[0,0]],[[0,0],[1,0],[2,0]])):
+            service.retarget(index,0,history,work=128,views=4)
+        batch = service.take(100.)
+        self.assertIsNotNone(batch)
+        token, _, rows = batch
+        service.pending.append((token,native_dense.submit(evaluator,rows)))
+        service.pause()
+        self.assertTrue(service.paused())
+        self.assertIsNone(rows.ptr)
+        self.assertFalse(service.pending or service.leases)
+        launched = service.stats()['launched_rows']
+        self.assertGreater(launched,0)
+        for _ in range(3):
+            service.pause()  # Repeated phase requests keep the same suspended work.
+            self.assertIsNone(service.take(2.))
+            with unittest.mock.patch.object(native_dense,'submit',wraps=native_dense.submit) as forward:
+                service.pump()
+                forward.assert_not_called()
+        self.assertEqual(service.stats()['launched_rows'],launched)
+        service.resume()
+        self.assertFalse(service.paused())
+        events, end = [], time.monotonic()+5
+        while len(events)<2 and time.monotonic()<end:
+            service.pump()
+            while (event:=service.event()) is not None:
+                events.append(event)
+        self.assertEqual({e['producer'] for e in events},{0,1})
+        for event in events:
+            self.assertEqual((event['token'],event['completed']),(1,128))
+            self.assertIn(tuple(event['action']),set(map(tuple,legal(event['history']))))
+            self.assertEqual(int(np.asarray(event['edges'])[:,7].sum()),event['root_completed'])
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                          service.stats()['active_producers']),(0,0,0))
+
+    def test_continuous_pause_preserves_a_failed_forward_until_retry(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[[0,0]],work=32,views=1)
+        batch = service.take(100.)
+        self.assertIsNotNone(batch)
+        token, _, rows = batch
+        with self.assertRaisesRegex(ValueError,'manual batches'):
+            service.pause()
+        self.assertIsNotNone(rows.ptr)
+        service.pending.append((token,native_dense.submit(evaluator,rows)))
+        with unittest.mock.patch.object(native_dense.Forward,'collect',side_effect=RuntimeError('collect failed')):
+            with self.assertRaisesRegex(RuntimeError,'collect failed'):
+                service.pause()
+        self.assertEqual(len(service.pending),1)
+        self.assertIsNotNone(rows.ptr)
+        self.assertEqual(service.stats()['inflight_batches'],1)
+        self.assertIsNone(service.take())
+        service.pause()
+        self.assertTrue(service.paused())
+        self.assertIsNone(rows.ptr)
+        service.close()  # A paused service can also be stopped without resuming.
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                          service.stats()['active_producers']),(0,0,0))
+
+    def test_continuous_cpu_proofs_progress_with_neural_inference_paused(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeProofs
+        from tactical_proof import library, independent_verify
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        history = NativeProofs.opening
+        pool = NativeProofs.pool(self,[NativeProofs.graph(self,history)],views=1,work=4096)
+        pool.step()
+        self.assertEqual(NativeProofs.answer(self,pool),1)
+        proofs = pool.enable_proofs(workers=1,queue=4,slice_ms=100,table_mb=1)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.pause()
+        service.retarget(0,0,history,work=4096,views=1)
+        event, end = None, time.monotonic()+5
+        while event is None and time.monotonic()<end:
+            self.assertIsNone(service.take())
+            event = service.event()
+            time.sleep(.002)
+        self.assertIsNotNone(event)
+        self.assertEqual(event['exact_winner'],0)
+        self.assertGreater(event['proof_plies'],0)
+        self.assertEqual(service.stats()['launched_rows'],0)
+        service.close()
+        self.assertGreater(proofs.stats()['installed'],0)
+        self.assertTrue(proofs.records())
+        for proof in proofs.records():
+            self.assertEqual(independent_verify(proof['result']['certificate'],proof['request']['history'],
+                              attacker=proof['result']['attacker'],known=proof['request']['known']),proof['result']['status'])
+        self.assertEqual((proofs.stats()['active'],proofs.stats()['queued'],proofs.stats()['ready']),(0,0,0))
+
     def test_continuous_cold_deadline_does_not_cancel_other_game(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler

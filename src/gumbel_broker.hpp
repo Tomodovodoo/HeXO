@@ -35,8 +35,10 @@ struct Job {
  Producer* owner;std::unique_ptr<void,SnapshotDeleter> snapshot;
  std::vector<uint64_t> ids;std::vector<Key> keys;
  std::vector<std::shared_ptr<const Prediction>> results;
+ std::vector<bool> installed;
  int remaining=0;
 };
+struct Completion {std::shared_ptr<Job> job;std::vector<int> rows;bool finished;};
 struct Subscriber {std::shared_ptr<Job> job;int row;};
 struct Task {
  Key key;int model,row;std::shared_ptr<Job> representative;
@@ -47,7 +49,7 @@ struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::
 struct Producer {
  Broker& broker;owner::Pool& pool;int model;
  std::thread thread;std::deque<std::shared_ptr<Job>> completed;
- std::vector<std::shared_ptr<Job>> outstanding;bool done=false;
+ std::vector<std::shared_ptr<Job>> outstanding;bool done=false;uint64_t pause_ack=0;
  std::deque<Command> commands;std::vector<uint64_t> epochs;
  std::vector<bool> requested,reported;
  Producer(Broker& b,owner::Pool& p,int m):broker(b),pool(p),model(m),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true){}
@@ -63,8 +65,8 @@ struct Broker {
  std::deque<std::shared_ptr<Task>> ready;
  std::map<uint64_t,std::vector<std::shared_ptr<Task>>> flights;
  int quantum,pending,merge_cells;double latency_ms;
- std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false;
- uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,withdrawn=0,batches=0,high_water=0;
+ std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
+ uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
  struct Event {Producer* producer;int game;std::string text;};
  std::deque<Event> events;std::string last_event;
@@ -111,6 +113,21 @@ struct Broker {
   Command command{game,samples,views,expected+1,work,ms,noise,{}};if(count)command.cells.assign(cells,cells+2*count);
   p.requested[game]=true;p.commands.push_back(std::move(command));wake.notify_all();
  }
+ void pause(bool value){
+  std::lock_guard lock(mutex);
+  if(!continuous || !started || cancelled)throw std::runtime_error("Resumable pause requires a running continuous inference service");
+  if(paused!=value){paused=value;++pause_epoch;}wake.notify_all();
+ }
+ bool admission(uint64_t& epoch){std::lock_guard lock(mutex);epoch=paused?pause_epoch:0;return !paused;}
+ void acknowledge(Producer& p,uint64_t epoch){
+  std::lock_guard lock(mutex);if(!paused || epoch!=pause_epoch || !p.completed.empty())return;
+  for(auto& job:p.outstanding)for(size_t row=0;row<job->results.size();++row)if(job->results[row] && !job->installed[row])return;
+  p.pause_ack=epoch;
+ }
+ bool fenced(){
+  std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);
+  return paused && flights.empty() && std::all_of(producers.begin(),producers.end(),[&](const auto& p){return p->done || (p->pause_ack==pause_epoch && p->completed.empty());});
+ }
  std::vector<Command> commands(Producer& p){std::lock_guard lock(mutex);std::vector<Command> out(p.commands.begin(),p.commands.end());p.commands.clear();return out;}
  void publish(Producer& p,int game,uint64_t token,std::string event){
   std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;events.push_back({&p,game,std::move(event)});wake.notify_all();
@@ -122,6 +139,7 @@ struct Broker {
  void finish_row(Subscriber s,std::shared_ptr<const Prediction> prediction){
   if(s.job->results[s.row])return;
   s.job->results[s.row]=std::move(prediction);
+  s.job->owner->pause_ack=0;
   if(!--s.job->remaining)s.job->owner->completed.push_back(s.job);
  }
  void enqueue(const std::shared_ptr<Job>& job){
@@ -149,9 +167,18 @@ struct Broker {
   if(task->subscribers.empty() && !task->flight){task->live=false;tasks.erase(found);++withdrawn;}
   wake.notify_all();
  }
- std::vector<std::shared_ptr<Job>> completions(Producer& producer){
+ std::vector<Completion> completions(Producer& producer){
   std::lock_guard lock(mutex);std::vector<std::shared_ptr<Job>> jobs(producer.completed.begin(),producer.completed.end());
-  producer.completed.clear();return jobs;
+  producer.completed.clear();
+  // A producer snapshot may span several device batches. Pausing must install
+  // the rows already returned without launching the snapshot's remaining rows.
+  if(paused)for(auto& job:producer.outstanding)if(std::find(jobs.begin(),jobs.end(),job)==jobs.end())jobs.push_back(job);
+  std::vector<Completion> out;
+  for(auto& job:jobs){Completion c{job,{},job->remaining==0};
+   for(size_t row=0;row<job->results.size();++row)if(job->results[row] && !job->installed[row]){c.rows.push_back(int(row));job->installed[row]=true;}
+   if(!c.rows.empty() || c.finished)out.push_back(std::move(c));
+  }
+  if(!out.empty())producer.pause_ack=0;return out;
  }
  void wait(Producer& producer){
   std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(1),[&]{return cancelled || !producer.completed.empty() || !producer.commands.empty();});
@@ -163,7 +190,7 @@ struct Broker {
   std::unique_lock lock(mutex);
   for(;;){
    if(!error.empty())throw std::runtime_error(error);
-   if(cancelled)return 0;
+   if(cancelled || paused)return 0;
    if(flights.size()>=2){if(!wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
    std::erase_if(ready,[](const auto& t){return !t->live || t->flight;});
    if(!ready.empty()){
@@ -222,11 +249,15 @@ inline void Producer::run()noexcept{
  try{
   std::vector<uint64_t> active(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
-   for(auto& job:broker.completions(*this)){
+   for(auto& completion:broker.completions(*this)){
+    auto& job=completion.job;std::vector<uint64_t> ids;
     std::vector<int64_t> offsets(1,0),actions;std::vector<double> logits,values;
-    for(auto& p:job->results){actions.insert(actions.end(),p->actions.begin(),p->actions.end());logits.insert(logits.end(),p->logits.begin(),p->logits.end());values.insert(values.end(),p->values.begin(),p->values.end());offsets.push_back(int64_t(logits.size()));}
-    pool.install(job->ids.data(),int(job->ids.size()),offsets.data(),actions.data(),logits.data(),values.data());
-    std::erase(outstanding,job);
+    for(int row:completion.rows){auto& p=job->results[row];ids.push_back(job->ids[row]);actions.insert(actions.end(),p->actions.begin(),p->actions.end());logits.insert(logits.end(),p->logits.begin(),p->logits.end());values.insert(values.end(),p->values.begin(),p->values.end());offsets.push_back(int64_t(logits.size()));}
+    if(!ids.empty()){
+     pool.install(ids.data(),int(ids.size()),offsets.data(),actions.data(),logits.data(),values.data());
+     std::lock_guard lock(broker.mutex);broker.installed_messages+=ids.size();
+    }
+    if(completion.finished)std::erase(outstanding,job);
    }
    for(auto& command:broker.commands(*this)){
     auto& o=*pool.games[command.game];o.sample_limit=command.samples;o.max_views=command.views;
@@ -234,18 +265,20 @@ inline void Producer::run()noexcept{
     pool.retarget(command.game,command.cells.data(),int(command.cells.size()/2),command.work,command.ms);
     active[command.game]=command.token;
    }
-   int progress=pool.step();
+   uint64_t pause_token=0;bool neural=broker.admission(pause_token);
+   int progress=pool.step(neural);
    for(auto& job:outstanding)for(size_t row=0;row<job->ids.size();++row){
+    if(job->installed[row])continue;
     int remaining=hxgf_retire(pool.feed,job->ids[row]);if(remaining<0)throw std::runtime_error(gumbel::error);
     if(!remaining)broker.withdraw(job,int(row));
    }
    if(broker.continuous)for(size_t i=0;i<active.size();++i)if(active[i] && pool.games[i]->stopped){
     auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
    }
-   if(int(outstanding.size())<broker.pending && !pool.stopped){
+   if(neural && int(outstanding.size())<broker.pending && !pool.stopped){
     int64_t layout[2];if(!hxgf_layout(pool.feed,broker.quantum,layout))throw std::runtime_error(gumbel::error);
     int count=int(layout[0]);if(count){
-     auto job=std::make_shared<Job>();job->owner=this;job->ids.resize(count);job->results.resize(count);job->remaining=count;
+     auto job=std::make_shared<Job>();job->owner=this;job->ids.resize(count);job->results.resize(count);job->installed.resize(count);job->remaining=count;
      std::vector<void*> trees(count);std::vector<int> requests(count);
      if(!hxgf_take(pool.feed,count,job->ids.data(),trees.data(),requests.data(),nullptr,nullptr,0))throw std::runtime_error(gumbel::error);
      job->snapshot.reset(hxgp_new(trees.data(),requests.data(),count,0));if(!job->snapshot)throw std::runtime_error(gumbel::error);
@@ -255,6 +288,7 @@ inline void Producer::run()noexcept{
      outstanding.push_back(job);broker.enqueue(job);progress=1;
     }
    }
+   broker.acknowledge(*this,pause_token);
    if(!progress)broker.wait(*this);
   }
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native inference producer failed");}
@@ -307,6 +341,9 @@ HX_API int hxb_start(void* p,double ms){try{static_cast<inference::Broker*>(p)->
 HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started){gumbel::error="Configure continuous mode before starting";return 0;}b.continuous=true;return 1;}
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+HX_API int hxb_pause(void* p,int paused){try{static_cast<inference::Broker*>(p)->pause(paused!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_paused(void* p){try{return static_cast<inference::Broker*>(p)->fenced();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+HX_API uint64_t hxb_installed(void* p){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);return b.installed_messages;}
 HX_API void hxb_cancel(void* p){static_cast<inference::Broker*>(p)->cancel();}
 HX_API int hxb_take(void* p,int limit,double wait,uint64_t* token,int* model,void** snapshot){try{return static_cast<inference::Broker*>(p)->take(limit,wait,token,model,snapshot);}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API int hxb_complete(void* p,uint64_t token,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){try{static_cast<inference::Broker*>(p)->complete(token,offsets,actions,logits,values);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

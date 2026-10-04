@@ -216,7 +216,7 @@ struct Pool {
  }
  ~Pool(){stop();}
  void stop(){for(auto& o:games)o->stop();stopped=true;}
- int step(){
+ int step(bool neural=true){
   if(proof_step)proof_step(proof_owner);
   if(stopped)return 0;int progress=0;++steps;
   // Backpressure pauses new neural selection, not deadlines or proof delivery.
@@ -225,6 +225,7 @@ struct Pool {
    if(o->expired()){o->deadline=true;o->stop();}
    else {root.proof_root();if(root.board.winner>=0 || (root.root->expanded && root.root->exact_winner>=0))o->stop();}
   }
+  if(!neural){stopped=std::all_of(games.begin(),games.end(),[](const auto& o){return o->stopped;});return 0;}
   size_t visited=0;
   if(host_workers>1 && (!ready_limit || hxgf_queued(feed)<ready_limit)){
    struct Phase {Pool* pool;std::vector<int> progress;size_t admitted=0;bool closed=false;} phase{this,std::vector<int>(games.size())};
