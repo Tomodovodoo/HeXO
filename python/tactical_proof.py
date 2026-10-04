@@ -2,8 +2,8 @@
 
 Certificates cover every legal defense, including a free second placement.
 An optional root candidate expands those obligations explicitly; quiet defender
-nodes remain UNKNOWN. A single native worker limits caller wait; reconstruction
-may finish in the background. Late results are not exposed as exact values.
+nodes remain UNKNOWN. Each resident native worker limits caller wait. Late
+results are not exposed as exact values. Independent instances can run together.
 
 Budgets: `nodes` bounds the total native search work (IDTT nodes plus PDS-PN
 level-1 nodes and level-2 expansions; `idtt_nodes` of it go to the optional IDTT
@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 
 PROVEN_WIN, UNKNOWN = 'PROVEN_WIN', 'UNKNOWN'
 PACKAGE = Path(os.environ.get('HEXO_TACTICAL_PACKAGE', Path(__file__).resolve().parents[1]/'tools/tactical'))
@@ -113,6 +114,10 @@ def build_hash(package=PACKAGE):
 class NativeTactics:
     """In-process native solver; one query at a time.
 
+    `independent=True` owns a separate resident native thread, tables, proof cache
+    and stamps. Use it as a context manager or call close() when the owner stops.
+    The default retains the legacy shared worker for existing callers.
+
     Every result carries `status`, `moves` (the verified first turn), `certificate`,
     `nodes_used` (search work charged against the budget), `budget` and `gate_score`
     (module contract), `proof_turns` (most attacker turns on any certificate path, the
@@ -132,7 +137,7 @@ class NativeTactics:
 
     accepts_cancel_event = True
 
-    def __init__(self, package=PACKAGE, *, stamps=False):
+    def __init__(self, package=PACKAGE, *, stamps=False, independent=False):
         self.stamps = bool(stamps)
         package = Path(package)
         binary = library(package)
@@ -148,6 +153,7 @@ class NativeTactics:
         self.lib.hexo_tactical_free.restype = None
         self.lock = threading.Lock()
         self.control_lock, self.request_id, self.cancelled = threading.Lock(), 0, False
+        self.worker, self.closed, self._worker_finalizer = None, False, None
         self.prepare = getattr(self.lib, 'hexo_tactical_prepare', None)
         if self.prepare is not None:
             self.prepare.argtypes, self.prepare.restype = [], C.c_uint64
@@ -155,6 +161,42 @@ class NativeTactics:
             self.lib.hexo_tactical_cancel.restype = C.c_bool
             self.lib.hexo_tactical_release.argtypes = [C.c_uint64]
             self.lib.hexo_tactical_release.restype = None
+        if independent:
+            self.lib.hexo_tactical_worker_new.argtypes = []
+            self.lib.hexo_tactical_worker_new.restype = C.c_void_p
+            self.lib.hexo_tactical_worker_query.argtypes = [C.c_void_p, C.c_char_p]
+            self.lib.hexo_tactical_worker_query.restype = C.c_void_p
+            self.lib.hexo_tactical_worker_busy.argtypes = [C.c_void_p]
+            self.lib.hexo_tactical_worker_busy.restype = C.c_bool
+            self.lib.hexo_tactical_worker_free.argtypes = [C.c_void_p]
+            self.lib.hexo_tactical_worker_free.restype = None
+            self.worker = self.lib.hexo_tactical_worker_new()
+            if not self.worker:
+                raise RuntimeError('Could not create independent native solver worker')
+            self._worker_finalizer = weakref.finalize(self, self.lib.hexo_tactical_worker_free, self.worker)
+
+    @property
+    def busy(self):
+        """Whether this independent instance still has native work in flight."""
+        with self.control_lock:
+            return bool(self.worker and self.lib.hexo_tactical_worker_busy(self.worker))
+
+    def close(self):
+        """Cancel current work, join the independent worker and release its tables."""
+        with self.control_lock:
+            self.closed = True
+            if self.request_id and self.lib.hexo_tactical_cancel(self.request_id):
+                self.cancelled = True
+        with self.lock, self.control_lock:
+            if self._worker_finalizer is not None:
+                self._worker_finalizer()
+                self.worker = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def cancel(self):
         """Cooperatively stop this instance's current query without cancelling its successor."""
@@ -182,6 +224,8 @@ class NativeTactics:
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
         try:
+            if self.closed:
+                raise RuntimeError('Native tactics instance is closed')
             remaining = math.floor(ms-(time.perf_counter()-start)*1000)
             if remaining < 1:
                 return unknown('deadline')
@@ -204,6 +248,8 @@ class NativeTactics:
             if shortest:
                 request['shortest'] = True
             with self.control_lock:
+                if self.closed:
+                    raise RuntimeError('Native tactics instance is closed')
                 self.cancelled = False
                 if cancel_event is not None and cancel_event.is_set():
                     return unknown('cancelled')
@@ -215,7 +261,8 @@ class NativeTactics:
             payload = json.dumps(request, separators=(',', ':')).encode()
             if len(payload) > REQUEST_LIMIT:
                 return unknown('request size limit')
-            output = self.lib.hexo_tactical_query(payload)
+            output = (self.lib.hexo_tactical_worker_query(self.worker, payload) if self.worker
+                      else self.lib.hexo_tactical_query(payload))
             if not output:
                 return unknown('null native response') | dict(nodes_fresh=None)
             try:
