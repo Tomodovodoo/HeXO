@@ -360,8 +360,8 @@ class InferenceService:
     prediction and proof messages into their own graphs. Fixed-work mode stays
     available with ms=0; interactive comparisons use a common clock.
     """
-    def __init__(self, pools, evaluators, *, batch_size=128, quantum=32, pending=2,
-                 merge_cells=32768, latency_ms=1.5):
+    def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
+                 merge_cells=32768, latency_ms=.2):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
