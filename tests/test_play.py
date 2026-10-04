@@ -864,11 +864,14 @@ class Jobs(unittest.TestCase):
             os.utime(record, ns=(10 ** 18, 10 ** 18))
             with unittest.mock.patch.object(tactical_proof, 'IsolatedTactics') as isolated:
                 first, build = engines.solver()
-                self.assertEqual((build, engines.solver()[0]), ('aaaaaaaa', first))
+                self.assertEqual((build, engines.solver()[0]), ('aaaaaaaa:stamps', first))
+                self.assertTrue(isolated.call_args.kwargs['stamps'])
                 record.write_text(json.dumps(dict(binary_sha256='b' * 64)))
                 os.utime(record, ns=(2 * 10 ** 18, 2 * 10 ** 18))
                 second, build = engines.solver()
-                self.assertEqual(build, 'bbbbbbbb')
+                self.assertEqual(build, 'bbbbbbbb:stamps')
+                reference = Engines('cpu', tactical_package=Path(directory), proof_stamps=False)
+                self.assertEqual(reference.solver_build(), 'bbbbbbbb')
                 first.abort.assert_called_once()
                 self.assertEqual(isolated.call_count, 2)
 
@@ -2267,7 +2270,8 @@ class GameProofs(unittest.TestCase):
         self.session = Session({'bubble:tiny': entry}, Engines('cpu'), Evaluations(), save_initial=False)
         self.addCleanup(self.session.close)
         self.session.configure_seat(1, 'human')
-        # Side 0 to move with a forced win in four turns; its winning turn starts at (-1, -11).
+        # Side 0 has a four-turn win; the default stamp-enabled solver returns a checked five-turn route.
+        # Its winning turn starts at (-1, -11).
         self.start = [tuple(p) for p in LATE_WIN]
         self.session.load(self.start + [(-1, -11)], True)
 
@@ -2280,29 +2284,29 @@ class GameProofs(unittest.TestCase):
 
     def test_a_proof_carries_back_to_the_played_move_and_stays(self):
         seven = self.analyse(80, 32768)
-        self.assertEqual(seven['proof'], dict(winner=0, turns=4, plies=13))
+        self.assertEqual(seven['proof'], dict(winner=0, turns=5, plies=17))
         six = self.analyse(79, 0)
         line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in seven['pv']]
-        self.assertEqual((six['proof'], six['value'], six['pv']), (dict(winner=0, turns=4, plies=14), 1., line))
+        self.assertEqual((six['proof'], six['value'], six['pv']), (dict(winner=0, turns=5, plies=18), 1., line))
         self.assertEqual((six['top'][0][:2], six['top'][0][3:]), ([-1, -11], [1., 1]))
         saved = self.session.lookup(self.start)
-        self.assertEqual(saved['proof']['plies'], 14)
+        self.assertEqual(saved['proof']['plies'], 18)
         budget = dict(simulations=saved['simulations'], solver_nodes=saved['solver_nodes'])
         self.session.save(self.start, self.session.engine_key(self.session.analysis), budget,
                           dict(moves=[], value=.5, top=[], proof=None, pv=[], threat=[]), 'tiny')
-        self.assertEqual(self.session.lookup(self.start)['proof']['plies'], 14)
+        self.assertEqual(self.session.lookup(self.start)['proof']['plies'], 18)
         self.session.undo()
         self.assertEqual(len(self.session.history), 79)
-        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 14)
-        self.assertEqual(self.analyse(79, 0, force=True)['proof']['plies'], 14)
-        self.assertEqual(self.analyse(79, 0, preset='lightning')['proof']['plies'], 14)
+        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 18)
+        self.assertEqual(self.analyse(79, 0, force=True)['proof']['plies'], 18)
+        self.assertEqual(self.analyse(79, 0, preset='lightning')['proof']['plies'], 18)
 
     def test_a_reopened_game_keeps_the_proofs_of_positions_it_undid(self):
         archive = tempfile.TemporaryDirectory()
         self.addCleanup(archive.cleanup)
         self.session.archive = Path(archive.name)
         self.session.load(self.start + [(-1, -11)], True)
-        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 13)
+        self.assertEqual(self.analyse(80, 32768)['proof']['plies'], 17)
         self.session.undo()
         self.session.save_freeplay()
         ident = self.session.remember_match(self.session.freeplay_directory)
@@ -2311,16 +2315,16 @@ class GameProofs(unittest.TestCase):
         study = reopened.open_saved_game(ident, 1)
         self.addCleanup(study.close)
         self.assertEqual(len(study.history), 79)
-        self.assertEqual(study.state()['evaluations'][79]['proof'], dict(winner=0, turns=4, plies=14))
+        self.assertEqual(study.state()['evaluations'][79]['proof'], dict(winner=0, turns=5, plies=18))
 
     def test_positions_inside_a_line_are_proven_after_a_reload(self):
         seven = self.analyse(80, 32768)
         line = [tuple(p[:2]) for p in seven['pv'][:3]]
         self.session.load(self.start + [(-1, -11), *line], True)
         inside = self.analyse(81, 0)
-        self.assertEqual((inside['proof']['winner'], inside['proof']['plies'], inside['value']), (0, 12, 0.))
-        self.assertEqual(self.session.state()['evaluations'][83]['proof'], dict(winner=0, turns=3, plies=10))
-        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 14)
+        self.assertEqual((inside['proof']['winner'], inside['proof']['plies'], inside['value']), (0, 16, 0.))
+        self.assertEqual(self.session.state()['evaluations'][83]['proof'], dict(winner=0, turns=4, plies=14))
+        self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], 18)
 
 
 class PrincipalVariation(unittest.TestCase):

@@ -385,9 +385,18 @@ class Bundle(unittest.TestCase):
         self.assertEqual(node(dict(kind='pv', history=history, certificate=reused['certificate'])),
                          dict(pv=local[0], plies=local[1]))
         self.assertTrue(local[0])
-        turn = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1, proofStamps=True))
+        turn = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1))
         self.assertEqual((turn['proof']['winner'], turn['value']), (0, 1.))
         self.assertEqual(tactical_proof.independent_verify(turn['proof']['certificate'], history), 'PROVEN_WIN')
+
+    def test_enabling_stamps_keeps_an_ordinary_one_stone_win_at_one_ply(self):
+        from tests.test_tactical_proof import IMMEDIATE
+        for enabled in (False, True):
+            with self.subTest(stamps=enabled):
+                turn = node(dict(kind='worker-turn', history=IMMEDIATE, simulations=16, nodes=1000,
+                                 proofStamps=enabled))
+                self.assertEqual((turn['proof']['winner'], turn['proof']['plies']), (0, 1))
+                self.assertEqual(len(turn['pv']), 1)
 
     def test_quiet_defender_certificate_has_the_same_browser_line(self):
         history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8],[-8,8]]

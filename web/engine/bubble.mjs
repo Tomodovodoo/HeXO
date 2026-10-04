@@ -60,12 +60,13 @@ export class BubbleEngine extends EngineWorker {
    * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Under a clock
    * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
    * continues that game's search tree; `options.known` is the game's proof table (proof.mjs Proofs.list()) the turn
-   * may use. Aborting `signal` cancels it (rejects with an AbortError).
+   * may use. Checked local proof reuse is on by default; `options.proofStamps = false` disables it.
+   * Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      proofStamps: options.proofStamps ?? false,
+      proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
       ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null}, options);
   }

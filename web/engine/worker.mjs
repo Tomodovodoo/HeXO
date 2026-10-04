@@ -116,7 +116,7 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, proofStamps = false}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, proofStamps = true}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
@@ -172,9 +172,10 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       if (verified(mine) && mine.moves.length) {
         moves = mine.moves.map(m => [...m]);
         const found = principalVariation(native, history, mine.certificate, {known: mineFacts});
+        const reused = mine.certificate.nodes.some(n => ['stamp', 'stamp_link', 'zone_replies'].includes(n.kind));
         pv = found.pv;
-        proof = {winner: player, turns: mine.proof_turns, plies: proofStamps ? state.remaining + 4 * (mine.proof_turns - 1) : found.plies,
-          ...(mine.dependencies?.length || proofStamps ? proofEvidence(mine) : {})};
+        proof = {winner: player, turns: mine.proof_turns, plies: reused ? state.remaining + 4 * (mine.proof_turns - 1) : found.plies,
+          ...(mine.dependencies?.length || reused ? proofEvidence(mine) : {})};
         top = [[...moves[0], 1, 1, 1]];
       } else {
         const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));

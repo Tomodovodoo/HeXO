@@ -197,7 +197,7 @@ if (job.kind === 'encode') {
   for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
-      known: job.known || null, proofStamps: job.proofStamps || false}});
+      known: job.known || null, proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
