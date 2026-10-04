@@ -974,7 +974,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
     def observe(n):
         watch(n)
-        if live and turn is not None and turn.tree is not None and not turn.moves and time.monotonic() >= shown[0]:
+        # A PV check temporarily searches the opponent's reply; its rows belong to that later position.
+        if (live and turn is not None and turn.tree is not None and not turn.moves
+                and turn.tree.history == turn.history and time.monotonic() >= shown[0]):
             if (seen := glimpse(turn.tree)) is not None:
                 shown[0] = time.monotonic() + .3
                 live(seen)

@@ -12,6 +12,8 @@
 //   {first, back, again: {action, visits, policy, completed_q} of A}
 // {kind: 'pv', history, certificate} -> {pv, plies} of the principal variation
 // {kind: 'rows', actions, policy, values, lead} -> top rows
+// {kind: 'glimpse', history, simulations, nodes: 0} -> live snapshots and results of two worker turns on one graph
+// {kind: 'analysis-bar', cases: [{history, value, live}]} -> the page's X/O labels and bar transform
 // {kind: 'overlay', cases: [{ev, stones}]} -> [boardOverlay(ev, stones)] from web/engine/overlay.js
 // {kind: 'offline', requests: [[path, body]]} -> [[status, history or error, paused]] from an OfflineSession
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
@@ -161,16 +163,23 @@ if (job.kind === 'encode') {
       evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))});
     answer = {...found, queries, nodes_used: job.nodes - nodes};
   } finally { tree.close(); }
-} else if (job.kind === 'worker-turn') {
+} else if (job.kind === 'worker-turn' || job.kind === 'glimpse') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const messages = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
-  const context = {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK, createModule, principalVariation, topRows,
+  const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
+  let graph = null;
+  const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
+    GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
     Proofs, answered, settled, proofTurns,
-    URL, performance, setTimeout, clearTimeout, onmessage: null, postMessage: message => messages.push(message),
+    URL, performance, setTimeout, clearTimeout, onmessage: null,
+    postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
-      evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))})},
+      evaluate: async leaves => leaves.map(({history, actions}) => {
+        const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;
+        return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
+      })})},
     Worker: class {
       postMessage({id, history, options}) {
         const result = solver.history(history, options);
@@ -182,11 +191,30 @@ if (job.kind === 'encode') {
     .replaceAll('import.meta.url', JSON.stringify(workerUrl.href));
   runInNewContext(source, context);
   await context.onmessage({data: {type: 'load', options: {prefer: 'wasm'}}});
-  await context.onmessage({data: {type: 'turn', id: 1, history: job.history,
-    simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10}});
+  for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
+    await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
+      simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10}});
+  }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
-  answer = messages.find(m => m.type === 'result').result;
+  answer = glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
+    live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
+    checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
+    : messages.find(m => m.type === 'result').result;
+} else if (job.kind === 'analysis-bar') {
+  const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
+  answer = job.cases.map(({history, value, live}) => {
+    const elements = new Map(), element = () => ({classList: {toggle() {}}, style: {}, firstChild: {style: {}}, replaceChildren() {}});
+    const page = {view: history.length, COLORS: ['yellow', 'blue'],
+      $: id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
+      S: {history, winner: -1, evaluations: live ? {} : {[history.length]: {value, top: [], threat: []}},
+        jobs: live ? [{kind: 'analyse', ply: history.length, status: 'running', live: {value, top: []}}] : []}};
+    runInNewContext(source.match(/^const playerAt=.*$/m)[0] + '\n' + source.match(/^const pct=.*$/m)[0] + '\n'
+      + source.slice(source.indexOf('function liveAt('), source.indexOf('function renderStudy('))
+      + '\nrenderAnalysis.sig = JSON.stringify([view, false, [], []]); renderAnalysis();', page);
+    return {x: elements.get('xv').textContent, o: elements.get('ov').textContent,
+      transform: elements.get('evalbar').firstChild.style.transform};
+  });
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate);
 } else if (job.kind === 'review') {

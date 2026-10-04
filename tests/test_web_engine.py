@@ -373,6 +373,29 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
+        history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
+        for length in (1, 2, 3, 4):
+            root = history[:length]
+            for repeat, turn in enumerate(node(dict(kind='glimpse', history=root, simulations=32, nodes=0))):
+                with self.subTest(length=length, repeat=repeat):
+                    self.assertTrue(turn['checked'], 'The principal-variation check must run')
+                    self.assertTrue(turn['live'])
+                    self.assertAlmostEqual(turn['result']['value'], .93, places=4)
+                    for glimpse in turn['live']:
+                        self.assertAlmostEqual(glimpse['value'], turn['result']['value'], places=4)
+                        self.assertEqual(glimpse['root'], root)
+
+    def test_analysis_bar_uses_the_mover_at_half_turn_positions(self):
+        history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
+        cases = [dict(history=history[:length], value=value, live=live)
+                 for length in (1, 2, 3, 4) for value in (.07, .93) for live in (True, False)]
+        for case, bar in zip(cases, node(dict(kind='analysis-bar', cases=cases))):
+            with self.subTest(**case):
+                x = case['value'] if play.player_at(len(case['history'])) == 0 else 1 - case['value']
+                self.assertEqual((bar['x'], bar['o']), (round(100 * x), round(100 * (1 - x))))
+                self.assertAlmostEqual(float(bar['transform'][7:-1]), x)
+
     def test_solver_leaves_prove_a_losing_half_turn(self):
         history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],
                    [-3, 1], [-1, 1], [-2, -1], [-4, 0], [-3, 0], [0, -1], [-2, -3], [-2, -2],
