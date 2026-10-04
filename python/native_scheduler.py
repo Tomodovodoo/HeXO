@@ -271,14 +271,16 @@ class SearchPool:
         """Pause between complete layer gathers; 0 drains every game and view."""
         checked(native.hxgm_ready_limit(self.ptr, rows))
 
-    def run(self, evaluator, ms, batch_size=128, ready_limit=None):
+    def run(self, evaluator, ms, batch_size=128, ready_limit=None, overlap=True):
         """Use dense_selfplay.Evaluator's packed forwards under one common clock.
-        Native gathering runs while the previous forward is in flight.
+        Native gathering runs while the previous forward is in flight; ready
+        inference can run while decoded prior results install. overlap=False
+        retains the serial handoff for timing comparisons.
         """
         if evaluator.model_version != self.model_version:
             raise ValueError('Evaluator does not match the pool weights')
         from native_dense import submit
-        pending = None
+        pending = completed = None
         if batch_size < 1:
             raise ValueError('A neural batch must contain at least one row')
         self.limit_ready(2*batch_size if ready_limit is None else ready_limit)
@@ -290,13 +292,21 @@ class SearchPool:
                 self.step()
                 if pending is not None:
                     ids, handle = pending
-                    self.feed.install_packed(ids, handle.collect())
+                    completed = ids, handle.collect()
                     pending = None
+                if completed is not None and not overlap:
+                    ids, rows = completed
+                    self.feed.install_packed(ids, rows)
+                    completed = None
                 if self.admit():
                     batch = self.feed.take_packed(batch_size)
                     if batch is not None:
                         ids, rows = batch
                         pending = ids, submit(evaluator, rows)
+                if completed is not None:
+                    ids, rows = completed
+                    self.feed.install_packed(ids, rows)
+                    completed = None
                 if self.done():
                     break
             self.cancel()
@@ -309,8 +319,12 @@ class SearchPool:
                 try:
                     self.cancel()
                 finally:
-                    if pending is not None:
-                        pending[1].close()
+                    try:
+                        if completed is not None:
+                            completed[1].close()
+                    finally:
+                        if pending is not None:
+                            pending[1].close()
                     self.abandon_fenced()
             finally:
                 if self.proofs is not None:

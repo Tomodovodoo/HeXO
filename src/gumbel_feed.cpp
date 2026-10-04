@@ -20,6 +20,7 @@ extern "C" {
 int hxg_next(void*);
 int hxg_history(void*,int,int64_t*);
 int hxg_fulfill(void*,int,const int64_t*,const double*,const double*,int);
+int hxg_retire(void*,int);
 void hxg_cancel(void*);
 }
 
@@ -76,6 +77,7 @@ struct Feed {
  std::list<Key> recency;
  std::unordered_map<void*,Root> roots;
  int64_t new_rows=0,joins=0,hits=0,installed=0;
+ uint64_t proof_requests=0,proof_rows=0,prune_ns=0;
  std::atomic<int64_t> queued=0;
  bool profile=false;
  uint64_t select_ns=0,identity_ns=0,cached_ns=0,install_ns=0;
@@ -153,6 +155,22 @@ struct Feed {
   }
   return ids;
  }
+ int prune(){
+  Timer clock(&prune_ns);int retired=0;
+  for(auto id:ready){
+   auto found=tasks.find(id);if(found==tasks.end() || found->second.submitted)continue;
+   auto& task=found->second;
+   std::erase_if(task.subscribers,[&](Subscriber subscriber){
+    int result=hxg_retire(subscriber.tree,subscriber.request);
+    if(result<0)throw std::runtime_error(gumbel::error);
+    if(result){++retired;++proof_requests;}return result!=0;
+   });
+   if(task.subscribers.empty()){pending.erase(task.key);tasks.erase(found);--queued;++proof_rows;}
+  }
+  // A cancelled/settled row leaves no queued identity to inspect next time.
+  std::erase_if(ready,[&](uint64_t id){auto it=tasks.find(id);return it==tasks.end() || it->second.submitted;});
+  return retired;
+ }
  void detach(void* tree) {
   // Detach before freeing or advancing a cancelled tree. Submitted rows retain no tree ownership.
   bool attached;{std::lock_guard lock(mutex);attached=roots.erase(tree)!=0;}
@@ -191,7 +209,7 @@ HX_API int hxgf_gather(void* p,void* tree,int64_t* out){try{return static_cast<f
 // Layout query and take are serialized on the graph-owner thread; no tree is re-rooted between them.
 HX_API int hxgf_layout(void* p,int limit,int64_t* out){try{
  if(limit<1 || !out)throw std::runtime_error("Invalid feed batch limit");
- auto& f=*static_cast<feeding::Feed*>(p);auto ids=f.batch(limit);int64_t size=0;
+ auto& f=*static_cast<feeding::Feed*>(p);f.prune();auto ids=f.batch(limit);int64_t size=0;
  for(auto id:ids)size+=f.tasks.at(id).history.size()/2;
  out[0]=int64_t(ids.size());out[1]=size;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
@@ -280,6 +298,8 @@ HX_API void hxgf_stats(void* p,int64_t* out){
 }
 // Distinct neural rows ready to launch, excluding submitted work and subscribers.
 HX_API int64_t hxgf_queued(void* p){return static_cast<feeding::Feed*>(p)->queued;}
+HX_API int hxgf_prune(void* p){try{return static_cast<feeding::Feed*>(p)->prune();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+HX_API void hxgf_pruning(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.proof_requests;out[1]=f.proof_rows;out[2]=f.prune_ns;}
 HX_API void hxgf_profile(void* p,int enabled){static_cast<feeding::Feed*>(p)->profile=enabled!=0;}
 HX_API void hxgf_times(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.select_ns;out[1]=f.identity_ns;out[2]=f.cached_ns;out[3]=f.install_ns;}
 }
