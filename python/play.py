@@ -956,23 +956,29 @@ class TurnSearch:
         """Apply a search result, or with simulations 0 evaluate the raw policy."""
         import numpy as np
         from dense_selfplay import root_value
-        if result is None:
-            current = [tuple(cell[:2]) for cell in self.local.cells]
-            found = self.network.evaluate([current])[0]
-            actions, values = found['actions'], None
-            policy = np.exp(found['logits'] - found['logits'].max())
-            policy /= policy.sum()
-            action, stone_value, exact = actions[policy.argmax()].tolist(), float(found['q'][0]), None
-        else:
-            action, policy, actions, values = result['action'], result['policy'], result['actions'], result['completed_q']
+        exact = None
+        if result is not None:
             self.completed += result.get('completed', 0)
-            stone_value = root_value(result, self.local.player)
             proven = result.get('proven') or 0
             exact = dict(winner=self.player if proven > 0 else 1 - self.player,
                          turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0),
                          plies=int(result['proof_plies'])) if proven else None
             if self.proof is None and (proven > 0 or proven < 0 and not self.moves):
                 self.proof = dict(exact, plies=exact['plies'] + self.played)
+        # Installing a root loss can settle a fresh tree before its first neural
+        # expansion. The proof is complete, but playing still needs a legal move.
+        if result is None or result['action'] is None:
+            current = [tuple(cell[:2]) for cell in self.local.cells]
+            found = self.network.evaluate([current])[0]
+            actions, values = found['actions'], None
+            policy = np.exp(found['logits'] - found['logits'].max())
+            policy /= policy.sum()
+            action, stone_value = actions[policy.argmax()].tolist(), float(found['q'][0])
+            if exact is not None:
+                stone_value = 1. if exact['winner'] == self.player else -1.
+        else:
+            action, policy, actions, values = result['action'], result['policy'], result['actions'], result['completed_q']
+            stone_value = root_value(result, self.local.player)
         if not self.given:
             self.moves.append([int(action[0]), int(action[1])])
         stone = self.moves[self.played]

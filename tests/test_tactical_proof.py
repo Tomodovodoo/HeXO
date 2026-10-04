@@ -124,6 +124,28 @@ class NativeStrategy(unittest.TestCase):
         with self.assertRaises(ValueError):
             independent_verify(result['certificate'], OPEN_THREE)
 
+    def test_only_verified_exact_leaves_become_dependencies(self):
+        result = self.engine.history(IMMEDIATE, nodes=1000, ms=1000)
+        self.assertEqual(result['status'], 'PROVEN_WIN')
+        known = [dict(history=IMMEDIATE, winner=0, plies=2)]
+        for fact in (0, 999999):
+            certificate = copy.deepcopy(result['certificate'])
+            certificate['nodes'].append(dict(kind='exact', fact=fact))
+            checked = self.engine.history(IMMEDIATE, known=known, certificate=certificate, nodes=1000, ms=1000)
+            self.assertEqual(checked['status'], 'PROVEN_WIN')
+            self.assertEqual((checked['exact_hits'], checked['dependencies']), (0, []))
+            self.assertFalse(any(n['kind'] == 'exact' for n in checked['certificate']['nodes']))
+            self.assertEqual(independent_verify(checked['certificate'], IMMEDIATE), 'PROVEN_WIN')
+            certificate['root'] = len(certificate['nodes']) - 1
+            rooted = self.engine.history(IMMEDIATE, known=known, certificate=certificate, nodes=1000, ms=1000)
+            self.assertEqual(rooted['status'], 'PROVEN_WIN' if fact == 0 else 'UNKNOWN')
+        certificate = self.engine.history(OPEN_THREE, nodes=10000, ms=2000)['certificate']
+        certificate['nodes'][certificate['root']]['alternatives'] = [dict(action=[[-1, 0], [2, 1]], child=len(certificate['nodes']))]
+        certificate['nodes'].append(dict(kind='exact', fact=999999))
+        checked = self.engine.history(OPEN_THREE, certificate=certificate, nodes=10000, ms=2000)
+        self.assertEqual((checked['status'], checked['dependencies']), ('PROVEN_WIN', []))
+        self.assertEqual(independent_verify(checked['certificate'], OPEN_THREE), 'PROVEN_WIN')
+
     def test_cooperative_cancel_keeps_native_worker_available(self):
         engine = NativeTactics()
         self.assertFalse(engine.cancel())

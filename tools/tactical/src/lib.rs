@@ -270,9 +270,25 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
             "infinity":prover::PROOF_NUMBER_INFINITY,"scope":"wide-forcing","game_exact":false})).unwrap_or(Value::Null);
     }
     if req.resume {response["resident_reused"]=json!(resident_reused);}
-    if let Some(cert)=cert {
+    if let Some(mut cert)=cert {
         match check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)) {
-            Ok((moves,turns))=>{
+            Ok((moves,turns,visited))=>{
+                // Only the primary verified strategy may declare dependencies.
+                // Drop unused nodes/alternatives in certificates containing exact
+                // leaves, so an unchecked fact cannot leak into saved evidence.
+                if cert.nodes.iter().any(|n|matches!(n,ProofNode::Exact{..})) {
+                    let indices:BTreeMap<_,_>=visited.iter().enumerate().map(|(i,&id)|(id,i as u32)).collect();
+                    cert.nodes=visited.iter().map(|&id| {
+                        let mut node=cert.nodes[id as usize].clone();
+                        match &mut node {
+                            ProofNode::AttackerMove{child,alternatives,..}=>{*child=indices[child];alternatives.clear();}
+                            ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=indices[&reply.child];},
+                            _=>{},
+                        }
+                        node
+                    }).collect();
+                    cert.root=indices[&cert.root];
+                }
                 // A shortening cut short by the time cap is not a function of the key, so it is not kept.
                 if cacheable && !cache_hit && fresh && (exact || !req.shortest) {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;

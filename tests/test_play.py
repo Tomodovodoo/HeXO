@@ -1002,6 +1002,30 @@ class GameGraphs(unittest.TestCase):
             self.assertEqual(known.known(history)['winner'], 0)
             self.assertEqual(known.known(history[:-1])['winner'], 0)
 
+    def test_fresh_losing_roots_still_play_in_single_and_pooled_evaluations(self):
+        from play import evaluate, evaluate_many, Proofs, replay
+        from tactical_proof import NativeTactics
+        from tests.test_tactical_proof import OPEN_THREE
+        from types import SimpleNamespace
+        engine = NativeTactics()
+        prover = SimpleNamespace(history=engine.history, abort=engine.cancel)
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        bubble = self.engines.bubble(None)
+        single = evaluate(bubble, prover, history, 16, 10000)
+        pooled = evaluate_many(bubble, [prover], [history], 16, 10000)[0]
+        known = Proofs()
+        known.add(history, single)
+        restored = evaluate(bubble, None, history, 16, 0, known=known)
+        for found in (single, pooled, restored):
+            self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
+            self.assertEqual(len(found['moves']), 2)
+            game = replay(history)
+            try:
+                for move in found['moves']:
+                    game.play(*move)
+            finally:
+                game.close()
+
     def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
         history = self.turn([(0, 0)], 1)
         self.assertEqual(self.seen[0], 0)

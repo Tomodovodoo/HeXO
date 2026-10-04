@@ -134,14 +134,14 @@ pub fn defenses_at(b:&Board, attacker:u8, remaining:u8, ctl:&Ctl) -> Result<BTre
 /// query). Returns the root action and the most attacker turns on any certificate
 /// path, counting the completing turn (an immediate win is 1 turn).
 pub fn verify(history:&[Point], start:usize, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32),String> {
-    verify_for(history,start,phase(start).0,cert,ctl,max_nodes)
+    verify_for(history,start,phase(start).0,cert,ctl,max_nodes).map(|(moves,turns,_)|(moves,turns))
 }
-pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32),String> {
+pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertificate, ctl:&Ctl, max_nodes:usize) -> Result<(Vec<Point>,u32,BTreeSet<u32>),String> {
     check(ctl)?;
     if cert.version!=1 || cert.width!="wide" || cert.nodes.len()>max_nodes {return Err("certificate format/size".into());}
     if start!=history.len() && start!=flip(history.len()) {return Err("invalid certificate root phase".into());}
     let board=replay_controlled(history,ctl)?;
-    struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, ctl:&'a Ctl, left:usize, stack:BTreeSet<u32>}
+    struct Checker<'a> {cert:&'a ProofCertificate, attacker:u8, ctl:&'a Ctl, left:usize, stack:BTreeSet<u32>, used:BTreeSet<u32>}
     impl Checker<'_> {
         fn walk(&mut self,id:u32,b:&Board,n:usize) -> Result<u32,String> {
             check(self.ctl)?;
@@ -205,16 +205,16 @@ pub fn verify_for(history:&[Point], start:usize, attacker:u8, cert:&ProofCertifi
                     1
                 }
             };
-            self.stack.remove(&id);Ok(turns)
+            self.stack.remove(&id);self.used.insert(id);Ok(turns)
         }
     }
-    let mut checker=Checker{cert,attacker,ctl,left:max_nodes,stack:BTreeSet::new()};
+    let mut checker=Checker{cert,attacker,ctl,left:max_nodes,stack:BTreeSet::new(),used:BTreeSet::new()};
     let turns=checker.walk(cert.root,&board,start)?;
     check(ctl)?;
     match &cert.nodes[cert.root as usize] {
-        ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok((action.clone(),turns)),
-        _ if phase(start).0!=attacker=>Ok((vec![],turns)),
-        ProofNode::Exact{..}=>Ok((vec![],turns)),
+        ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>Ok((action.clone(),turns,checker.used)),
+        _ if phase(start).0!=attacker=>Ok((vec![],turns,checker.used)),
+        ProofNode::Exact{..}=>Ok((vec![],turns,checker.used)),
         _=>Err("root must be attacker action".into())
     }
 }
