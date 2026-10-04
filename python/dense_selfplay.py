@@ -740,7 +740,7 @@ class SelfPlayGame:
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
-        if s.root_noise and not self.native_owner:
+        if s.root_noise and not getattr(self, 'native_owner', False):
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
 
     @property

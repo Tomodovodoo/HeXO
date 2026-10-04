@@ -1268,6 +1268,26 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class NativeScheduler(unittest.TestCase):
+    def test_retarget_same_context_keeps_new_subscriber_after_old_empty_completion(self):
+        pool = self.pool([self.graph()], views=1, work=16, cache=0)
+        pool.step()
+        old = pool.feed.take(128)
+        self.assertIsNotNone(old)
+        pool.retarget(0, [(0,0)], work=16)
+        pool.step()
+        new = pool.feed.take(128)
+        self.assertIsNotNone(new)
+        self.assertNotEqual(old[0].tolist(), new[0].tolist())
+        # A cancelled immutable batch remains completable. Its empty result
+        # must neither fail the new root nor erase its pending identity.
+        pool.feed.install(old[0], [None]*len(old[0]))
+        self.assertEqual(pool.stats()['failed'], 0)
+        self.assertEqual(pool.feed.stats()['pending_rows'], len(new[0]))
+        self.answer(pool, new)
+        self.finish(pool)
+        self.assertEqual(pool.games[0].stats()['completed'], 16)
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+
     def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
         import ctypes as C
         from neural_search import bind, ptr
@@ -1933,6 +1953,13 @@ class NativeProofs(unittest.TestCase):
         proofs.resume()
         proofs.step()
         self.assertGreater(proofs.stats()['submitted'], stats['submitted'])
+        proofs.drain()
+        effort = proofs.effort(0)
+        self.assertEqual(set(effort), {1,2})
+        self.assertEqual(sum(r['fresh_nodes'] for r in effort.values()), proofs.stats()['fresh_nodes'])
+        self.assertEqual(sum(r['missing_fresh'] for r in effort.values()), proofs.stats()['missing_fresh'])
+        self.assertEqual(sum(r['queries'] for r in effort.values()), proofs.stats()['finished'])
+        self.assertEqual(effort[1]['queries'], stats['finished'])
 
     def test_attached_loop_prevents_pool_free_and_duplicate_owners(self):
         graph = self.graph()

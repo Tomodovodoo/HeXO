@@ -3747,6 +3747,75 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_native_proofs_reach_played_rows_with_fresh_effort(self):
+        from native_selfplay import play_cohort
+        from tests.test_neural_search import NativeProofs
+        from tactical_proof import library, independent_verify
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-proof', 'fixed', 'cpu', 64, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=4096, game_graph=512,
+                                             max_plies=128, tactics=False, adjudicate_proven=True,
+                                             opening_random_plies=0.)
+        history = NativeProofs.opening
+        games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, native_owner=True,
+                    book=(dict(suite='test', key=str(i), ply=len(history)), history)) for i in range(2)]
+        episodes, rows, receipt = play_cohort(games, producers=2, proof_workers=1, slice_ms=25, views=4)
+        self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
+        self.assertTrue(all(r['proven']==1 and r['proof_plies']>0 for r in rows))
+        self.assertTrue(all(r['search']['missing_fresh']==0 for r in rows))
+        self.assertGreater(sum(r['solver_nodes'] for r in rows),0)
+        self.assertEqual(sum(r['solver_nodes'] for r in rows), sum(s['fresh_nodes'] for s in receipt['proof_stats']))
+        self.assertTrue(receipt['proofs'])
+        for proof in receipt['proofs']:
+            self.assertEqual(independent_verify(proof['result']['certificate'],proof['request']['history'],
+                             attacker=proof['result']['attacker'],known=proof['request']['known']),proof['result']['status'])
+        self.assertTrue(all(s['active']==0 and s['queued']==0 and s['ready']==0 for s in receipt['proof_stats']))
+
+    def test_continuous_service_can_retarget_while_expired_batch_remains_in_flight(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=4,work=32,quantum=8)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[(0,0)],ms=250.,views=4)
+        with self.assertRaisesRegex(ValueError,'matching game completion'):
+            service.retarget(0,0,[(0,0)],work=16)
+        batch = service.take(100.)
+        self.assertIsNotNone(batch)
+        token, _, rows = batch
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        held = service.take(100.)
+        self.assertIsNotNone(held)
+        end = time.monotonic()+2
+        event = None
+        while event is None and time.monotonic()<end:
+            event = service.event()
+            time.sleep(.001)
+        self.assertIsNotNone(event)
+        self.assertEqual((event['history'],event['token']), ([[0,0]],1))
+        saved = copy.deepcopy(event)
+        service.retarget(0,0,[(0,0)],expected=1,work=16,samples=4,views=1)
+        with self.assertRaisesRegex(ValueError,'matching game completion'):
+            service.retarget(0,0,[(0,0)],expected=0,work=16)
+        token, _, rows = held
+        service.complete(token,native_dense.submit(evaluator,rows).collect())
+        second = None
+        end = time.monotonic()+2
+        while second is None and time.monotonic()<end:
+            service.pump()
+            second = service.event()
+        self.assertIsNotNone(second)
+        self.assertEqual((second['token'],second['completed'],second['root_completed']), (2,16,16))
+        self.assertEqual(saved,event)
+        self.assertEqual(int(np.asarray(second['edges'])[:,7].sum()),16)
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],service.stats()['active_producers']),(0,0,0))
+
     def test_continuous_native_selfplay_records_only_played_roots_and_replays_targets(self):
         from native_selfplay import play_cohort
         torch.set_num_threads(2)
@@ -3756,7 +3825,15 @@ class EngineTests(unittest.TestCase):
                                              opening_random_plies=0., root_noise=.2)
         games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, native_owner=True) for i in range(2)]
         games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', native_owner=True))
-        episodes, rows, receipt = play_cohort(games, producers=2, quantum=8, views=4, cache=128)
+        events = []
+        with unittest.mock.patch.object(games[0], 'searched', wraps=games[0].searched) as searched:
+            episodes, rows, receipt = play_cohort(games, producers=2, quantum=8, views=4, cache=128,
+                                                progress=lambda index, event: events.append((index, event)))
+        self.assertTrue(all(call.args[0]['completed']==call.args[0]['search']['root_completed']
+                            for call in searched.call_args_list))
+        self.assertTrue(any(call.args[0]['search']['completed']>call.args[0]['completed']
+                            for call in searched.call_args_list))
+        self.assertTrue(all(event['network_value'] is not None for _, event in events if not event['history']))
         self.assertEqual(len(episodes), 3)
         self.assertEqual((receipt['inference']['pending_rows'], receipt['inference']['inflight_batches'],
                           receipt['inference']['active_producers']), (0,0,0))

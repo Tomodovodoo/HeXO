@@ -26,7 +26,7 @@ struct Owner {
  std::vector<uint64_t> direct_root_credits;
  std::vector<Cell> focus;std::mt19937_64 rng;uint64_t next_id=1,ticks=0,allocations=0,reclaimed=0,completed=0,issued=0,cancelled=0,created=0,retired=0,step_ns=0,discover_ns=0;
  int quantum,max_views,max_depth,sample_limit=16;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
- bool stopped=false,deadline=false;double exploration=.2;
+ bool stopped=false,deadline=false,root_raw_known=false;double exploration=.2,root_raw=0;
  Owner(Tree& source,int capacity,int q,int count,int depth,uint64_t work,double ms,uint64_t seed,void* common=nullptr):owned_feed(common?nullptr:hxgf_new(capacity)),feed(common?common:owned_feed.get()),game(source.state),rng(seed),quantum(q),max_views(count),max_depth(depth),work_limit(work),time_limit_ms(ms),started(std::chrono::steady_clock::now()){
   if(!source.shared || !feed || q<4 || count<1 || count>64 || depth<1 || depth>32 || !std::isfinite(ms) || ms<0 || (!work && !ms))throw std::runtime_error("Invalid native owner limits");
   if(game->scheduler_owner)throw std::runtime_error("Game already has a native owner");
@@ -55,6 +55,7 @@ struct Owner {
  void record(View& v,uint64_t credits){
   auto& t=*v.tree;auto& node=*t.root;double raw=0;
   bool raw_known=hxgf_root_value(feed,v.tree.get(),&raw)!=0;
+  if(!v.depth && raw_known){root_raw=raw;root_raw_known=true;}
   int winner=t.board.winner>=0?t.board.winner:node.exact_winner;
   bool known=winner>=0 || node.expanded || node.n>0;
   double estimate=winner>=0?(winner==node.player?1.:-1.):node.q;
@@ -267,6 +268,7 @@ struct Pool {
   root.tree->root_at(history);root.history=history;root.key=gumbel::keys(history).second;
   root.completed=root.issued=root.cancelled=0;root.passes=0;root.active=root.discovered=false;
   o.focus=std::move(history);o.candidates.clear();o.last_root.clear();o.direct_root_credits.clear();
+  o.root_raw_known=false;o.root_raw=0;
   o.completed=o.issued=o.cancelled=o.ticks=o.allocations=o.reclaimed=o.retired=o.step_ns=o.discover_ns=0;o.created=1;o.view_cursor=0;
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;
   failed[index]=false;stopped=false;++retargets;o.start(root);

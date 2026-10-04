@@ -69,6 +69,7 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                 proven = 0 if winner<0 else 1 if winner==player else -1
                 result = dict(event, actions=edges[:, :2].astype(np.int64), visits=edges[:, 6].astype(np.int64),
                               completed_q=edges[:, 3], values=edges[:, 4], policy=edges[:, 5],
+                              completed=event['root_completed'],
                               proven=proven, proof_turns=0, solver_nodes=0, solver_budget=0,
                               proof_action=edges[edges[:, 8].astype(bool), :2].astype(np.int64).tolist() if proven>0 else [])
                 result['search'] = dict(source='native-root', model=model.sha, context=event['context'],
@@ -78,11 +79,15 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                                         root_estimate=None, solver_generation=event['solver_generation'])
                 more = game.searched(result)
                 result['search']['root_estimate'] = game.values[len(event['history'])]
-                for ply, exact, distance in event['exact_prefixes']:
+                for ply, exact, distance, witnesses in event['exact_prefixes']:
                     row = next((r for r in game.rows if r['ply']==ply), None)
                     if row is not None:
-                        game.label(ply, 1 if row['player']==exact else -1, 0)
-                        row['proof_plies'] = distance
+                        proven = 1 if row['player']==exact else -1
+                        if row.get('proven') and row['proven']!=proven:
+                            raise ValueError('Graph proof contradicts an earlier exact played-root label')
+                        game.label(ply, proven, 0, witnesses if proven>0 and witnesses else None)
+                        if distance>0:
+                            row['proof_plies'] = min(row.get('proof_plies') or distance, distance)
                 if progress:
                     progress(index, event)
                 if more:
@@ -90,11 +95,12 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                 else:
                     finished.add(index)
         service.close()
-        proofs, effort = [], {}
+        proofs, proof_stats, effort = [], [], {}
         for producer, loop in enumerate(proof_loops):
             if loop is None:
                 continue
             proofs.extend(dict(r, producer=producer) for r in loop.records())
+            proof_stats.append(dict(loop.stats(), producer=producer))
             for owner in range(len(pools[producer].games)):
                 effort[producer, owner] = loop.effort(owner)
         for index, game in enumerate(games):
@@ -119,4 +125,4 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
         episode, played = game.episode()
         episodes.append(episode)
         rows.extend(dict(row, game=index) for row in played)
-    return episodes, rows, dict(inference=stats, proofs=proofs)
+    return episodes, rows, dict(inference=stats, proofs=proofs, proof_stats=proof_stats)
