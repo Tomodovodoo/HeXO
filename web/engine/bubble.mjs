@@ -70,7 +70,7 @@ export class BubbleEngine extends EngineWorker {
       leafNodes: budget.leaf_nodes ?? 0, leafQueryMs: budget.leaf_ms ?? 10,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null}, options);
+      ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
   /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */

@@ -37,6 +37,33 @@ class NativeStrategy(unittest.TestCase):
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
 
+    def test_saved_moves_reprove_changed_positions_without_trusting_their_verdict(self):
+        with NativeTactics(independent=True) as native:
+            original = native.history(OPEN_THREE, nodes=20000, ms=5000)
+            evidence = [dict(history=OPEN_THREE, winner=0, pv=[], certificate=original['certificate'])]
+            changed = copy.deepcopy(OPEN_THREE)
+            changed[-1] = [7,8]
+            found = native.history(changed, replay=evidence, stamps=True, library=[], nodes=5000, ms=5000)
+            self.assertEqual(found['status'], 'PROVEN_WIN', found['reason'])
+            self.assertFalse(found.get('dependencies'))
+            self.assertEqual(independent_verify(found['certificate'], changed), 'PROVEN_WIN')
+            warm = native.history(changed, stamps=True, library=[], nodes=1, ms=3000)
+            self.assertEqual(warm['status'], 'PROVEN_WIN', warm['reason'])
+            counterwin = [[0,0],[0,8],[1,8],[1,0],[2,0],[2,8],[3,8]]
+            rejected = native.history(counterwin, replay=evidence, stamps=True, library=[], nodes=5000, ms=5000)
+            self.assertEqual(rejected['status'], 'UNKNOWN')
+            with self.assertRaises(ValueError):
+                independent_verify(found['certificate'], counterwin)
+        with NativeTactics(independent=True) as native:
+            half = OPEN_THREE + original['moves']
+            lost = native.history(half, replay=evidence, attacker='defender', stamps=True, library=[], nodes=5000, ms=5000)
+            self.assertEqual(lost['status'], 'PROVEN_LOSS', lost['reason'])
+            self.assertEqual(independent_verify(lost['certificate'], half, attacker='defender'), 'PROVEN_LOSS')
+        with NativeTactics(independent=True) as native:
+            incomplete = [dict(history=OPEN_THREE, winner=0, pv=[[*p,0,i+1] for i,p in enumerate(original['moves'])])]
+            failed = native.history(changed, replay=incomplete, stamps=True, library=[], nodes=5000, ms=5000)
+            self.assertEqual(failed['status'], 'UNKNOWN')
+
     def test_independent_workers_keep_caches_and_stamps_separate(self):
         with NativeTactics(independent=True) as first, NativeTactics(independent=True) as second:
             options = dict(nodes=20000, ms=5000, table_mb=4, resume=True)

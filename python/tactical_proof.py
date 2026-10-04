@@ -211,7 +211,7 @@ class NativeTactics:
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
                 certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None,
-                bounds=False, resume=False, known=(), stamps=None, library=None):
+                bounds=False, resume=False, known=(), stamps=None, library=None, replay=()):
         stamps = self.stamps if stamps is None else stamps
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
@@ -237,6 +237,8 @@ class NativeTactics:
                 request['stamps'] = True
             if library is not None:
                 request['library'] = library
+            if replay:
+                request['replay'] = replay
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -370,7 +372,7 @@ class IsolatedTactics:
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
                 certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False, known=(),
-                stamps=None, library=None):
+                stamps=None, library=None, replay=()):
         stamps = self.stamps if stamps is None else stamps
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
@@ -413,6 +415,8 @@ class IsolatedTactics:
                 request['stamps'] = True
             if library is not None:
                 request['library'] = library
+            if replay:
+                request['replay'] = replay
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -668,7 +672,7 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     work, converted_nodes = 0, {}
     def expand(index, stack, document=certificate, nesting=0):
         if (type(index) is not int or not 0 <= index < len(document['nodes']) or
-                index in stack or len(stack) >= 128 or nesting > 8):
+                index in stack or len(stack) >= 128 or nesting > 32):
             raise ValueError('Invalid certificate edge, cycle or depth')
         if time.perf_counter() >= deadline:
             raise VerificationTimeout('Certificate conversion deadline')
@@ -696,7 +700,7 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
             source = node['source']
             strategy = source['certificate']
             if (strategy['version'] != 1 or strategy['width'] != 'wide' or len(strategy['nodes']) > 4096 or
-                    nesting >= 8 or any(n['kind'] == 'exact' for n in strategy['nodes'])):
+                    nesting >= 32 or any(n['kind'] == 'exact' for n in strategy['nodes'])):
                 raise ValueError('A stamp needs an independent ordinary strategy')
             return dict(kind='reuse', player=source['player'], remaining=source['remaining'], winner=source['winner'],
                         child=expand(strategy['root'], set(), strategy, nesting+1))

@@ -58,6 +58,9 @@ fn control(ctl:&Ctl)->Result<(),String> {if ctl.expired(){Err("stamp deadline or
 /// Share identical suffixes of a checked primary strategy. Every defense stays
 /// present; the checker still visits a shared node in each board context.
 fn compact(cert:&ProofCertificate,ctl:&Ctl)->Result<ProofCertificate,String> {
+    compact_root(cert,cert.root,ctl)
+}
+fn compact_root(cert:&ProofCertificate,root:u32,ctl:&Ctl)->Result<ProofCertificate,String> {
     struct Build<'a> {cert:&'a ProofCertificate,ctl:&'a Ctl,nodes:Vec<ProofNode>,old:BTreeMap<u32,u32>,same:BTreeMap<Vec<u8>,u32>}
     impl Build<'_> {
         fn visit(&mut self,id:u32)->Result<u32,String> {
@@ -67,7 +70,8 @@ fn compact(cert:&ProofCertificate,ctl:&Ctl)->Result<ProofCertificate,String> {
             match &mut node {
                 ProofNode::AttackerMove{child,alternatives,..}=>{alternatives.clear();*child=self.visit(*child)?;},
                 ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=self.visit(reply.child)?;},
-                ProofNode::ImmediateWin{..}|ProofNode::Unstoppable{..}=>{},
+                ProofNode::ImmediateWin{..}|ProofNode::Unstoppable{..}|ProofNode::Stamp{..}=>{},
+                ProofNode::StampLink{source}=>*source=self.visit(*source)?,
                 _=>return Err("stamp source is not independent".into()),
             }
             let key=serde_json::to_vec(&node).map_err(|e|e.to_string())?;
@@ -78,8 +82,8 @@ fn compact(cert:&ProofCertificate,ctl:&Ctl)->Result<ProofCertificate,String> {
         }
     }
     let mut build=Build{cert,ctl,nodes:vec![],old:BTreeMap::new(),same:BTreeMap::new()};
-    let root=build.visit(cert.root)?;
-    Ok(ProofCertificate{root,nodes:build.nodes,..cert.clone()})
+    let root=build.visit(root)?;
+    Ok(ProofCertificate{root,nodes:build.nodes,version:cert.version,width:cert.width.clone()})
 }
 
 #[derive(Clone)]
@@ -109,9 +113,7 @@ impl Stamp {
             || p.1.unsigned_abs()>check::LIMIT as u32 || check::won(&root,p,s)) {return Err("invalid stamp position".into());}
         let start=ply(source.player,source.remaining);
         check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?;
-        if source.certificate.nodes.iter().any(|n|matches!(n,ProofNode::Stamp{..}|ProofNode::StampLink{..})) {
-            source.certificate=materialize(&source.certificate,&root,start,source.winner,ctl)?;
-        }
+        let composed=source.certificate.nodes.iter().any(|n|matches!(n,ProofNode::Stamp{..}|ProofNode::StampLink{..}));
         source.certificate=compact(&source.certificate,ctl)?;
         let (_,turns,used)=check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?;
         if used.len()>4096 {return Err("stamp strategy size limit".into());}
@@ -125,7 +127,7 @@ impl Stamp {
         if stamp.required.is_empty() || stamp.empty.len()>4096 || stamp.guards.len()>8192 {return Err("stamp footprint limit".into());}
         // Discard the rest of the original game. Replaying the strategy with
         // only its supporting stones also removes now-obsolete defense branches.
-        if stamp.required.len()<stamp.source.stones.len() {
+        if !composed && stamp.required.len()<stamp.source.stones.len() {
             let bare:Board=stamp.required.iter().map(|&p|(p,stamp.source.winner)).collect();
             if let Ok(certificate)=materialize(&stamp.source.certificate,&bare,start,stamp.source.winner,ctl) {
                 let source=StampSource{stones:bare.into_iter().collect(),certificate,..stamp.source.clone()};
@@ -155,6 +157,35 @@ impl Stamp {
         if *left==0 {return Err("stamp work limit".into());} *left-=1;
         let (mover,remaining)=check::phase(n);let winner=self.source.winner;
         match &cert.nodes[id as usize] {
+            ProofNode::StampLink{source}=>self.collect(root,b,n,*source,cert,left,ctl)?,
+            ProofNode::Stamp{source}=>{
+                let child=remember((**source).clone(),ctl)?;
+                let stones:Vec<_>=b.iter().map(|(&p,&s)|(p,player(s))).collect();
+                if !child.matches(&|p|b.get(&p).copied().map(player),&stones,player(mover),remaining) {
+                    let strategy=materialize(&source.certificate,b,n,winner,ctl)?;
+                    self.collect(root,b,n,strategy.root,&strategy,left,ctl)?;
+                } else {
+                    self.preserve(root,child.required.iter().chain(&child.empty).copied());
+                    let added:BTreeSet<_>=b.iter().filter(|&(p,&s)|s==winner && !root.contains_key(p)).map(|(&p,_)|p).collect();
+                    let extra:BTreeSet<_>=b.iter().filter(|&(p,&s)|s!=winner && !root.contains_key(p)).map(|(&p,_)|p).collect();
+                    if child.allowance>0 {
+                        let before=added.union(&child.before).copied().collect();
+                        if self.allowance==0 {self.before=before;} else {self.before=self.before.intersection(&before).copied().collect();}
+                        self.allowance=self.allowance.max(child.allowance);
+                        for w in extra.iter().copied().flat_map(windows) {
+                            let points=cells(w);
+                            if points.iter().any(|p|added.contains(p)||child.before.contains(p)) {continue;}
+                            let limit=5-child.allowance as i8-points.iter().filter(|p|extra.contains(p)).count() as i8;
+                            self.guards.entry(w).and_modify(|n|*n=(*n).min(limit)).or_insert(limit);
+                        }
+                    }
+                    for (&w,&bound) in &child.guards {
+                        let points=cells(w);if points.iter().any(|p|added.contains(p)) {continue;}
+                        let limit=bound-points.iter().filter(|p|extra.contains(p)).count() as i8;
+                        self.guards.entry(w).and_modify(|n|*n=(*n).min(limit)).or_insert(limit);
+                    }
+                }
+            },
             ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>{
                 let mut post=b.clone();
                 for &p in action {
@@ -403,7 +434,7 @@ fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,Stri
     if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==source).cloned()) {
         if portable {stamp.portable.set(true);}return Ok(stamp);
     }
-    DEPTH.with(|n|if n.get()>=8 {Err("nested stamp limit")} else {n.set(n.get()+1);Ok(())})?;
+    DEPTH.with(|n|if n.get()>=32 {Err("nested stamp limit")} else {n.set(n.get()+1);Ok(())})?;
     let _depth=CompileDepth;
     let stamp=Rc::new(Stamp::compile(source,ctl)?);
     if let Some(prior)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source==stamp.source).cloned()) {
@@ -471,6 +502,170 @@ pub fn moves(source:&StampSource,b:&Board,n:usize)->Result<Vec<Coord>,String> {
         if check::won(&board,p,source.winner) {break;}
     }
     Ok(moves)
+}
+
+/// Saved lines are move suggestions, never exact premises. Rebuild an ordinary
+/// all-defence strategy on the current board before it can become a stamp.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {pub history:Vec<Coord>,pub winner:u8,pub pv:Vec<(i32,i32,u8,u32)>,#[serde(default)] pub certificate:Option<ProofCertificate>}
+
+pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64)->Result<ProofCertificate,String> {
+    if lines.len()>256 || lines.iter().any(|l|l.history.len()>800 || l.winner>1)
+        || lines.iter().map(|l|l.history.len()+l.pv.len()).sum::<usize>()>50000 {return Err("replay input limit".into());}
+    let (mover,remaining)=check::phase(n);
+    let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+    if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source.winner==winner &&
+        s.matches(&|p|board.get(&p).copied().map(player),&stones,player(mover),remaining)).cloned()) {
+        if let Some(meter)=&ctl.meter {meter.add(1);}
+        return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Stamp{source:Box::new(stamp.source.clone())}]});
+    }
+    // A saved, self-contained stamp can be checked directly after a reload.
+    // Conditional exact leaves are deliberately left for move-guided replay.
+    let own:Vec<_>=board.iter().filter(|&(_,s)|*s==winner).map(|(&p,_)|p).collect();
+    for line in lines.iter().filter(|l|l.winner==winner && check::phase(l.history.len())==(mover,remaining)) {
+        let mut prior:Vec<_>=line.history.iter().enumerate().filter(|&(i,_)|check::phase(i).0==winner).map(|(_,p)|*p).collect();prior.sort();
+        if prior!=own {continue;}
+        if let Some(cert)=&line.certificate {
+            if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {
+                if verify(source,board,n,winner,ctl).is_ok() {
+                    if let Some(meter)=&ctl.meter {meter.add(1);}
+                    return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Stamp{source:source.clone()}]});
+                }
+            }
+        }
+    }
+    type HintKey=(Vec<Coord>,u8);
+    type Hints=BTreeMap<HintKey,Vec<(Vec<Coord>,BTreeSet<Coord>)>>;
+    fn hint(hints:&mut Hints,b:&Board,n:usize,winner:u8,action:Vec<Coord>) {
+        let (mover,remaining)=check::phase(n);
+        if mover!=winner || action.len()!=remaining as usize {return;}
+        let own=b.iter().filter(|&(_,s)|*s==winner).map(|(&p,_)|p).collect();
+        let enemy=b.iter().filter(|&(_,s)|*s!=winner).map(|(&p,_)|p).collect();
+        let item=(action,enemy);let list=hints.entry((own,remaining)).or_default();
+        if !list.contains(&item) {list.push(item);}
+    }
+    fn scan(hints:&mut Hints,cert:&ProofCertificate,id:u32,b:&Board,n:usize,winner:u8,ctl:&Ctl,left:&mut usize,depth:usize)->Result<(),String> {
+        control(ctl)?;
+        if *left==0 || depth>=100 {return Err("replay evidence work limit".into());}*left-=1;
+        let node=cert.nodes.get(id as usize).ok_or("invalid replay edge")?;
+        match node {
+            ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>{
+                hint(hints,b,n,winner,action.clone());
+                if let ProofNode::AttackerMove{child,..}=node {
+                    if let Ok((post,ply,false))=check::apply(b,n,action) {scan(hints,cert,*child,&post,ply,winner,ctl,left,depth+1)?;}
+                }
+            },
+            ProofNode::DefenderReplies{responses}|ProofNode::ZoneReplies{responses,..}=>for reply in responses {
+                let mut post=b.clone();let mover=check::phase(n).0;
+                if reply.action.iter().any(|p|!check::legal(&post,*p)) {continue;}
+                for &p in &reply.action {post.insert(p,mover);}
+                scan(hints,cert,reply.child,&post,n+reply.action.len(),winner,ctl,left,depth+1)?;
+            },
+            ProofNode::Stamp{source}=>scan(hints,&source.certificate,source.certificate.root,b,n,winner,ctl,left,depth+1)?,
+            ProofNode::StampLink{source}=>scan(hints,cert,*source,b,n,winner,ctl,left,depth+1)?,
+            _=>{},
+        }
+        Ok(())
+    }
+    let _time=measure("replay");
+    let mut hints:BTreeMap<HintKey,Vec<(Vec<Coord>,BTreeSet<Coord>)>>=BTreeMap::new();
+    let mut input_left=200000;
+    let input_time=measure("replay input");
+    for line in lines {
+        control(ctl)?;
+        if line.winner!=winner {continue;}
+        let mut b=check::replay_controlled(&line.history,ctl)?;
+        if let Some(cert)=&line.certificate {scan(&mut hints,cert,cert.root,&b,line.history.len(),winner,ctl,&mut input_left,0)?;}
+        for (i,&(q,r,s,ply)) in line.pv.iter().enumerate() {
+            let at=line.history.len()+i;let (mover,remaining)=check::phase(at);
+            if ply!=i as u32+1 || s!=mover || !check::legal(&b,(q,r)) {break;}
+            if mover==winner && i+remaining as usize<=line.pv.len() {
+                let action=&line.pv[i..i+remaining as usize];
+                if action.iter().enumerate().all(|(j,p)|p.2==winner && p.3==(i+j+1) as u32) {
+                    hint(&mut hints,&b,at,winner,action.iter().map(|p|(p.0,p.1)).collect());
+                }
+            }
+            b.insert((q,r),s);
+            if check::won(&b,(q,r),s) {break;}
+        }
+    }
+    drop(input_time);
+    struct Work<'a> {
+        hints:&'a BTreeMap<HintKey,Vec<(Vec<Coord>,BTreeSet<Coord>)>>,ctl:&'a Ctl,winner:u8,left:u64,
+        cert:ProofCertificate,memo:BTreeMap<(Board,u8,u8),Option<u32>>,learned:Vec<Rc<Stamp>>,
+        attempted:BTreeSet<HintKey>,
+    }
+    impl Work<'_> {
+        fn walk(&mut self,b:&Board,n:usize,depth:usize)->Result<Option<u32>,String> {
+            control(self.ctl)?;
+            if self.left==0 || depth>=100 || self.cert.nodes.len()>=50000 {return Err("replay work limit".into());}
+            let (mover,remaining)=check::phase(n);let key=(b.clone(),mover,remaining);
+            if let Some(result)=self.memo.get(&key) {return Ok(*result);}
+            self.left-=1;
+            if let Some(meter)=&self.ctl.meter {meter.add(1);}
+            let stones:Vec<_>=b.iter().map(|(&p,&s)|(p,player(s))).collect();
+            if let Some(stamp)=self.learned.iter().find(|stamp|stamp.source.winner==self.winner && stamp.matches(&|p|b.get(&p).copied().map(player),&stones,player(mover),remaining)) {
+                let _hit=measure("replay hit");
+                let id=self.cert.nodes.len() as u32;
+                self.cert.nodes.push(ProofNode::Stamp{source:Box::new(stamp.source.clone())});
+                self.memo.insert(key,Some(id));return Ok(Some(id));
+            }
+            let immediate=check::completions(b,mover,remaining,self.ctl)?;
+            let node=if let Some(action)=immediate.into_iter().next() {
+                if mover!=self.winner {self.memo.insert(key,None);return Ok(None);}
+                ProofNode::ImmediateWin{action}
+            } else if mover==self.winner {
+                let own=b.iter().filter(|&(_,s)|*s==mover).map(|(&p,_)|p).collect();
+                let enemy:BTreeSet<_>=b.iter().filter(|&(_,s)|*s!=mover).map(|(&p,_)|p).collect();
+                let mut candidates=self.hints.get(&(own,remaining)).cloned().unwrap_or_default();
+                candidates.sort_by_key(|(_,prior)|prior.symmetric_difference(&enemy).count());
+                let mut tried=BTreeSet::new();let mut found=None;
+                for (action,_) in candidates {
+                    if !tried.insert(action.clone()) {continue;}
+                    let Ok((post,ply,terminal))=check::apply(b,n,&action) else {continue;};
+                    if terminal {found=Some(ProofNode::ImmediateWin{action});break;}
+                    if let Some(child)=self.walk(&post,ply,depth+1)? {
+                        found=Some(ProofNode::AttackerMove{action,child,alternatives:vec![]});break;
+                    }
+                }
+                let Some(found)=found else {self.memo.insert(key,None);return Ok(None);};found
+            } else {
+                let Ok(required)=check::defenses_at(b,self.winner,remaining,self.ctl) else {return Ok(None);};
+                if required.is_empty() {ProofNode::Unstoppable{threats:check::completions(b,self.winner,2,self.ctl)?.into_iter().collect()}}
+                else {
+                    let mut responses=vec![];
+                    for action in required.into_values() {
+                        let (post,ply,terminal)=check::apply(b,n,&action)?;
+                        if terminal {self.memo.insert(key,None);return Ok(None);}
+                        let Some(child)=self.walk(&post,ply,depth+1)? else {self.memo.insert(key,None);return Ok(None);};
+                        responses.push(hexo_solver::prover::certificate::ProofResponse{action,child});
+                    }
+                    ProofNode::DefenderReplies{responses}
+                }
+            };
+            let id=self.cert.nodes.len() as u32;self.cert.nodes.push(node);self.memo.insert(key,Some(id));
+            if mover==self.winner && self.attempted.len()<256 {
+                let own=b.iter().filter(|&(_,s)|*s==mover).map(|(&p,_)|p).collect();
+                if self.attempted.insert((own,remaining)) {
+                    let certificate=compact_root(&self.cert,id,self.ctl)?;
+                    if certificate.nodes.len()<=128 {
+                        let source=StampSource{stones:b.iter().map(|(&p,&s)|(p,s)).collect(),player:mover,remaining,winner:self.winner,certificate};
+                        if let Ok(stamp)=remember(source,self.ctl) {
+                            self.cert.nodes[id as usize]=ProofNode::Stamp{source:Box::new(stamp.source.clone())};
+                            while !self.learned.is_empty() && (self.learned.len()>=MAX_STAMPS ||
+                                self.learned.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes>MAX_BYTES) {self.learned.remove(0);}
+                            self.learned.push(stamp);
+                        }
+                    }
+                }
+            }
+            Ok(Some(id))
+        }
+    }
+    let mut work=Work{hints:&hints,ctl,winner,left:budget,cert:ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![]},memo:BTreeMap::new(),learned:LIBRARY.with(|l|l.borrow().clone()),attempted:BTreeSet::new()};
+    work.cert.root=work.walk(board,n,0)?.ok_or("saved moves do not cover this position")?;
+    compact(&work.cert,ctl)
 }
 
 type Pattern=(Vec<Coord>,Vec<(usize,u8,Coord)>);
@@ -575,6 +770,45 @@ impl StampOracle for Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composed_stamp_checks_changed_defenses_and_remote_tempo() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let entries:serde_json::Value=serde_json::from_str(include_str!("../stamps.json")).unwrap();
+        let original:StampSource=serde_json::from_value(entries[0]["source"].clone()).unwrap();
+        let board:Board=original.stones.iter().copied().collect();
+        let start=ply(original.player,original.remaining);
+        let ProofNode::AttackerMove{action,child,..}=&original.certificate.nodes[original.certificate.root as usize] else {panic!()};
+        let (post,n,_)=check::apply(&board,start,action).unwrap();
+        let ProofNode::DefenderReplies{responses}=&original.certificate.nodes[*child as usize] else {panic!()};
+        let mut nodes=vec![ProofNode::Unstoppable{threats:vec![]}];let mut replies=vec![];
+        for reply in responses {
+            let (next,at,_)=check::apply(&post,n,&reply.action).unwrap();
+            let source=StampSource{stones:next.into_iter().collect(),player:check::phase(at).0,remaining:check::phase(at).1,winner:0,
+                certificate:compact_root(&original.certificate,reply.child,&ctl).unwrap()};
+            let id=nodes.len() as u32;nodes.push(ProofNode::Stamp{source:Box::new(source)});
+            replies.push(hexo_solver::prover::certificate::ProofResponse{action:reply.action.clone(),child:id});
+        }
+        let defense=nodes.len() as u32;nodes.push(ProofNode::DefenderReplies{responses:replies});
+        nodes[0]=ProofNode::AttackerMove{action:action.clone(),child:defense,alternatives:vec![]};
+        let source=StampSource{certificate:ProofCertificate{version:1,width:"wide".into(),root:0,nodes},..original.clone()};
+        let composed=Stamp::compile(source,&ctl).unwrap();
+        assert!(composed.source.certificate.nodes.iter().any(|n|matches!(n,ProofNode::Stamp{..})));
+        let varied=[(-3,0),(3,1),(2,2),(0,1),(2,8),(3,8),(4,8)];let mut accepted=0;let mut rejected=0;
+        for mask in 0..1<<varied.len() {
+            let mut changed=board.clone();changed.insert((0,8),1);changed.insert((1,8),1);
+            for (i,&p) in varied.iter().enumerate() {if mask&(1<<i)!=0 {changed.insert(p,1);}}
+            let stones:Vec<_>=changed.iter().map(|(&p,&s)|(p,player(s))).collect();
+            if composed.matches(&|p|changed.get(&p).copied().map(player),&stones,Player::P1,2) {
+                accepted+=1;
+                let flat=materialize(&original.certificate,&changed,start,0,&ctl).unwrap();
+                check::verify_board(&changed,start,0,&flat,&ctl,50000).unwrap();
+            } else {rejected+=1;}
+        }
+        assert!(accepted>0 && rejected>0);
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
 
     #[test]
     fn dominance_preserves_matches_and_speed_tradeoffs() {

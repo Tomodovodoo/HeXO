@@ -212,6 +212,34 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_saved_strategy_survives_refresh_reload_and_replays_a_changed_board(self):
+        from tests.test_tactical_proof import OPEN_THREE
+        original = tactical_proof.NativeTactics().history(OPEN_THREE, nodes=20000, ms=5000)
+        pv = node(dict(kind='pv', history=OPEN_THREE, certificate=original['certificate']))
+        found = dict(proof=dict(winner=0, plies=pv['plies'], certificate=original['certificate']), pv=pv['pv'],
+                     moves=original['moves'], value=1, top=[], solved=True)
+        source = """import {readFileSync} from 'node:fs';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {Native} from './web/engine/search.mjs';
+import createModule from './web/engine/gumbel.mjs';
+const {history,found}=JSON.parse(readFileSync(0,'utf8')),native=new Native(await createModule());
+const session=new BrowserSession(native),entry={id:'test',kind:'bubble',name:'Test',presets:{standard:{simulations:8,solver_nodes:5000}}};
+session.registerEngine(entry,{});session.load(history,true);const spec=session.spec({engine:'test'});
+await session.record(history,spec,found);
+await session.record(history,spec,{...found,proof:{winner:0,plies:found.proof.plies}});
+await session.persist();await session.saving;
+const restored=new BrowserSession(native);restored.storage=session.storage;await restored.restore({paused:true});restored.extendProofs();
+const changed=history.map(p=>[...p]);changed[changed.length-1]=[7,8];
+console.log(JSON.stringify({records:restored.records,replay:restored.proofs.replay(changed),changed}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              input=json.dumps(dict(history=OPEN_THREE, found=found)), capture_output=True, text=True, check=True)
+        saved = json.loads(done.stdout)
+        self.assertEqual(saved['replay'][0]['certificate'], original['certificate'])
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], simulations=8, nodes=5000))
+        self.assertEqual(result['proof']['winner'], 0)
+        self.assertEqual(result['actual_completed'], 0)
+        self.assertEqual(tactical_proof.independent_verify(result['proof']['certificate'], saved['changed']), 'PROVEN_WIN')
+
     def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
         from types import SimpleNamespace
         root = [[0,0],[1,-2],[-1,-2],[0,-2],[2,-1],[-2,-3],[3,-3],[4,-2],[6,-3],

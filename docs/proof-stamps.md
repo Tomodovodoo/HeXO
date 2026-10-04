@@ -43,9 +43,41 @@ limit. The checker still verifies each branch in its own board context.
 The compiler also tries the proof again with only its supporting stones left.
 It uses that smaller source only if its stamp still matches the original board.
 Removing enemy blockers can otherwise create a shorter strategy that cannot
-work with those blockers present. Composed
-proofs are expanded and rechecked before saving, so learning cannot create
-ever-growing chains of imported strategies.
+work with those blockers present. A composed strategy keeps its checked child
+stamps. Their required and protected cells become parent conditions. Guards
+subtract enemy stones added along the parent path, and guaranteed friendly
+prefixes block the corresponding counter-threat windows. The raw checker
+still checks the complete composition. Nested sources have a limit of 32;
+the existing source size and library accounting limits also apply.
+
+## Replaying an analysed variation
+
+Browser analysis retains certificates and recorded continuations across
+refresh and reload. If the attacker has the same stones at a saved root or
+along a recorded continuation, these records can supply attack suggestions
+on the changed board. The replay follows legal suggested attacks and derives
+every required defensive cover from the current board. A changed counterwin,
+missing reply or quiet unresolved continuation leaves the result UNKNOWN.
+Saved exact verdicts never prove a changed board.
+
+During replay, complete sub-strategies become checked local stamps. Subsequent
+defensive branches can reuse those stamps after checking their conditions.
+This avoids replaying every stone of the same forcing continuation for every
+irrelevant defence. Composing their conditions avoids expanding that repeated
+work again when the parent strategy becomes a stamp.
+
+The optional tactical API argument is `replay`, a list of records containing
+`history`, `winner`, `pv` and optionally `certificate`. It requires `stamps`.
+At most 256 records and 50,000 history/PV cells are accepted. Evidence scanning
+has a 200,000-node limit, and replay shares the query's node meter and deadline.
+The browser tries at most 20,000 nodes and 15 seconds per candidate winner
+before falling back to ordinary search. This archive replay runs in untimed
+analysis and review; ordinary play and timed games keep their existing path.
+Disabling proof stamps also disables archive replay.
+
+The result is a standalone certificate. Refreshes that keep a tighter scalar
+proof retain the previous strategy separately for later replay. Its longer
+bound does not replace the tighter displayed result.
 
 ## Tempo and identity
 
@@ -144,6 +176,26 @@ The player saves the certificate with the exact outcome; its existing proof
 table propagates that result into the game graph.
 
 ## CPU measurements
+
+The analysed turn-17 variation replacing Blue's `[-2,0]` with `[-1,0]`
+was checked with the saved 153-record study in a fresh WASM worker. Both
+queries allowed 524,288 nodes and 15 seconds on the same CPU, at BelowNormal
+priority. The reference received the archive's applicable exact graph facts;
+replay received its move suggestions and certificates.
+
+| Changed turn-17 position | Time | Fresh nodes | Result |
+|---|---:|---:|---|
+| Previous production solver | 15.01 s | 84,890 | UNKNOWN, deadline |
+| Checked strategy replay | 5.99 s | 1,509 | Proven win, 62-placement bound |
+| Same worker querying the resulting stamp again | 12 ms | 1 | Proven win |
+
+Restoring the whole study through `BrowserSession` and running the normal
+worker analysis path took 5.92 seconds of analysis, with the same 1,509 nodes
+and proof bound. This integration check used a uniform test network; the
+tactical solver and certificates were real. The independent Python verifier
+also accepted the full changed-board certificate. These are one puzzle's
+measurements, not a general solver speed-up claim. The baseline did not finish,
+so the table does not assign it a time-to-solve ratio.
 
 Run `PYTHONPATH=python:. python tools/proof_stamps.py --benchmark results.json`
 in a fresh process (use `python;.` on Windows). The input file is the existing
