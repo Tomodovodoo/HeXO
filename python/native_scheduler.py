@@ -447,6 +447,8 @@ class InferenceService:
 
         Success transfers the source Tree and closes its caller wrapper. The
         command retains its store, not the caller's Tree address.
+        Old caller trees must close after release acknowledgement and before
+        replacement admission so their destructors cannot race the old owner.
         Predictions are reusable only within the slot's frozen model identity.
         """
         cells = np.ascontiguousarray(source.history, np.int64).reshape(-1, 2)

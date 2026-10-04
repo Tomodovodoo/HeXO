@@ -120,6 +120,8 @@ class NativeGames:
         """Start a fresh game in a fully retired slot, retaining model predictions."""
         if index not in self.finished or not game.native_owner or set(game.trees)!=self.slot_models[index]:
             raise ValueError('Replacement needs a retired slot and its frozen model set')
+        if any(tree.ptr for tree in self.games[index].trees.values()):
+            raise ValueError('Publish and close the retired game before replacing its slot')
         self.games[index] = game
         self.finished.remove(index)
         self.warming[index] = {self.mapping[index,m] for m in game.trees}

@@ -115,6 +115,10 @@ struct Broker {
   if(p.released[game]!=(source!=nullptr))throw std::runtime_error("Release the previous game before replacing its slot");
   Command command{game,samples,views,expected+1,work,ms,noise,{}};if(count)command.cells.assign(cells,cells+2*count);
   if(source){
+   auto& old=*p.pool.games[game];
+   if(std::any_of(old.game->pins.begin(),old.game->pins.end(),[&](const auto& pin){
+       return std::none_of(old.views.begin(),old.views.end(),[&](const auto& view){return pin.first==view.tree.get();});}))
+    throw std::runtime_error("Close retired caller trees before replacing their slot");
    if(!version || p.pool.model!=version || !source->shared || source->state->scheduler_owner || !source->requests.empty() || count!=int(source->board.history.size()) ||
       std::any_of(source->state->pins.begin(),source->state->pins.end(),[&](const auto& pin){return pin.first!=source;}))
     throw std::runtime_error("Replacement requires a fresh graph of the slot's frozen model");

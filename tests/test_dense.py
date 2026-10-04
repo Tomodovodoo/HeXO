@@ -3801,11 +3801,14 @@ class EngineTests(unittest.TestCase):
             released = service.event()
             time.sleep(.001)
         self.assertEqual((released['kind'],released['token'],released['effort']),('released',2,[]))
+        with self.assertRaisesRegex(ValueError,'Close retired caller trees'):
+            service.replace(0,0,fresh,expected=2,work=16,views=1)
+        self.assertIsNotNone(fresh.ptr)  # Rejection leaves the new graph caller-owned.
+        old.close()  # Close only after retirement acknowledgement, before old-owner destruction.
         other = NativeScheduler.graph(self,version='other-model')
         with self.assertRaisesRegex(ValueError,'frozen model'):
             service.replace(0,0,other,expected=2,work=16,views=1)
         service.replace(0,0,fresh,expected=2,work=16,samples=4,views=1)
-        old.close()
         self.assertIsNone(fresh.ptr)  # Successful transfer closed the caller Tree before native mutation.
         fresh.close()
         token, _, rows = held
