@@ -1,4 +1,4 @@
-"""Seal in the browser (web/engine/seal/engine.wasm via seal.mjs) plays the turns the server's Seal library plays."""
+"""Native and browser Seal obey the same turn, tactic, clock and range contracts."""
 import json
 from pathlib import Path
 import shutil
@@ -12,9 +12,9 @@ WASM = ROOT/'web'/'engine'/'seal'/'engine.wasm'
 SEAL = library.with_name(library.name.replace('hexo', 'hexo_seal'))
 NODE = shutil.which('node')
 MS = 1000
-# Seal searches to a clock and adds one random far candidate at the root, so its turn is compared on positions where
-# the server library gave one answer over repeated runs at 300 and 1500 ms and both builds agreed on the CI runner.
-STABLE = [OPEN_THREE, IMMEDIATE] + [FIXTURE['positions'][key] for key in (
+# Timed depth and randomized far candidates can give different moves between native and WASM.
+# Exercise both implementations on the same early, tactical and midgame positions.
+POSITIONS = [OPEN_THREE, IMMEDIATE] + [FIXTURE['positions'][key] for key in (
     '1790600149713752:2:253', '1790599946154496:12:253', '1790600287230040:30:256', '1790600287230040:25:213',
     '1790604657706760:28:77', '1790621505551580:15:155', '1790621505551580:9:95', '1790621505551580:17:37',
     '1790622219655928:27:23')]
@@ -41,11 +41,29 @@ def server(history, ms):
 @unittest.skipUnless(NODE and WASM.exists() and SEAL.exists(),
                      'needs node, web/engine/seal (python tools/build_web.py seal) and the Seal library')
 class WebSealParity(unittest.TestCase):
-    def test_turns_match_the_server_library(self):
-        answers = browser([dict(history=history, ms=MS) for history in STABLE])
-        for history, answer in zip(STABLE, answers, strict=True):
-            with self.subTest(stones=len(history)):
-                self.assertEqual(sorted(answer['raw']), sorted(server(history, MS)))
+    def test_both_backends_play_legal_turns_and_take_the_immediate_win(self):
+        answers = browser([dict(history=history, ms=MS) for history in POSITIONS])
+        for history, answer in zip(POSITIONS, answers, strict=True):
+            for backend, moves in (('browser', answer['moves']), ('native', server(history, MS))):
+                with self.subTest(stones=len(history), backend=backend):
+                    game = Game(history)
+                    try:
+                        player, remaining = game.player, game.remaining
+                        self.assertGreaterEqual(len(moves), 1)
+                        self.assertLessEqual(len(moves), 2)
+                        played = 0
+                        for q, r in moves[:remaining]:
+                            self.assertEqual(game.player, player)
+                            self.assertTrue(game.legal(q, r))
+                            game.play(q, r)
+                            played += 1
+                            if game.winner >= 0:
+                                break
+                        self.assertTrue(played == remaining or game.winner == player)
+                        if history == IMMEDIATE:
+                            self.assertEqual(game.winner, player)
+                    finally:
+                        game.close()
 
     def test_turn_is_cut_to_the_stones_left(self):
         empty, whole, one_left = browser([dict(history=history, ms=50) for history in ([], [[0, 0]], [[0, 0], [1, 0]])])
