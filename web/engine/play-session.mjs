@@ -169,7 +169,7 @@ export class BrowserSession extends OfflineSession {
   /** `record` (or null) at `history`, `played` the game's next stone, with what the game's proof table proves there
    * (proof.mjs proven). */
   withProofs(history, record, played = null) {
-    return proven(this.proofs, history, record, this.native.game(history).remaining, played);
+    return proven(this.proofs, history, record, history.length % 2 ? 2 : 1, played);
   }
   study(winner) {
     const sig = `${position(this.history)}|${JSON.stringify(this.analysis)}|${this.analysis && this.engineKey(this.analysis)}|${this.evaluationsVersion}|${this.records.length}|${winner}`;

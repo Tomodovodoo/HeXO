@@ -759,6 +759,7 @@ class Proofs:
 
     def __init__(self):
         self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.RLock()
+        self.known_cache = {}
 
     def add(self, history, record, line=None):
         """Index the root proof and any leaf continuations retained in `record['proofs']`.
@@ -790,6 +791,7 @@ class Proofs:
         old = self.entries.get(key)
         witnessed = lambda line: len(line) if all(len(stone) == 4 for stone in line) else 0
         if old is None or old['winner'] == winner and (plies, -witnessed(pv)) < (old['plies'], -witnessed(old['pv'])):
+            self.known_cache.clear()
             stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
             self.entries[key] = dict(history=[list(p) for p in history], winner=int(winner), plies=int(plies), pv=pv, stones=stones)
             self.sizes.setdefault(len(history), set()).add(key)
@@ -807,13 +809,19 @@ class Proofs:
                         and all(len(p) == 4 for p in entry['pv'])):
                     pv = pv[:i] + [[*p[:3], p[3] + i] for p in entry['pv']]
                 if player_at(len(current)) != outcome['winner']:
-                    replies = [(d, a, o) for a, (w, d, o) in self.edges(current).items()
-                               if w == outcome['winner'] and d + i <= outcome['plies'] and o['pv']]
+                    replies = []
+                    for action, (winner, _, child) in self.edges(current).items():
+                        if winner != outcome['winner']:
+                            continue
+                        child = self.known(current + [action]) or child
+                        if child['plies'] + 1 + i <= outcome['plies'] and child['pv']:
+                            last = child['pv'][-1]
+                            replies.append(((last[3] if len(last) == 4 else len(child['pv'])) + 1, action, child))
                     if replies:
-                        distance, action, reply = min(replies, key=lambda e: (-e[0], e[1]))
+                        distance, action, reply = min(replies, key=lambda e: (-e[0], -e[2]['plies'], e[1]))
                         # Retain the certificate's equal-length reply and its tie-break.
                         first = tuple(pv[i][:2]) if i < len(pv) else None
-                        if first != action and not any(a == first and d == distance for d, a, _ in replies):
+                        if first != action and not any(a == first and d == distance and o['plies'] == reply['plies'] for d, a, o in replies):
                             pv = pv[:i] + [[*action, player_at(len(current)), i + 1]] + [
                                 [*p[:3], p[3] + i + 1] for p in reply['pv']]
                 if i == len(pv) or len(pv[i]) != 4 or pv[i][3] != i + 1 or pv[i][2] != player_at(len(current)):
@@ -916,10 +924,16 @@ class Proofs:
 
     def known(self, history):
         """The best known guarantee and its updated continuation, or None when nothing is proven."""
-        found = self.choice(history)
-        if found is None:
-            return None
-        return dict(winner=found['winner'], plies=found['plies'], pv=self.line(history, found))
+        at = tuple(tuple(p) for p in history)
+        with self.lock:
+            if at in self.known_cache:
+                return self.known_cache[at]
+            found = self.choice(history)
+            outcome = None if found is None else dict(winner=found['winner'], plies=found['plies'], pv=self.line(history, found))
+            self.known_cache[at] = outcome
+            if len(self.known_cache) > 4096:
+                del self.known_cache[next(iter(self.known_cache))]
+            return outcome
 
     def extend(self, store, history):
         """Index the saved evaluations holding a proof of every position of `history` (see `Evaluations.proven`)."""

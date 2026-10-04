@@ -229,12 +229,17 @@ export class Proofs {
         pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
       }
       if (sideAt(current.length) !== outcome.winner) {
+        // A padded turn bound can outlast its drawn line. Resolve each child's
+        // current continuation before comparing how long the defences last.
         const replies = [...this.edges(current).values()]
-          .filter(e => e.winner === outcome.winner && e.distance + i <= outcome.plies && e.outcome.pv.length)
-          .sort((a, b) => b.distance - a.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
+          .filter(e => e.winner === outcome.winner)
+          .map(e => ({...e, outcome: this.known([...current, e.action]) || e.outcome}))
+          .filter(e => e.outcome.plies + 1 + i <= outcome.plies && e.outcome.pv.length)
+          .map(e => ({...e, length: (e.outcome.pv.at(-1)[3] ?? e.outcome.pv.length) + 1}))
+          .sort((a, b) => b.length - a.length || b.outcome.plies - a.outcome.plies || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
         if (replies.length) {
           const reply = replies[0], first = pv[i]?.slice(0, 2).join(',');
-          if (first !== reply.action.join(',') && !replies.some(e => e.distance === reply.distance && e.action.join(',') === first)) {
+          if (first !== reply.action.join(',') && !replies.some(e => e.length === reply.length && e.outcome.plies === reply.outcome.plies && e.action.join(',') === first)) {
             pv = [...pv.slice(0, i), [...reply.action, sideAt(current.length), i + 1], ...shifted(reply.outcome.pv, i + 1)];
           }
         }
