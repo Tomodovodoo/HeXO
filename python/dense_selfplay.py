@@ -1242,8 +1242,12 @@ def worker(args):
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
-    engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes,
-                    native_feed=settings.native_feed, native_packing=settings.native_packing)
+    if settings.native_scheduler:
+        from native_selfplay import ActorEngine
+        engine = ActorEngine(settings)
+    else:
+        engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes,
+                        native_feed=settings.native_feed, native_packing=settings.native_packing)
     began, solver_failures = time.perf_counter(), 0
     state = dict(published(run, args.worker), error=None)
     target = None if args.games is None else args.games+state['games_completed']
@@ -1282,6 +1286,8 @@ def worker(args):
             solver=engine.solver.summary(now-began) if engine.solver else None)
         fields.update(book_fraction=settings.book_fraction, restart_fraction=settings.restart_fraction,
                       off_policy_openings=len(book_starts.nodes) if book_starts else 0)
+        if settings.native_scheduler:
+            fields['native_scheduler'] = engine.summary()
         write_json(status_path, fields)
         if fields['solver'] and fields['solver']['failures'] > solver_failures:
             solver_failures = fields['solver']['failures']
@@ -1295,7 +1301,7 @@ def worker(args):
         nonlocal model
         if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
             graph = model.evaluator.graph
-            if graph is not None:
+            if graph is not None and not settings.native_scheduler:
                 graph.close()
                 model.evaluator.graph = None
                 del graph
@@ -1354,9 +1360,11 @@ def worker(args):
             if historical and historical.models and sum(g.opponent is not None for g in engine.slots) < historical.target:
                 opponent, learner = historical.next()
                 sides = [model, opponent] if learner == 0 else [opponent, model]
-                engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book))
+                engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book,
+                                        native_owner=settings.native_scheduler))
             else:
-                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book))
+                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book,
+                                        native_owner=settings.native_scheduler))
             started += 1
 
     try:
@@ -1375,8 +1383,12 @@ def worker(args):
                 if entered:
                     paused_since = time.perf_counter()
                     log_event(run, 'actor', 'info', f'worker {args.worker} paused: {gate.reason}', process=args.worker)
+                if pending_ack or entered and settings.native_scheduler:
+                    if settings.native_scheduler:
+                        engine.synchronize_inflight([model,*(historical.models.values() if historical else [])])
+                    else:
+                        engine.synchronize_inflight()
                 if pending_ack:
-                    engine.synchronize_inflight()
                     phase_ack.update(pending_ack)
                     token_pause = True
                 if entered or pending_ack:
@@ -1391,6 +1403,8 @@ def worker(args):
                 if token_pause:
                     refresh_sources()
                     token_pause = False
+                if settings.native_scheduler:
+                    engine.resume()
                 log_event(run, 'actor', 'info', f'worker {args.worker} resumed: {gate.reason}', process=args.worker)
                 status('playing'); last = time.perf_counter()
             fill_slots()
