@@ -3747,6 +3747,67 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_ready_inference_can_run_before_prior_results_install(self):
+        import unittest.mock as mock
+        import native_dense
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                graphs = [NativeScheduler.graph(self), NativeScheduler.graph(self, [(0,0),(1,0),(2,0)]),
+                          NativeScheduler.graph(self, [(0,0),(0,1),(1,1)])]
+                pool = NativeScheduler.pool(self, graphs, views=1, work=32)
+                events = mock.Mock()
+                with mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
+                     mock.patch.object(pool.feed, 'install_packed', wraps=pool.feed.install_packed) as install, \
+                     mock.patch.object(pool, 'admit', side_effect=[True,True,True,True,False]):
+                    events.attach_mock(submit, 'submit')
+                    events.attach_mock(install, 'install')
+                    pool.run(evaluator, 5000, batch_size=1, overlap=overlap)
+                calls = [call[0] for call in events.mock_calls if call[0] in ('submit','install')]
+                self.assertEqual(calls[:3], ['submit','submit','install'] if overlap else ['submit','install','submit'])
+                self.assertTrue(all(call.args[1].ptr is None for call in submit.call_args_list))
+                self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+                pool.close()
+
+    def test_failed_install_closes_prior_results_and_new_inference(self):
+        import unittest.mock as mock
+        import native_dense
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
+        pool = NativeScheduler.pool(self, [NativeScheduler.graph(self),
+                                          NativeScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
+        with mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
+             mock.patch.object(pool.feed, 'install_packed', side_effect=RuntimeError('install failed')), \
+             mock.patch.object(pool, 'admit', side_effect=[True,True,True,True]):
+            with self.assertRaisesRegex(RuntimeError, 'install failed'):
+                pool.run(evaluator, 5000, batch_size=1)
+        self.assertEqual(submit.call_count, 2)
+        self.assertTrue(all(call.args[1].ptr is None for call in submit.call_args_list))
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+
+    def test_failed_fence_does_not_abandon_a_submitted_batch(self):
+        import native_dense
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
+        pool = NativeScheduler.pool(self, [NativeScheduler.graph(self),
+                                          NativeScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
+        with unittest.mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
+             unittest.mock.patch.object(pool.feed, 'install_packed', side_effect=RuntimeError('install failed')), \
+             unittest.mock.patch.object(native_dense.Forward, 'close', side_effect=RuntimeError('fence failed')), \
+             unittest.mock.patch.object(pool, 'abandon_fenced', wraps=pool.abandon_fenced) as abandon, \
+             unittest.mock.patch.object(pool, 'admit', side_effect=[True,True,True,True]):
+            with self.assertRaisesRegex(RuntimeError, 'fence failed'):
+                pool.run(evaluator, 5000, batch_size=1)
+            abandon.assert_not_called()
+        self.assertIsNone(submit.call_args_list[0].args[1].ptr)
+        self.assertIsNotNone(submit.call_args_list[1].args[1].ptr)
+        self.assertGreater(pool.feed.stats()['pending_rows'], 0)
+        # This check used CPU forwards. Release its snapshot before fenced teardown.
+        submit.call_args_list[1].args[1].close()
+        pool.abandon_fenced()
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+
     def test_packed_engine_deduplicates_roots_and_completes_legal_searches(self):
         torch.manual_seed(1753)
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
