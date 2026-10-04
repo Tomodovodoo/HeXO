@@ -368,7 +368,7 @@ class InferenceService:
         versions = [e.model_version for e in self.models]
         if len(versions)!=len(set(versions)) or any(p.model_version not in versions for p in pools):
             raise ValueError('One frozen evaluator is required for every pool model version')
-        self.batch_size, self.pending, self._stats = batch_size, [], None
+        self.batch_size, self.pending, self.leases, self._stats = batch_size, [], {}, None
         self._ptr = native.hxb_new(quantum, pending, merge_cells, latency_ms)
         if not self._ptr:
             checked(False)
@@ -394,16 +394,33 @@ class InferenceService:
                                 C.byref(model), C.byref(pointer))
         if count<0:
             checked(False)
-        return (token.value, model.value, PackedRows.from_native(pointer.value, count)) if count else None
+        if not count:
+            return None
+        try:
+            rows = PackedRows.from_native(pointer.value, count)
+        except BaseException:
+            native.hxgp_free(pointer.value)
+            checked(native.hxb_abort(self.ptr, token.value))
+            raise
+        self.leases[token.value] = rows
+        return token.value, model.value, rows
 
     def start(self, ms=0):
         checked(native.hxb_start(self.ptr, ms))
 
     def complete(self, token, rows):
-        try:
-            checked(native.hxb_complete(self.ptr, token, *rows.outputs()))
-        finally:
-            rows.close()
+        if self.leases.get(token) is not rows:
+            raise ValueError('Unknown inference service snapshot')
+        checked(native.hxb_complete(self.ptr, token, *rows.outputs()))
+        del self.leases[token]
+        rows.close()
+
+    def abandon_fenced(self, token):
+        """Abandon a manual batch after its GPU readers have been fenced."""
+        rows = self.leases[token]
+        checked(native.hxb_abort(self.ptr, token))
+        del self.leases[token]
+        rows.close()
 
     def done(self):
         status = native.hxb_done(self.ptr)
@@ -442,7 +459,7 @@ class InferenceService:
                         if uncertain:
                             self.pending.append((token, uncertain[0]))
                         else:
-                            checked(native.hxb_abort(self._ptr, token))
+                            self.abandon_fenced(token)
                         raise
                     self.pending.append((token, handle))
                 if self.pending:
@@ -459,13 +476,16 @@ class InferenceService:
             for token, handle in tuple(self.pending):
                 try:
                     handle.close()
-                    checked(native.hxb_abort(self._ptr, token))
+                    if token in self.leases:
+                        self.abandon_fenced(token)
                     self.pending.remove((token, handle))
                 except BaseException as error:
                     if failure is None:
                         failure = error
             if failure is not None:
                 raise failure
+            if self.leases:
+                raise ValueError('Complete or abandon_fenced every manually taken service batch before close')
             checked(native.hxb_join(self._ptr))
             self._stats = self.stats()
             checked(native.hxb_free(self._ptr))

@@ -3747,6 +3747,67 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
+        import ctypes
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start()
+        token, model, rows = service.take(100.)
+        for index, (side, count) in enumerate(rows.groups):
+            predictions = np.zeros((count,side*side+2),np.float32)
+            rows.decode(index,0,predictions)
+        ctypes.c_double.from_address(rows.outputs()[2]).value = float('nan')
+        with self.assertRaisesRegex(ValueError,'Invalid inference prediction'):
+            service.complete(token,rows)
+        self.assertIsNotNone(rows.ptr)
+        self.assertEqual(service.stats()['inflight_batches'],1)
+        with self.assertRaisesRegex(ValueError,'abandon_fenced'):
+            service.close()
+        # No GPU was launched; the manually decoded batch is already fenced.
+        service.abandon_fenced(token)
+        service.close()
+        self.assertIsNone(rows.ptr)
+        self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+        self.assertEqual(pool.games[0].stats()['pending'],0)
+
+    def test_inference_service_snapshot_adoption_failure_releases_native_flight(self):
+        import native_dense
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        with unittest.mock.patch.object(native_dense.PackedRows,'from_native',side_effect=RuntimeError('adoption failed')):
+            with self.assertRaisesRegex(RuntimeError,'adoption failed'):
+                service.run()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],service.stats()['active_producers']),(0,0,0))
+        self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+
+    def test_inference_service_failed_forward_retains_lease_until_fence_recovery(self):
+        import native_dense
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        with unittest.mock.patch.object(native_dense.Forward,'collect',side_effect=RuntimeError('collect failed')), \
+             unittest.mock.patch.object(native_dense.Forward,'close',side_effect=RuntimeError('fence failed')):
+            with self.assertRaisesRegex(RuntimeError,'fence failed'):
+                service.run()
+        self.assertEqual(len(service.pending),1)
+        self.assertIsNotNone(service.pending[0][1].rows.ptr)
+        self.assertEqual(service.stats()['inflight_batches'],1)
+        # Real CPU close now fences/releases the retained handle before native abandonment.
+        service.close()
+        self.assertFalse(service.pending or service.leases)
+        self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+
     def test_inference_service_owns_producers_and_drains_real_packed_forwards(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
