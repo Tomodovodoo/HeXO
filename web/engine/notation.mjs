@@ -196,23 +196,11 @@ export async function compressFile(blob) {
   return data.size < blob.size ? new Blob([data], {type: 'application/gzip'}) : blob;
 }
 
-/** Accept ordinary game files and their gzip downloads, with the same decoded size limit. */
+/** Accept ordinary files and their gzip downloads. readGame limits individual games; backups may be larger. */
 export async function readGameFile(file) {
-  if (file.size > MAX_GAME_BYTES) throw Error('Game file exceeds 32 MB');
   const header = new Uint8Array(await file.slice(0, 2).arrayBuffer());
   if (header[0] !== 31 || header[1] !== 139) return file.text();
-  const reader = file.stream().pipeThrough(new DecompressionStream('gzip')).getReader(), chunks = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > MAX_GAME_BYTES) throw Error('Decoded game file exceeds 32 MB');
-      chunks.push(value);
-    }
-  } finally { await reader.cancel(); reader.releaseLock(); }
-  return new Blob(chunks).text();
+  return new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text();
 }
 
 export async function readGame(text, native, fetcher = fetch) {

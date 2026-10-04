@@ -43,8 +43,9 @@ still load, and updating an evaluation does not replace the older version in a s
 cache holds at most 32 MiB of JSON by byte count, separate from the session's active analysis.
 
 Game and backup downloads of at least 256 KiB use `.json.gz` when compression makes them smaller. Import accepts
-these files directly, as well as ordinary JSON, up to 32 MiB after decompression. The JSON inside has the same
-format and retains all analysis records and certificates. The HTTP replay response remains ordinary JSON.
+these files directly, as well as ordinary JSON. Individual game text is limited to 32 MiB; a whole-library backup
+may be larger. The JSON inside has the same format and retains all analysis records and certificates. The HTTP
+replay response remains ordinary JSON.
 
 On a 5,288,454-byte study with 153 records, a Chrome IndexedDB check measured repeated save submission at
 0.52 ms, down from 308 ms, and completion at 8.53 ms, down from 534 ms. A fresh storage instance restored the

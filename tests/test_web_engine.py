@@ -225,15 +225,17 @@ const text=await readGameFile(file),history=await readGame(text,{game(){}});
 await cold.put('evaluations',{...record,document:[{replacement:true}]});
 const original=await cold.get('sessions','live'),backup=await cold.backup(),restored=new PlayStorage(null);
 await restored.restore(backup,{game(){}});
+const largeBackup=JSON.stringify({...backup,note:'x'.repeat(33*1024*1024)});
+const backupText=await readGameFile(await compressFile(new Blob([largeBackup])));
 console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal:JSON.stringify(saved.records[0])===JSON.stringify(record),
- fileEqual:text===json,oldPreserved:original.records[0].document.length,restored:(await restored.get('sessions','live')).records[0].document.length}));"""
+ fileEqual:text===json,backupEqual:backupText===largeBackup,oldPreserved:original.records[0].document.length,restored:(await restored.get('sessions','live')).records[0].document.length}));"""
         done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
                               capture_output=True, text=True, check=True)
         result = json.loads(done.stdout)
         self.assertGreater(result['bytes'], 1048576)
         self.assertLess(result['compressed'], result['bytes'] // 4)
         self.assertEqual(result['history'], [[0,0]])
-        self.assertTrue(result['equal'] and result['fileEqual'])
+        self.assertTrue(result['equal'] and result['fileEqual'] and result['backupEqual'])
         self.assertEqual((result['oldPreserved'], result['restored']), (40000, 40000))
 
     def test_matching_replay_precedes_newer_unrelated_records(self):
