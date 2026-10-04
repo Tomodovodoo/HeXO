@@ -240,7 +240,6 @@ inline void Producer::run()noexcept{
     if(!remaining)broker.withdraw(job,int(row));
    }
    if(broker.continuous)for(size_t i=0;i<active.size();++i)if(active[i] && pool.games[i]->stopped){
-    if(pool.failed[i])throw std::runtime_error("Inference failed for continuous actor game");
     auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
    }
    if(int(outstanding.size())<broker.pending && !pool.stopped){
@@ -269,6 +268,11 @@ inline void Producer::run()noexcept{
 }
 inline std::string Producer::result(int index,uint64_t token){
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
+ if(pool.failed[index]){
+  auto producer=std::find_if(broker.producers.begin(),broker.producers.end(),[&](const auto& p){return p.get()==this;})-broker.producers.begin();
+  std::string out="{\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(index)+",\"token\":"+std::to_string(token)+",\"error\":\"span\",\"history\":[";
+  for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return out+"]}";
+ }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");
  t.current(n);int ignored=0;auto q=t.completed_q(n,ignored);
  uint64_t maximum=0;double lo=1e300,hi=-1e300;
@@ -291,7 +295,7 @@ inline std::string Producer::result(int index,uint64_t token){
  out<<"],\"exact_prefixes\":[";Board prefix;size_t count=0;
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(gumbel::keys(prefix).first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;
-  for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}prefix.make(o.focus[ply]);}
+  for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}prefix.make(o.focus[ply]);}
  out<<"]}";return out.str();
 }
 }

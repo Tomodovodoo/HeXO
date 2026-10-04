@@ -3747,6 +3747,57 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_continuous_prefix_labels_keep_only_shortest_graph_witnesses(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        graph = NativeScheduler.graph(self)
+        graph.expand()
+        actions = graph.result(0,0,0,0)['actions']
+        # Trusted proof inputs can have different upper bounds. A later row
+        # must receive only the shortest retained witnesses of its prefix.
+        graph.mark(actions[0],1,42)
+        graph.mark(actions[1],1,34)
+        pool = NativeScheduler.pool(self,[graph],views=1,work=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.retarget(0,0,[[0,0],actions[0].tolist()],work=8,views=1)
+        event = None
+        end = time.monotonic()+2
+        while event is None and time.monotonic()<end:
+            service.pump()
+            event = service.event()
+        self.assertIsNotNone(event)
+        prefix = next(r for r in event['exact_prefixes'] if r[0]==1)
+        self.assertEqual(prefix[1:], [1,34,[actions[1].tolist()]])
+        service.close()
+
+    def test_continuous_native_span_stops_only_its_game_and_rejects_legacy_budgets(self):
+        from native_selfplay import play_cohort
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-span', 'fixed', 'cpu', 32, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=16, root_samples=4,
+                                             game_graph=128, max_plies=6, tactics=False,
+                                             opening_random_plies=0.)
+        with self.assertRaisesRegex(ValueError,'frontier slice'):
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_root_nodes=32),1,native_owner=True)
+        wide = line_history(34)
+        games = [dense_selfplay.SelfPlayGame([model,model],settings,1,native_owner=True,
+                    book=(dict(suite='test',key='wide',ply=len(wide)),wide)),
+                 dense_selfplay.SelfPlayGame([model,model],settings,2,native_owner=True)]
+        events = []
+        episodes, rows, receipt = play_cohort(games, producers=1, views=1,
+                                              progress=lambda index,event:events.append((index,event)))
+        self.assertEqual(episodes[0]['reason'], 'span')
+        self.assertEqual(list(map(tuple,episodes[0]['moves'])), wide)
+        self.assertFalse(any(r['game']==0 for r in rows))
+        self.assertEqual(len(episodes[1]['moves']),6)
+        self.assertEqual(len([r for r in rows if r['game']==1]),6)
+        self.assertTrue(any(index==0 and event.get('error')=='span' for index,event in events))
+        self.assertEqual((receipt['inference']['pending_rows'],receipt['inference']['inflight_batches'],
+                          receipt['inference']['active_producers']), (0,0,0))
+
     def test_continuous_native_proofs_reach_played_rows_with_fresh_effort(self):
         from native_selfplay import play_cohort
         from tests.test_neural_search import NativeProofs

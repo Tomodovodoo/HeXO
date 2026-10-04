@@ -63,6 +63,12 @@ def play_cohort(games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                         or event['token'] != epochs[key]+1):
                     raise ValueError('Native completion does not match the game/model/root generation')
                 epochs[key] = event['token']
+                if 'error' in event:
+                    game.reason = event['error']
+                    finished.add(index)
+                    if progress:
+                        progress(index, event)
+                    continue
                 edges = np.asarray(event.pop('edges'), np.float64)
                 player = game.game.player
                 winner = event['exact_winner']

@@ -697,6 +697,8 @@ class SelfPlayGame:
             raise ValueError('Native self-play requires game_graph, uses native depth views, and has no certificate line rows')
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
+        if native_owner and dense_solver.active(self.solver, self.schedule):
+            raise ValueError('Native self-play uses frontier slice settings, not legacy solver query budgets')
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
         if restart is not None and book is not None:
