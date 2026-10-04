@@ -10,7 +10,7 @@ use hexo_engine::types::Player;
 use hexo_solver::forcing::Meter;
 use hexo_solver::prover::{self,Ctl,DriverKind,ProverConfig};
 use hexo_solver::prover::io::{Position,PosConfig,Verdict};
-use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse};
+use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse,ExactFact,ExactScope,exact_at};
 use serde::Deserialize;
 use serde_json::{json,Value};
 
@@ -31,7 +31,12 @@ static CACHE:OnceLock<Mutex<BTreeMap<Key,Solved>>>=OnceLock::new();
 /// two-placement turn on the current stones (a flipped-turn threat query).
 #[derive(Deserialize,Clone,Copy,PartialEq,Default)]
 #[serde(rename_all="lowercase")]
-enum Attacker {#[default] Mover, Opponent}
+enum Attacker {#[default] Mover, Opponent, Defender}
+/// Trusted exact game outcomes from the caller's graph, supplied separately
+/// from certificates. A certificate cannot manufacture its own premises.
+#[derive(Deserialize,serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Known {history:Vec<(i32,i32)>,winner:u8,plies:u32}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -50,6 +55,7 @@ struct Request {
     #[serde(default)] bounds:bool,
     /// Carry resident entries and proven witnesses through table resizes.
     #[serde(default)] resume:bool,
+    #[serde(default)] known:Vec<Known>,
 }
 fn position(board:&check::Board,side:u8,remaining:u8)->Position {
     Position{stones:board.iter().map(|(&p,&s)|(p,if s==0{Player::P1}else{Player::P2})).collect(),
@@ -89,6 +95,60 @@ fn complete_candidate(board:&check::Board,start:usize,moves:&[(i32,i32)],req:&Re
     }
     cert.nodes[1]=ProofNode::DefenderReplies{responses};Ok(cert)
 }
+
+/// Start at the real defender turn, including a one-stone half turn. All moves
+/// outside the complete cover set lose immediately; every cover needs a proof.
+fn defend(board:&check::Board,ply:usize,req:&Request,ctl:&Ctl,meter:&Meter)->Result<ProofCertificate,String> {
+    let (mover,remaining)=check::phase(ply);
+    let attacker=1-mover;
+    let root=position(board,mover,remaining);
+    if let Some((fact,known))=exact_at(&root.stones,root.attacker,remaining) {
+        if known.winner==root.attacker {return Err("defender root is exact won".into());}
+        return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Exact{fact,after:vec![]}]});
+    }
+    let defenses=check::defenses_at(board,attacker,remaining,ctl)?;
+    let mut cert=ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Unstoppable{threats:vec![]}]};
+    if defenses.is_empty() {return Ok(cert);}
+    let mut responses=Vec::new();
+    for action in defenses.into_values() {
+        if ctl.expired() {return Err("defender query deadline".into());}
+        let (next,n,won)=check::apply(board,ply,&action)?;
+        if won {return Err("defender counterwin".into());}
+        let pos=position(&next,attacker,check::phase(n).1);
+        let mut terminal=exact_at(&pos.stones,pos.attacker,pos.placements_remaining).map(|(id,f)|(id,f,vec![]));
+        // The graph can already have refuted a first stone without allocating
+        // its second-stone children. Every continuation of that losing turn is
+        // still lost, and the certificate records the actual remaining move.
+        if terminal.is_none() && action.len()==2 {
+            for first in 0..2 {
+                let mut partial=board.clone();partial.insert(action[first],mover);
+                if !check::legal(board,action[first]) {continue;}
+                let prefix=position(&partial,mover,1);
+                if let Some((id,fact))=exact_at(&prefix.stones,prefix.attacker,1) {
+                    terminal=Some((id,fact,vec![action[1-first]]));break;
+                }
+            }
+        }
+        let mut child=if let Some((fact,known,after))=terminal {
+            if known.winner!=pos.attacker {return Err("defender has an exact winning cover".into());}
+            ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Exact{fact,after}]}
+        } else {
+            if meter.spent()>=req.nodes {return Err("defender query node budget".into());}
+            let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,node_budget:req.nodes,tt_mb:1,pn2_nodes:1000,..Default::default()};
+            prover::pdspn::solve(&pos,&cfg,ctl).certificate.ok_or("unproved defender continuation")?
+        };
+        if cert.nodes.len()+child.nodes.len()>check_nodes(req.nodes) {return Err("defender certificate size limit".into());}
+        let offset=cert.nodes.len() as u32;
+        responses.push(ProofResponse{action,child:offset+child.root});
+        for node in &mut child.nodes {match node {
+            ProofNode::AttackerMove{child,alternatives,..}=>{*child+=offset;for a in alternatives {a.child+=offset;}}
+            ProofNode::DefenderReplies{responses}=>{for r in responses {r.child+=offset;}}
+            _=>{}
+        }}
+        cert.nodes.extend(child.nodes);
+    }
+    cert.nodes[0]=ProofNode::DefenderReplies{responses};Ok(cert)
+}
 /// The certificate re-proved at the fewest attacker turns the remaining nodes and half the remaining time can
 /// establish, and whether that count is the exact minimum over the solver's forcing width; None when the
 /// probes returned no certificate. The caller verifies it.
@@ -111,22 +171,46 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
 fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
-        || (req.resume && req.table_mb==0) {return Err("invalid tactical limits".into());}
+        || (req.resume && req.table_mb==0) || req.known.len()>4096
+        || req.known.iter().map(|k|k.history.len()).sum::<usize>()>200_000
+        || (req.attacker==Attacker::Defender && req.root_moves.is_some()) {return Err("invalid tactical limits".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
     let meter=Meter::new(req.nodes);
     let ctl=Ctl{deadline:Some(deadline),cancel,meter:Some(meter.clone())};
     if ctl.expired() {return Err("cancelled or deadline".into());}
-    if req.resume {prover::dfpn::set_resident_resume(req.table_mb as usize);}
+    let mut facts=Vec::new();
+    let mut identities=BTreeMap::new();
+    for known in &req.known {
+        if known.history.len()>800 || known.winner>1 || known.plies==0 || known.plies>10_000 {return Err("invalid exact premise".into());}
+        let board=check::replay_controlled(&known.history,&ctl)?;
+        let (side,remaining)=check::phase(known.history.len());
+        if side!=known.winner && known.plies<=remaining as u32 {return Err("exact premise distance precedes winner's turn".into());}
+        let pos=position(&board,side,remaining);
+        if let Some(winner)=identities.insert((board,side,remaining),known.winner) {
+            if winner!=known.winner {return Err("contradictory exact premises".into());}
+            return Err("duplicate exact premise".into());
+        }
+        let turns=(known.plies+if side==known.winner {4-remaining as u32} else {2-remaining as u32}+3)/4;
+        facts.push(ExactFact{stones:pos.stones,player:pos.attacker,remaining,
+            winner:if known.winner==0 {Player::P1}else{Player::P2},turns});
+    }
+    let _facts=ExactScope::new(facts);
+    // Premise-dependent search state must never serve another snapshot.
+    if !req.known.is_empty() {prover::dfpn::set_resident(0);}
+    else if req.resume {prover::dfpn::set_resident_resume(req.table_mb as usize);}
     else {prover::dfpn::set_resident(req.table_mb as usize);}
     let board=check::replay_controlled(&req.history,&ctl)?;
     let ply=if req.attacker==Attacker::Opponent {check::flip(req.history.len())} else {req.history.len()};
-    let (side,remaining)=check::phase(ply);
+    let (mover,remaining)=check::phase(ply);
+    let side=if req.attacker==Attacker::Defender {1-mover} else {mover};
+    let cacheable=req.known.is_empty() && req.attacker!=Attacker::Defender;
     let fresh=req.certificate.is_none() && req.root_moves.is_none();
     let key=(board.iter().map(|(&p,&s)|(p,s)).collect(),side,remaining,req.nodes,req.idtt_nodes,
         if req.idtt_nodes>0 {req.depth} else {0},req.table_mb>0,req.shortest && fresh);
     let scope=json!({"rules":{"win_length":6,"placement_radius":8,"match_move_cap":null},
-        "defenses":"all legal two-stone covers including complete free-second frontier; quiet defender nodes unsupported",
-        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":3,
+        "defenses":"all legal covers for the remaining stones including complete free-second frontier; quiet defender nodes unsupported",
+        "attacks":"wide Strix proposals plus optional root candidate; selective negatives remain UNKNOWN","checker_version":4,
+        "exact_premises":req.known.len(),
         "budget":{"nodes":req.nodes,"idtt_nodes":req.idtt_nodes,"idtt_depth_cap":req.depth,"safety_ms":req.ms,
             "work":"one shared meter over IDTT nodes, PDS-PN level-1 nodes and level-2 expansions; verifier path limit 128",
             "check_nodes":check_nodes(req.nodes)}});
@@ -137,10 +221,12 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     let mut exact=false;
     let mut proof_numbers=None;
     let mut resident_reused=false;
-    let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if let Some(moves)=&req.root_moves {
+    let cert=if let Some(cert)=req.certificate.clone() {Some(cert)} else if req.attacker==Attacker::Defender {
+        defend(&board,ply,&req,&ctl,&meter).ok()
+    } else if let Some(moves)=&req.root_moves {
         Some(complete_candidate(&board,ply,moves,&req,&ctl,&meter)?)
     } else {
-        let saved=cache.lock().map_err(|_|"cache lock")?.get(&key).cloned();
+        let saved=if cacheable {cache.lock().map_err(|_|"cache lock")?.get(&key).cloned()} else {None};
         if let Some((cert,used,verdict,minimal))=saved {
             proof_numbers=Some((0,prover::PROOF_NUMBER_INFINITY));
             cache_hit=true;cached_nodes=Some(used);probe_verdict=verdict;exact=minimal;Some(cert)
@@ -163,7 +249,7 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
                 found.certificate
             };
             match found {
-                Some(cert) if req.shortest =>
+                Some(cert) if req.shortest && req.known.is_empty() =>
                     match shorten(&pos,&cert,&req,&ctl,&meter) {
                         Some((tight,minimal)) if check::verify(&req.history,ply,&tight,&ctl,check_nodes(req.nodes)).is_ok() =>
                             {exact=minimal;Some(tight)}
@@ -175,7 +261,7 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
     };
     let mut response=json!({"status":"UNKNOWN","native_verified":false,"moves":[],"certificate":null,
         "revision":REVISION,"scope":scope,"cache_hit":cache_hit,"idtt_verdict":probe_verdict.clone(),
-        "attacker":if req.attacker==Attacker::Opponent {"opponent"} else {"mover"},
+        "attacker":match req.attacker {Attacker::Opponent=>"opponent",Attacker::Defender=>"defender",Attacker::Mover=>"mover"},
         "reason":"no verified strategy","nodes_used":cached_nodes.unwrap_or(meter.spent().min(req.nodes)),"proof_turns":null,"elapsed_ms":0.0,
         "nodes_fresh":meter.spent().min(req.nodes),
         "shortest":false});
@@ -184,19 +270,39 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
             "infinity":prover::PROOF_NUMBER_INFINITY,"scope":"wide-forcing","game_exact":false})).unwrap_or(Value::Null);
     }
     if req.resume {response["resident_reused"]=json!(resident_reused);}
-    if let Some(cert)=cert {
-        match check::verify(&req.history,ply,&cert,&ctl,check_nodes(req.nodes)) {
-            Ok((moves,turns))=>{
+    if let Some(mut cert)=cert {
+        match check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)) {
+            Ok((moves,turns,visited))=>{
+                // Only the primary verified strategy may declare dependencies.
+                // Drop unused nodes/alternatives in certificates containing exact
+                // leaves, so an unchecked fact cannot leak into saved evidence.
+                if cert.nodes.iter().any(|n|matches!(n,ProofNode::Exact{..})) {
+                    let indices:BTreeMap<_,_>=visited.iter().enumerate().map(|(i,&id)|(id,i as u32)).collect();
+                    cert.nodes=visited.iter().map(|&id| {
+                        let mut node=cert.nodes[id as usize].clone();
+                        match &mut node {
+                            ProofNode::AttackerMove{child,alternatives,..}=>{*child=indices[child];alternatives.clear();}
+                            ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=indices[&reply.child];},
+                            _=>{},
+                        }
+                        node
+                    }).collect();
+                    cert.root=indices[&cert.root];
+                }
                 // A shortening cut short by the time cap is not a function of the key, so it is not kept.
-                if !cache_hit && fresh && (exact || !req.shortest) {
+                if cacheable && !cache_hit && fresh && (exact || !req.shortest) {
                     let mut guard=cache.lock().map_err(|_|"cache lock")?;
                     if guard.len()>=128 {guard.clear();}
                     guard.insert(key,(cert.clone(),meter.spent().min(req.nodes),probe_verdict,exact));
                 }
-                response["status"]=json!("PROVEN_WIN");response["native_verified"]=json!(true);
+                response["status"]=json!(if req.attacker==Attacker::Defender {"PROVEN_LOSS"} else {"PROVEN_WIN"});response["native_verified"]=json!(true);
+                response["winner"]=json!(side);
+                response["exact_hits"]=json!(cert.nodes.iter().filter(|n|matches!(n,ProofNode::Exact{..})).count());
+                let used:std::collections::BTreeSet<_>=cert.nodes.iter().filter_map(|n|if let ProofNode::Exact{fact,..}=n {Some(*fact)} else {None}).collect();
+                response["dependencies"]=json!(used.into_iter().map(|id|json!({"fact":id,"outcome":req.known[id as usize]})).collect::<Vec<_>>());
                 response["moves"]=json!(moves);response["proof_turns"]=json!(turns);response["shortest"]=json!(exact);
                 response["certificate"]=serde_json::to_value(cert).map_err(|e|e.to_string())?;
-                response["reason"]=json!("independent raw-board strategy verification");
+                response["reason"]=json!(if req.known.is_empty() {"independent raw-board strategy verification"} else {"raw-board strategy verified against supplied exact graph premises"});
             }
             Err(reason)=>response["reason"]=json!(reason),
         }

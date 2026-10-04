@@ -47,6 +47,9 @@ bind('hxg_root_at', C.c_int, ptr, ints, C.c_int)
 bind('hxg_store', C.c_int, ptr, ptr)
 bind('hxg_root_version', C.c_int64, ptr)
 bind('hxg_q', C.c_int, ptr, ptr)
+bind('hxg_facts', C.c_int, ptr, ptr, C.c_int)
+bind('hxg_prove_loss', C.c_int, ptr, C.c_int, C.c_int)
+bind('hxg_value', C.c_double, ptr)
 HOLD = -3  # hxg_next: the search waits at its armed hold
 GRAPH_LIMIT = 4096  # expanded nodes a GameGraph keeps between searches, about 56 KB each at 640 legal moves
 PV_DROP = .05       # completed-Q fall (value units, -1 to 1) of the chosen stone that sends a checked search back
@@ -214,6 +217,23 @@ class NeuralSearch:
         native.hxg_census(self.ptr, out.ctypes.data)
         return dict(zip(('nodes', 'expanded', 'exact', 'duplicates'), map(int, out)))
 
+    def facts(self):
+        """Reachable exact outcomes as a bounded, worker-safe snapshot. Distances
+        are placement upper bounds; no neural score is treated as a proof."""
+        out = np.empty(100_000, np.int64)
+        used = native.hxg_facts(self.ptr, out.ctypes.data, len(out))
+        facts, i = [], 0
+        while i < used and len(facts) < 2048:
+            count, winner, plies = map(int, out[i:i+3])
+            i += 3
+            facts.append(dict(history=out[i:i+2*count].reshape(-1, 2).tolist(), winner=winner, plies=plies))
+            i += 2*count
+        return facts
+
+    def prove_loss(self, winner, plies):
+        """Install a verified loss at this root and propagate it to its parents."""
+        checked(native.hxg_prove_loss(self.ptr, int(winner), int(plies)))
+
     def result(self, start, finished, evaluated, hits, *, choice='gumbel'):
         n = native.hxg_stats(self.ptr, None, None, None, None)
         actions = np.empty((n, 2), np.int64)
@@ -234,6 +254,7 @@ class NeuralSearch:
         return dict(action=actions[selected].tolist() if selected is not None else None,
                     actions=actions, visits=visits, values=values, policy=policy, scores=scores, completed_q=completed_q,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
+                    node_value=native.hxg_value(self.ptr),
                     elapsed_ms=(finished-start)*1000,
                     exact_winner=winner,
                     proven=proven, proof_turns=0, solver_nodes=0, solver_budget=0,

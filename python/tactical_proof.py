@@ -59,7 +59,7 @@ def check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate=None, table_mb=0)
     counts = [nodes] if gate is None else [nodes, gate.get('floor'), gate.get('cap_low'), gate.get('cap_high')]
     if (type(ms) is not int or not 1 <= ms <= 60000 or any(type(n) is not int or not 1 <= n <= MAX_NODES for n in counts)
             or type(idtt_nodes) is not int or not 0 <= idtt_nodes < min(counts)
-            or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent')
+            or type(depth) is not int or not 1 <= depth <= 64 or attacker not in ('mover', 'opponent', 'defender')
             or type(table_mb) is not int or not 0 <= table_mb <= MAX_TABLE_MB
             or (gate is not None and (set(gate) != {'weight', 'floor', 'cap_low', 'cap_high'}
                                       or not 0 <= gate['weight'] <= 100 or gate['cap_low'] > gate['cap_high']))):
@@ -168,7 +168,7 @@ class NativeTactics:
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
                 certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, cancel_event=None,
-                bounds=False, resume=False):
+                bounds=False, resume=False, known=()):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
             raise ValueError('Solver resume requires a positive table_mb')
@@ -185,6 +185,8 @@ class NativeTactics:
                 return unknown('deadline')
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, table_mb=table_mb)
+            if known:
+                request['known'] = known
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -313,7 +315,7 @@ class IsolatedTactics:
         return self.history([cell[:2] for cell in game.cells], **budgets)
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
-                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False):
+                certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False, known=()):
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
             raise ValueError('Solver resume requires a positive table_mb')
@@ -349,6 +351,8 @@ class IsolatedTactics:
             request = dict(history=history, ms=remaining, nodes=nodes, idtt_nodes=idtt_nodes, depth=depth,
                            attacker=attacker, certificate=certificate, root_moves=root_moves, gate=gate,
                            table_mb=table_mb, shortest=shortest)
+            if known:
+                request['known'] = known
             if bounds:
                 request['bounds'] = True
             if resume:
@@ -582,7 +586,7 @@ def threat_cells(certificate):
     return [tuple(cell) for cell in node['action']]
 
 
-def independent_verify(certificate, history, attacker='mover', deadline_seconds=10.):
+def independent_verify(certificate, history, attacker='mover', deadline_seconds=10., *, known=()):
     """Second checker via proof.py, independent of both native search and verifier.
 
     `attacker` is the query's attacker: 'opponent' checks the certificate on the
@@ -604,6 +608,8 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
             raise ValueError('Invalid certificate edge, cycle, depth or work limit')
         node = certificate['nodes'][index]
         stack = stack | {index}
+        if node['kind'] == 'exact':
+            return dict(kind='exact', fact=node['fact'], after=node.get('after', []))
         if node['kind'] == 'immediate_win':
             return dict(kind='move', moves=node['action'], child=dict(kind='terminal'))
         if node['kind'] == 'attacker_move':
@@ -616,14 +622,17 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
         raise ValueError('Unknown certificate node')
     if certificate['version'] != 1 or certificate['width'] != 'wide':
         raise ValueError('Unsupported certificate schema')
-    if attacker not in ('mover', 'opponent'):
+    if attacker not in ('mover', 'opponent', 'defender'):
         raise ValueError('Unknown attacker')
     n = len(history)
     flipped = attacker == 'opponent'
     start = n+1+n % 2 if flipped else n
-    converted = dict(version=1, history=[list(p) for p in history], attacker=((start+1)//2) % 2 if start else 0,
+    winner = ((start+1)//2) % 2 if start else 0
+    if attacker == 'defender':
+        winner = 1-winner
+    converted = dict(version=1, history=[list(p) for p in history], attacker=winner,
                      flipped=flipped, tree=expand(certificate['root'], set()))
-    return verify(converted, history, deadline=deadline)
+    return verify(converted, history, deadline=deadline, known=known)
 
 
 if __name__ == '__main__' and sys.argv[1:2] == ['serve']:

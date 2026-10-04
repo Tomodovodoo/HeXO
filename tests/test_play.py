@@ -956,6 +956,76 @@ class GameGraphs(unittest.TestCase):
     def graph(self, line):
         return self.engines.graphs[('seat', line)][1]
 
+    def test_defender_proof_uses_refuted_graph_edges_propagates_and_reloads(self):
+        from play import evaluate, Proofs
+        from neural_search import checked, native
+        from tactical_proof import NativeTactics
+        from tests.test_tactical_proof import OPEN_THREE
+        prover = NativeTactics()
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        cold = prover.history(history, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(cold['status'], 'PROVEN_LOSS')
+        replies = cold['certificate']['nodes'][0]['responses']
+        bubble = self.engines.bubble(None)
+        trees = self.engines.game_graph(bubble, 'defender')
+        graph, _ = trees(history[:-1], 32, bubble.evaluator)
+        # Start from a graph with exactly the imported facts. No local tactical
+        # classification should fill in its hundreds of still unknown edges.
+        checked(native.hxg_tactics(graph.ptr, 0))
+        graph.expand()
+        graph.at(history)
+        graph.expand()
+        # Exactly the four cover first stones are refuted. Hundreds of other
+        # root edges remain unresolved, so the graph alone cannot settle it.
+        for first in {tuple(p) for r in replies for p in r['action']}:
+            graph.at(history+[list(first)])
+            graph.prove_loss(0, 23)
+        graph.at(history)
+        self.assertEqual(graph.result(0, 0, 0, 0)['proven'], 0)
+        self.assertEqual(len(graph.facts()), 4)
+        from types import SimpleNamespace
+        found = evaluate(bubble, SimpleNamespace(history=prover.history, abort=prover.cancel), history, 32, 1, trees=trees)
+        self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
+        self.assertTrue(found['proof']['dependencies'])
+        checked_proof = prover.history(history, attacker='defender', certificate=found['proof']['certificate'],
+                                      known=[d['outcome'] for d in found['proof']['dependencies']], nodes=1, ms=1000)
+        self.assertEqual(checked_proof['status'], 'PROVEN_LOSS')
+        graph.at(history[:-1])
+        self.assertEqual(graph.result(0, 0, 0, 0)['proven'], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'proofs.jsonl'
+            store = Evaluations(path)
+            store.add(history, 'test', dict(simulations=32, solver_nodes=1), found)
+            restored = Evaluations(path)
+            known = Proofs()
+            known.extend(restored, history)
+            self.assertEqual(known.known(history)['winner'], 0)
+            self.assertEqual(known.known(history[:-1])['winner'], 0)
+
+    def test_fresh_losing_roots_still_play_in_single_and_pooled_evaluations(self):
+        from play import evaluate, evaluate_many, Proofs, replay
+        from tactical_proof import NativeTactics
+        from tests.test_tactical_proof import OPEN_THREE
+        from types import SimpleNamespace
+        engine = NativeTactics()
+        prover = SimpleNamespace(history=engine.history, abort=engine.cancel)
+        history = OPEN_THREE + [[-1, 0], [2, 1]]
+        bubble = self.engines.bubble(None)
+        single = evaluate(bubble, prover, history, 16, 10000)
+        pooled = evaluate_many(bubble, [prover], [history], 16, 10000)[0]
+        known = Proofs()
+        known.add(history, single)
+        restored = evaluate(bubble, None, history, 16, 0, known=known)
+        for found in (single, pooled, restored):
+            self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
+            self.assertEqual(len(found['moves']), 2)
+            game = replay(history)
+            try:
+                for move in found['moves']:
+                    game.play(*move)
+            finally:
+                game.close()
+
     def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
         history = self.turn([(0, 0)], 1)
         self.assertEqual(self.seen[0], 0)
@@ -2253,6 +2323,23 @@ class GameProofs(unittest.TestCase):
 
 class PrincipalVariation(unittest.TestCase):
     """`principal_variation` and the solver step of an evaluation."""
+
+    def test_a_known_win_without_a_move_still_finds_and_saves_its_witness(self):
+        from play import solve
+        from tactical_proof import NativeTactics, independent_verify
+        from tests.test_tactical_proof import OPEN_THREE
+        from types import SimpleNamespace
+        engine = NativeTactics()
+        known = [dict(history=OPEN_THREE, winner=0, plies=24, pv=[]),
+                 dict(history=OPEN_THREE+[[-1, 0], [2, 1]], winner=0, plies=20, pv=[])]
+        found = solve(SimpleNamespace(history=engine.history, abort=engine.cancel), OPEN_THREE, 1000, known=known)
+        self.assertTrue(found['moves'])
+        proof = found['proof']
+        self.assertEqual(proof['winner'], 0)
+        self.assertTrue(proof['dependencies'])
+        self.assertEqual(independent_verify(proof['certificate'], OPEN_THREE,
+                                           known=[d['outcome'] for d in proof['dependencies']]), 'PROVEN_WIN')
+
     # Side 1 to move at [(0, 0)]: its two stones, then defender covers lasting one or two more attacker turns (of the
     # two longest, the far one listed first), then an unstoppable fork whose defender stones do not matter.
     CERTIFICATE = dict(root=0, nodes=[

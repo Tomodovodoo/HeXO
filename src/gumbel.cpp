@@ -724,6 +724,43 @@ HX_API int hxg_census(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(
 HX_API int hxg_exact(void* p){auto& t=*static_cast<gumbel::Tree*>(p);return t.board.winner>=0?t.board.winner:t.root->exact_winner;}
 // Placements within which hxg_exact's winner completes six from the root (0 on a finished board), -1 when not exact.
 HX_API int hxg_distance(void* p){auto& t=*static_cast<gumbel::Tree*>(p);return t.board.winner>=0?0:t.root->exact_winner>=0?t.root->distance:-1;}
+// A read-only snapshot of reachable exact positions. Records are int64 words:
+// history length, winner, placement upper bound, then q/r pairs. An exact edge
+// need not have an allocated child. The caller supplies a bounded buffer; only
+// complete records are written. Neural values never enter this snapshot.
+HX_API int hxg_facts(void* p,int64_t* out,int capacity){
+ auto& t=*static_cast<gumbel::Tree*>(p);int used=0;
+ std::unordered_set<const gumbel::Node*> visited;
+ std::unordered_set<gumbel::Key,gumbel::KeyHash> emitted;
+ std::vector<Cell> history;for(auto& u:t.board.history)history.push_back(u.c);
+ auto emit=[&](int winner,int distance){
+  int size=3+int(2*history.size());
+  if(winner<0 || distance<=0 || used+size>capacity || !emitted.insert(gumbel::keys(history).first).second)return;
+  out[used++]=int64_t(history.size());out[used++]=winner;out[used++]=distance;
+  for(auto c:history){out[used++]=c.q;out[used++]=c.r;}
+ };
+ std::function<void(const gumbel::Node&)> walk=[&](const gumbel::Node& n){
+  if(used+3+int(2*history.size())>capacity || !visited.insert(&n).second)return;
+  emit(n.exact_winner,n.distance);
+  for(auto& e:n.edges)if(e.exact_winner>=0 || e.child){
+   history.push_back(e.action);emit(e.exact_winner,e.distance-1);
+   if(e.child)walk(*e.child);
+   history.pop_back();
+  }
+ };
+ walk(*t.root);return used;
+}
+// A verified defender-root certificate settles a loss without visiting every
+// legal edge. Parents and rule-equivalent nodes receive it through normal graph
+// propagation. No pending search is mutated by this synchronous entry point.
+HX_API int hxg_prove_loss(void* p,int winner,int distance){try{
+ auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;
+ if(!t.requests.empty() || winner!=1-n.player || distance<1 || (n.exact_winner>=0 && n.exact_winner!=winner))throw std::runtime_error("Invalid root loss proof");
+ gumbel::Outcome outcome{n.player,winner,distance,n.stones,true,{}};
+ t.apply(outcome,n);t.refresh(n);t.learn(n);t.propagate(n,nullptr);return 1;
+ }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// The node estimate, for display when the listed candidates are all refuted.
+HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);return t.root->q;}
 HX_API int hxg_begin(void* p,int simulations,int sample){try{static_cast<gumbel::Tree*>(p)->begin(simulations,sample);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_next(void* p){try{return static_cast<gumbel::Tree*>(p)->request();}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}

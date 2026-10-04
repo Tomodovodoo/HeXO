@@ -21,6 +21,69 @@ use crate::forcing::{CellSet2, WinDepthHints};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+
+/// An exact game outcome supplied by the caller's proof graph. These are
+/// premises, never neural estimates or scoped forcing-search negatives.
+#[derive(Clone)]
+pub struct ExactFact {
+    pub stones: Vec<(Coord, Player)>,
+    pub player: Player,
+    pub remaining: u8,
+    pub winner: Player,
+    pub turns: u32,
+}
+
+#[derive(Default)]
+struct ExactFacts {
+    facts: Vec<ExactFact>,
+    buckets: FxHashMap<(u64, Player, u8), Vec<usize>>,
+}
+thread_local! { static EXACT: RefCell<ExactFacts> = RefCell::new(ExactFacts::default()); }
+
+/// Query-local scope: even an error or panic retires the snapshot. The caller
+/// must also isolate any search tables from queries with different premises.
+pub struct ExactScope;
+impl ExactScope {
+    pub fn new(mut facts: Vec<ExactFact>) -> Self {
+        let mut buckets: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for (id, fact) in facts.iter_mut().enumerate() {
+            fact.stones.sort_unstable_by_key(|&(p, side)| (p, side == Player::P2));
+            let mut board = crate::forcing::SolverBoard::new();
+            for &(p, side) in &fact.stones { board.place(p, side); }
+            buckets.entry((board.hash, fact.player, fact.remaining)).or_default().push(id);
+        }
+        EXACT.with(|slot| *slot.borrow_mut() = ExactFacts { facts, buckets });
+        Self
+    }
+}
+impl Drop for ExactScope {
+    fn drop(&mut self) { EXACT.with(|slot| *slot.borrow_mut() = ExactFacts::default()); }
+}
+
+pub fn exact_fact(id: u32) -> Option<ExactFact> {
+    EXACT.with(|slot| slot.borrow().facts.get(id as usize).cloned())
+}
+
+pub fn exact_at(stones: &[(Coord, Player)], player: Player, remaining: u8) -> Option<(u32, ExactFact)> {
+    let mut board = crate::forcing::SolverBoard::new();
+    for &(p, side) in stones { board.place(p, side); }
+    lookup_exact(board.hash, player, remaining, || {
+        let mut stones = stones.to_vec();
+        stones.sort_unstable_by_key(|&(p, side)| (p, side == Player::P2));
+        stones
+    })
+}
+
+pub(crate) fn lookup_exact(hash: u64, player: Player, remaining: u8,
+    stones: impl FnOnce() -> Vec<(Coord, Player)>) -> Option<(u32, ExactFact)> {
+    EXACT.with(|slot| {
+        let known = slot.borrow();
+        let ids = known.buckets.get(&(hash, player, remaining))?;
+        let board = stones();
+        ids.iter().find_map(|&id| (known.facts[id].stones == board).then(|| (id as u32, known.facts[id].clone())))
+    })
+}
 
 pub const CERTIFICATE_VERSION: u32 = 1;
 const DEFAULT_VERIFY_NODE_LIMIT: usize = 5_000_000;
@@ -36,6 +99,9 @@ pub struct ProofResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProofNode {
+    /// Reference into the caller's trusted, query-local exact-outcome snapshot.
+    /// A standalone verifier without that snapshot rejects this leaf.
+    Exact { fact: u32, #[serde(default, skip_serializing_if = "Vec::is_empty")] after: Vec<Coord> },
     /// The attacker completes a six within the placements remaining this turn.
     ImmediateWin { action: Vec<Coord> },
     /// Proved forcing attacker actions (OR choices), shortest verified bound
@@ -194,6 +260,7 @@ impl ProofBuilder<'_> {
     /// positive facts are consulted — a miss means "search it", never "close it".
     #[inline]
     fn hint_proven(&self, node: Node, remaining: Option<u8>) -> bool {
+        if self.k.exact(node, remaining).is_some_and(|(_, won, _)| won) { return true; }
         let (Some(hints), Some(turns)) = (self.hints, remaining) else {
             return false;
         };
@@ -211,7 +278,9 @@ impl ProofBuilder<'_> {
             return Err(format!("missing proved node {key:016x}"));
         }
 
-        let (proof_node, depth) = match node {
+        let (proof_node, depth) = if let Some((fact, true, turns)) = self.k.exact(node, remaining) {
+            (ProofNode::Exact { fact, after: Vec::new() }, turns)
+        } else { match node {
             Node::Or { placements } => match self.k.or_eval(placements) {
                 OrEval::WinNow if remaining != Some(0) => {
                     let action = self
@@ -323,7 +392,7 @@ impl ProofBuilder<'_> {
                     (ProofNode::DefenderReplies { responses }, depth)
                 }
             },
-        };
+        }};
 
         let id = u32::try_from(self.nodes.len())
             .map_err(|_| "proof DAG contains more than u32::MAX nodes".to_string())?;
@@ -403,6 +472,7 @@ fn replay_pv(
             .get(id as usize)
             .ok_or_else(|| format!("proof node {id} is out of range"))?;
         let value = match node {
+            ProofNode::Exact { fact, .. } => exact_fact(*fact).ok_or("missing exact premise")?.turns,
             ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => 1,
             ProofNode::AttackerMove { child, .. } => {
                 1u32.saturating_add(depth(certificate, *child, memo, ctl)?)
@@ -438,6 +508,7 @@ fn replay_pv(
             .get(id as usize)
             .ok_or_else(|| format!("proof node {id} is out of range"))?;
         match node {
+            ProofNode::Exact { .. } => break,
             ProofNode::ImmediateWin { action } => {
                 let cells = CellSet2::from_cells(action);
                 k.place_attacker(&cells);
@@ -635,6 +706,12 @@ impl ProofVerifier<'_> {
         self.reached.insert(id);
 
         let depth = match (expected, proof) {
+            (_, ProofNode::Exact { fact, after }) => {
+                if !after.is_empty() { return Err("continued premise needs the raw-board checker".into()); }
+                let (actual, won, turns) = self.k.exact(expected, None).ok_or("missing or mismatched exact premise")?;
+                if actual != fact || !won { return Err("exact premise does not prove this attacker".into()); }
+                turns
+            }
             (Node::Or { placements }, ProofNode::ImmediateWin { action }) => {
                 let claimed = parse_action(&action)?;
                 let actual = self
@@ -814,7 +891,7 @@ fn primary_reachable(certificate: &ProofCertificate, ctl: &Ctl) -> Result<FxHash
             ProofNode::DefenderReplies { responses } => {
                 pending.extend(responses.iter().map(|response| response.child));
             }
-            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } => {}
+            ProofNode::ImmediateWin { .. } | ProofNode::Unstoppable { .. } | ProofNode::Exact { .. } => {}
         }
     }
     Ok(reached)

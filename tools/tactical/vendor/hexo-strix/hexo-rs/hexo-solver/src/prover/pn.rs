@@ -43,6 +43,9 @@ pub(crate) fn eval_child_at(
     node: Node,
     remaining: Option<u8>,
 ) -> (u32, u32, bool) {
+    if let Some((_, won, _)) = k.exact(node, remaining) {
+        return if won { (0, INF, true) } else { (INF, 0, true) };
+    }
     match node {
         // OR children are seeded from `or_estimate`, not full move generation:
         // most are never expanded, and generation dominated the search.
@@ -421,6 +424,9 @@ impl PnSearch {
         let node = self.arena[cur].node;
         let remaining = self.arena[cur].remaining;
         self.arena[cur].expanded = true;
+        if let Some((_, won, _)) = k.exact(node, remaining) {
+            return if won { self.set_terminal(cur, 0, INF) } else { self.set_terminal(cur, INF, 0) };
+        }
         // (child_node, move) list, and whether children are reached by an attacker
         // move (OR parent) or a defender cover (AND parent).
         let (child_node, moves, parent_is_or): (Node, Vec<CellSet2>, bool) = match node {

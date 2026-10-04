@@ -63,7 +63,7 @@ export async function compile(source) {
 function checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb) {
   const int = (x, lo, hi) => Number.isInteger(x) && lo <= x && x <= hi;
   if (!int(ms, 1, 60000) || !int(nodes, 1, MAX_NODES) || !int(idtt_nodes, 0, nodes - 1) || !int(depth, 1, 64)
-      || !['mover', 'opponent'].includes(attacker) || !int(table_mb, 0, MAX_TABLE_MB)) {
+      || !['mover', 'opponent', 'defender'].includes(attacker) || !int(table_mb, 0, MAX_TABLE_MB)) {
     throw new RangeError('Invalid tactical budgets');
   }
 }
@@ -100,7 +100,7 @@ export async function loadTactical(source) {
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
-                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false } = {}) {
+                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, known = [] } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     if (resume && !table_mb) throw new RangeError('Solver resume requires a positive table_mb');
     const start = performance.now();
@@ -112,6 +112,7 @@ export async function loadTactical(source) {
     const remaining = Math.floor(ms - (performance.now() - start));
     if (remaining < 1) return unknown('deadline');
     const request = { history, ms: remaining, nodes, idtt_nodes, depth, attacker, table_mb };
+    if (known.length) request.known = known;
     if (certificate != null) request.certificate = certificate;
     if (root_moves != null) request.root_moves = root_moves;
     if (shortest) request.shortest = true;

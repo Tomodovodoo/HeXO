@@ -270,6 +270,20 @@ export class NeuralSearch {
       largest_batch: stats.largest, network_ms: stats.network_ms, stopped, elapsed_ms: performance.now() - start};
   }
   /** Root statistics as NeuralSearch.result: action, actions, visits, values, completed_q, policy, scores, exact fields. */
+  facts() {
+    const capacity = 100000, buffer = this.n.alloc(8 * capacity);
+    try {
+      const used = this.m._hxg_facts(this.ptr, buffer, capacity), words = this.n.view(BigInt64Array, buffer, used), facts = [];
+      for (let i = 0; i < used && facts.length < 2048;) {
+        const count = Number(words[i++]), winner = Number(words[i++]), plies = Number(words[i++]), history = [];
+        for (let j = 0; j < count; j++) history.push([Number(words[i++]), Number(words[i++])]);
+        facts.push({history, winner, plies});
+      }
+      return facts;
+    } finally { this.m._free(buffer); }
+  }
+  proveLoss(winner, plies) { this.n.checked(this.m._hxg_prove_loss(this.ptr, winner, plies)); }
+
   result(choice = 'gumbel') {
     const m = this.m, n = m._hxg_stats(this.ptr, 0, 0, 0, 0);
     const a = this.n.alloc(16 * n), v = this.n.alloc(4 * n), q = this.n.alloc(8 * n), s = this.n.alloc(8 * n), p = this.n.alloc(8 * n);
@@ -290,7 +304,7 @@ export class NeuralSearch {
         policy.forEach((p, i) => { if (p > policy[selected]) selected = i; });
       }
       return {action: selected >= 0 ? actions[selected] : null, actions, visits, values, completed_q, policy, scores,
-        completed: m._hxg_completed(this.ptr), exact_winner: winner, proven,
+        completed: m._hxg_completed(this.ptr), exact_winner: winner, proven, node_value: m._hxg_value(this.ptr),
         proof_plies: proven ? m._hxg_distance(this.ptr) : 0,
         proof_action: proven > 0 ? actions.filter((_, i) => Number.isFinite(scores[i])) : []};
     } finally {

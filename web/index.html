@@ -945,8 +945,11 @@ function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=
 /* the evaluation shown for ply p: the saved one, else the search of a running move or analysis of that position;
    its top rows without the stones the search never tried (no policy share, not proven), which older saves kept */
 function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live);
-  return j?{value:j.live.value,top:j.live.top,threat:[],pv:[],proof:null,live:true}:null}
-function shownEval(p){const e=S.evaluations[p]||liveAt(p);return e&&{...e,top:(e.top||[]).filter(t=>t[2]>=.00005||t[4]>0)}}
+  return j?{value:j.live.value,top:j.live.top,refuted:j.live.refuted,threat:[],pv:[],proof:null,live:true}:null}
+function shownEval(p){const e=S.evaluations[p]||liveAt(p);if(!e)return e;
+  const top=(e.top||[]).filter(t=>t[2]>=.00005||t[4]>0),refuted=!e.proof&&top.length&&top.every(t=>t[4]<0);
+  const value=refuted?(e.node_value??(e.value>0&&e.value<1?e.value:null)):e.value;
+  return {...e,top,value,refuted:refuted?top.length:0}}
 function finished(){return S.winner>=0&&view===S.history.length}
 function renderAnalysis(){
   const ev=shownEval(view),side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
@@ -955,11 +958,12 @@ function renderAnalysis(){
   bar.classList.toggle('idle',x==null);bar.classList.toggle('stale',!over&&!!seen&&!ev);bar.classList.toggle('pending',!!job&&!over);
   bar.classList.toggle('live',!!ev?.live);
   if(x!=null)bar.firstChild.style.transform=`scaleX(${x})`;
-  $('xv').textContent=x==null?'':pct(x);$('ov').textContent=x==null?'':pct(1-x);
+  const label=v=>ev?.refuted?(v<.005?'<1':v>.995?'>99':pct(v)):pct(v);
+  $('xv').textContent=x==null?'':label(x);$('ov').textContent=x==null?'':label(1-x);
   const proof=!over&&ev&&ev.proof;
   for(const side of[0,1]){const box=$(side?'oproof':'xproof');box.style.color=COLORS[side];
     box.replaceChildren(...(proof&&proof.winner===side?[el('i',{class:'hexdot',style:`--c:${COLORS[side]}`}),proof.plies?String(proof.plies):'+'+proof.turns]:[]))}
-  const top=over?[]:ev?ev.top:[],max=Math.max(...top.map(t=>t[2]),.001),sig=JSON.stringify([view,over&&S.winner,top,ev&&ev.threat]);
+  const top=over?[]:ev?ev.top:[],max=Math.max(...top.map(t=>t[2]),.001),sig=JSON.stringify([view,over&&S.winner,top,ev&&ev.threat,!!proof]);
   if(renderAnalysis.sig===sig)return;renderAnalysis.sig=sig;
   const box=$('top');box.classList.toggle('live',!!ev?.live);
   if(over){box.replaceChildren(el('div',{class:'result',style:`--c:${COLORS[S.winner]}`},
@@ -972,6 +976,7 @@ function renderAnalysis(){
     d.onclick=()=>{const[sx,sy]=screen(t[0],t[1]);cam.x+=canvas.clientWidth/2-sx;cam.y+=canvas.clientHeight/2-sy;draw()};
     d.onmouseenter=()=>{hot=[t[0],t[1]];draw()};d.onmouseleave=()=>{hot=null;draw()};return d});
   while(rows.length<5)rows.push(el('div',{class:'blank'},el('span',{},rows.length+1),el('span',{},'·'),el('em'),el('span'),el('span')));
+  if(!ev?.proof&&top.length&&top.every(t=>t[4]<0))rows.push(el('small',{},`${top.length} replies refuted, not proven`));
   box.replaceChildren(...rows);
 }
 function renderStudy(){
