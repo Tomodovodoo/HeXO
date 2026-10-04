@@ -171,6 +171,16 @@ struct Feed {
   std::erase_if(ready,[&](uint64_t id){auto it=tasks.find(id);return it==tasks.end() || it->second.submitted;});
   return retired;
  }
+ int retire(uint64_t id){
+  auto found=tasks.find(id);if(found==tasks.end() || !found->second.submitted)throw std::runtime_error("Unknown snapshot task");
+  auto& subscribers=found->second.subscribers;
+  std::erase_if(subscribers,[&](Subscriber subscriber){
+   int result=hxg_retire(subscriber.tree,subscriber.request);
+   if(result<0)throw std::runtime_error(gumbel::error);if(result)++proof_requests;return result!=0;
+  });
+  // Immutable snapshots survive retirement. The owner still completes this task once.
+  return int(subscribers.size());
+ }
  void detach(void* tree) {
   // Detach before freeing or advancing a cancelled tree. Submitted rows retain no tree ownership.
   bool attached;{std::lock_guard lock(mutex);attached=roots.erase(tree)!=0;}
@@ -299,6 +309,10 @@ HX_API void hxgf_stats(void* p,int64_t* out){
 // Distinct neural rows ready to launch, excluding submitted work and subscribers.
 HX_API int64_t hxgf_queued(void* p){return static_cast<feeding::Feed*>(p)->queued;}
 HX_API int hxgf_prune(void* p){try{return static_cast<feeding::Feed*>(p)->prune();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+HX_API int hxgf_retire(void* p,uint64_t id){try{return static_cast<feeding::Feed*>(p)->retire(id);}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+HX_API const int64_t* hxgf_key(void* p,uint64_t id,int64_t* count){try{
+ auto& task=static_cast<feeding::Feed*>(p)->tasks.at(id);*count=int64_t(task.key.size());return task.key.data();
+}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 HX_API void hxgf_pruning(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.proof_requests;out[1]=f.proof_rows;out[2]=f.prune_ns;}
 HX_API void hxgf_profile(void* p,int enabled){static_cast<feeding::Feed*>(p)->profile=enabled!=0;}
 HX_API void hxgf_times(void* p,uint64_t* out){auto& f=*static_cast<feeding::Feed*>(p);out[0]=f.select_ns;out[1]=f.identity_ns;out[2]=f.cached_ns;out[3]=f.install_ns;}

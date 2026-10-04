@@ -3747,6 +3747,40 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_inference_service_owns_producers_and_drains_real_packed_forwards(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pools = [NativeScheduler.pool(self,[NativeScheduler.graph(self,history)],views=1,work=32)
+                 for history in ([(0,0)],[(0,0)],[(0,0),(1,0),(2,0)])]
+        service = InferenceService(pools,[evaluator])
+        self.addCleanup(service.close)
+        with self.assertRaisesRegex(ValueError,'inference service'):
+            pools[0].step()
+        with self.assertRaisesRegex(ValueError,'inference service'):
+            pools[0].games[0].stats()
+        service.run()
+        stats = service.stats()
+        self.assertGreater(stats['launched_rows'],0)
+        self.assertEqual((stats['pending_rows'],stats['inflight_batches'],stats['active_producers']),(0,0,0))
+        for pool in pools:
+            stats = pool.games[0].stats()
+            self.assertEqual((stats['completed'],stats['issued'],stats['pending']),(32,32,0))
+            self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()),32)
+            self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+        with self.assertRaisesRegex(ValueError,'closed'):
+            service.take()
+        # Keep each game's graph and cache, then resume after its played stone.
+        for pool in pools:
+            pool.retarget(0,pool.games[0].history()+[pool.games[0].choice()],work=16)
+        resumed = InferenceService(pools,[evaluator])
+        self.addCleanup(resumed.close)
+        resumed.run()
+        for pool in pools:
+            self.assertEqual(pool.games[0].stats()['completed'],16)
+            self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()),16)
+            self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+
     def test_ready_inference_can_run_before_prior_results_install(self):
         import unittest.mock as mock
         import native_dense

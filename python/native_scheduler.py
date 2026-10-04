@@ -29,6 +29,15 @@ for name, result, args in (
 ):
     bind('hxgo_'+name, result, *args)
 bind('hxgf_abandon_all', C.c_int, ptr)
+bind('hxb_new', ptr, C.c_int, C.c_int, C.c_int, C.c_double)
+for name, result, args in (
+    ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
+    ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
+    ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
+    ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
+    ('join', C.c_int, [ptr]), ('free', C.c_int, [ptr]), ('stats', None, [ptr, ptr]),
+):
+    bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
 for name, result, args in (
     ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
@@ -63,6 +72,7 @@ class ProofLoop:
     def ptr(self):
         if not self._ptr:
             raise ValueError('Proof loop is closed')
+        self.pool.ptr  # The native producer owns graph/proof delivery while attached.
         return self._ptr
 
     def step(self):
@@ -218,6 +228,7 @@ class SearchPool:
 
     def enable_proofs(self, package=None, **options):
         """Opt in to concurrent proving. Actor/learner target construction is unchanged."""
+        self.ptr
         if self.proofs is not None:
             raise ValueError('Search pool already has a proof loop')
         self.proofs = ProofLoop(self, package, **options)
@@ -227,6 +238,8 @@ class SearchPool:
     def ptr(self):
         if not self._ptr:
             raise ValueError('Search pool is closed')
+        if getattr(self, '_service', None) is not None:
+            raise ValueError('Search pool is owned by its native inference service')
         return self._ptr
 
     def clock(self, ms):
@@ -332,7 +345,130 @@ class SearchPool:
 
     def close(self):
         if self._ptr:
+            self.ptr
             if self.proofs is not None:
                 self.proofs.close()
             checked(native.hxgm_free(self._ptr))
             self._ptr = None
+
+
+class InferenceService:
+    """Native independent producers feeding one model-keyed GPU batch service.
+
+    Pools and their source graphs are exclusively owned until close(). Python
+    only launches/collects immutable packed batches. Producer threads install
+    prediction and proof messages into their own graphs. Fixed-work mode stays
+    available with ms=0; interactive comparisons use a common clock.
+    """
+    def __init__(self, pools, evaluators, *, batch_size=128, quantum=32, pending=2,
+                 merge_cells=32768, latency_ms=1.5):
+        if not pools or batch_size<1 or batch_size>1024:
+            raise ValueError('Open pools and a valid inference batch size are required')
+        self.pools, self.models = [], list(evaluators)
+        versions = [e.model_version for e in self.models]
+        if len(versions)!=len(set(versions)) or any(p.model_version not in versions for p in pools):
+            raise ValueError('One frozen evaluator is required for every pool model version')
+        self.batch_size, self.pending, self._stats = batch_size, [], None
+        self._ptr = native.hxb_new(quantum, pending, merge_cells, latency_ms)
+        if not self._ptr:
+            checked(False)
+        try:
+            for pool in pools:
+                checked(native.hxb_attach(self._ptr, pool.ptr, versions.index(pool.model_version)))
+                pool._service = self
+                self.pools.append(pool)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def ptr(self):
+        if not self._ptr:
+            raise ValueError('Inference service is closed')
+        return self._ptr
+
+    def take(self, wait_ms=0):
+        from native_dense import PackedRows
+        token, model, pointer = C.c_uint64(), C.c_int(), ptr()
+        count = native.hxb_take(self.ptr, self.batch_size, wait_ms, C.byref(token),
+                                C.byref(model), C.byref(pointer))
+        if count<0:
+            checked(False)
+        return (token.value, model.value, PackedRows.from_native(pointer.value, count)) if count else None
+
+    def start(self, ms=0):
+        checked(native.hxb_start(self.ptr, ms))
+
+    def complete(self, token, rows):
+        try:
+            checked(native.hxb_complete(self.ptr, token, *rows.outputs()))
+        finally:
+            rows.close()
+
+    def done(self):
+        status = native.hxb_done(self.ptr)
+        if status<0:
+            checked(False)
+        return bool(status)
+
+    def stats(self):
+        if not self._ptr and self._stats is not None:
+            return dict(self._stats)
+        out = np.empty(10, np.uint64)
+        native.hxb_stats(self.ptr, out.ctypes.data)
+        return dict(zip(('unique_rows', 'coalesced_rows', 'launched_rows', 'subscriber_deliveries',
+                         'withdrawn_ready_rows', 'batches', 'row_high_water', 'pending_rows',
+                         'inflight_batches', 'active_producers'), map(int, out)))
+
+    def cancel(self):
+        if self._ptr:
+            native.hxb_cancel(self._ptr)
+
+    def run(self, ms=0):
+        import native_dense
+        try:
+            self.start(ms)
+            while not self.done():
+                while len(self.pending)<2:
+                    batch = self.take(0 if self.pending else 2.)
+                    if batch is None:
+                        break
+                    token, model, rows = batch
+                    try:
+                        handle = native_dense.submit(self.models[model], rows)
+                    except BaseException:
+                        self.cancel()
+                        uncertain = [h for h in native_dense._quarantined if h.rows is rows]
+                        if uncertain:
+                            self.pending.append((token, uncertain[0]))
+                        else:
+                            checked(native.hxb_abort(self._ptr, token))
+                        raise
+                    self.pending.append((token, handle))
+                if self.pending:
+                    token, handle = self.pending[0]
+                    self.complete(token, handle.collect())
+                    self.pending.pop(0)
+        finally:
+            self.close()
+
+    def close(self):
+        if self._ptr:
+            self.cancel()
+            failure = None
+            for token, handle in tuple(self.pending):
+                try:
+                    handle.close()
+                    checked(native.hxb_abort(self._ptr, token))
+                    self.pending.remove((token, handle))
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            if failure is not None:
+                raise failure
+            checked(native.hxb_join(self._ptr))
+            self._stats = self.stats()
+            checked(native.hxb_free(self._ptr))
+            self._ptr = None
+            for pool in self.pools:
+                pool._service = None
