@@ -212,6 +212,19 @@ class Overlay(unittest.TestCase):
 class BrowserProofs(unittest.TestCase):
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
+    def test_shorter_proof_replaces_saved_parent_after_undo_and_reload(self):
+        history = [[0,0],[1,0],[2,0],[0,1]]
+        old = dict(moves=[[3,1],[4,1]], value=1, top=[], proof=dict(winner=0,plies=42,turns=11),
+                   pv=[[3,1,0,1],[4,1,0,2]])
+        child = dict(moves=[[0,2]], value=1, top=[], proof=dict(winner=0,plies=29,turns=8),
+                     pv=[[0,2,0,1]], threat=[], solved=True)
+        answer = node(dict(kind='proofs',history=history,ply=4,found=child,records=[(history[:-1],old)]))
+        for shown in (answer['analysed'],answer['undone']['shown'],answer['quick']['shown'],answer['reloaded']):
+            self.assertEqual(shown['proof'], dict(winner=0,plies=30,turns=8))
+            self.assertEqual(shown['moves'], [[0,1],[0,2]])
+            self.assertEqual(shown['pv'], [[0,1,0,1],[0,2,0,2]])
+
+
     def test_partial_proofs_gain_the_child_line_and_survive_reload(self):
         history = [[0, 0], [1, 0], [2, 0]]
         pv = [[1, 0, 1, 1], [2, 0, 1, 2], [2, 3, 0, 3], [3, 3, 0, 4], [3, 0, 1, 5], [4, 0, 1, 6]]
@@ -237,6 +250,11 @@ class BrowserProofs(unittest.TestCase):
                    [[0, 0], [2, 2], [3, 2]], [[0, 0], [-2, 0], [-2, 1], [-3, 1]]]
         # Lost A covers B,A, including after serializing and rebuilding the table.
         queries += [[[0,0],[5,4],[4,4]], [[0,0],[4,4],[5,4]], [[0,0],[5,4]]]
+        defender = [[0,0],[2,-2],[3,-2]]
+        records += [(defender,dict(proof=dict(winner=1,plies=12),pv=[[0,1,0,1],[0,2,0,2],[3,0,1,3]])),
+                    (defender+[[0,1]],dict(proof=dict(winner=1,plies=3),pv=[[0,2,0,1],[3,0,1,2]])),
+                    (defender+[[1,1]],dict(proof=dict(winner=1,plies=7),pv=[[1,2,0,1],[3,0,1,2]]))]
+        queries += [defender]
         result = dict(actions=[[1, 0], [4, 4], [7, 7]], values=[.1, .2, .3], completed_q=[.1, .2, .3], policy=[.2, .5, .3],
                       action=[4, 4], proven=0)
         lost = dict(actions=[[4, 4]], values=[.4], completed_q=[.4], policy=[1.], action=[4, 4], proven=0)
@@ -250,8 +268,10 @@ class BrowserProofs(unittest.TestCase):
             self.assertEqual((answer['known'], sorted(answer['edges'])), (table.known(history), edges), history)
             order = lambda f: json.dumps(f, sort_keys=True)
             self.assertEqual(sorted(answer['facts'], key=order), sorted(table.facts(history), key=order))
-        self.assertIn([4,4,0,3], found['queries'][-1]['edges'])
-        self.assertEqual({k:found['queries'][-3]['known'][k] for k in ('winner','plies')}, dict(winner=0,plies=2))
+        self.assertIn([4,4,0,3], found['queries'][-2]['edges'])
+        self.assertEqual({k:found['queries'][-4]['known'][k] for k in ('winner','plies')}, dict(winner=0,plies=2))
+        self.assertEqual(found['queries'][-1]['known']['pv'][0],[1,1,0,1])
+        self.assertEqual(found['queries'][-1]['known']['plies'],12)
         self.assertEqual({k: found['settled'][k] for k in ('action', 'proven', 'proof_plies', 'values', 'completed_q')},
                          dict(action=[1, 0], proven=1, proof_plies=6, values=[1, -1, .3], completed_q=[1, -1, .3]))
         self.assertEqual({k: found['exact'][k] for k in ('action', 'proven', 'proof_plies', 'values')},
@@ -800,7 +820,7 @@ class Bundle(unittest.TestCase):
                         option['marks'] = ([[*first, 1 - mover, 3]] if marked == ['lost'] else
                                            [[*first, mover, 7], [*second, mover, 5]])
                         tree.expand()
-                        for q, r, winner, distance in sorted(option['marks'], key=lambda m: (m[2] == mover, m[3])):
+                        for q, r, winner, distance in option['marks']:
                             tree.mark((q, r), winner, distance)
                     result = tree.search(simulations, root_samples=16, batch_size=16,
                                          **{k: v for k, v in option.items() if k != 'marks'})

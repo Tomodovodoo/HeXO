@@ -750,7 +750,7 @@ class Proofs:
     `edges` and `known` read what a position's continuations prove. Safe to use from several threads."""
 
     def __init__(self):
-        self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.Lock()
+        self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.RLock()
 
     def add(self, history, record, line=None):
         """Index `record` (fields of `evaluate`) at `history` when it holds a proof; `line`, the record's saved
@@ -781,15 +781,27 @@ class Proofs:
             self.sizes.setdefault(len(history), set()).add(key)
 
     def line(self, history, outcome):
-        """Extend a partial line with later witnesses at the exact positions it reaches, within its proof bound.
-        Omitted defender stones end the walk because the position after them is unknown."""
+        """Follow the shortest known attack and longest covered defence within this proof's bound.
+        A partial set of defensive replies never tightens the position's universal bound. Omitted defender stones
+        end the walk because the position after them is unknown."""
         current, pv, i = list(history), outcome.get('pv') or [], 0
         with self.lock:
             while i <= len(pv):
-                entry = self.entries.get(proof_key(current))
+                entry = self.choice(current)
                 if (entry is not None and entry['winner'] == outcome['winner'] and entry['plies'] + i <= outcome['plies']
-                        and len(entry['pv']) > len(pv) - i and all(len(p) == 4 for p in entry['pv'])):
+                        and (entry['plies'] + i < outcome['plies'] or len(entry['pv']) > len(pv) - i)
+                        and all(len(p) == 4 for p in entry['pv'])):
                     pv = pv[:i] + [[*p[:3], p[3] + i] for p in entry['pv']]
+                if player_at(len(current)) != outcome['winner']:
+                    replies = [(d, a, o) for a, (w, d, o) in self.edges(current).items()
+                               if w == outcome['winner'] and d + i <= outcome['plies'] and o['pv']]
+                    if replies:
+                        distance, action, reply = min(replies, key=lambda e: (-e[0], e[1]))
+                        # Retain the certificate's equal-length reply and its tie-break.
+                        first = tuple(pv[i][:2]) if i < len(pv) else None
+                        if first != action and not any(a == first and d == distance for d, a, _ in replies):
+                            pv = pv[:i] + [[*action, player_at(len(current)), i + 1]] + [
+                                [*p[:3], p[3] + i + 1] for p in reply['pv']]
                 if i == len(pv) or len(pv[i]) != 4 or pv[i][3] != i + 1 or pv[i][2] != player_at(len(current)):
                     break
                 current.append(tuple(pv[i][:2]))
@@ -858,9 +870,8 @@ class Proofs:
                             found[first[:2]] = (outcome['winner'], outcome['plies'] + 1, outcome)
         return found
 
-    def known(self, history):
-        """The outcome of `history` ({winner, plies, pv}) from its own entry, else the shortest win of the side to
-        move through `edges`, its line led by that stone and extended from stored children; None when nothing is known."""
+    def choice(self, history):
+        """The tightest stored guarantee, also considering shorter winning continuations."""
         with self.lock:
             entry = self.entries.get(proof_key(history))
             if entry is None and len(history) > 1 and len(history) % 2 == 1:
@@ -879,16 +890,22 @@ class Proofs:
                     candidates.append(dict(winner=mover, plies=loss['plies'] - 1, pv=[]))
                 if candidates:
                     entry = min(candidates, key=lambda e: e['plies'])
-        if entry is not None:
-            return dict(winner=entry['winner'], plies=entry['plies'], pv=self.line(history, entry))
         mover = player_at(len(history))
+        if entry is not None and entry['winner'] != mover:
+            return entry
         wins = sorted((d, a, o) for a, (w, d, o) in self.edges(history).items() if w == mover)
-        if not wins:
-            return None
+        if not wins or entry is not None and (entry['plies'] < wins[0][0] or entry['plies'] == wins[0][0] and entry['pv']):
+            return entry
         distance, action, outcome = wins[0]
-        found = dict(winner=mover, plies=distance,
-                     pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
-        return dict(found, pv=self.line(history, found))
+        return dict(winner=mover, plies=distance,
+                    pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
+
+    def known(self, history):
+        """The best known guarantee and its updated continuation, or None when nothing is proven."""
+        found = self.choice(history)
+        if found is None:
+            return None
+        return dict(winner=found['winner'], plies=found['plies'], pv=self.line(history, found))
 
     def extend(self, store, history):
         """Index the saved evaluations holding a proof of every position of `history` (see `Evaluations.proven`)."""
@@ -1956,7 +1973,8 @@ class Session:
             return None
         mover = player_at(len(history))
         shown = dict(found or dict(moves=[], top=[], threat=[], simulations=0, solver_nodes=0))
-        if outcome is not None and not shown.get('proof'):
+        if outcome is not None and (not shown.get('proof') or
+                outcome['winner'] == shown['proof']['winner'] and outcome['plies'] < proof_plies(shown['proof'], history)):
             game = replay(history)
             try:
                 remaining = game.remaining
@@ -1965,7 +1983,7 @@ class Session:
             won = outcome['winner'] == mover
             shown.update(value=1. if won else 0., pv=outcome['pv'], proof=dict(
                 winner=outcome['winner'], plies=outcome['plies'], turns=proof_turns(outcome['plies'], remaining, won)))
-            if found is None and won:
+            if won:
                 shown['moves'] = [p[:2] for i, p in enumerate(outcome['pv'][:remaining]) if p[2] == mover and p[3] == i + 1]
         if shown.get('proof'):
             shown['pv'] = self.proofs.line(history, dict(winner=shown['proof']['winner'],
