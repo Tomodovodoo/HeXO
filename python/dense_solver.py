@@ -682,11 +682,12 @@ class Proof:
                     index, i = branch['child'], i+1
                 continue
             if node['kind'] in ('defender_replies', 'unstoppable'):
-                labels += [(p, -1, turns) for p in range(i, min(i+2, len(history)))]
-                reply = history[i:i+2]
-                if len(reply) < 2:
+                remaining = 2 if i % 2 else 1
+                labels += [(p, -1, turns) for p in range(i, min(i+remaining, len(history)))]
+                reply = history[i:i+remaining]
+                if len(reply) < remaining:
                     return labels, ([], turns), node, reply
-                i += 2
+                i += remaining
                 if node['kind'] == 'unstoppable':
                     threat = next((t for t in node['threats'] if not set(map(tuple, t)) & set(reply)), None)
                     if threat is None:

@@ -2891,7 +2891,8 @@ class Session:
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
                         max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
-                        solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes'])))
+                        solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes']),
+                                    stamps=getattr(self.engines, 'proof_stamps', False)))
         if kind == 'six':
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
                         cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),

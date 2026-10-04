@@ -7,6 +7,7 @@ verify(certificate, history) independently checks the proof against trusted hist
 invalid certificate and VerificationTimeout, which says nothing about validity, when its deadline passes.
 """
 from itertools import combinations
+from functools import lru_cache
 from math import isfinite
 from time import perf_counter
 
@@ -233,21 +234,36 @@ def verify(certificate, history, *, deadline=None, known=()):
                 winner = side
         return board, n+1, winner
 
+    @lru_cache(maxsize=512)
+    def segments_at(q, r):
+        return tuple(tuple((q+(j-offset)*a, r+(j-offset)*b) for j in range(6))
+                     for a, b in ((0, 1), (1, -1), (1, 0)) for offset in range(6))
+
     def threats(board, side, allowance, outside=None):
         # Enumerate complete coordinate segments rather than native window codes.
+        # Even with two unknown outside stones, a winning six needs an existing
+        # friendly stone. Geometry is shared; occupancy is checked afresh.
         segments = set()
-        for q, r in board:
-            for a, b in ((0, 1), (1, -1), (1, 0)):
-                for offset in range(6):
-                    segments.add(tuple((q+(j-offset)*a, r+(j-offset)*b) for j in range(6)))
+        for (q, r), owner in board.items():
+            require(True)
+            if owner == side:
+                segments.update(segments_at(q, r))
         result = set()
         for segment in segments:
-            if any(board.get(p) == 1-side for p in segment):
-                continue
-            empty = frozenset(p for p in segment if p not in board)
-            spare = min(outside[1], len(empty-outside[0])) if outside else 0
-            if 0 < len(empty) <= allowance+spare and all(max(map(abs, p)) <= 10**12 for p in empty):
-                result.add(empty)
+            empty = []
+            for p in segment:
+                owner = board.get(p)
+                if owner == 1-side:
+                    break
+                if owner is None:
+                    empty.append(p)
+                    if len(empty) > allowance + (outside[1] if outside else 0):
+                        break
+            else:
+                gaps = frozenset(empty)
+                spare = min(outside[1], len(gaps-outside[0])) if outside else 0
+                if 0 < len(gaps) <= allowance+spare and all(max(map(abs, p)) <= LIMIT for p in gaps):
+                    result.add(gaps)
         return result
 
     def fullturn(state, moves, reused=False, outside=None):
@@ -262,7 +278,19 @@ def verify(certificate, history, *, deadline=None, known=()):
         require(winner == side or phase(n)[0] != side)
         return board, n, winner
 
+    checked_states = set()
     def walk(node, state, reused=False, outside=None):
+        require(True)
+        board, n, winner = state
+        key = id(node), frozenset(board.items()), phase(n), winner, reused, outside
+        if key in checked_states:
+            return
+        check_node(node, state, reused, outside)
+        if len(checked_states) >= 8192:
+            checked_states.clear()
+        checked_states.add(key)
+
+    def check_node(node, state, reused=False, outside=None):
         board, n, winner = state
         side, remaining = phase(n)
         kind = node["kind"]

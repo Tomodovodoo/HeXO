@@ -618,8 +618,19 @@ def independent_verify(certificate, history, attacker='mover', deadline_seconds=
     """
     from proof import verify, VerificationTimeout
     deadline = time.perf_counter()+deadline_seconds
-    work = 0
+    work, converted_nodes = 0, {}
     def expand(index, stack, document=certificate, nesting=0):
+        if (type(index) is not int or not 0 <= index < len(document['nodes']) or
+                index in stack or len(stack) >= 128 or nesting > 8):
+            raise ValueError('Invalid certificate edge, cycle or depth')
+        if time.perf_counter() >= deadline:
+            raise VerificationTimeout('Certificate conversion deadline')
+        key = id(document), index, nesting
+        if key not in converted_nodes:
+            converted_nodes[key] = decode(index, stack, document, nesting)
+        return converted_nodes[key]
+
+    def decode(index, stack, document, nesting):
         nonlocal work
         if time.perf_counter() >= deadline:
             raise VerificationTimeout('Certificate conversion deadline')

@@ -281,9 +281,9 @@ fn materialize(cert:&ProofCertificate,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Resu
                     if terminal {return Err("reused defense wins".into());}
                     kept.push(hexo_solver::prover::certificate::ProofResponse{action,child:walk(out,cert,reply.child,&post,ply,winner,ctl,depth+1)?});
                 }
-                if kept.is_empty() {ProofNode::Unstoppable{threats:vec![]}} else {ProofNode::DefenderReplies{responses:kept}}
+                if kept.is_empty() {ProofNode::Unstoppable{threats:check::completions(b,winner,2,ctl)?.into_iter().collect()}} else {ProofNode::DefenderReplies{responses:kept}}
             }
-            ProofNode::Unstoppable{..}=>ProofNode::Unstoppable{threats:vec![]},
+            ProofNode::Unstoppable{..}=>ProofNode::Unstoppable{threats:check::completions(b,winner,2,ctl)?.into_iter().collect()},
             _=>return Err("stamp cannot import conditional premises".into()),
         };
         let id=out.nodes.len() as u32;out.nodes.push(node);Ok(id)
@@ -374,7 +374,7 @@ fn locate(patterns:&[Pattern],entries:&[Rc<Stamp>],stones:&[(Coord,Player)],get:
 }
 
 pub struct Oracle {entries:Vec<Rc<Stamp>>, instances:RefCell<Vec<(usize,u8,Coord,bool)>>,
-    base:BTreeSet<Coord>, candidates:Vec<BTreeSet<(u8,Coord,bool)>>, patterns:Vec<Pattern>,
+    base_len:usize, candidates:RefCell<Vec<BTreeSet<(u8,Coord,bool)>>>, patterns:Vec<Pattern>,
     misses:RefCell<HashSet<(u64,u8,u8)>>, pub hits:Cell<u64>,ctl:Ctl}
 impl Oracle {
     pub fn new(ctl:&Ctl,root:&Board)->Rc<Self> {
@@ -402,7 +402,7 @@ impl Oracle {
             let uses:Vec<_>=uses.into_iter().filter(|&(id,_,_)|entries[id].portable.get()).collect();
             (!uses.is_empty()).then_some((offsets,uses))
         }).collect();
-        Rc::new(Self{entries,candidates,patterns,base:root.keys().copied().collect(),instances:RefCell::new(vec![]),
+        Rc::new(Self{entries,candidates:RefCell::new(candidates),patterns,base_len:root.len(),instances:RefCell::new(vec![]),
             misses:RefCell::new(HashSet::new()),hits:Cell::new(0),ctl:ctl.clone()})
     }
 }
@@ -415,9 +415,14 @@ impl StampOracle for Oracle {
         }}
         // Small primitive shapes can occur anywhere and in either colour.
         // A cheap supporting-stone/mask match precedes the global threat guards.
-        let added:Vec<_>=stones.iter().filter(|(p,_)|!self.base.contains(p)).copied().collect();
-        let mut candidates=self.candidates.clone();
-        locate(&self.patterns,&self.entries,&added,get,&mut candidates,&self.ctl);
+        // SolverBoard preserves the query's root stones as a prefix. Every
+        // searched edge adds at most two stones; an occurrence created there
+        // contains one of them. Retain candidate geometry across branches and
+        // recheck its full mask on every use. An unusual jump can only miss an
+        // optimization, never establish a proof without that check.
+        let added=&stones[self.base_len.min(stones.len()).max(stones.len().saturating_sub(2))..];
+        let mut candidates=self.candidates.borrow_mut();
+        locate(&self.patterns,&self.entries,added,get,&mut candidates,&self.ctl);
         for (id,stamp) in self.entries.iter().enumerate() {
             if stamp.required.len()>4 || stamp.source.remaining!=remaining {continue;}
             let swap=side(mover)!=stamp.source.player;

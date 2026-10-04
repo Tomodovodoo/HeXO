@@ -90,12 +90,20 @@ checker. The native worker checks these sources on first use. An explicit
 `library` list supplies other checked sources; `library=[]` skips builtin seeding
 without clearing strategies already learned in that worker.
 
+A locally holding reply is not a game-theoretic draw. The library stores
+complete wins for either colour; a hit for the defender can disprove an
+attacker's branch. An unsuccessful forcing search supplies no library verdict
+and cannot justify pruning all other moves. Likewise, the suggested abstract
+"three-stone tempo" must be realized by legal exchanges before a proof can use
+it. The board and its real remaining placement count carry that information.
+
 The worker retains at most 32 compiled templates under a 4 MiB accounting
 budget, including an allowance for compiled masks and containers. Matching
 instances and negative lookup memoization are bounded and expire after each
 query. Existing small shapes are indexed once at the query root. Only imported
-primitives are also matched around newly played stones, so every learned proof
-does not add another per-node geometry scan. Larger game-local stamps are
+primitives are also matched around the last two added stones. Candidate
+geometries survive backtracking within a query, with at most 512 per template;
+every use checks the actual stones and masks again. Larger game-local stamps are
 discarded when the current branch permanently occupies a required empty cell
 or gives a required friendly cell to the opponent. Every hit is checked against
 the current board and tempo. No result survives merely because it matched an
@@ -107,6 +115,31 @@ shares the query's node meter. Compilation and checking share its cancellation
 token and deadline. The first enabled query also pays for library verification.
 The player saves the certificate with the exact outcome; its existing proof
 table propagates that result into the game graph.
+
+## CPU measurements
+
+Run `PYTHONPATH=python:. python tools/proof_stamps.py --benchmark results.json`
+in a fresh process (use `python;.` on Windows). The input file is the existing
+28-position fixture from dense-v1 shards. Queries have equal node budgets and
+10-second deadlines; wall time includes checking and serialization. The
+changed-board cases first learn the source strategy, then add four legal remote
+stones, preserving the mover and turn phase. They exercise local reuse rather
+than the existing cache for identical boards.
+
+| Queries | Reference | Stamps | Result |
+|---|---:|---:|---|
+| 28 original positions, total | 825.9 ms | 1472.4 ms | Same 7 wins; no stamp hits |
+| 8 changed real positions, total | 482.4 ms | 683.2 ms | Same 7 wins; 3 stamp hits |
+| Changed shard `1790600287230040:30:248` | 66.20 ms / 1003 fresh nodes | 2.93 ms / 1 node | 22.6x; both proven |
+| Changed shard `1790604657706760:28:77` | 24.43 ms / 24 fresh nodes | 1.65 ms / 1 node | 14.9x; both proven |
+| Open three after four remote stones | 534.79 ms / 8972 fresh nodes | 4.97 ms / 1 node | 107.7x; both proven |
+
+The real-position queries use 8192 nodes; the open-three comparison uses 50000.
+These are solver timings, not actor or GPU throughput claims. The library uses
+about 219 KiB of its accounting budget in this run. Reuse pays when a strategy
+matches; misses cost time, so this remains opt-in. A quiet diamond is also
+proved with a full two-stone defender turn, and independently checked, where
+the reference defender query returns UNKNOWN.
 
 The distinction between forcing, holding and unstoppable shapes is also useful
 in [Six's shape guide](https://github.com/CixMango/Six/blob/main/guide/shapes.md).

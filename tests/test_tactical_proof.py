@@ -91,6 +91,10 @@ class NativeStrategy(unittest.TestCase):
         result = self.engine.history(history, attacker='defender', stamps=True, nodes=20000, ms=10000)
         self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
         self.assertEqual(independent_verify(result['certificate'], history, attacker='defender'), 'PROVEN_LOSS')
+        from dense_solver import Proof
+        proof = Proof(list(map(tuple, history)), result['certificate'])
+        self.assertTrue(proof.action(history + [[14,-8]]))
+        self.assertEqual(proof.path(history + [[14,-8]])[0][0][:2], (len(history), -1))
         certificate = copy.deepcopy(result['certificate'])
         root = certificate['nodes'][certificate['root']]
         self.assertEqual(root['kind'], 'zone_replies')
@@ -99,6 +103,24 @@ class NativeStrategy(unittest.TestCase):
                                             stamps=True, nodes=20000, ms=5000)['status'], 'UNKNOWN')
         with self.assertRaises(ValueError):
             independent_verify(certificate, history, attacker='defender')
+
+        # Matching the response list alone is insufficient: the outside-region
+        # fallback must cover the removed cell too. Both checkers reject this.
+        certificate = copy.deepcopy(result['certificate'])
+        root = certificate['nodes'][certificate['root']]
+        p = root['responses'].pop()['action'][0]
+        root['zone'].remove(p)
+        self.assertEqual(self.engine.history(history, attacker='defender', certificate=certificate,
+                                            stamps=True, nodes=20000, ms=5000)['status'], 'UNKNOWN')
+        with self.assertRaises(ValueError):
+            independent_verify(certificate, history, attacker='defender')
+
+    def test_unstoppable_shape_covers_a_complete_quiet_turn(self):
+        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8]]
+        result = self.engine.history(history, attacker='defender', stamps=True, nodes=50000, ms=60000)
+        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
+        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender',
+                                           deadline_seconds=120), 'PROVEN_LOSS')
 
     def test_open_three_wide_builder_full_strategy(self):
         result = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
@@ -248,6 +270,9 @@ class NativeStrategy(unittest.TestCase):
             self.assertEqual(tactics.stats['kills'], 0)
             self.assertEqual(tactics.history(IMMEDIATE, ms=1000)['status'], 'PROVEN_WIN')
             self.assertEqual(tactics.process.pid, pid)
+            reused = tactics.history(OPEN_THREE, stamps=True, nodes=1, ms=3000)
+            self.assertEqual(reused['status'], 'PROVEN_WIN')
+            self.assertEqual(independent_verify(json.loads(reused['certificate_json']), OPEN_THREE), 'PROVEN_WIN')
         finally:
             tactics.close()
 
@@ -534,14 +559,16 @@ class Gate(unittest.TestCase):
 
 
 class IndependentCheckerBounds(unittest.TestCase):
-    def test_negative_index_and_shared_dag_expansion_rejected(self):
+    def test_negative_index_and_malformed_shared_dag_are_rejected(self):
         with self.assertRaises(ValueError):
             independent_verify(dict(version=1, width='wide', root=-1, nodes=[
                 dict(kind='immediate_win', action=[[0,0]])]), [])
         nodes = [dict(kind='defender_replies', responses=[
             dict(action=[[0,0]], child=i+1), dict(action=[[0,1]], child=i+1)]) for i in range(18)]
         nodes.append(dict(kind='unstoppable', threats=[]))
-        with self.assertRaisesRegex(ValueError, 'work limit'):
+        # Shared nodes no longer expand exponentially during conversion; the
+        # raw checker rejects this graph's invalid defender root directly.
+        with self.assertRaisesRegex(ValueError, 'Invalid forcing certificate'):
             independent_verify(dict(version=1, width='wide', root=0, nodes=nodes), [])
 
 

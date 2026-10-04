@@ -264,6 +264,8 @@ def _worker(connection, cancellation, config):
                                  tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
                                  net_kernels=config.get('net_kernels', 'fused'))
             search, solver = config.get('search', {}), config.get('solver', {})
+            if player.prover is not None:
+                player.prover.stamps = bool(solver.get('stamps', False))
             player.configure(dict(search=search.get('enabled', True),
                                   simulations=search.get('simulations', 128),
                                   solver=solver.get('enabled', player.prover is not None),
