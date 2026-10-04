@@ -1,4 +1,5 @@
 #include "hexo.hpp"
+#include "gumbel_parallel.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -11,6 +12,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <memory>
+#include <atomic>
 
 namespace gumbel { extern thread_local std::string error; }
 extern "C" {
@@ -58,9 +61,12 @@ struct Prediction {
  std::vector<int64_t> actions;
  std::vector<double> logits,values;
 };
-struct Cached { Prediction prediction;std::list<Key>::iterator recency; };
+struct Cached { std::shared_ptr<const Prediction> prediction;std::list<Key>::iterator recency; };
 struct Root { Key key;double value=0;bool known=false; };
 struct Feed {
+ std::mutex mutex;
+ std::unique_ptr<Workers> workers=std::make_unique<Workers>();
+ void* (*group)(void*)=nullptr;
  size_t capacity;
  uint64_t next=1;
  std::map<uint64_t,Task> tasks;
@@ -69,13 +75,14 @@ struct Feed {
  std::unordered_map<Key,Cached,Hash> cache;
  std::list<Key> recency;
  std::unordered_map<void*,Root> roots;
- int64_t new_rows=0,joins=0,hits=0,installed=0,queued=0;
+ int64_t new_rows=0,joins=0,hits=0,installed=0;
+ std::atomic<int64_t> queued=0;
  bool profile=false;
  uint64_t select_ns=0,identity_ns=0,cached_ns=0,install_ns=0;
  explicit Feed(int limit):capacity(limit) { if(limit<0)throw std::runtime_error("Negative feed cache capacity"); }
- Cached* get(const Key& key) {
-  auto found=cache.find(key);if(found==cache.end())return nullptr;
-  recency.splice(recency.begin(),recency,found->second.recency);return &found->second;
+ std::shared_ptr<const Prediction> get(const Key& key) {
+  auto found=cache.find(key);if(found==cache.end())return {};
+  recency.splice(recency.begin(),recency,found->second.recency);return found->second.prediction;
  }
  void root_value(void* tree,const Key& key,const Prediction& p) {
   if(auto root=roots.find(tree);root!=roots.end() && root->second.key==key){
@@ -85,9 +92,12 @@ struct Feed {
  void fulfill(Subscriber subscriber,const Key& key,const Prediction& p) {
   if(!hxg_fulfill(subscriber.tree,subscriber.request,p.actions.data(),p.logits.data(),p.values.data(),int(p.values.size())))
    throw std::runtime_error(gumbel::error);
+  std::lock_guard lock(mutex);
   root_value(subscriber.tree,key,p);++installed;
  }
- void put(Key key,Prediction p) {
+ // Cache payloads are immutable; a producer keeps its snapshot through a
+ // concurrent eviction without copying every legal action and prediction.
+ void put(Key key,std::shared_ptr<const Prediction> p) {
   if(!capacity)return;
   if(auto found=cache.find(key);found!=cache.end()){
    found->second.prediction=std::move(p);recency.splice(recency.begin(),recency,found->second.recency);return;
@@ -98,36 +108,42 @@ struct Feed {
  void begin(void* tree,const int64_t* history,int n) {
   if(!tree || n<0 || (n&&!history))throw std::runtime_error("Invalid feed root");
   Root root{context(history,n)};
-  if(auto p=get(root.key)){root.value=p->prediction.values.front();root.known=true;}
+  std::lock_guard lock(mutex);
+  if(auto p=get(root.key)){root.value=p->values.front();root.known=true;}
   roots[tree]=std::move(root);
  }
  // Drain to the existing tree barrier. Splitting a visit layer here changes interior selection.
  int gather(void* tree,int64_t* out) {
-  if(!roots.contains(tree) || !out)throw std::runtime_error("Invalid feed gather");
-  int added=0;auto initial_hits=hits,initial_joins=joins;bool progress=false;
+  {std::lock_guard lock(mutex);if(!roots.contains(tree) || !out)throw std::runtime_error("Invalid feed gather");}
+  int added=0,joined=0,cached_hits=0;bool progress=false;
+  uint64_t selection=0,identity=0,cached_work=0;
   int status=0;
   while(true){
    int request;
-   {Timer clock(profile?&select_ns:nullptr);request=hxg_next(tree);}
+   {Timer clock(profile?&selection:nullptr);request=hxg_next(tree);}
    if(request==-2)throw std::runtime_error(gumbel::error);
    if(request==-1){progress=true;continue;}
    if(request<=0){status=request;break;}
-   std::vector<int64_t> history;Key key;Cached* cached;
-   {Timer clock(profile?&identity_ns:nullptr);
+   std::vector<int64_t> history;Key key;std::shared_ptr<const Prediction> cached;
+   {Timer clock(profile?&identity:nullptr);
     int n=hxg_history(tree,request,nullptr);history.resize(2*n);hxg_history(tree,request,history.data());
-    key=context(history.data(),n);cached=get(key);
+    key=context(history.data(),n);
+    std::lock_guard lock(mutex);cached=get(key);
+    if(!cached){
+     if(auto existing=pending.find(key);existing!=pending.end()){
+      tasks.at(existing->second).subscribers.push_back({tree,request});++joins;++joined;
+     }else{
+      if(next==0)throw std::runtime_error("Feed task identity exhausted");
+      uint64_t id=next++;pending.emplace(key,id);
+      tasks.emplace(id,Task{std::move(key),std::move(history),{{tree,request}}});ready.push_back(id);
+      ++added;++new_rows;++queued;
+     }
+    }else {++hits;++cached_hits;}
    }
-   if(cached){Timer clock(profile?&cached_ns:nullptr);fulfill({tree,request},key,cached->prediction);++hits;progress=true;continue;}
-   if(auto existing=pending.find(key);existing!=pending.end()){
-    tasks.at(existing->second).subscribers.push_back({tree,request});++joins;
-   }else{
-    if(next==0)throw std::runtime_error("Feed task identity exhausted");
-    uint64_t id=next++;pending.emplace(key,id);
-    tasks.emplace(id,Task{std::move(key),std::move(history),{{tree,request}}});ready.push_back(id);
-    ++added;++new_rows;++queued;
-   }
+   if(cached){Timer clock(profile?&cached_work:nullptr);fulfill({tree,request},key,*cached);progress=true;}
   }
-  out[0]=added;out[1]=hits-initial_hits;out[2]=joins-initial_joins;out[3]=progress;
+  {std::lock_guard lock(mutex);select_ns+=selection;identity_ns+=identity;cached_ns+=cached_work;}
+  out[0]=added;out[1]=cached_hits;out[2]=joined;out[3]=progress;
   return status;
  }
  std::vector<uint64_t> batch(int limit)const {
@@ -139,7 +155,9 @@ struct Feed {
  }
  void detach(void* tree) {
   // Detach before freeing or advancing a cancelled tree. Submitted rows retain no tree ownership.
-  if(roots.erase(tree))hxg_cancel(tree);
+  bool attached;{std::lock_guard lock(mutex);attached=roots.erase(tree)!=0;}
+  if(attached)hxg_cancel(tree);
+  std::lock_guard lock(mutex);
   for(auto it=tasks.begin();it!=tasks.end();){
    auto& t=it->second;
    std::erase_if(t.subscribers,[&](Subscriber s){return s.tree==tree;});
@@ -153,14 +171,21 @@ extern "C" {
 HX_API void* hxgf_new(int capacity){try{return new feeding::Feed(capacity);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 // Trees must be detached while still alive. No tree is dereferenced by the destructor.
 HX_API void hxgf_free(void* p){delete static_cast<feeding::Feed*>(p);}
+HX_API int hxgf_workers(void* p,int count,void* (*group)(void*)){try{
+ auto& f=*static_cast<feeding::Feed*>(p);auto workers=std::make_unique<feeding::Workers>(count);
+ f.workers=std::move(workers);f.group=group;return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxgf_parallel(void* p,int count,void (*work)(void*,int),void* data){try{
+ static_cast<feeding::Feed*>(p)->workers->run(count,work,data);return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_begin(void* p,void* tree,const int64_t* history,int n){try{static_cast<feeding::Feed*>(p)->begin(tree,history,n);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_seed(void* p,void* tree,const int64_t* actions,const double* logits,const double* values,int count){try{
- auto& f=*static_cast<feeding::Feed*>(p);auto root=f.roots.find(tree);
+ auto& f=*static_cast<feeding::Feed*>(p);std::lock_guard lock(f.mutex);auto root=f.roots.find(tree);
  if(root==f.roots.end() || count<1 || !actions || !logits || !values)throw std::runtime_error("Invalid feed root prediction");
  for(int i=0;i<count;++i)if(!std::isfinite(logits[i]) || !std::isfinite(values[i]) || std::abs(values[i])>1)
   throw std::runtime_error("Invalid feed root prediction");
- feeding::Prediction prediction{{actions,actions+2*count},{logits,logits+count},{values,values+count}};
- f.root_value(tree,root->second.key,prediction);f.put(root->second.key,std::move(prediction));return 1;
+ auto prediction=std::make_shared<feeding::Prediction>(feeding::Prediction{{actions,actions+2*count},{logits,logits+count},{values,values+count}});
+ f.root_value(tree,root->second.key,*prediction);f.put(root->second.key,std::move(prediction));return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgf_gather(void* p,void* tree,int64_t* out){try{return static_cast<feeding::Feed*>(p)->gather(tree,out);}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 // Layout query and take are serialized on the graph-owner thread; no tree is re-rooted between them.
@@ -207,22 +232,39 @@ HX_API int hxgf_install(void* p,const uint64_t* ids,int count,const int64_t* off
    throw std::runtime_error("Invalid feed prediction");
  if(int(failures.size())>stopped_capacity)throw std::runtime_error("Feed stopped-tree buffer too small");
  int output=0;for(auto tree:failures){stopped[output++]=tree;f.detach(tree);}
+ struct Completion {feeding::Subscriber subscriber;const feeding::Key* key;std::shared_ptr<const feeding::Prediction> prediction;};
+ std::vector<std::vector<Completion>> groups;std::map<void*,size_t> by_game;
+ std::vector<std::shared_ptr<const feeding::Prediction>> predictions(count);
  for(int i=0;i<count;++i){
   auto found=f.tasks.find(ids[i]);auto& task=found->second;int64_t first=offsets[i],last=offsets[i+1];
   if(last>first){
-   feeding::Prediction prediction{{actions+2*first,actions+2*last},{logits+first,logits+last},{values+first,values+last}};
-   for(auto subscriber:task.subscribers)f.fulfill(subscriber,task.key,prediction);
-   f.put(task.key,std::move(prediction));
+   auto prediction=std::make_shared<feeding::Prediction>(feeding::Prediction{{actions+2*first,actions+2*last},{logits+first,logits+last},{values+first,values+last}});
+   predictions[i]=prediction;
+   for(auto subscriber:task.subscribers){
+    void* identity=f.group?f.group(subscriber.tree):subscriber.tree;
+    auto [entry,inserted]=by_game.emplace(identity,groups.size());if(inserted)groups.emplace_back();
+    groups[entry->second].push_back({subscriber,&task.key,prediction});
+   }
   }
+ }
+ // Each group owns one graph. Shared cache/task maps are changed only after
+ // all graph workers return; immutable predictions may serve several games.
+ struct Work {feeding::Feed* feed;std::vector<std::vector<Completion>>* groups;} work{&f,&groups};
+ f.workers->run(int(groups.size()),[](void* data,int index){auto& w=*static_cast<Work*>(data);
+  for(auto& result:(*w.groups)[index])w.feed->fulfill(result.subscriber,*result.key,*result.prediction);
+ },&work);
+ for(int i=0;i<count;++i){
+  auto found=f.tasks.find(ids[i]);auto& task=found->second;
+  if(predictions[i])f.put(task.key,std::move(predictions[i]));
   f.pending.erase(task.key);f.tasks.erase(found);
  }
  return output;
 }catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API void hxgf_detach(void* p,void* tree){static_cast<feeding::Feed*>(p)->detach(tree);}
 HX_API int hxgf_root_value(void* p,void* tree,double* value){
- auto& f=*static_cast<feeding::Feed*>(p);auto root=f.roots.find(tree);
+ auto& f=*static_cast<feeding::Feed*>(p);std::lock_guard lock(f.mutex);auto root=f.roots.find(tree);
  if(root!=f.roots.end() && !root->second.known)if(auto cached=f.get(root->second.key)){
-  root->second.value=cached->prediction.values.front();root->second.known=true;
+  root->second.value=cached->values.front();root->second.known=true;
  }
  if(root==f.roots.end()||!root->second.known)return 0;
  *value=root->second.value;return 1;
