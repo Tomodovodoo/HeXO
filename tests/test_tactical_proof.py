@@ -119,6 +119,20 @@ class NativeStrategy(unittest.TestCase):
             thread.join(2)
             engine.close()
 
+    def test_learned_stamp_still_matches_its_original_position(self):
+        proof = self.engine.history(LATE_WIN, nodes=50000, ms=3000)
+        self.assertEqual(proof['status'], 'PROVEN_WIN')
+        learned = self.engine.history(LATE_WIN, certificate=proof['certificate'], stamps=True, library=[], nodes=1, ms=5000)
+        self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
+        # Removing enemy stones makes a shorter strategy possible, but that
+        # strategy needs (0,-7) and (0,-3) empty on the real board.
+        self.assertFalse(set(map(tuple, learned['stamp_learned']['empty'])) & set(map(tuple, LATE_WIN)))
+        reused = self.engine.history(LATE_WIN, stamps=True, library=[], nodes=1, ms=3000)
+        self.assertEqual(reused['status'], 'PROVEN_WIN', reused['reason'])
+        self.assertEqual(reused['stamp_hits'], 1)
+        self.assertLess(reused['stamp_bytes'], 4 * 1024 * 1024)
+        self.assertEqual(independent_verify(reused['certificate'], LATE_WIN), 'PROVEN_WIN')
+
     def test_local_stamp_reuses_changed_positions_and_checks_interference(self):
         learned = self.engine.history(OPEN_THREE, stamps=True, nodes=20000, ms=5000)
         self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])

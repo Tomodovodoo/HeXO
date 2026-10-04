@@ -55,6 +55,33 @@ fn transformed_source(source:&StampSource,sym:u8,offset:Coord,swap:bool)->StampS
 pub fn ply(p:u8,remaining:u8)->usize {if p==0 {5-remaining as usize}else{3-remaining as usize}}
 fn control(ctl:&Ctl)->Result<(),String> {if ctl.expired(){Err("stamp deadline or cancellation".into())}else{Ok(())}}
 
+/// Share identical suffixes of a checked primary strategy. Every defense stays
+/// present; the checker still visits a shared node in each board context.
+fn compact(cert:&ProofCertificate,ctl:&Ctl)->Result<ProofCertificate,String> {
+    struct Build<'a> {cert:&'a ProofCertificate,ctl:&'a Ctl,nodes:Vec<ProofNode>,old:BTreeMap<u32,u32>,same:BTreeMap<Vec<u8>,u32>}
+    impl Build<'_> {
+        fn visit(&mut self,id:u32)->Result<u32,String> {
+            control(self.ctl)?;
+            if let Some(&new)=self.old.get(&id) {return Ok(new);}
+            let mut node=self.cert.nodes[id as usize].clone();
+            match &mut node {
+                ProofNode::AttackerMove{child,alternatives,..}=>{alternatives.clear();*child=self.visit(*child)?;},
+                ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=self.visit(reply.child)?;},
+                ProofNode::ImmediateWin{..}|ProofNode::Unstoppable{..}=>{},
+                _=>return Err("stamp source is not independent".into()),
+            }
+            let key=serde_json::to_vec(&node).map_err(|e|e.to_string())?;
+            let new=if let Some(&same)=self.same.get(&key) {same} else {
+                let new=self.nodes.len() as u32;self.nodes.push(node);self.same.insert(key,new);new
+            };
+            self.old.insert(id,new);Ok(new)
+        }
+    }
+    let mut build=Build{cert,ctl,nodes:vec![],old:BTreeMap::new(),same:BTreeMap::new()};
+    let root=build.visit(cert.root)?;
+    Ok(ProofCertificate{root,nodes:build.nodes,..cert.clone()})
+}
+
 #[derive(Clone)]
 pub struct Stamp {
     pub portable:Cell<bool>,
@@ -85,18 +112,9 @@ impl Stamp {
         if source.certificate.nodes.iter().any(|n|matches!(n,ProofNode::Stamp{..}|ProofNode::StampLink{..})) {
             source.certificate=materialize(&source.certificate,&root,start,source.winner,ctl)?;
         }
+        source.certificate=compact(&source.certificate,ctl)?;
         let (_,turns,used)=check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?;
         if used.len()>4096 {return Err("stamp strategy size limit".into());}
-        let indices:BTreeMap<_,_>=used.iter().enumerate().map(|(i,&id)|(id,i as u32)).collect();
-        source.certificate.nodes=used.iter().map(|&id| {
-            let mut node=source.certificate.nodes[id as usize].clone();
-            match &mut node {
-                ProofNode::AttackerMove{child,alternatives,..}=>{*child=indices[child];alternatives.clear();}
-                ProofNode::DefenderReplies{responses}=>for r in responses {r.child=indices[&r.child];},
-                _=>{},
-            } node
-        }).collect();
-        source.certificate.root=indices[&source.certificate.root];
         let bytes=serde_json::to_vec(&source).map_err(|e|e.to_string())?.len();
         if bytes>MAX_BYTES/2 {return Err("stamp size limit".into());}
         let mut stamp=Self{portable:Cell::new(false),source,turns,required:BTreeSet::new(),empty:BTreeSet::new(),guards:BTreeMap::new(),
@@ -111,7 +129,12 @@ impl Stamp {
             let bare:Board=stamp.required.iter().map(|&p|(p,stamp.source.winner)).collect();
             if let Ok(certificate)=materialize(&stamp.source.certificate,&bare,start,stamp.source.winner,ctl) {
                 let source=StampSource{stones:bare.into_iter().collect(),certificate,..stamp.source.clone()};
-                if let Ok(reduced)=remember(source,ctl) {return Ok((*reduced).clone());}
+                if let Ok(reduced)=remember(source,ctl) {
+                    let stones:Vec<_>=root.iter().map(|(&p,&s)|(p,player(s))).collect();
+                    if reduced.matches(&|p|root.get(&p).copied().map(player),&stones,player(stamp.source.player),stamp.source.remaining) {
+                        return Ok((*reduced).clone());
+                    }
+                }
             }
         }
         stamp.bytes=2*stamp.bytes+64*(stamp.required.len()+stamp.empty.len()+stamp.before.len()+stamp.guards.len())

@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import unittest
 from tactical_proof import NativeTactics, library, independent_verify
-from tests.test_tactical_proof import FIXTURE, IMMEDIATE, NO_THREAT, OPEN_THREE, TWO_TURN
+from tests.test_tactical_proof import FIXTURE, IMMEDIATE, LATE_WIN, NO_THREAT, OPEN_THREE, TWO_TURN
 
 ROOT = Path(__file__).resolve().parents[1]
 WASM = ROOT/'web'/'engine'/'tactical.wasm'
@@ -35,6 +35,17 @@ def wasm_results(queries):
 
 @unittest.skipUnless(NODE and WASM.exists() and library().exists(), 'needs node, web/engine/tactical.wasm and the native library')
 class WebTacticalParity(unittest.TestCase):
+    def test_learned_browser_stamp_keeps_the_real_board_blockers(self):
+        proof = NativeTactics().history(LATE_WIN, nodes=50000, ms=3000)
+        learned, reused = wasm_results([
+            (LATE_WIN, dict(certificate=proof['certificate'], stamps=True, library=[], nodes=1, ms=5000)),
+            (LATE_WIN, dict(stamps=True, library=[], nodes=1, ms=5000)),
+        ])
+        self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
+        self.assertEqual(reused['status'], 'PROVEN_WIN', reused['reason'])
+        self.assertEqual(reused['stamp_hits'], 1)
+        self.assertEqual(independent_verify(reused['certificate'], LATE_WIN), 'PROVEN_WIN')
+
     def test_defender_roots_and_exact_graph_premises_match_native(self):
         native = NativeTactics()
         history = OPEN_THREE + [[-1, 0], [2, 1]]
