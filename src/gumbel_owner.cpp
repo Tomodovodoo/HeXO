@@ -224,7 +224,9 @@ struct Pool {
    if(ready_limit && hxgf_queued(feed)>=ready_limit)break;
    auto& o=*games[(cursor+visited++)%games.size()];if(!o.stopped)progress+=o.step(ready_limit);
   }
-  cursor=(cursor+(ready_limit?visited:1))%games.size();stopped=std::all_of(games.begin(),games.end(),[](const auto& o){return o->stopped;});return progress;
+  // A full pass keeps normal rotation; a paused pass resumes at the first game
+  // not visited. Enabling a watermark alone must not pin the same first game.
+  cursor=(cursor+(ready_limit && visited<games.size()?visited:1))%games.size();stopped=std::all_of(games.begin(),games.end(),[](const auto& o){return o->stopped;});return progress;
  }
  bool admit(){
   if(proof_step)proof_step(proof_owner);
