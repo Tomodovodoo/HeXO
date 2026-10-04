@@ -211,6 +211,31 @@ class Overlay(unittest.TestCase):
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
 
+    def test_large_archive_storage_and_compressed_files_keep_all_evidence(self):
+        source = """import {PlayStorage} from './web/engine/storage.mjs';
+import {compressFile,readGameFile,readGame} from './web/engine/notation.mjs';
+const record={id:'analysis',document:Array.from({length:40000},(_,i)=>({i,description:'saved evidence '.repeat(4)}))};
+const storage=new PlayStorage(null);
+await storage.put('evaluations',record);
+await storage.saveSession({id:'live',_write_token:'one',records:[record]},null,null);
+const cold=new PlayStorage(null);cold.memory=storage.memory;
+const saved=await cold.get('sessions','live'),game={history:[[0,0]],records:saved.records};
+const json=JSON.stringify(game),file=await compressFile(new Blob([json],{type:'application/json'}));
+const text=await readGameFile(file),history=await readGame(text,{game(){}});
+await cold.put('evaluations',{...record,document:[{replacement:true}]});
+const original=await cold.get('sessions','live'),backup=await cold.backup(),restored=new PlayStorage(null);
+await restored.restore(backup,{game(){}});
+console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal:JSON.stringify(saved.records[0])===JSON.stringify(record),
+ fileEqual:text===json,oldPreserved:original.records[0].document.length,restored:(await restored.get('sessions','live')).records[0].document.length}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertGreater(result['bytes'], 1048576)
+        self.assertLess(result['compressed'], result['bytes'] // 4)
+        self.assertEqual(result['history'], [[0,0]])
+        self.assertTrue(result['equal'] and result['fileEqual'])
+        self.assertEqual((result['oldPreserved'], result['restored']), (40000, 40000))
+
     def test_matching_replay_precedes_newer_unrelated_records(self):
         source = """import {Proofs} from './web/engine/proof.mjs';
 const proofs=new Proofs(),history=[[0,0],[1,0],[0,1]],record={proof:{winner:0,plies:20},pv:[]};

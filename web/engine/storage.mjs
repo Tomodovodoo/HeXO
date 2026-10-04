@@ -1,4 +1,6 @@
 /* Games and evaluations belong to this browser. Model downloads use the versioned Cache API in network.mjs. */
+import {compressFile, readGameFile} from './notation.mjs';
+
 export class PlayStorage {
   static async open() {
     if (!globalThis.indexedDB) return new PlayStorage(null);
@@ -10,7 +12,55 @@ export class PlayStorage {
     });
     return new PlayStorage(db);
   }
-  constructor(db) { this.db = db; this.memory = new Map(); }
+  constructor(db) { this.db = db; this.memory = new Map(); this.packed = new WeakMap(); this.unpacked = new Map(); this.unpacking = new Map(); this.unpackedBytes = 0; }
+  /** Record versions are immutable. Blobs let snapshots share their bytes without cloning proof trees. */
+  packRecord(record) {
+    if (!record || typeof record !== 'object') return Promise.resolve(record);
+    if (!this.packed.has(record)) this.packed.set(record, (async () => {
+      const blob = new Blob([JSON.stringify(record)], {type: 'application/json'});
+      if (blob.size < 16384) return record;
+      const packed = {id: record.id, packed_record: await compressFile(blob), record_version: crypto.randomUUID(), record_bytes: blob.size};
+      this.remember(packed, record);
+      return packed;
+    })());
+    return this.packed.get(record);
+  }
+  remember(packed, record) {
+    if (this.unpacked.has(packed.record_version)) return;
+    while (this.unpacked.size && this.unpackedBytes + packed.record_bytes > 32 * 1024 * 1024) {
+      const key = this.unpacked.keys().next().value;
+      this.unpackedBytes -= this.unpacked.get(key).bytes; this.unpacked.delete(key);
+    }
+    if (packed.record_bytes <= 32 * 1024 * 1024) {
+      this.unpacked.set(packed.record_version, {record, bytes: packed.record_bytes}); this.unpackedBytes += packed.record_bytes;
+    }
+  }
+  async unpackRecord(record) {
+    if (!(record?.packed_record instanceof Blob)) return record;
+    const cached = this.unpacked.get(record.record_version);
+    if (cached) return cached.record;
+    if (!this.unpacking.has(record.record_version)) this.unpacking.set(record.record_version, (async () => {
+      try {
+        const unpacked = JSON.parse(await readGameFile(record.packed_record));
+        this.packed.set(unpacked, Promise.resolve(record)); this.remember(record, unpacked);
+        return unpacked;
+      } finally { this.unpacking.delete(record.record_version); }
+    })());
+    return this.unpacking.get(record.record_version);
+  }
+  async records(row, encode) {
+    if (!row) return row;
+    const convert = r => encode ? this.packRecord(r) : this.unpackRecord(r);
+    if (row.packed_record instanceof Blob) return encode ? row : convert(row);
+    const out = {...row};
+    if (row.records) out.records = await Promise.all(row.records.map(convert));
+    if (row.position?.records) out.position = {...row.position, records: await Promise.all(row.position.records.map(convert))};
+    if (row.match) out.match = await this.records(row.match, encode);
+    if (row.evaluations) out.evaluations = Object.fromEntries(await Promise.all(Object.entries(row.evaluations).map(async ([key, value]) => [key, await convert(value)])));
+    return out;
+  }
+  encode(store, row) { return store === 'evaluations' ? this.packRecord(row) : this.records(row, true); }
+  decode(store, row) { return store === 'evaluations' ? this.unpackRecord(row) : this.records(row, false); }
   request(store, mode, operation) {
     if (!this.db) return Promise.resolve(operation(null).result);
     return new Promise((resolve, reject) => {
@@ -19,12 +69,16 @@ export class PlayStorage {
       tx.onabort = tx.onerror = () => reject(tx.error || result.error);
     });
   }
-  get(store, id) { return this.request(store, 'readonly', s => s ? s.get(id) : {result: this.memory.get(`${store}:${id}`)}); }
-  all(store) { return this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)}); }
-  put(store, value) { return this.request(store, 'readwrite', s => { if (s) return s.put(value); this.memory.set(`${store}:${value.id}`, structuredClone(value)); return {result: value.id}; }); }
-  saveSession(snapshot, freeplay, expected, games = []) {
-    const rows = [['sessions', snapshot], ...(snapshot.match ? [['matches', snapshot.match]] : []),
+  async get(store, id) { return this.decode(store, await this.request(store, 'readonly', s => s ? s.get(id) : {result: this.memory.get(`${store}:${id}`)})); }
+  async all(store) { return Promise.all((await this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)})).map(row => this.decode(store, row))); }
+  async put(store, value) {
+    value = await this.encode(store, value);
+    return this.request(store, 'readwrite', s => { if (s) return s.put(value); this.memory.set(`${store}:${value.id}`, structuredClone(value)); return {result: value.id}; });
+  }
+  async saveSession(snapshot, freeplay, expected, games = []) {
+    let rows = [['sessions', snapshot], ...(snapshot.match ? [['matches', snapshot.match]] : []),
       ...(freeplay ? [['games', freeplay.game], ['matches', freeplay.summary]] : []), ...games.map(game => ['games', game])];
+    rows = await Promise.all(rows.map(async ([store, row]) => [store, await this.encode(store, row)]));
     if (!this.db) {
       if ((this.memory.get(`sessions:${snapshot.id}`)?._write_token ?? null) !== expected) return Promise.resolve(false);
       for (const [store, value] of rows) this.memory.set(`${store}:${value.id}`, structuredClone(value));
