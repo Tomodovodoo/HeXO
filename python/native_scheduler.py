@@ -15,6 +15,7 @@ for name, result, args in (
     ('free', C.c_int, [ptr]), ('step', C.c_int, [ptr]), ('cancel', C.c_int, [ptr]),
     ('done', C.c_int, [ptr]), ('feed', ptr, [ptr]), ('admit', C.c_int, [ptr]),
     ('clock', C.c_int, [ptr, C.c_double]), ('owner', ptr, [ptr, C.c_int]),
+    ('ready_limit', C.c_int, [ptr, C.c_int]),
     ('cancel_game', C.c_int, [ptr, C.c_int]),
     ('retarget', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_uint64, C.c_double]),
     ('stats', None, [ptr, ptr]), ('install', C.c_int, [ptr, ptr, C.c_int, ptr, ptr, ptr, ptr]),
@@ -258,7 +259,11 @@ class SearchPool:
         self.cancel()
         checked(native.hxgf_abandon_all(self.feed.ptr))
 
-    def run(self, evaluator, ms, batch_size=128):
+    def limit_ready(self, rows):
+        """Pause between complete layer gathers; 0 drains every game and view."""
+        checked(native.hxgm_ready_limit(self.ptr, rows))
+
+    def run(self, evaluator, ms, batch_size=128, ready_limit=None):
         """Use dense_selfplay.Evaluator's packed forwards under one common clock.
         Native gathering runs while the previous forward is in flight.
         """
@@ -266,6 +271,9 @@ class SearchPool:
             raise ValueError('Evaluator does not match the pool weights')
         from native_dense import submit
         pending = None
+        if batch_size < 1:
+            raise ValueError('A neural batch must contain at least one row')
+        self.limit_ready(2*batch_size if ready_limit is None else ready_limit)
         self.clock(ms)
         if self.proofs is not None:
             self.proofs.resume()
