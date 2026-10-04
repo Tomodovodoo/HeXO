@@ -501,10 +501,12 @@ class Bundle(unittest.TestCase):
         known = [dict(history=OPEN_THREE, winner=0, plies=24, pv=[]),
                  dict(history=history, winner=0, plies=20, pv=[])]
         found = node(dict(kind='worker-turn', history=OPEN_THREE, simulations=16, nodes=1000, known=known))
-        self.assertTrue(found['moves'])
+        # The complete winning turn now comes directly from the tighter stored child,
+        # even though the root already has a looser scalar proof. No new certificate is needed.
+        self.assertEqual({tuple(p) for p in found['moves']}, {(-1,0),(2,1)})
         self.assertEqual(found['value'], 1.)
-        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], OPEN_THREE,
-                         known=[d['outcome'] for d in found['proof']['dependencies']]), 'PROVEN_WIN')
+        self.assertEqual(found['proof']['plies'],22)
+        self.assertEqual((found['actual_completed'],found['actual_solver_nodes']),(0,0))
 
     def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
