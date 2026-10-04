@@ -37,6 +37,8 @@ for name, result, args in (
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
     ('join', C.c_int, [ptr]), ('free', C.c_int, [ptr]), ('stats', None, [ptr, ptr]),
     ('continuous', C.c_int, [ptr]), ('event', C.c_char_p, [ptr]),
+    ('pause', C.c_int, [ptr, C.c_int]), ('paused', C.c_int, [ptr]),
+    ('installed', C.c_uint64, [ptr]),
     ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
                          C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double]),
 ):
@@ -442,6 +444,37 @@ class InferenceService:
             return None
         return json.loads(text)
 
+    def pause(self):
+        """Fence neural forwards and retain queued work; native CPU proofs continue.
+
+        Requires continuous mode. Active forwards are collected and installed,
+        not abandoned. A failed fence retains its handle for close()/retry.
+        Timed roots still use wall time; fixed-work roots retain their work.
+        """
+        import time
+        if set(self.leases)-{token for token, _ in self.pending}:
+            raise ValueError('Complete or abandon_fenced manual batches before pausing')
+        checked(native.hxb_pause(self.ptr, 1))
+        while self.pending:
+            token, handle = self.pending[0]
+            self.complete(token, handle.collect())
+            self.pending.pop(0)
+        end = time.monotonic()+5.
+        while not self.paused():
+            if time.monotonic()>=end:
+                raise TimeoutError('Native producers have not acknowledged the neural pause')
+            time.sleep(.001)
+
+    def paused(self):
+        """True only after GPU flights and native installation reach the pause."""
+        status = native.hxb_paused(self.ptr)
+        if status<0:
+            checked(False)
+        return bool(status)
+
+    def resume(self):
+        checked(native.hxb_pause(self.ptr, 0))
+
     def complete(self, token, rows):
         if self.leases.get(token) is not rows:
             raise ValueError('Unknown inference service snapshot')
@@ -467,9 +500,13 @@ class InferenceService:
             return dict(self._stats)
         out = np.empty(10, np.uint64)
         native.hxb_stats(self.ptr, out.ctypes.data)
-        return dict(zip(('unique_rows', 'coalesced_rows', 'launched_rows', 'subscriber_deliveries',
+        result = dict(zip(('unique_rows', 'coalesced_rows', 'launched_rows', 'subscriber_deliveries',
                          'withdrawn_ready_rows', 'batches', 'row_high_water', 'pending_rows',
                          'inflight_batches', 'active_producers'), map(int, out)))
+        # Native feed messages installed, including retired/empty messages.
+        # This is not a neural-row or search-visit count.
+        result['installed_message_rows'] = int(native.hxb_installed(self.ptr))
+        return result
 
     def cancel(self):
         if self._ptr:
