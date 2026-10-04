@@ -239,11 +239,16 @@ HX_API int hxgf_install(void* p,const uint64_t* ids,int count,const int64_t* off
   auto found=f.tasks.find(ids[i]);auto& task=found->second;int64_t first=offsets[i],last=offsets[i+1];
   if(last>first){
    auto prediction=std::make_shared<feeding::Prediction>(feeding::Prediction{{actions+2*first,actions+2*last},{logits+first,logits+last},{values+first,values+last}});
-   predictions[i]=prediction;
-   for(auto subscriber:task.subscribers){
-    void* identity=f.group?f.group(subscriber.tree):subscriber.tree;
-    auto [entry,inserted]=by_game.emplace(identity,groups.size());if(inserted)groups.emplace_back();
-    groups[entry->second].push_back({subscriber,&task.key,prediction});
+   if(f.workers->size()==1){
+    for(auto subscriber:task.subscribers)f.fulfill(subscriber,task.key,*prediction);
+    f.put(task.key,std::move(prediction));
+   }else{
+    predictions[i]=prediction;
+    for(auto subscriber:task.subscribers){
+     void* identity=f.group?f.group(subscriber.tree):subscriber.tree;
+     auto [entry,inserted]=by_game.emplace(identity,groups.size());if(inserted)groups.emplace_back();
+     groups[entry->second].push_back({subscriber,&task.key,prediction});
+    }
    }
   }
  }
