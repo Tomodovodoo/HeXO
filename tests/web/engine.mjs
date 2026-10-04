@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence} from '../../web/engine/proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
 import {defaultThreads} from '../../web/engine/network.mjs';
@@ -195,7 +195,7 @@ if (job.kind === 'encode') {
   let graph = null;
   const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
-    Proofs, answered, settled, proofTurns, proofKey, proofEvidence,
+    Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
     postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),

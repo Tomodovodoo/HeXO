@@ -123,6 +123,22 @@ def entries():
 
 
 class Store(unittest.TestCase):
+    def test_leaf_proofs_survive_a_later_unproven_record_and_disk_reload(self):
+        from play import Proofs
+        history, budget = [(0, 0)], dict(simulations=8, solver_nodes=0)
+        fact = dict(history=[[0, 0], [1, 0]], winner=1, plies=5,
+                    pv=[[2, 0, 1, 1], [3, 0, 1, 4], [4, 0, 1, 5]])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'evaluations.jsonl'
+            store = Evaluations(path)
+            store.add(history, 'test', budget, evaluation(.5) | dict(top=[], proofs=[fact]))
+            store.add(history, 'test', budget, evaluation(.5) | dict(top=[]))
+            restored = Evaluations(path)
+            self.assertEqual(restored.get(history, 'test', budget)['proofs'], [fact])
+            table = Proofs()
+            table.extend(restored, history)
+            self.assertEqual(table.known(history)['pv'], [[1, 0, 1, 1]] + [[*p[:3], p[3]+1] for p in fact['pv']])
+
     def test_appends_reloads_prefers_deepest_and_keeps_backups(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'evaluations.jsonl'
@@ -2007,6 +2023,30 @@ class Proofs(unittest.TestCase):
 
 class TurnTrees(unittest.TestCase):
     """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
+
+    def test_leaf_certificate_line_survives_a_saved_evaluation_and_reaches_the_turn_start(self):
+        import tactical_proof
+        from play import evaluate, Proofs
+        from tests.test_tactical_proof import LATE_WIN
+        history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
+        found = evaluate(self.bubble(), tactical_proof.NativeTactics(), history, 8, 0,
+                         leaf_nodes=2048, leaf_ms=1000)
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertEqual(len(found['moves']), 1)
+        self.assertGreater(len(found['pv']), 5)
+        self.assertEqual(found['pv'], found['proofs'][0]['pv'])
+        saved = json.loads(json.dumps(found))
+        table = Proofs()
+        table.add(history, saved)
+        half = table.known(history)
+        root = table.known(history[:-1])
+        self.assertEqual(half['pv'], saved['pv'])
+        self.assertEqual(root['plies'], half['plies'] + 1)
+        self.assertEqual(root['pv'], [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in saved['pv']])
+        # A leaf proof is retained even if the search has not established the whole root.
+        table = Proofs()
+        table.add(history[:-1], dict(proof=None, proofs=saved['proofs']))
+        self.assertEqual(table.known(history[:-1]), root)
 
     def setUp(self):
         import hexnet

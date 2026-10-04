@@ -660,6 +660,18 @@ def proof_evidence(result, certificate):
                 solver_build=result.get('build_hash'))
 
 
+def winning_line(history, result, known=()):
+    """The continuation and bound of an already verified mover certificate."""
+    cert = result.get('certificate') or json.loads(result['certificate_json'])
+    pv, plies = principal_variation(history, cert, known=known)
+    reused = any(n['kind'] in ('stamp', 'stamp_link', 'zone_replies') for n in cert['nodes'])
+    if reused:
+        plies = (2 if len(history) % 2 else 1) + 4*(result['proof_turns']-1)
+    evidence = proof_evidence(result, cert) if result.get('dependencies') or reused else {}
+    return dict(moves=[list(m) for m in result['moves']], pv=pv,
+                proof=dict(winner=player_at(len(history)), turns=result['proof_turns'], plies=plies, **evidence))
+
+
 def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
     win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
@@ -690,14 +702,7 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
                                                 shortest=True, **mine_options), watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine) and mine['moves']:
-        cert = mine.get('certificate') or json.loads(mine['certificate_json'])
-        pv, plies = principal_variation(history, cert, known=mine_known)
-        reused = any(n['kind'] in ('stamp', 'stamp_link', 'zone_replies') for n in cert['nodes'])
-        if reused:
-            plies = remaining + 4*(mine['proof_turns']-1)
-        evidence = proof_evidence(mine, cert) if mine.get('dependencies') or reused else {}
-        found.update(moves=[list(m) for m in mine['moves']], pv=pv,
-                     proof=dict(winner=player, turns=mine['proof_turns'], plies=plies, **evidence))
+        found.update(winning_line(history, mine, mine_known))
         return found
     theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline, **options),
                            watch, prover.abort)
@@ -753,10 +758,16 @@ class Proofs:
         self.entries, self.sizes, self.seen, self.lock = {}, {}, set(), threading.RLock()
 
     def add(self, history, record, line=None):
-        """Index `record` (fields of `evaluate`) at `history` when it holds a proof; `line`, the record's saved
-        text, skips a record already indexed."""
+        """Index the root proof and any leaf continuations retained in `record['proofs']`.
+        `line`, the record's saved text, skips a record already indexed."""
+        if line in self.seen:
+            return
+        for fact in record.get('proofs', []):
+            self.add(fact['history'], dict(proof=dict(winner=fact['winner'], plies=fact['plies']), pv=fact['pv']))
         proof = record.get('proof')
-        if not proof or line in self.seen:
+        if not proof:
+            if line is not None:
+                self.seen.add(line)
             return
         current = [tuple(map(int, p)) for p in history]
         plies, pv = proof_plies(proof, current), [list(p) for p in record.get('pv') or []]
@@ -954,6 +965,8 @@ class SearchProofs:
         self.query_ms = query_ms
         self.ms = min(60_000, max(10_000, nodes // 8))
         self.used = 0
+        self.records = {}
+        self.known = None
 
     def history(self, history, *, ms=10, certificate=None):
         allowance = min(ms, self.query_ms, int(self.ms))
@@ -969,6 +982,15 @@ class SearchProofs:
         self.left = max(0, self.left - spent)
         self.ms -= (time.perf_counter() - start) * 1000
         self.watch(0)
+        if verified(result) and result.get('moves'):
+            found = winning_line(history, result)
+            fact = dict(history=[list(p) for p in history], winner=found['proof']['winner'],
+                        plies=found['proof']['plies'], pv=found['pv'])
+            old = self.records.get(proof_key(history))
+            if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
+                self.records[proof_key(history)] = fact
+            if self.known is not None:
+                self.known.add(history, found)
         return result
 
 
@@ -1002,13 +1024,15 @@ class TurnSearch:
         self.node_value = None
         self.later, self.played = [], 0
         self.trees = trees or self.advanced
-        self.known = known
+        self.known = known if known is not None else Proofs()
         outcome = known.known(self.history) if known is not None and self.proof is None else None
         if outcome is not None and outcome['winner'] != self.player:
             self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
                               turns=proof_turns(outcome['plies'], self.local.remaining, False))
             self.pv = outcome['pv']
         self.proofs = proofs
+        if proofs is not None:
+            proofs.known = self.known
 
     def advanced(self, history, simulations, network):
         from neural_search import NeuralSearch
@@ -1101,10 +1125,19 @@ class TurnSearch:
         after = self.known.known([*self.history, *map(tuple, self.moves)]) if extended else None
         if after is not None and after['winner'] == self.proof['winner']:
             pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
-        return dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
+        found = dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
                     actual_completed=self.completed,
                     actual_solver_nodes=self.solver_used + (self.proofs.used if self.proofs else 0), later=self.later)
+        if self.proofs is not None and self.proofs.records:
+            found['proofs'] = list(self.proofs.records.values())
+        given = answered(self.history, self.known)
+        if given is not None and (not self.proof or given['proof']['plies'] <= proof_plies(self.proof, self.history)):
+            found.update({k: given[k] for k in ('moves', 'value', 'top', 'proof', 'pv')})
+        elif self.proof:
+            found['pv'] = self.known.line(self.history, dict(winner=self.proof['winner'],
+                plies=proof_plies(self.proof, self.history), pv=pv))
+        return found
 
     def close(self):
         if self.trees == self.advanced and self.tree is not None:
@@ -1584,6 +1617,10 @@ def well_formed(record):
             and all(isinstance(c, list) and 3 <= len(c) <= 5 and cells([c[:3]], 3, number) and all(map(number, c[3:]))
                     for c in record['top'])
             and (cells(record.get('pv', []), 3) or cells(record.get('pv', []), 4)) and cells(record.get('threat', []), 2)
+            and isinstance(record.get('proofs', []), list)
+            and all(isinstance(f, dict) and cells(f.get('history'), 2) and f.get('winner') in (0, 1)
+                    and type(f.get('plies')) is int and f['plies'] > 0 and cells(f.get('pv'), 4)
+                    for f in record.get('proofs', []))
             and (proof is None or isinstance(proof, dict) and proof.get('winner') in (0, 1)
                  and type(proof.get('turns')) is int))
 
@@ -1638,7 +1675,7 @@ class Evaluations:
         self.order.pop(full, None)
         self.order[full] = line
         self.by_position.setdefault((position, record['engine']), set()).add(budget)
-        if record.get('proof'):
+        if record.get('proof') or record.get('proofs'):
             self.proofs.setdefault(position, set()).add(full)
         else:
             self.proofs.get(position, set()).discard(full)
@@ -1654,8 +1691,17 @@ class Evaluations:
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
                       solver_nodes=budget['solver_nodes'], **evaluation,
                       at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        line = json.dumps(record, separators=(',', ':'))
         with self.lock:
+            saved = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
+            saved, facts = json.loads(saved) if saved else {}, {}
+            for fact in [*saved.get('proofs', []), *record.get('proofs', [])]:
+                key = proof_key(fact['history'])
+                old = facts.get(key)
+                if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
+                    facts[key] = fact
+            if facts:
+                record['proofs'] = list(facts.values())
+            line = json.dumps(record, separators=(',', ':'))
             if self.path:
                 with open(self.path, 'a', encoding='utf-8') as out:
                     out.write(line + '\n')
@@ -3374,7 +3420,11 @@ class Session:
         later = found.pop('later', [])
         saved = self.store.get(history, weights, spent)
         if saved and saved.get('proof') and not found.get('proof'):
-            record = saved
+            if found.get('proofs'):
+                record = self.store.add(history, weights, spent, found | dict(model=model) |
+                                        {k: saved[k] for k in ('moves', 'value', 'top', 'proof', 'pv')})
+            else:
+                record = saved
         else:
             record = self.store.add(history, weights, spent, found | dict(model=model))
         self.proofs.add(history, record)

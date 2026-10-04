@@ -10,7 +10,7 @@ import createModule from './gumbel.mjs';
 import {Native, NeuralSearch, EvaluationCache, GameGraphs, PV_CHECK} from './search.mjs';
 import {Network, probe, runtime} from './network.mjs';
 import {Stages, errorReport, stall} from './stages.mjs';
-import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence} from './proof.mjs';
+import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine} from './proof.mjs';
 
 const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 'defender counterwin',
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
@@ -121,7 +121,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
-  const table = known ? new Proofs(known) : null, given = answered(native, history, table);
+  const table = new Proofs(known || []), given = answered(native, history, table), leafProofs = new Map();
   if (given) return {...given, ms: Math.round(performance.now() - start)};
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   if (line != null) tree = games.graph(line, history, {seed: 1740, tactics: true, qRangeFloor, model: network.version});
@@ -155,6 +155,12 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     leafMs -= performance.now() - before;
     solverUsed += used;
     check();
+    if (verified(found) && found.moves.length) {
+      const record = winningLine(native, leaves, found), key = proofKey(leaves), old = leafProofs.get(key);
+      const fact = {history: leaves.map(p => [...p]), winner: record.proof.winner, plies: record.proof.plies, pv: record.pv};
+      if (!old || fact.plies < old.plies || fact.plies === old.plies && fact.pv.length > old.pv.length) leafProofs.set(key, fact);
+      table.add(leaves, record);
+    }
     return found;
   } : null;
   try {
@@ -167,12 +173,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       solved = searched(mine);
       solverUsed += mine.nodes_used || 0;
       if (verified(mine) && mine.moves.length) {
-        moves = mine.moves.map(m => [...m]);
-        const found = principalVariation(native, history, mine.certificate, {known: mineFacts});
-        const reused = mine.certificate.nodes.some(n => ['stamp', 'stamp_link', 'zone_replies'].includes(n.kind));
-        pv = found.pv;
-        proof = {winner: player, turns: mine.proof_turns, plies: reused ? state.remaining + 4 * (mine.proof_turns - 1) : found.plies,
-          ...(mine.dependencies?.length || reused ? proofEvidence(mine) : {})};
+        ({moves, pv, proof} = winningLine(native, history, mine, mineFacts));
         top = [[...moves[0], 1, 1, 1]];
       } else {
         const theirs = note(await solve(id, history, {attacker: 'opponent', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
@@ -268,8 +269,12 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       pv = moves.map(([q, r], i) => [q, r, player, i + 1]);
       if (after?.winner === proof.winner) pv.push(...after.pv.map(([q, r, side, ply]) => [q, r, side, ply + moves.length]));
     }
+    const knownTurn = answered(native, history, table);
+    if (knownTurn && (!proof || knownTurn.proof.plies <= proof.plies)) ({moves, value, top, proof, pv} = knownTurn);
+    else if (proof) pv = table.line(history, {winner: proof.winner, plies: proof.plies, pv});
     return {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
+      ...(leafProofs.size ? {proofs: [...leafProofs.values()]} : {}),
       ...(failure ? {solver_error: failure} : {})};
   } catch (error) {
     // A turn that stops after touching its game graph names the graph, so the session can count that search.
