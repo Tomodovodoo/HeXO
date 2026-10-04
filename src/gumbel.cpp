@@ -79,7 +79,7 @@ struct GameStore {
   return false;
  }
 };
-struct RootEdge { double gumbel=0;int epoch=0;uint64_t credits=0; };
+struct RootEdge { double gumbel=0,opening_q=0;int epoch=0;uint64_t credits=0; };
 struct RootSession {
  std::vector<RootEdge> edges;bool prepared=false,hold=false;
  int budget=0,started=0,completed=0,samples=0,last=0;uint64_t issued=0,cancelled=0;
@@ -138,6 +138,14 @@ struct Tree {
   for(auto& e:root_edges){double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
   root_prepared=true;
   schedule(int(std::count_if(root->edges.begin(),root->edges.end(),[](const auto& e){return e.eligible;})));
+  freeze_root_q();
+ }
+ // Root sampling uses the evidence available at this search's start. Keep it with the view's root session so
+ // predictions from early candidates or other views cannot change the remaining Gumbel-top-k draws.
+ void freeze_root_q(){
+  if(!shared)return;
+  current(*root);auto& q=transformed(*root);
+  for(size_t i=0;i<q.size();++i)root_edges[i].opening_q=q[i];
  }
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
  // Edge value for the node's mover: exact, else in a graph the child's MCGS value (which may come from other
@@ -614,7 +622,7 @@ struct Tree {
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
     auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
     bool forced=false;auto logits=considered?std::vector<double>():sampling(*node);
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || root_edges[i].epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=root_edges[i].gumbel+(considered?e.logit:logits[i])+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || root_edges[i].epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=root_edges[i].gumbel+(considered?e.logit:logits[i])+(considered?q[i]:root_edges[i].opening_q)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
     if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.eligible || root_edges[i].epoch>considered)continue;double score=root_edges[i].gumbel+e.logit+q[i]+bonus(e);if(root_edges[i].epoch>reached || (root_edges[i].epoch==reached && score>best)){reached=root_edges[i].epoch;best=score;chosen=i;}}
@@ -699,7 +707,7 @@ struct Tree {
   }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.exact_winner!=exact || edge.distance>distance)){edge.exact_winner=exact;edge.distance=distance;edge.bound=true;}settle(node);}
-  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);
+  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);if(at_root)freeze_root_q();if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);
  }
  // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
  // turns on any certificate path, which bound the win within move_count + 4 * (turns - 1) placements.
