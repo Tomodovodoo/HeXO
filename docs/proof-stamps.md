@@ -124,7 +124,9 @@ attacker prefix. Small relocatable shapes compare across all twelve hex
 symmetries, translations and colour swaps; large strategies compare in their
 actual game coordinates. Broader-but-slower strategies remain separate. Equal
 conditions and bounds keep the smaller compiled strategy. Portable status
-follows the retained entry; an active query keeps its original sources.
+follows the retained entry; an active query keeps its original sources. If a
+replacement uses another coordinate frame or colour, it also becomes eligible
+for discovery when supporting stones are created below the query root.
 
 This comparison runs only when learning or importing a stamp. The library
 remains local to one solver worker. Ordinary player analysis uses one worker;
@@ -190,7 +192,7 @@ threads. No query hit its deadline. All 546 outcomes still agreed.
 
 | Six-game replay | Before deduplication | After deduplication |
 |---|---:|---:|
-| Solver time | 28.922 s | 27.708 s |
+| Solver time | 28.922 s | 32.177 s |
 | Fresh nodes | 329,076 | 328,468 |
 | Proven-win queries | 210 | 210 |
 | Stamp hits | 97 | 98 |
@@ -198,9 +200,11 @@ threads. No query hit its deadline. All 546 outcomes still agreed.
 | Mean compiled entries | 26.6 | 15.1 |
 | Peak accounted library size | 234.1 KiB | 275.3 KiB |
 
-This single pair took 4.2% less time. Fewer duplicate templates left room for
-larger distinct proofs, so peak bytes increased within the same 4 MiB limit.
-These recorded continuations do not measure newly selected moves or games/hour.
+The final version took 11.3% more time in this comparison. It preserves discovery
+of discarded coordinate frames below the query root, which costs extra matching
+work. Fewer duplicate templates left room for larger distinct proofs, so peak
+bytes increased within the same 4 MiB limit. These recorded continuations do not
+measure newly selected moves or games/hour.
 
 The distinction between forcing, holding and unstoppable shapes is also useful
 in [Six's shape guide](https://github.com/CixMango/Six/blob/main/guide/shapes.md).

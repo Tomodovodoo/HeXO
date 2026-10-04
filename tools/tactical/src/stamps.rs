@@ -275,6 +275,14 @@ impl Stamp {
                 || (!points.iter().any(|p|other.before.contains(p)) && 5-other.allowance as i8<=limit)
         })
     }
+    fn inherit_discovery(&self,other:&Self) {
+        // A discarded source was also checked directly at its fixed coordinates
+        // below the query root. A relocated/colour-swapped replacement must be
+        // discoverable as its supporting stones are created during search.
+        if other.portable.get() || self.source.winner!=other.source.winner || !self.dominates_at(other,0,(0,0)) {
+            self.portable.set(true);
+        }
+    }
 
     pub fn key(&self)->String {
         // Coordinates of the supporting stones, checked empty cells and every
@@ -405,13 +413,13 @@ fn remember_as(source:StampSource,ctl:&Ctl,portable:bool)->Result<Rc<Stamp>,Stri
             let older=prior.dominates(&stamp,ctl)?;
             let newer=stamp.dominates(prior,ctl)?;
             if older && (!newer || prior.bytes<=stamp.bytes) {
-                if stamp.portable.get() {prior.portable.set(true);}
+                prior.inherit_discovery(&stamp);
                 return Ok(());
             }
             if newer {replaced.push(i);}
         }
         for &i in replaced.iter().rev() {
-            if list[i].portable.get() {stamp.portable.set(true);}
+            stamp.inherit_discovery(&list[i]);
             list.remove(i);
         }
         while !list.is_empty() && (list.len()>=MAX_STAMPS || list.iter().map(|s|s.bytes).sum::<usize>()+stamp.bytes>MAX_BYTES) {
@@ -643,6 +651,31 @@ mod tests {
         assert!(!broad.empty.contains(&(8,8)));
         assert_eq!(oracle.source(0),old_source);
         assert!(LIBRARY.with(|l|Rc::ptr_eq(&l.borrow()[0],&broad)));
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
+
+    #[test]
+    fn discarded_frames_remain_discoverable_below_the_query_root() {
+        let ctl=Ctl::new(0.0);
+        let source=StampSource{stones:(0..4).map(|q|((q,0),0)).collect(),player:0,remaining:2,winner:0,
+            certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
+                nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
+        let translated=transformed_source(&source,0,(20,-10),false);
+        // Both insertion orders exercise retaining an existing representative
+        // and replacing one with a smaller strategy in another frame.
+        for sources in [[source.clone(),translated.clone()],[translated.clone(),source.clone()]] {
+            LIBRARY.with(|l|l.borrow_mut().clear());
+            for source in sources {remember(source,&ctl).unwrap();}
+            assert_eq!(stats().0,1);
+            assert!(LIBRARY.with(|l|l.borrow()[0].portable.get()));
+            let mut board:Board=[((20,-10),0),((21,-10),0)].into_iter().collect();
+            let oracle=Oracle::new(&ctl,&board);
+            board.insert((22,-10),0);board.insert((23,-10),0);
+            let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+            let (id,winner,turns)=oracle.lookup(1,&stones,&|p|board.get(&p).copied().map(player),Player::P1,2).unwrap();
+            assert_eq!((winner,turns),(Player::P1,1));
+            assert_eq!(verify(&oracle.source(id),&board,ply(0,2),0,&ctl).unwrap(),1);
+        }
         LIBRARY.with(|l|l.borrow_mut().clear());
     }
 }
