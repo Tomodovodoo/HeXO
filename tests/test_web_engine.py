@@ -1272,6 +1272,14 @@ class Bundle(unittest.TestCase):
             self.assertEqual(case['after']['nodes'], expected)
             self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2-expected)
             self.assertEqual(case['counters']['pending'], 0)
+        for case in found['ownerConflicts']:
+            self.assertEqual(case['before']['nodes'], 2)
+            self.assertLess(case['before']['bytes'], case['before']['limit'])
+            self.assertEqual(case['after']['focus_stones'], 4)
+            self.assertEqual(case['after']['nodes'], 0 if case['forward'] else 2)
+            self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2 if case['forward'] else 0)
+            self.assertEqual(case['counters']['pending'], 0)
+            self.assertEqual(case['counters']['views'], 1)
         for growth in (found['proofGrowth'], found['leafProofGrowth']):
             self.assertGreaterEqual(growth['before']['nodes'], 2)
             self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])

@@ -564,6 +564,9 @@ export class NativeOwner {
     this.n.checked(this.m._hxgf_abandon_all(this.feed));
     this.n.checked(this.m._hxgo_free(this.ptr));
     this.ptr = 0; this.root.ptr = 0; this.graph.nativeOwner = null;
+    // The scheduler root owned archive focus. Reclaim it before this graph
+    // advances, so permanent colour conflicts follow the played position.
+    this.graph.at(this.graph.history);
   }
   async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel'}) {
     if (this.busy || !this.ptr) throw new Error('Native owner is closed or already running');

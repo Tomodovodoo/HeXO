@@ -267,6 +267,22 @@ if (job.kind === 'encode') {
       answer.conflicts.push({forward,opposite,before,after:retained.archive(),counters:retained.counters()});
     } finally {retained.close();}
   }
+  answer.ownerConflicts = [];
+  for (const forward of [false,true]) {
+    const retained = new GameGraph(native, {history: [[0,0]], seed: 7, limit: 1, archiveBytes: 65536, archiveForward: forward});
+    let owner;
+    try {
+      for (const history of [[[0,0]], [[0,0],[1,0],[2,0]], [[0,0],[1,0],[2,0],[3,0]]]) {
+        retained.at(history); native.checked(native.m._hxg_begin(retained.ptr,1,1));
+        const [id,leaf] = retained.request(); retained.fulfill(id,leaf.actions,(await evaluate([leaf]))[0]);
+      }
+      retained.at([[0,0]]);
+      owner = new NativeOwner(retained, {work: 32, ms: 0});
+      owner.close(); const before = retained.archive();
+      for (const point of [[4,0],[5,0],[1,0]]) retained.advance(point);
+      answer.ownerConflicts.push({forward,before,after:retained.archive(),counters:retained.counters()});
+    } finally {owner?.close();retained.close();}
+  }
   const second = original.map(c => [...c]), third = original.map(c => [...c]);
   [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
   [third[1],third[9]] = [third[9],third[1]];[third[2],third[10]] = [third[10],third[2]];
