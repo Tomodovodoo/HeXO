@@ -271,9 +271,16 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
 /// clamp(8 * nodes, 50,000, 200,000) certificate nodes and visits. `ms` is only a
 /// safety cap, and a query that reaches it returns UNKNOWN.
 fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<Value,String> {
-    CACHE.with(|cache|run_cached(req,start,cancel,cache))
+    let meter=Meter::new(req.nodes);let limit=req.nodes;
+    CACHE.with(|cache|match run_cached(req,start,cancel,cache,&meter) {
+        Ok(value)=>Ok(value),
+        // Completed setup/check failures still own their meter. A legacy caller
+        // abandoning an active query remains unaccounted in query_value.
+        Err(reason)=>Ok(json!({"status":"UNKNOWN","native_verified":false,"reason":reason,
+            "moves":[],"nodes_fresh":meter.spent().min(limit)})),
+    })
 }
-fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTreeMap<Key,Solved>>) -> Result<Value,String> {
+fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTreeMap<Key,Solved>>,meter:&Meter) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
         || (req.resume && req.table_mb==0) || req.known.len()>4096
@@ -281,7 +288,6 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         || (!req.replay.is_empty() && (!req.stamps || req.certificate.is_some() || req.root_moves.is_some()))
         || (req.attacker==Attacker::Defender && req.root_moves.is_some()) {return Err("invalid tactical limits".into());}
     let deadline=start+Duration::from_millis(req.ms as u64);
-    let meter=Meter::new(req.nodes);
     let ctl=Ctl{deadline:Some(deadline),cancel,meter:Some(meter.clone())};
     if ctl.expired() {return Err("cancelled or deadline".into());}
     stamps::reset_timings(req.stamps && req.bounds);
@@ -728,7 +734,20 @@ mod tests {
         assert!(check::verify(&OPEN_THREE,OPEN_THREE.len(),&certificate,&ctl,200000).is_err());
         let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":1000,"nodes":100000,
             "idtt_nodes":0,"depth":8,"certificate":certificate})).unwrap();
-        assert!(run_controlled(req,Instant::now(),Arc::clone(&ctl.cancel)).is_err());
+        let result=run_controlled(req,Instant::now(),Arc::clone(&ctl.cancel)).unwrap();
+        assert_eq!(result["status"],"UNKNOWN");
+        assert_eq!(result["nodes_fresh"],0);
+    }
+    #[test]
+    fn completed_expired_setup_reports_work_without_a_strategy() {
+        let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":1,"nodes":100000,
+            "idtt_nodes":0,"depth":8})).unwrap();
+        let start=Instant::now()-Duration::from_millis(10);
+        let result=run_controlled(req,start,Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(result["status"],"UNKNOWN");
+        assert_eq!(result["native_verified"],false);
+        assert_eq!(result["nodes_fresh"],0);
+        assert!(result["reason"].as_str().unwrap().contains("deadline"));
     }
     #[test]
     fn certificate_limit_follows_node_budget() {
