@@ -4032,7 +4032,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((replacement['token'],replacement['completed'],replacement['root_completed']),(3,16,16))
         self.assertEqual(replacement['history'],[[0,0]])
         self.assertEqual(int(np.asarray(replacement['edges'])[:,7].sum()),16)
-        self.assertEqual(saved,event)
+        self.assertTrue(event['edges'].flags.owndata)
+        np.testing.assert_array_equal(saved['edges'],event['edges'])
+        self.assertEqual({k:v for k,v in saved.items() if k!='edges'},
+                         {k:v for k,v in event.items() if k!='edges'})
         service.close()
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
                           service.stats()['active_producers']),(0,0,0))
@@ -4158,6 +4161,7 @@ class EngineTests(unittest.TestCase):
 
     def test_continuous_pause_fences_forwards_then_resumes_every_game(self):
         from native_scheduler import InferenceService
+        from neural_search import native
         from tests.test_neural_search import NativeScheduler
         import native_dense
         torch.set_num_threads(2)
@@ -4191,14 +4195,27 @@ class EngineTests(unittest.TestCase):
         events, end = [], time.monotonic()+5
         while len(events)<2 and time.monotonic()<end:
             service.pump()
-            while (event:=service.event()) is not None:
+            while len(events)<2:
+                if not events:
+                    event = service.event()
+                else:
+                    text = native.hxb_event(service.ptr)
+                    event = json.loads(text) if text is not None else None
+                if event is None:
+                    break
                 events.append(event)
         self.assertEqual({e['producer'] for e in events},{0,1})
         for event in events:
             self.assertEqual((event['token'],event['completed']),(1,128))
             self.assertIn(tuple(event['action']),set(map(tuple,legal(event['history']))))
             self.assertEqual(int(np.asarray(event['edges'])[:,7].sum()),event['root_completed'])
+        first = events[0]['edges'].copy()
+        for event in events:
+            edges = np.asarray(event['edges'])
+            self.assertEqual(set(map(tuple,edges[:,:2].astype(np.int64))),set(map(tuple,legal(event['history']))))
+            self.assertAlmostEqual(float(edges[:,5].sum()),1.)
         service.close()
+        np.testing.assert_array_equal(first,events[0]['edges'])
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
                           service.stats()['active_producers']),(0,0,0))
 
@@ -4461,7 +4478,10 @@ class EngineTests(unittest.TestCase):
             second = service.event()
         self.assertIsNotNone(second)
         self.assertEqual((second['token'],second['completed'],second['root_completed']), (2,16,16))
-        self.assertEqual(saved,event)
+        self.assertTrue(event['edges'].flags.owndata)
+        np.testing.assert_array_equal(saved['edges'],event['edges'])
+        self.assertEqual({k:v for k,v in saved.items() if k!='edges'},
+                         {k:v for k,v in event.items() if k!='edges'})
         self.assertEqual(int(np.asarray(second['edges'])[:,7].sum()),16)
         service.close()
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],service.stats()['active_producers']),(0,0,0))
