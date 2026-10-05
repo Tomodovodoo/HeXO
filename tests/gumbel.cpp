@@ -3,6 +3,29 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // Dormant descendants survive a cut ancestor. Proofs propagate through
+ // retained links, and beginning a descendant comparison promotes/pins its
+ // lineage so another view cannot free a raw backup pointer.
+ {gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  auto a=expand({{0,0}}),b=expand({{0,0},{1,0}}),c=expand({{0,0},{1,0},{2,0}});
+  t.root_at({{0,0}});assert(b->dormant && c->dormant);
+  {gumbel::Tree view(11,t.state);view.shared=view.graph=true;view.root_at({{0,0},{1,0},{2,0}});view.begin(4,2);
+   assert(!b->dormant && t.state->pinned(b.get()));t.evict();t.trim_archive();
+   assert(t.nodes.at(b->context).lock()==b && t.state->pinned(b.get()));
+  }
+  t.evict();assert(b->dormant && c->dormant);
+  c->exact_winner=1;c->distance=3;t.learn(*c);t.revise(*c);
+  assert(b->exact_winner==1 && a->exact_winner==1);
+  auto& archive=*t.state->archive;
+  auto cut=archive.remove(archive.contexts.at(b->context));t.discard(cut);cut.reset();b.reset();
+  assert(archive.contexts.contains(c->context));
+  t.root_at({{0,0},{1,0},{2,0}});assert(t.root==c && !c->dormant && c->exact_winner==1);
+  assert(c->edges.size()==t.board.legal_moves().size());
+  assert(archive.total_bytes()<=archive.limit);
+ }
  // Sparse selection maximizes the complete legal stable-softmax score. Cold
  // mass remains available after dominant priors are refuted, including weights
  // that underflowed at expansion. Pending children still contribute mass but

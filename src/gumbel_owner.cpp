@@ -34,7 +34,7 @@ struct Owner {
   for(auto& u:source.board.history)focus.push_back(u.c);views.reserve(max_views);
   View root;root.tree=std::make_unique<Tree>(rng(),game);root.tree->shared=root.tree->graph=true;
   root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;
-  root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
+  game->primary=root.tree.get();root.tree->archive_focus(focus);root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
   start(views[0]);game->scheduler_owner=this;
  }
  ~Owner(){stop();if(game->scheduler_owner==this)game->scheduler_owner=nullptr;}
@@ -282,7 +282,7 @@ struct Pool {
   auto& o=*games[index];o.stop();o.views.resize(1);auto& root=o.views[0];
   // Keep this Tree address alive for outstanding solver DTOs. Packed neural rows
   // already own their encoding snapshot; cancelled subscribers never install late.
-  root.tree->root_at(history);root.history=history;root.key=gumbel::keys(history).second;
+  root.tree->archive_focus(history);root.tree->root_at(history);root.history=history;root.key=gumbel::keys(history).second;
   root.completed=root.issued=root.cancelled=0;root.passes=0;root.active=root.discovered=false;
   o.focus=std::move(history);o.candidates.clear();o.last_root.clear();o.direct_root_credits.clear();
   o.root_raw_known=false;o.root_raw=0;

@@ -790,6 +790,46 @@ class Refuted(Ranked):
         return out
 
 class SharedGraph(unittest.TestCase):
+    def test_dormant_reconvergence_restores_edge_evidence_and_new_credits_are_separate(self):
+        original = [(0,0),(1,1),(2,1),(2,0),(0,3),(0,2),(1,2),(-1,2),(3,1),(-1,0),(0,-1)]
+        current = original[:3]+original[7:9]+original[5:7]
+        returned = current+original[3:5]+original[9:11]
+        graph = GameGraph(Uniform(), 'archive', original, seed=51, limit=4, archive_bytes=262144,
+                          cache=EvaluationCache(capacity=0))
+        self.addCleanup(graph.close)
+        first = graph.search(128, root_samples=16, batch_size=16)
+        graph.at(current)
+        graph.search(128, root_samples=16, batch_size=16)
+        graph.search(4, root_samples=4, batch_size=16)
+        self.assertGreater(graph.archive()['discarded'], 0)
+        self.assertLessEqual(graph.archive()['bytes'], graph.archive()['limit'])
+        graph.at(returned)
+        reused = graph.result(0, 0, 0, 0)
+        np.testing.assert_array_equal(reused['visits'], first['visits'])
+        self.assertGreater(graph.archive()['reused'], 0)
+        self.assertEqual(len(reused['actions']), len(first['actions']))
+        result = graph.search(8, root_samples=8, batch_size=16)
+        self.assertEqual(result['completed'], 8)
+        self.assertEqual(int(graph.credits().sum()), 8)
+        self.assertEqual(int(result['visits'].sum()), 136)
+        self.assertEqual(graph.counters()['pending'], 0)
+
+    def test_auxiliary_archive_focus_and_rejected_configuration_leave_game_usable(self):
+        graph = GameGraph(Uniform(), 'archive-focus', [(0,0)], limit=4, archive_bytes=65536)
+        self.addCleanup(graph.close)
+        graph.search(64, root_samples=8, batch_size=8)
+        graph.at(graph.history)
+        before = graph.archive()['focus_stones']
+        view = graph.view([(0,0),(1,1)])
+        self.addCleanup(view.close)
+        self.assertEqual(graph.archive()['focus_stones'], before)
+        with self.assertRaisesRegex(ValueError, 'Archive needs'):
+            from neural_search import checked
+            checked(native.hxg_archive(graph.ptr, 65536))
+        self.assertEqual(graph.archive()['limit'], 65536)
+        graph.search(8, root_samples=4, batch_size=4)
+        self.assertLessEqual(graph.archive()['bytes'], 65536)
+
     def test_later_marks_tighten_a_proven_root_and_its_stored_parent(self):
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
         graph = GameGraph(Uniform(), 'tighter-proof', history, seed=3, tactics=False)
@@ -1268,6 +1308,21 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class NativeScheduler(unittest.TestCase):
+    def test_scheduled_primary_owns_archive_focus_after_source_closes(self):
+        history = [(0,0),(1,1),(2,1)]
+        graph = GameGraph(Uniform(), 'scheduler', history, limit=4, archive_bytes=65536)
+        self.addCleanup(graph.close)
+        pool = self.pool([graph], quantum=8, views=4, work=64)
+        graph.close()
+        self.finish(pool)
+        root = native.hxgo_root(pool.games[0].ptr)
+        counts = np.zeros(10, np.int64)
+        self.assertTrue(native.hxg_archive_stats(root, counts.ctypes.data))
+        self.assertEqual(counts[9], len(history))
+        pool.retarget(0, [*history, (2,0), (0,3)], work=32)
+        self.finish(pool)
+        self.assertTrue(native.hxg_archive_stats(root, counts.ctypes.data))
+        self.assertEqual(counts[9], len(history)+2)
     def test_retarget_same_context_keeps_new_subscriber_after_old_empty_completion(self):
         pool = self.pool([self.graph()], views=1, work=16, cache=0)
         pool.step()

@@ -107,6 +107,22 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'archive') {
+  const original = [[0,0],[1,1],[2,1],[2,0],[0,3],[0,2],[1,2],[-1,2],[3,1],[-1,0],[0,-1]];
+  const current = [...original.slice(0,3), ...original.slice(7,9), ...original.slice(5,7)];
+  const returned = [...current, ...original.slice(3,5), ...original.slice(9,11)];
+  const graph = new GameGraph(native, {history: original, seed: 51, limit: 4, archiveBytes: 262144});
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
+  const cache = new EvaluationCache(0);
+  try {
+    const first = await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    graph.at(current);
+    await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    await graph.search({simulations:4, rootSamples:4, batchSize:16, evaluate, cache});
+    graph.at(returned);const reused = graph.result();
+    const after = await graph.search({simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
+    answer = {first:first.visits, reused:reused.visits, after:after.visits, credits:graph.credits(), archive:graph.archive(), counters:graph.counters()};
+  } finally {graph.close();}
 } else if (job.kind === 'views') {
   const parent = new GameGraph(native, {history: job.history, seed: 3});
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));

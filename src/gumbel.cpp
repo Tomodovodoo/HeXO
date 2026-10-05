@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <bitset>
 #ifdef HEXO_RECLAIM_PROFILE
 #include <chrono>
 #include <cstdio>
@@ -118,7 +119,13 @@ struct ColdBlock {double mass=0;int best=-1;bool dirty=true;};
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
 // visits and value sum (for its mover) an evicted node of its context had when it left the store, less its own
 // network value, which the node's expansion supplies again.
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false;double value=0,q=0,carried_sum=0,policy_mass=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
+// An archived node must describe its coloured set after an ancestor disappears.
+// Shared immutable history links cost one allocation per new searched position,
+// only when archival is enabled; no Board or full history is copied per leaf.
+struct HistoryLink {std::shared_ptr<const HistoryLink> before;Cell cell;int stones;
+ HistoryLink(std::shared_ptr<const HistoryLink> p,Cell c):before(std::move(p)),cell(c),stones(before?before->stones+1:1){}
+};
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false;double value=0,q=0,carried_sum=0,policy_mass=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
  std::pmr::vector<int> active;std::pmr::vector<ColdBlock> cold;bool selective=false,cold_dirty=true;int cold_best=-1;double cold_mass=0;
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->pool),tracked(&memory->pool),active(&memory->pool),cold(&memory->pool){empty.owner=this;}
@@ -177,6 +184,66 @@ void materialized(Node* node,Edge& edge){node->activate(edge);}
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
 struct Summary { int n=0;double q=0,value=0;Key position; };
+struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
+struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
+// Dormant nodes hold evidence, not scheduling rights. Each entry owns itself,
+// independently of its ancestors. The bounded membership index ranks future
+// reconvergence; only the exact neural context key authorizes reactivation.
+struct Archive {
+ static constexpr size_t slots=256;
+ struct Entry {std::shared_ptr<Node> node;size_t bytes=0;};
+ std::array<Entry,slots> entries;
+ std::unordered_map<Key,size_t,KeyHash> contexts;
+ std::unordered_map<ColouredCell,std::bitset<slots>,ColouredHash> membership;
+ std::bitset<slots> occupied,compatible;
+ std::vector<ColouredCell> focus;
+ size_t limit,bytes=0;uint64_t retained=0,reused=0,discarded=0;
+ explicit Archive(size_t budget):limit(budget){}
+ static size_t payload(const Node& n){
+  size_t states=n.selective?n.active.size():std::count_if(n.edges.begin(),n.edges.end(),[](const Edge& e){return !e.read().empty;});
+  // Charge every history link conservatively even when prefixes are shared.
+  return sizeof(Node)+2*sizeof(void*)+n.edges.capacity()*sizeof(Edge)+states*sizeof(EdgeState)
+   +(n.active.capacity()+n.tracked.capacity())*sizeof(int)+n.cold.capacity()*sizeof(ColdBlock)
+   +n.parents.capacity()*sizeof(std::weak_ptr<Node>)+size_t(n.stones)*(sizeof(HistoryLink)+2*sizeof(void*));
+ }
+ size_t index_bytes()const{
+  return sizeof(Archive)+focus.capacity()*sizeof(ColouredCell)
+   +(contexts.bucket_count()+membership.bucket_count())*sizeof(void*)
+   +contexts.size()*(sizeof(decltype(contexts)::value_type)+2*sizeof(void*))
+   +membership.size()*(sizeof(decltype(membership)::value_type)+2*sizeof(void*));
+ }
+ size_t total_bytes()const{return bytes+index_bytes();}
+ void set_focus(const std::vector<Cell>& h){
+  focus.clear();for(size_t i=0;i<h.size();++i)focus.push_back({h[i],int((i+1)/2%2)});
+  compatible=occupied;
+  for(auto c:focus){auto found=membership.find(c);if(found==membership.end()){compatible.reset();break;}compatible&=found->second;}
+ }
+ void refresh(){bytes=0;for(auto& e:entries)if(e.node){e.bytes=payload(*e.node);bytes+=e.bytes;}}
+ void insert(const std::shared_ptr<Node>& node){
+  size_t slot=0;while(slot<slots && occupied[slot])++slot;
+  if(slot==slots)throw std::runtime_error("Dormant archive has no free slot");
+  auto& entry=entries[slot];entry={node,payload(*node)};bytes+=entry.bytes;contexts.emplace(node->context,slot);occupied.set(slot);compatible.set(slot);
+  for(auto p=node->history;p;p=p->before)membership[{p->cell,(p->stones/2)%2}].set(slot);
+  for(auto c:focus){auto found=membership.find(c);if(found==membership.end() || !found->second[slot]){compatible.reset(slot);break;}}
+  node->dormant=true;++retained;
+ }
+ std::shared_ptr<Node> remove(size_t slot){
+  auto node=std::move(entries[slot].node);bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);
+  for(auto p=node->history;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});found->second.reset(slot);if(found->second.none())membership.erase(found);}
+  return node;
+ }
+ template<class Allowed> size_t victim(Allowed allowed)const{
+  size_t chosen=slots;double best=std::numeric_limits<double>::infinity();
+  for(size_t i=0;i<slots;++i)if(occupied[i] && allowed(entries[i].node.get())){auto& e=entries[i];
+   // Colour containment is necessary for forward reuse, not a reachability
+   // proof. Keep incompatible entries less eagerly so undo remains useful.
+   double benefit=(compatible[i]?4.:1.)*std::log1p(e.node->n)/(1+std::abs(e.node->stones-int(focus.size())));
+   double score=benefit/std::max(size_t(1),e.bytes);
+   if(chosen==slots || score<best || (score==best && e.node->used<entries[chosen].node->used)){chosen=i;best=score;}
+  }
+  return chosen;
+ }
+};
 struct GameStore {
  std::shared_ptr<EdgeMemory> memory=std::make_shared<EdgeMemory>();
  std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;
@@ -184,6 +251,7 @@ struct GameStore {
  std::unordered_map<Key,Outcome,KeyHash> outcomes;
  std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
+ std::unique_ptr<Archive> archive;Tree* primary=nullptr;
  size_t limit=0;uint64_t clock=0;int64_t evicted=0;void* scheduler_owner=nullptr;
  uint64_t half_losses=0;
  std::unordered_map<const void*,std::vector<Node*>> pins;
@@ -252,10 +320,12 @@ struct Tree {
  explicit Tree(uint64_t seed,std::shared_ptr<GameStore> game=std::make_shared<GameStore>()):
   root(std::make_shared<Node>(game->memory)),state(std::move(game)),nodes(state->nodes),positions(state->positions),outcomes(state->outcomes),
   limit(state->limit),clock(state->clock),evicted(state->evicted),store(state->store),evicted_stats(state->evicted_stats),rng(seed){pin();}
- ~Tree(){cancel();state->pins.erase(this);}
+ ~Tree(){cancel();state->pins.erase(this);if(state->primary==this)state->primary=nullptr;}
  Tree(const Tree&)=delete;
  Tree& operator=(const Tree&)=delete;
- void pin(){if(!shared)return;auto& list=state->pins[this];list.clear();list.push_back(root.get());for(auto [node,index]:lineage)list.push_back(node);}
+ void pin(){if(!shared)return;reactivate(root);auto& list=state->pins[this];list.clear();list.push_back(root.get());
+  for(auto [node,index]:lineage){reactivate(node->shared_from_this());list.push_back(node);}
+ }
  void save_root(){if(shared && root_prepared)root_sessions[keys(board).second]={root_edges,true,hold,budget,started,completed,samples,last,issued,cancelled,sequence,priority,defence};}
  void restore_root(){
   root_edges.clear();root_prepared=false;hold=false;budget=started=completed=samples=last=0;issued=cancelled=0;
@@ -294,17 +364,28 @@ struct Tree {
  bool known(const Edge& e)const {return e.read().exact_winner>=0 || e.read().visits || (graph && e.read().child && e.read().child->n);}
  // The node for the tree's board as a new child: a fresh node, or with graph search the shared node of this turn
  // context, created with any outcome already proven for the position.
- std::shared_ptr<Node> child_here() {
+ void reactivate(const std::shared_ptr<Node>& node){
+  if(!node->dormant)return;
+  auto& archive=*state->archive;auto found=archive.contexts.find(node->context);
+  if(found==archive.contexts.end())throw std::runtime_error("Unowned dormant node");
+  archive.remove(found->second);node->dormant=false;store[node->context]=node;++archive.reused;node->used=clock;
+ }
+ void archive_focus(const std::vector<Cell>& history){if(state->archive)state->archive->set_focus(history);}
+ std::shared_ptr<Node> child_here(std::shared_ptr<const HistoryLink> before={},bool descended=false) {
   if(!graph){auto n=std::make_shared<Node>(state->memory);n->player=board.player;return n;}
   auto [position,context]=keys(board);auto& slot=nodes[context];
-  if(auto n=slot.lock())return n;
+  if(auto n=slot.lock()){reactivate(n);return n;}
   auto n=std::make_shared<Node>(state->memory);n->player=board.player;n->remaining=board.remaining;n->position=position;n->context=context;n->stones=int(board.cells.size());
   if(board.remaining==1 && !board.history.empty())n->first=board.history.back().c;
+  if(state->archive){
+   if(descended)n->history=std::make_shared<HistoryLink>(std::move(before),board.history.back().c);
+   else for(auto& u:board.history)n->history=std::make_shared<HistoryLink>(n->history,u.c);
+  }
   slot=n;positions[position].push_back(n);
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    auto& o=old->second;n->n=o.n;n->q=o.q;n->carried=o.n-1;n->carried_sum=o.q*o.n-o.value;evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.n-1;n->carried_sum=o.q*o.n-o.value;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -419,25 +500,49 @@ struct Tree {
  // without a child) other than the root, down to seven eighths of the limit, and bounds the summaries and outcomes
  // kept for positions no longer stored. A removed child's last visits and value
  // stay on its parents' edges.
+ // Drop an archive entry or an ordinary evicted node. Its descendants remain
+ // independently owned. Incoming edges freeze the last numerical evidence;
+ // exact facts still belong to the rule-position table.
+ void discard(const std::shared_ptr<Node>& node){
+  clean(*node);
+  for(auto& w:node->parents)if(auto p=w.lock())for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.read().child==node){
+   e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->q:-node->q)*e.read().visits;
+   e.write().child.reset();
+  }}
+  if(node->n)evicted_stats[node->context]={node->n,node->q,node->value,node->position};
+  node->dormant=false;
+ }
+ void trim_archive(bool need_slot=false,bool refresh=true){
+  if(!state->archive)return;
+  auto& archive=*state->archive;if(refresh)archive.refresh();
+  while(archive.occupied.any() && (archive.total_bytes()>archive.limit || (need_slot && archive.occupied.all()))){
+   size_t slot=archive.victim([&](const Node* n){return !n->pending && !state->pinned(n);});
+   if(slot==Archive::slots)break;
+   auto node=archive.remove(slot);discard(node);++archive.discarded;
+  }
+ }
  void evict() {
   if(!shared || !limit || !requests.empty())return;
+  trim_archive();
   auto count=[&]{size_t k=0;for(auto& [key,n]:store)k+=n->expanded;return k;};
-  size_t expanded=count();if(expanded<=limit)return;
-  const size_t target=limit-limit/8;
+  size_t expanded=count();
+  const size_t target=expanded>limit?limit-limit/8:expanded;
   while(expanded>target){
    std::vector<Node*> leaves;
-   for(auto& [key,n]:store)if(!state->pinned(n.get()) && !n->pending && std::none_of(n->tracked_edges().begin(),n->tracked_edges().end(),[&](int i){return bool(n->edges[i].read().child);}))leaves.push_back(n.get());
+   for(auto& [key,n]:store)if(!state->pinned(n.get()) && !n->pending && std::none_of(n->tracked_edges().begin(),n->tracked_edges().end(),[&](int i){auto& child=n->edges[i].read().child;return child && !child->dormant;}))leaves.push_back(n.get());
    if(leaves.empty())break;
    std::sort(leaves.begin(),leaves.end(),[](const Node* x,const Node* y){return x->used<y->used;});
    for(Node* x:leaves){
     if(expanded<=target)break;
-    clean(*x);
-    for(auto& w:x->parents)if(auto p=w.lock())for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.read().child.get()==x){
-     e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.read().visits;
-     e.write().child.reset();
-    }}
-    if(x->n)evicted_stats[x->context]={x->n,x->q,x->value,x->position};
-    expanded-=x->expanded;++evicted;store.erase(x->context);
+    // Keep the incoming links while dormant: exact and numerical improvements
+    // must still reach every surviving parent. Only actual discard cuts them.
+    auto node=store.at(x->context);expanded-=x->expanded;++evicted;store.erase(x->context);
+    if(state->archive && node->expanded){
+     trim_archive(true,false);
+     if(!state->archive->occupied.all()){state->archive->insert(node);trim_archive(false,false);}
+     else discard(node);
+    }
+    else discard(node);
    }
   }
   // At most four times `limit` summaries: those with the fewest visits leave first.
@@ -462,6 +567,8 @@ struct Tree {
   if(!shared || !requests.empty())throw std::runtime_error("Root changes need a shared graph and no pending requests");
   Board next;for(auto c:history){if(!next.legal(c))throw std::runtime_error("Illegal root history");next.make(c);}
   save_root();board=next;priority.clear();defence.clear();hold=false;budget=started=completed=0;lineage.clear();++version;
+  if(!state->primary)state->primary=this;
+  if(state->primary==this)archive_focus(history);
   root=child_here();root->player=board.player;root->used=++clock;restore_root();pin();adopt(root,history);
   evict();
  }
@@ -793,7 +900,8 @@ struct Tree {
    if(chosen<0)return 0;
    auto& edge=node->edges[chosen];if(edge.read().child && edge.read().child->pending)return 0;
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
-   if(!edge.read().child){if(shared)attach(*node,edge,child_here());else {edge.write().child=child_here();if(graph){node->track(edge);edge.read().child->parents.push_back(node->weak_from_this());}}}
+   if(!edge.read().child){if(shared)attach(*node,edge,child_here(node->history,true));else {edge.write().child=child_here();if(graph){node->track(edge);edge.read().child->parents.push_back(node->weak_from_this());}}}
+   if(shared)reactivate(edge.read().child);
    node=edge.read().child.get();path.leaf=node;if(shared)node->used=clock;
    if(board.winner>=0 || edge.read().exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
@@ -901,6 +1009,7 @@ struct Tree {
    }
    auto next_legal=position.legal_moves();
    auto child=std::make_shared<Node>(state->memory);child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
+   if(state->archive)child->history=std::make_shared<HistoryLink>(node->history,witness);
    child->edges.reserve(next_legal.size());for(auto c:next_legal){Edge e(&child->empty);e.action=c;e.eligibility(c==Cell{moves[2],moves[3]});if(e.read().eligible){e.write().exact_winner=player;e.write().distance=distance-1;e.write().bound=true;}child->edges.push_back(std::move(e));}
    if(graph){auto [p,c]=keys(position);child->position=p;child->context=c;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);if(shared)store[c]=child;learn(*child);}
    for(auto& e:node->edges)if(e.action==witness){e.write().child=std::move(child);if(graph)node->track(e);break;}
@@ -909,9 +1018,9 @@ struct Tree {
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].write().pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;}}requests.clear();}
  void advance(Cell action){owner_access();if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::shared_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;
   for(auto& e:root->edges)if(e.action==action){winner=e.read().exact_winner;distance=e.read().distance;bound=e.read().bound;next=shared?e.read().child:std::move(e.write().child);break;}
-  save_root();board.make(action);root=next?std::move(next):child_here();root->player=board.player;restore_root();
+  save_root();auto before=root->history;board.make(action);root=next?std::move(next):child_here(std::move(before),true);reactivate(root);root->player=board.player;restore_root();
   // A shared graph keeps the siblings and every earlier position; a new root joins its stored parents.
-  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);pin();adopt(root,history);root->used=++clock;++version;}
+  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);if(state->primary==this)archive_focus(history);pin();adopt(root,history);root->used=++clock;++version;}
   if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   if(graph){
    std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
@@ -981,7 +1090,21 @@ HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p)
 // expanded; `limit` bounds the expanded nodes kept between searches (0: no bound). 0 with the error set otherwise.
 HX_API int hxg_share(void* p,int64_t limit){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty() || limit<0){gumbel::error="A shared graph needs an unexpanded root and a nonnegative limit";return 0;}
  if(!hxg_graph(p,1))return 0;
- t.shared=true;t.limit=size_t(limit);t.root->context=gumbel::keys(t.board).second;t.store[t.root->context]=t.root;t.pin();return 1;}
+ t.shared=true;t.limit=size_t(limit);t.root->context=gumbel::keys(t.board).second;t.store[t.root->context]=t.root;t.state->primary=&t;t.pin();return 1;}
+// Optional byte-bounded dormant evidence. Configure once before the first
+// expansion so every archived node has its own immutable history descriptor.
+HX_API int hxg_archive(void* p,int64_t bytes){try{
+ auto& t=*static_cast<gumbel::Tree*>(p);t.owner_access();
+ if(!t.shared || t.state->archive || !t.requests.empty() || std::any_of(t.store.begin(),t.store.end(),[](const auto& entry){return entry.second->expanded || entry.second->stones;}) || bytes<65536)
+  throw std::runtime_error("Archive needs an unexpanded shared graph and at least 64 KiB");
+ t.state->archive=std::make_unique<gumbel::Archive>(size_t(bytes));
+ t.archive_focus({});return 1;
+ }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Managed dormant payload and estimated index allocations, not pool residency
+// or process RSS. History prefixes are conservatively charged per entry.
+HX_API int hxg_archive_stats(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);auto* a=t.state->archive.get();if(!a)return 0;
+ a->refresh();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus.size())};
+ std::copy(values.begin(),values.end(),out);return 1;}
 // Shared graph: moves the root to the position after `history` (n int64 q/r pairs), keeping every node's statistics
 // (Tree::root_at); 0 with the error set for an illegal history, an unshared tree or pending requests.
 HX_API int hxg_root_at(void* p,const int64_t* history,int n){try{std::vector<Cell> h;for(int i=0;i<n;++i)h.push_back({history[2*i],history[2*i+1]});static_cast<gumbel::Tree*>(p)->root_at(h);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
