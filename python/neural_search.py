@@ -44,6 +44,7 @@ if hasattr(native, 'hxg_defence'):
 bind('hxg_mark_exact', C.c_int, ptr, C.c_int64, C.c_int64, C.c_int, C.c_int)
 bind('hxg_share', C.c_int, ptr, C.c_int64)
 bind('hxg_archive', C.c_int, ptr, C.c_int64)
+bind('hxg_archive_forward', C.c_int, ptr, C.c_int)
 bind('hxg_archive_stats', C.c_int, ptr, ptr)
 bind('hxg_root_at', C.c_int, ptr, ints, C.c_int)
 bind('hxg_store', C.c_int, ptr, ptr)
@@ -98,10 +99,12 @@ class NeuralSearch:
     the N eligible moves instead of the prior p, while halving, the final choice and the policy target keep p.
     `limit`, when given, makes the tree a shared game graph (see GameGraph) keeping at most that many expanded nodes
     between searches (0: no bound). `archive_bytes` optionally retains up to 256 dormant expansions under a managed
-    payload/index byte allowance (at least 64 KiB); it does not bound allocator residency or the active graph."""
+    payload/index byte allowance (at least 64 KiB); it does not bound allocator residency or the active graph.
+    `archive_forward` releases opposite-colour conflicts with the primary played board at safe owner points;
+    leave it false when retaining analysis for undo."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
                  tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
-                 limit=None, archive_bytes=0):
+                 limit=None, archive_bytes=0, archive_forward=False):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -118,6 +121,8 @@ class NeuralSearch:
                 checked(native.hxg_share(self.ptr, int(limit)))
             if archive_bytes:
                 checked(native.hxg_archive(self.ptr, int(archive_bytes)))
+            if archive_forward:
+                checked(native.hxg_archive_forward(self.ptr, 1))
             checked(native.hxg_q_range_floor(self.ptr, q_range_floor))
             checked(native.hxg_root_noise(self.ptr, root_noise))
             for point in history:
@@ -344,9 +349,10 @@ class GameGraph(NeuralSearch):
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
-                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0):
+                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0, archive_forward=False):
         super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
-                         q_range_floor=q_range_floor, root_noise=root_noise, limit=limit, archive_bytes=archive_bytes)
+                         q_range_floor=q_range_floor, root_noise=root_noise, limit=limit, archive_bytes=archive_bytes,
+                         archive_forward=archive_forward)
 
     def at(self, history):
         """Move the root to the position after `history`, keeping every node's statistics."""

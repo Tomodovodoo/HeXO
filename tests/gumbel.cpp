@@ -99,6 +99,41 @@ int main(){
   assert(c->edges.size()==t.board.legal_moves().size());
   assert(archive.total_bytes()<=archive.limit);
  }
+ // Only opposite colours prevent forward reconvergence. Test both directions,
+ // including a conflict after a missing focus cell, new archive insertions,
+ // safe deferral for pending/pinned nodes, and independently retained facts.
+ for(bool forward:{false,true})for(bool opposite:{false,true}){
+  gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));assert(hxg_archive_forward(&t,forward));
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  auto a=expand({{0,0}}),b=expand({{0,0},{1,0},{2,0}}),c=expand({{0,0},{1,0},{2,0},{3,0}});
+  t.root_at({{0,0}});auto& archive=*t.state->archive;assert(b->dormant && c->dormant && archive.total_bytes()<archive.limit);
+  c->exact_winner=1;c->distance=5;t.learn(*c);auto position=c->position;
+  if(opposite)t.root_at({{0,0},{4,0},{5,0},{1,0}});else t.root_at({{0,0},{3,0}});
+  assert(archive.contexts.contains(c->context)==!forward);
+  assert(archive.contexts.contains(b->context)==!(forward && opposite));
+  assert(t.outcomes.at(position).winner==1);
+  if(forward && !opposite){b->pending=true; // A late waiter must not lose its node.
+   t.root_at({{0,0},{4,0},{5,0},{1,0}});assert(archive.contexts.contains(b->context));
+   b->pending=false;t.trim_archive();assert(!archive.contexts.contains(b->context));
+  }
+  assert(archive.total_bytes()<=archive.limit);
+ }
+ {gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));assert(hxg_archive_forward(&t,1));
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  expand({{0,0}});auto b=expand({{0,0},{1,0},{2,0}});t.root_at({{0,0}});assert(b->dormant);
+  {gumbel::Tree view(11,t.state);view.shared=view.graph=true;view.root_at({{0,0},{1,0},{2,0}});view.begin(4,2);int request=view.request();assert(request>0);
+   auto before=t.state->archive->focus;assert(!hxg_archive_forward(&view,0));assert(t.state->archive->forward);
+   t.root_at({{0,0},{4,0},{5,0},{1,0}});assert(t.state->pinned(b.get()) && view.requests.contains(request));
+   view.cancel();assert(view.requests.empty());assert(t.state->archive->focus!=before);
+  }
+  expand({{0,0},{4,0},{5,0},{1,0}});t.evict();t.trim_archive();assert(!t.state->archive->contexts.contains(b->context));
+  // New conflicts arriving from the active store are discarded on insertion.
+  assert(!t.store.contains(b->context) && !b->dormant);
+ }
  // Sparse selection maximizes the complete legal stable-softmax score. Cold
  // mass remains available after dominant priors are refuted, including weights
  // that underflowed at expansion. Pending children still contribute mass but

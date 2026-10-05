@@ -817,11 +817,34 @@ class Refuted(Ranked):
         return out
 
 class SharedGraph(unittest.TestCase):
+    def test_forward_archive_discards_both_colour_conflicts_but_keeps_missing_stones(self):
+        for forward in (False, True):
+            for opposite in (False, True):
+                graph = GameGraph(Uniform(), 'forward', [(0,0)], seed=7, limit=1,
+                                  archive_bytes=65536, archive_forward=forward)
+                try:
+                    for history in ([(0,0)], [(0,0),(1,0),(2,0)], [(0,0),(1,0),(2,0),(3,0)]):
+                        graph.at(history)
+                        graph.expand()
+                    graph.at([(0,0)])
+                    before = graph.archive()
+                    self.assertEqual(before['nodes'], 2)
+                    self.assertLess(before['bytes'], before['limit'])
+                    focus = [(0,0),(4,0),(5,0),(1,0)] if opposite else [(0,0),(3,0)]
+                    graph.at(focus)
+                    after = graph.archive()
+                    self.assertEqual(after['nodes'], 0 if forward and opposite else 1 if forward else 2)
+                    self.assertEqual(after['discarded']-before['discarded'],
+                                     2 if forward and opposite else 1 if forward else 0)
+                    self.assertEqual(graph.counters()['pending'], 0)
+                finally:
+                    graph.close()
+
     def test_dormant_reconvergence_restores_edge_evidence_and_new_credits_are_separate(self):
         original = [(0,0),(1,1),(2,1),(2,0),(0,3),(0,2),(1,2),(-1,2),(3,1),(-1,0),(0,-1)]
         current = original[:3]+original[7:9]+original[5:7]
         returned = current+original[3:5]+original[9:11]
-        graph = GameGraph(Uniform(), 'archive', original, seed=51, limit=4, archive_bytes=262144,
+        graph = GameGraph(Uniform(), 'archive', original, seed=51, limit=4, archive_bytes=262144, archive_forward=True,
                           cache=EvaluationCache(capacity=0))
         self.addCleanup(graph.close)
         first = graph.search(128, root_samples=16, batch_size=16)
@@ -1344,7 +1367,7 @@ class SharedGraph(unittest.TestCase):
 class NativeScheduler(unittest.TestCase):
     def test_scheduled_primary_owns_archive_focus_after_source_closes(self):
         history = [(0,0),(1,1),(2,1)]
-        graph = GameGraph(Uniform(), 'scheduler', history, limit=4, archive_bytes=65536)
+        graph = GameGraph(Uniform(), 'scheduler', history, limit=4, archive_bytes=65536, archive_forward=True)
         self.addCleanup(graph.close)
         pool = self.pool([graph], quantum=8, views=4, work=64)
         graph.close()

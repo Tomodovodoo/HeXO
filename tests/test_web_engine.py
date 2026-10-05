@@ -1125,6 +1125,13 @@ class Bundle(unittest.TestCase):
         self.assertGreater(found['archive']['reused'], 0)
         self.assertGreater(found['archive']['discarded'], 0)
         self.assertLessEqual(found['archive']['bytes'], found['archive']['limit'])
+        for case in found['conflicts']:
+            expected = 0 if case['forward'] and case['opposite'] else 1 if case['forward'] else 2
+            self.assertEqual(case['before']['nodes'], 2)
+            self.assertLess(case['before']['bytes'], case['before']['limit'])
+            self.assertEqual(case['after']['nodes'], expected)
+            self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2-expected)
+            self.assertEqual(case['counters']['pending'], 0)
         for growth in (found['proofGrowth'], found['leafProofGrowth']):
             self.assertGreaterEqual(growth['before']['nodes'], 2)
             self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])

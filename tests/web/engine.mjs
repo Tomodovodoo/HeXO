@@ -111,7 +111,7 @@ if (job.kind === 'encode') {
   const original = [[0,0],[1,1],[2,1],[2,0],[0,3],[0,2],[1,2],[-1,2],[3,1],[-1,0],[0,-1]];
   const current = [...original.slice(0,3), ...original.slice(7,9), ...original.slice(5,7)];
   const returned = [...current, ...original.slice(3,5), ...original.slice(9,11)];
-  const graph = new GameGraph(native, {history: original, seed: 51, limit: 4, archiveBytes: 262144});
+  const graph = new GameGraph(native, {history: original, seed: 51, limit: 4, archiveBytes: 262144, archiveForward: true});
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
   const cache = new EvaluationCache(0);
   try {
@@ -123,6 +123,19 @@ if (job.kind === 'encode') {
     const after = await graph.search({simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
     answer = {first:first.visits, reused:reused.visits, after:after.visits, credits:graph.credits(), archive:graph.archive(), counters:graph.counters()};
   } finally {graph.close();}
+  answer.conflicts = [];
+  for (const forward of [false,true]) for (const opposite of [false,true]) {
+    const retained = new GameGraph(native, {history: [[0,0]], seed: 7, limit: 1, archiveBytes: 65536, archiveForward: forward});
+    try {
+      for (const history of [[[0,0]], [[0,0],[1,0],[2,0]], [[0,0],[1,0],[2,0],[3,0]]]) {
+        retained.at(history); native.checked(native.m._hxg_begin(retained.ptr,1,1));
+        const [id,leaf] = retained.request(); retained.fulfill(id,leaf.actions,(await evaluate([leaf]))[0]);
+      }
+      retained.at([[0,0]]); const before = retained.archive();
+      retained.at(opposite ? [[0,0],[4,0],[5,0],[1,0]] : [[0,0],[3,0]]);
+      answer.conflicts.push({forward,opposite,before,after:retained.archive(),counters:retained.counters()});
+    } finally {retained.close();}
+  }
   const second = original.map(c => [...c]), third = original.map(c => [...c]);
   [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
   [third[1],third[9]] = [third[9],third[1]];[third[2],third[10]] = [third[10],third[2]];
