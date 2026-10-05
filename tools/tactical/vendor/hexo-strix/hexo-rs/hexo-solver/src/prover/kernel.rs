@@ -36,7 +36,7 @@
 
 use crate::forcing::{
     CellSet2, SolverBoard, attacker_turns_with, completions, futile_defender_pair, min_covers2, threat_window_count,
-    MAX_WL,
+    MAX_WL, zob,
 };
 use hexo_engine::game::{GameConfig, GameState};
 use hexo_engine::types::{Coord, Player};
@@ -184,17 +184,37 @@ impl KernelCtx {
         self.board.hash
     }
 
+    /// Hash a generated legal turn without updating the board's window index.
+    pub(crate) fn child_hash(&self, mv: &CellSet2, attacker: bool) -> u64 {
+        let side = if attacker { self.atk } else { self.dfn };
+        mv.cells().iter().fold(self.hash(), |hash, &cell| {
+            debug_assert!(self.board.get(cell).is_none());
+            hash ^ zob(cell, side)
+        })
+    }
+
     /// Exact graph outcomes close both OR and AND nodes. A win bound exceeding
     /// a bounded probe's horizon says nothing about that shorter horizon.
-    pub(crate) fn exact(&self, node: Node, horizon: Option<u8>) -> Option<(super::certificate::Terminal, bool, u32)> {
-        use super::certificate::{Terminal, lookup_exact, lookup_stamp};
+    pub(crate) fn exact_graph(&self, node: Node, horizon: Option<u8>) -> Option<(super::certificate::Terminal, bool, u32)> {
+        use super::certificate::{Terminal, lookup_exact};
         let (player, remaining) = match node {
             Node::Or { placements } => (self.atk, placements),
             Node::And => (self.dfn, 2),
         };
-        let (terminal, winner, turns) = if let Some((id, fact))=lookup_exact(self.hash(), player, remaining, || self.canonical_stones()) {
-            (Terminal::Graph(id),fact.winner,fact.turns)
-        } else { lookup_stamp(self.hash(), &self.board.stones, &|p|self.board.get(p), player, remaining)? };
+        let (id, fact) = lookup_exact(self.hash(), player, remaining, || self.canonical_stones())?;
+        let won = fact.winner == self.atk;
+        if won && horizon.is_some_and(|n| u32::from(n) < fact.turns) { return None; }
+        Some((Terminal::Graph(id), won, fact.turns))
+    }
+
+    pub(crate) fn exact(&self, node: Node, horizon: Option<u8>) -> Option<(super::certificate::Terminal, bool, u32)> {
+        use super::certificate::lookup_stamp;
+        if let Some(fact) = self.exact_graph(node, horizon) { return Some(fact); }
+        let (player, remaining) = match node {
+            Node::Or { placements } => (self.atk, placements),
+            Node::And => (self.dfn, 2),
+        };
+        let (terminal, winner, turns) = lookup_stamp(self.hash(), &self.board.stones, &|p|self.board.get(p), player, remaining)?;
         let won = winner == self.atk;
         if won && horizon.is_some_and(|n| u32::from(n) < turns) { return None; }
         Some((terminal, won, turns))

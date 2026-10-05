@@ -239,7 +239,7 @@ fn splitmix64(mut z: u64) -> u64 {
 /// poisoned every hash-keyed table (TT, comps cache, gencache), returning
 /// verdicts computed for unrelated positions.
 #[inline]
-fn zob(coord: Coord, player: Player) -> u64 {
+pub(crate) fn zob(coord: Coord, player: Player) -> u64 {
     let (q, r) = coord;
     let packed = ((q as u32 as u64) << 32) | (r as u32 as u64);
     let salt = match player {

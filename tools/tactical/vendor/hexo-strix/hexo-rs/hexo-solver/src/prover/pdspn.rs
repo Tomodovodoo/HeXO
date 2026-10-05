@@ -19,7 +19,10 @@
 //! same `MID` with `1 + ε` thresholds, 2-way TT, and identical kernel node
 //! semantics, so PDS-PN and df-pn agree by construction). PDS-PN adds the level-2
 //! step: the first descent into any frontier node runs a bounded [`PnSearch`]
-//! (capped at `--pn2-nodes`, default 50 000; tree discarded) to seed its numbers.
+//! (capped at `--pn2-nodes`, default 50 000) to seed its numbers. Level 2 shares
+//! transposed positions and propagates changes to every parent. Its expanded
+//! estimates and settled subproofs survive in the existing table; the temporary
+//! graph is discarded after the seed.
 //!
 //! **Parameter choices (the paper leaves these open; exact tuning is not
 //! required):**

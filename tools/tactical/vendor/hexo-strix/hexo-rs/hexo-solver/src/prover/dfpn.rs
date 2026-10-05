@@ -44,9 +44,7 @@ const EPS: f64 = 0.25;
 /// exact, so soundness is untouched. 0 = pure proof-number order.
 const MOVE_RANK_BIAS: u32 = 0;
 /// Hard recursion-depth ceiling: a single forcing line deeper than this trips
-/// `BUDGET_EXCEEDED` rather than risk unbounded board growth / stack use. Real
-/// wins are shallow (corpus depth ≤ 6; the deepest composition is ~18 turns ≈ 40
-/// plies), so this only fires on pathological non-terminating forcing.
+/// `BUDGET_EXCEEDED` rather than risk unbounded board growth / stack use.
 const MAX_PLY: u32 = 1024;
 
 /// Resident search state of one attacker: table and proven witnesses.
@@ -209,8 +207,8 @@ impl<'a> Dfpn<'a> {
 
     /// PDS-PN level-2 seed: on the first descent into `node` (board at its
     /// position), run a bounded best-first PN search and cache the resulting
-    /// `(pn, dn)` in the TT. The PN tree itself is discarded (PN²-style memory
-    /// discipline — only the node's numbers survive). No-op in df-pn mode or on a
+    /// `(pn, dn)` in the TT. The temporary graph is discarded after exporting
+    /// its expanded estimates and subproof witnesses. No-op in df-pn mode or on a
     /// node already seeded/resolved.
     fn pn_seed(&mut self, node: Node, remaining: Option<u8>) {
         if !self.pds_mode {
@@ -247,13 +245,14 @@ impl<'a> Dfpn<'a> {
         // Every target shares the kernel memos with level 1, so the work meter and
         // the verdict are the same on wasm32 as on native builds.
         self.pn.set_hints(self.hints.clone());
-        let (pn, dn) = self.pn.search_at(&mut self.k, node, remaining);
+        let (pn, dn) = self.pn.search_at(&mut self.k, node, remaining, Some(&mut self.tt));
         self.leaf_solves += 1;
+        // A bounded seed can settle descendants without settling its root. Keep
+        // their witnesses when the temporary tree is discarded so later seeds
+        // and level 1 can reuse these facts without re-solving them.
+        self.pn.collect_proven(&mut self.proven);
         if pn == 0 {
             self.proven.insert(key);
-            // Export the level-2 subtree's proven positions so PV reconstruction
-            // can descend through this frontier (the PN tree is otherwise discarded).
-            self.pn.collect_proven(&mut self.proven);
         }
         // Store with high work so the (expensive) PN result is retained.
         self.tt.store(key, pn, dn, self.pn2_nodes.min(INF as u64) as u32);
@@ -265,8 +264,9 @@ impl<'a> Dfpn<'a> {
     /// closes it as disproved. Both facts are monotone in the remaining-turn
     /// budget, so reuse across horizons is sound. Returns `None` on no hit.
     #[inline]
-    fn hint_val(&mut self, node: Node, remaining: Option<u8>) -> Option<(u32, u32)> {
-        if let Some((_, won, _)) = self.k.exact(node, remaining) {
+    fn hint_val(&mut self, node: Node, remaining: Option<u8>, stamps: bool) -> Option<(u32, u32)> {
+        let exact = if stamps { self.k.exact(node, remaining) } else { self.k.exact_graph(node, remaining) };
+        if let Some((_, won, _)) = exact {
             let key = node_key_at(self.k.hash(), node, remaining);
             let (pn, dn) = if won { self.proven.insert(key); (0, INF) } else { (INF, 0) };
             self.tt.store(key, pn, dn, 1);
@@ -304,7 +304,7 @@ impl<'a> Dfpn<'a> {
         if let Some(v) = self.tt.probe(key) {
             return v;
         }
-        if let Some(v) = self.hint_val(node, remaining) {
+        if let Some(v) = self.hint_val(node, remaining, false) {
             return v;
         }
         let (pn, dn, _terminal) = eval_child_at(&mut self.k, node, remaining);
@@ -313,6 +313,15 @@ impl<'a> Dfpn<'a> {
         }
         self.tt.store(key, pn, dn, 1);
         (pn, dn)
+    }
+
+    fn move_val(&mut self, mv: &CellSet2, attacker: bool, node: Node, remaining: Option<u8>) -> (u32, u32) {
+        let key = node_key_at(self.k.child_hash(mv, attacker), node, remaining);
+        if let Some(value) = self.tt.probe(key) { return value; }
+        if attacker { self.k.place_attacker(mv); } else { self.k.place_defender(mv); }
+        let value = self.child_val(node, remaining);
+        self.k.unplace(mv);
+        value
     }
 
     #[inline]
@@ -351,7 +360,7 @@ impl<'a> Dfpn<'a> {
         // Certificate-derived hint cutoff: a guided probe can close a node at its
         // current horizon without any expansion when the certificate already
         // established the fact (monotone in the remaining-turn budget).
-        if let Some((pn, dn)) = self.hint_val(node, remaining) {
+        if let Some((pn, dn)) = self.hint_val(node, remaining, true) {
             return (pn, dn);
         }
 
@@ -434,9 +443,12 @@ impl<'a> Dfpn<'a> {
             let mut pn = INF;
             let mut dn = 0u32;
             for mv in mvs.iter() {
-                self.k.place_attacker(mv);
-                let (cpn, cdn) = self.child_val(Node::And, child_remaining);
-                self.k.unplace(mv);
+                let (cpn, cdn) = self.move_val(mv, true, Node::And, child_remaining);
+                if cpn == 0 {
+                    self.proven.insert(key);
+                    self.tt.store(key, 0, INF, (self.nodes-entry_nodes).min(INF as u64) as u32);
+                    return (0, INF);
+                }
                 pn = pn.min(cpn);
                 dn = sat_add(dn, cdn);
                 self.kids.push((cpn, cdn));
@@ -519,9 +531,11 @@ impl<'a> Dfpn<'a> {
             let mut second_dn = INF;
             let mut best_child_pn = 0u32;
             for (i, cov) in covers.iter().enumerate() {
-                self.k.place_defender(cov);
-                let (cpn, cdn) = self.child_val(Node::Or { placements: 2 }, remaining);
-                self.k.unplace(cov);
+                let (cpn, cdn) = self.move_val(cov, false, Node::Or { placements: 2 }, remaining);
+                if cdn == 0 {
+                    self.tt.store(key, INF, 0, (self.nodes-entry_nodes).min(INF as u64) as u32);
+                    return (INF, 0);
+                }
                 pn = sat_add(pn, cpn);
                 dn = dn.min(cdn);
                 if cdn < best_dn {

@@ -3,14 +3,16 @@
 //! replacement, and the classic in-memory best-first PN search used as PDS-PN's
 //! level-2 evaluator.
 //!
-//! Proof number `pn` = a lower bound on the leaves that must be proved to prove a
-//! node; disproof number `dn` = the dual. At an OR node `pn = min` over children,
+//! Proof number `pn` estimates the effort to prove a node; disproof number `dn`
+//! is the dual. Shared descendants can be counted by more than one branch.
+//! At an OR node `pn = min` over children,
 //! `dn = sum`; at an AND node they swap. A proved node is `(0, INF)`, a disproved
 //! node `(INF, 0)`, an unexpanded unknown `(1, 1)`.
 
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
 use crate::forcing::{CellSet2, Limits, WinDepthHints};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BinaryHeap;
 use std::rc::Rc;
 
 /// The proof/disproof "infinity". Kept well below `u32::MAX` so saturating sums of
@@ -43,10 +45,10 @@ pub(crate) fn eval_child_at(
     node: Node,
     remaining: Option<u8>,
 ) -> (u32, u32, bool) {
-    if let Some((_, won, _)) = k.exact(node, remaining) {
+    if let Some((_, won, _)) = k.exact_graph(node, remaining) {
         return if won { (0, INF, true) } else { (INF, 0, true) };
     }
-    match node {
+    let estimate = match node {
         // OR children are seeded from `or_estimate`, not full move generation:
         // most are never expanded, and generation dominated the search.
         Node::Or { placements } => match k.or_estimate(placements) {
@@ -62,7 +64,14 @@ pub(crate) fn eval_child_at(
             AndEval::Loss => (INF, 0, true),
             AndEval::Covers(c) => ((c.len() as u32).clamp(1, INF - 1), 1, false),
         },
+    };
+    // A nonterminal candidate gets its stamp lookup when selected for expansion.
+    // Before discarding a forcing dead end, still allow a local strategy to close
+    // it: the stamp model can prove quiet continuations the forcing tree omits.
+    if estimate.1 == 0 && let Some((_, won, _)) = k.exact(node, remaining) {
+        return if won { (0, INF, true) } else { (INF, 0, true) };
     }
+    estimate
 }
 
 #[inline]
@@ -187,6 +196,9 @@ impl ProofTt {
         for w in 0..WAYS {
             let s = self.slots[b + w];
             if !s.occupied || s.key == key {
+                if s.occupied && (s.pn == 0 || s.dn == 0) && pn != 0 && dn != 0 {
+                    return;
+                }
                 self.slots[b + w] = Slot { key, pn, dn, work, occupied: true };
                 self.stored += 1;
                 return;
@@ -250,35 +262,41 @@ impl ProofTt {
 // Classic in-memory best-first PN search (PDS-PN level 2 / PN²-style evaluator).
 // --------------------------------------------------------------------------
 
-/// A node of the in-memory PN tree. Children are lazily generated on first
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PnEdge {
+    child: usize,
+    mv: CellSet2,
+}
+
+/// A node of the in-memory PN graph. Children are lazily generated on first
 /// expansion; terminals carry `(0, INF)` / `(INF, 0)`.
 struct PnNode {
     node: Node,
     /// Remaining attacker turns at this exact node (`None` = unbounded).
     remaining: Option<u8>,
-    /// The move (attacker turn or defender cover) that reaches this node from its
-    /// parent; `None` at the root. Cells are (un)applied on the shared board as we
-    /// walk up/down, so the board always reflects the current node.
-    mv: Option<CellSet2>,
     pn: u32,
     dn: u32,
     expanded: bool,
     /// Indices into the arena; empty until expanded.
-    children: Vec<usize>,
-    parent: usize,
+    children: Vec<PnEdge>,
+    parents: Vec<usize>,
+    depth: usize,
+    pending: bool,
     terminal: bool,
     /// The node's `node_key` (board hash folded with kind/placements), captured
     /// when the board was at this node's position. Lets a proved level-2 subtree
     /// export its proven nodes into the level-1 proven-set for PV reconstruction.
     key: u64,
+    work: u32,
 }
 
-/// A bounded best-first PN search over the shared kernel. Returns refined
-/// `(pn, dn)` estimates for a subposition, capped at `max_nodes` expansions
-/// (PN²-style: the tree is discarded after the call). Used only to seed PDS-PN
-/// level-1 leaf numbers with something better than the `(1, 1)` heuristic.
+/// Bounded best-first PN over a graph of turn-context keys. The temporary graph
+/// is discarded after each call; expanded estimates and settled subproofs enter
+/// level 1's existing bounded table. All parents share a transposed node's work.
 pub(crate) struct PnSearch {
     arena: Vec<PnNode>,
+    index: FxHashMap<u64, usize>,
+    backups: BinaryHeap<(usize, usize)>,
     max_nodes: u64,
     expansions: u64,
     /// Certificate-derived win-depth hints (guided probes only). A hit closes a
@@ -294,6 +312,8 @@ impl PnSearch {
     pub(crate) fn new(max_nodes: u64) -> PnSearch {
         PnSearch {
             arena: Vec::new(),
+            index: FxHashMap::default(),
+            backups: BinaryHeap::new(),
             max_nodes: max_nodes.max(1),
             expansions: 0,
             hints: None,
@@ -325,7 +345,7 @@ impl PnSearch {
     /// Returns `(pn, dn)` of the root when it is (dis)proved or the node cap is
     /// hit. The board is restored to the root position on return.
     pub(crate) fn search(&mut self, k: &mut KernelCtx, root_node: Node) -> (u32, u32) {
-        self.search_at(k, root_node, None)
+        self.search_at(k, root_node, None, None)
     }
 
     /// Horizon-aware PN² search used by depth-bounded PDS-PN.
@@ -334,21 +354,28 @@ impl PnSearch {
         k: &mut KernelCtx,
         root_node: Node,
         remaining: Option<u8>,
+        mut tt: Option<&mut ProofTt>,
     ) -> (u32, u32) {
         self.arena.clear();
+        self.index.clear();
         self.expansions = 0;
         self.arena.push(PnNode {
             node: root_node,
             remaining,
-            mv: None,
             pn: 1,
             dn: 1,
             expanded: false,
             children: Vec::new(),
-            parent: usize::MAX,
+            parents: Vec::new(),
+            depth: 0,
+            pending: false,
             terminal: false,
             key: node_key_at(k.hash(), root_node, remaining),
+            work: 0,
         });
+        self.index.insert(self.arena[0].key, 0);
+        let mut applied: Vec<PnEdge> = Vec::new();
+        let mut selected = Vec::new();
         loop {
             let root = &self.arena[0];
             if root.pn == 0 || root.dn == 0 {
@@ -357,7 +384,9 @@ impl PnSearch {
             if self.expansions >= self.max_nodes || self.limits.charge() || self.limits.expired() {
                 break;
             }
-            // Descend to the most-proving node, applying moves to the board.
+            // Select in the tree first. Consecutive leaves often share a long
+            // prefix; leave those stones and their incremental windows in place.
+            selected.clear();
             let mut cur = 0usize;
             loop {
                 let n = &self.arena[cur];
@@ -369,39 +398,51 @@ impl PnSearch {
                 let mut best = n.children[0];
                 let mut best_val = u32::MAX;
                 for &c in &n.children {
-                    let cc = &self.arena[c];
+                    let cc = &self.arena[c.child];
                     let v = if is_or { cc.pn } else { cc.dn };
                     if v < best_val {
                         best_val = v;
                         best = c;
                     }
                 }
-                cur = best;
-                let mv = self.arena[cur].mv;
-                if let Some(mv) = mv {
-                    // Apply the move that leads into `cur`. Attacker moves into AND
-                    // children, defender covers into OR children.
-                    let parent_is_or = self.arena[self.arena[cur].parent].node.is_or();
-                    if parent_is_or {
-                        k.place_attacker(&mv);
-                    } else {
-                        k.place_defender(&mv);
-                    }
+                cur = best.child;
+                selected.push(best);
+            }
+            let common = applied.iter().zip(&selected).take_while(|(a, b)| a == b).count();
+            for edge in applied[common..].iter().rev() {
+                k.unplace(&edge.mv);
+            }
+            for edge in &selected[common..] {
+                if !self.arena[edge.child].node.is_or() {
+                    k.place_attacker(&edge.mv);
+                } else {
+                    k.place_defender(&edge.mv);
                 }
             }
+            std::mem::swap(&mut applied, &mut selected);
             // Expand `cur`.
-            self.expand(k, cur);
+            self.expand(k, cur, &mut tt);
             self.expansions += 1;
-            // Back up, unwinding the board to the root.
-            self.backup(cur);
-            self.unwind(k, cur);
+            // Back up the proof numbers; restore only the differing board suffix
+            // on the next iteration, including if an ancestor just settled.
+            self.backup(cur, &mut tt);
+        }
+        for edge in applied.iter().rev() {
+            k.unplace(&edge.mv);
+        }
+        if let Some(t) = tt {
+            for n in &self.arena {
+                if n.expanded {
+                    t.store(n.key, n.pn, n.dn, n.work);
+                }
+            }
         }
         let (pn, dn) = (self.arena[0].pn, self.arena[0].dn);
         (pn, dn)
     }
 
-    /// Export every proved (`pn == 0`) node's key from the current tree into
-    /// `out`. Called after a `search` that proved its root, so the level-1 driver's
+    /// Export every proved (`pn == 0`) node's key from the current graph into
+    /// `out`, including when the root remains unresolved. The level-1 driver's
     /// proven-set gains the level-2 subtree's proven positions — which is what lets
     /// PV reconstruction descend through a node that PDS-PN closed via level-2 PN
     /// (whose tree is otherwise discarded). Sound: every such node is a genuine
@@ -420,10 +461,15 @@ impl PnSearch {
     /// `(0, INF)` / `(INF, 0)` at once and internal nodes are seeded from their
     /// branching factor rather than the shapeless `(1, 1)`. This is what makes a
     /// bounded PN search useful within `max_nodes`.
-    fn expand(&mut self, k: &mut KernelCtx, cur: usize) {
+    fn expand(&mut self, k: &mut KernelCtx, cur: usize, tt: &mut Option<&mut ProofTt>) {
         let node = self.arena[cur].node;
         let remaining = self.arena[cur].remaining;
         self.arena[cur].expanded = true;
+        if let Some((pn, dn)) = tt.as_deref_mut().and_then(|t| t.probe(self.arena[cur].key))
+            && (pn == 0 || dn == 0)
+        {
+            return self.set_terminal(cur, pn, dn);
+        }
         if let Some((_, won, _)) = k.exact(node, remaining) {
             return if won { self.set_terminal(cur, 0, INF) } else { self.set_terminal(cur, INF, 0) };
         }
@@ -448,45 +494,62 @@ impl PnSearch {
         };
         let child_remaining = if parent_is_or { after_attacker(remaining) } else { remaining };
         for mv in moves {
-            if parent_is_or {
-                k.place_attacker(&mv);
-            } else {
-                k.place_defender(&mv);
-            }
             // Certificate-derived hint cutoff before the ordinary immediate
             // evaluation: a guided probe closes nodes the certificate already
             // resolved at this horizon without expanding them.
-            let (pn, dn, terminal) = if let (Some(hints), Some(turns)) =
-                (&self.hints, child_remaining)
-            {
-                let (is_or, placements) = child_node.tag();
-                let hash = k.hash();
-                if hints.proves_within(hash, is_or, placements, turns) {
-                    (0, INF, true)
-                } else if hints.disproves_within(hash, is_or, placements, turns) {
-                    (INF, 0, true)
-                } else {
-                    eval_child_at(k, child_node, child_remaining)
-                }
+            let hash = k.child_hash(&mv, parent_is_or);
+            let key = node_key_at(hash, child_node, child_remaining);
+            let idx = if let Some(&idx) = self.index.get(&key) {
+                debug_assert_eq!(self.arena[idx].depth, self.arena[cur].depth+1);
+                idx
             } else {
-                eval_child_at(k, child_node, child_remaining)
+                let mut evaluate = || {
+                    if parent_is_or { k.place_attacker(&mv); } else { k.place_defender(&mv); }
+                    let value = eval_child_at(k, child_node, child_remaining);
+                    k.unplace(&mv);
+                    value
+                };
+                let cached = tt.as_deref_mut().and_then(|t| t.probe(key));
+                let (pn, dn, terminal) = if let Some((pn, dn)) = cached {
+                    (pn, dn, pn == 0 || dn == 0)
+                } else if let (Some(hints), Some(turns)) =
+                    (&self.hints, child_remaining)
+                {
+                    let (is_or, placements) = child_node.tag();
+                    if hints.proves_within(hash, is_or, placements, turns) {
+                        (0, INF, true)
+                    } else if hints.disproves_within(hash, is_or, placements, turns) {
+                        (INF, 0, true)
+                    } else {
+                        evaluate()
+                    }
+                } else {
+                    evaluate()
+                };
+                let idx = self.arena.len();
+                self.arena.push(PnNode {
+                    node: child_node,
+                    remaining: child_remaining,
+                    pn,
+                    dn,
+                    expanded: false,
+                    children: Vec::new(),
+                    parents: Vec::new(),
+                    depth: self.arena[cur].depth+1,
+                    pending: false,
+                    terminal,
+                    key,
+                    work: 0,
+                });
+                self.index.insert(key, idx);
+                idx
             };
-            let key = node_key_at(k.hash(), child_node, child_remaining);
-            k.unplace(&mv);
-            let idx = self.arena.len();
-            self.arena.push(PnNode {
-                node: child_node,
-                remaining: child_remaining,
-                mv: Some(mv),
-                pn,
-                dn,
-                expanded: false,
-                children: Vec::new(),
-                parent: cur,
-                terminal,
-                key,
-            });
-            self.arena[cur].children.push(idx);
+            self.arena[idx].parents.push(cur);
+            self.arena[cur].children.push(PnEdge { child: idx, mv });
+            let (pn, dn) = (self.arena[idx].pn, self.arena[idx].dn);
+            if (parent_is_or && pn == 0) || (!parent_is_or && dn == 0) {
+                break;
+            }
         }
         self.recompute(cur);
     }
@@ -504,14 +567,14 @@ impl PnSearch {
             return;
         }
         let is_or = self.arena[cur].node.is_or();
-        let children = self.arena[cur].children.clone();
+        let children = &self.arena[cur].children;
         if children.is_empty() {
             return;
         }
         let (mut min_pn, mut sum_pn) = (INF, 0u32);
         let (mut min_dn, mut sum_dn) = (INF, 0u32);
-        for &c in &children {
-            let cc = &self.arena[c];
+        for &c in children {
+            let cc = &self.arena[c.child];
             min_pn = min_pn.min(cc.pn);
             sum_pn = sat_add(sum_pn, cc.pn);
             min_dn = min_dn.min(cc.dn);
@@ -527,26 +590,75 @@ impl PnSearch {
         }
     }
 
-    /// Propagate updated numbers from `cur` up to the root.
-    fn backup(&mut self, mut cur: usize) {
-        loop {
+    /// Every transposed parent sees a changed child. Stones only accumulate, so
+    /// decreasing depth visits a parent after all affected children, once.
+    fn backup(&mut self, start: usize, tt: &mut Option<&mut ProofTt>) {
+        self.backups.clear();
+        self.backups.push((self.arena[start].depth, start));
+        self.arena[start].pending = true;
+        while let Some((_, cur)) = self.backups.pop() {
+            self.arena[cur].pending = false;
+            let before = (self.arena[cur].pn, self.arena[cur].dn);
             self.recompute(cur);
-            let p = self.arena[cur].parent;
-            if p == usize::MAX {
-                break;
+            self.arena[cur].work = self.arena[cur].work.saturating_add(1);
+            let n = &self.arena[cur];
+            if (n.pn == 0 || n.dn == 0) && let Some(t) = tt.as_deref_mut() {
+                t.store(n.key, n.pn, n.dn, n.work);
             }
-            cur = p;
+            if cur != start && before == (n.pn, n.dn) { continue; }
+            for i in 0..self.arena[cur].parents.len() {
+                let p = self.arena[cur].parents[i];
+                if !self.arena[p].pending {
+                    self.arena[p].pending = true;
+                    self.backups.push((self.arena[p].depth, p));
+                }
+            }
         }
     }
 
-    /// Undo the board moves applied while descending to `cur`, back to the root.
-    fn unwind(&mut self, k: &mut KernelCtx, mut cur: usize) {
-        while self.arena[cur].parent != usize::MAX {
-            let mv = self.arena[cur].mv;
-            if let Some(mv) = mv {
-                k.unplace(&mv);
-            }
-            cur = self.arena[cur].parent;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexo_engine::types::Player;
+
+    #[test]
+    fn shared_search_restores_the_board_after_budget_cuts() {
+        let history = [(0,0),(0,8),(2,8),(1,0),(2,0),(4,8),(6,8)];
+        let stones: Vec<_> = history.into_iter().enumerate().map(|(i, p)|
+            (p, if (i+1)/2%2 == 0 { Player::P1 } else { Player::P2 })).collect();
+        let mut k = KernelCtx::new_wide(&stones, Player::P1, 6, 8, true).unwrap();
+        let original = k.canonical_stones();
+        let hash = k.hash();
+        let mv = CellSet2::two((8,8), (9,8));
+        for attacker in [false, true] {
+            let expected = k.child_hash(&mv, attacker);
+            if attacker { k.place_attacker(&mv); } else { k.place_defender(&mv); }
+            assert_eq!(k.hash(), expected);
+            k.unplace(&mv);
+            assert_eq!(k.hash(), hash);
+        }
+        let mut shared = false;
+        for limit in [1, 7, 64, 256, 1000] {
+            let mut search = PnSearch::new(limit);
+            let mut table = ProofTt::new(1);
+            search.search_at(&mut k, Node::Or { placements: 2 }, None, Some(&mut table));
+            assert_eq!(k.canonical_stones(), original, "budget {limit}");
+            assert_eq!(k.hash(), hash);
+            assert!(search.expansions() <= limit);
+            shared |= search.arena.iter().any(|n| n.parents.len() > 1);
+        }
+        assert!(shared, "real turn transpositions are shared");
+    }
+
+    #[test]
+    fn stale_estimates_cannot_erase_settled_table_entries() {
+        let mut table = ProofTt::new(1);
+        for (key, pn, dn) in [(7, 0, INF), (11, INF, 0)] {
+            table.store(key, pn, dn, 1);
+            table.store(key, 1, 1, u32::MAX);
+            assert_eq!(table.peek(key), Some((pn, dn)));
         }
     }
 }
