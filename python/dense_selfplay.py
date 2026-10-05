@@ -185,9 +185,7 @@ class Evaluator(hexnet.DenseEvaluator):
                 chunk = indices[start:start+step]
                 x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
-                out = self.predict(x)
-                packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
-                chunks.append((size, chunk, result[start:start+len(chunk)].copy_(packed, non_blocking=True)))
+                chunks.append((size, chunk, self.copy_predictions(x, result[start:start+len(chunk)])))
         # A blocking-sync event parks collect() in the driver instead of spinning a core while the GPU works.
         event = torch.cuda.Event(blocking=True) if self.cuda else None
         if event:

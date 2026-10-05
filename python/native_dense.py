@@ -201,9 +201,7 @@ def submit(evaluator, rows, max_cells=48*48*48):
                 size = min(step, count-start)
                 x = host[start:start+size].to(evaluator.device, non_blocking=True)
                 x = x.to(memory_format=evaluator.memory_format, dtype=torch.bfloat16 if evaluator.cuda else torch.float32)
-                out = evaluator.predict(x)
-                packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
-                target = result[start:start+size].copy_(packed, non_blocking=True)
+                target = evaluator.copy_predictions(x, result[start:start+size])
                 handle.chunks.append((index, start, target))
             if index in handle.observations:
                 handle.observations[index][3].record()

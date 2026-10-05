@@ -927,7 +927,9 @@ class FusedCudaTests(unittest.TestCase):
         torch.manual_seed(3070)
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model, max_batch=128)
+        self.addCleanup(runner.close)
         inputs, outputs, saved = [], [], []
+        downloads, download_snapshots = [], []
         for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
                            (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
             x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
@@ -940,6 +942,14 @@ class FusedCudaTests(unittest.TestCase):
             inputs.append(x)
             outputs.append(out)
             saved.append({name: value.clone() for name, value in out.items()})
+            destination = torch.empty((rows, side*side+2), dtype=torch.float32, pin_memory=True)
+            runner.copy_to(x, destination)
+            torch.cuda.current_stream().synchronize()
+            for name, got in (('policy', destination[:, :-2]), ('far', destination[:, -2]),
+                              ('value_logit', destination[:, -1])):
+                self.assert_bf16_close(expected[name].cpu(), got)
+            downloads.append(destination)
+            download_snapshots.append(destination.clone())
         self.assertIn((24, 128), runner.graphs)
         self.assertIn((32, 64), runner.graphs)
         self.assertIn((40, 64), runner.graphs)
@@ -950,6 +960,48 @@ class FusedCudaTests(unittest.TestCase):
         for out, snapshot in zip(outputs, saved):
             for name in out:
                 torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
+        for destination, snapshot in zip(downloads, download_snapshots):
+            torch.testing.assert_close(destination, snapshot, rtol=0, atol=0)
+        # Both in-flight pinned destinations survive a later graph replay.
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            x = inputs[0]
+            first = torch.empty((len(x), 24*24+2), dtype=torch.float32, pin_memory=True)
+            second = torch.empty_like(first, pin_memory=True)
+            runner.copy_to(x, first)
+            runner.copy_to(inputs[2], second[:1])
+            done = torch.cuda.Event(blocking=True)
+            done.record()
+        done.synchronize()
+        torch.testing.assert_close(first[:, :-2], saved[0]['policy'].cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(second[0, :-2], saved[2]['policy'][0].cpu(), rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, 'pinned contiguous'):
+            runner.copy_to(x, first[:, :-1])
+        # The same caller contract applies when the memory allowance selects eager inference.
+        fallback = ActorGraph(model, max_incremental_bytes=0)
+        self.addCleanup(fallback.close)
+        fallback.copy_to(inputs[0], first)
+        torch.cuda.current_stream().synchronize()
+        self.assert_bf16_close(saved[0]['policy'].cpu(), first[:, :-2])
+        fallback.close()
+        # A later segment can fail after an earlier download was queued.
+        partial = ActorGraph(model, max_batch=32)
+        self.addCleanup(partial.close)
+        x = inputs[5]  # 33 rows, split into 32 and 1.
+        destination = torch.empty((len(x), 24*24+2), dtype=torch.float32, pin_memory=True)
+        partial.copy_to(x[:32], destination[:32])
+        capture = partial._capture
+        def fail_tail(side, capacity):
+            if capacity == 1:
+                raise RuntimeError('tail launch failed')
+            return capture(side, capacity)
+        with torch.cuda.stream(stream), unittest.mock.patch.object(partial, '_capture', side_effect=fail_tail):
+            with self.assertRaisesRegex(RuntimeError, 'tail launch failed'):
+                partial.copy_to(x, destination)
+            done.record()
+        done.synchronize()
+        self.assert_bf16_close(saved[5]['policy'][:32].cpu(), destination[:32, :-2])
+        partial.close()
         runner.close()
         reserved = torch.cuda.memory_reserved()
         for _ in range(4):
@@ -4883,6 +4935,7 @@ class EngineTests(unittest.TestCase):
                 evaluator = SimpleNamespace(cuda=True, free=[], graph=None, max_batch=8,
                                             device=torch.device('cpu'), memory_format=torch.contiguous_format,
                                             predict=unittest.mock.Mock(side_effect=predict))
+                evaluator.copy_predictions = hexnet.DenseEvaluator.copy_predictions.__get__(evaluator)
                 try:
                     checked(native.hxg_begin(tree.ptr, 2, 2))
                     feed.begin(tree)

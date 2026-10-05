@@ -558,6 +558,14 @@ class DenseEvaluator:
         with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):
             return self.graph(planes) if self.graph is not None else self.model(planes, planes[:, 3:4], aux=False)
 
+    def copy_predictions(self, planes, target):
+        """Queue packed rows into owned staging; CUDA callers fence before reading."""
+        if self.cuda and self.graph is not None:
+            return self.graph.copy_to(planes, target)
+        out = self.predict(planes)
+        packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
+        return target.copy_(packed, non_blocking=True)
+
     @torch.inference_mode()
     def evaluate_leaves(self, leaves):
         from neural_search import native
@@ -574,8 +582,11 @@ class DenseEvaluator:
                 np.stack([samples[i].planes for i in chunk], out=host.numpy())
                 x = host.to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
-                out = self.predict(x)
-                packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1).cpu().numpy()
+                output = staging_buffer(self.staging, ('out', size), len(chunk), (size*size+2,), torch.float32, self.cuda)
+                self.copy_predictions(x, output)
+                if self.cuda:
+                    torch.cuda.current_stream(self.device).synchronize()
+                packed = output.numpy()
                 if not np.isfinite(packed).all():
                     raise FloatingPointError('Nonfinite dense model predictions')
                 for row, i in zip(packed, chunk):

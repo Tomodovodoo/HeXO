@@ -106,6 +106,39 @@ class ActorGraph:
     @torch.inference_mode()
     def __call__(self, planes):
         """Return caller-owned aux=False outputs for resident BF16 [B,8,S,S]."""
+        packed = self.packed(planes)
+        return {'policy': packed[:, :-2], 'far': packed[:, -2],
+                'value_logit': packed[:, -1]}
+
+    @torch.inference_mode()
+    def packed(self, planes):
+        """Caller-owned float32 policy, far-policy and value-logit rows."""
+        return self._forward(planes)
+
+    @torch.inference_mode()
+    def copy_to(self, planes, target):
+        """Queue packed predictions into caller-owned pinned CPU rows.
+
+        The caller retains target until a completion fence on its CUDA stream.
+        Downloads precede the next replay on the serialized graph stream.
+        """
+        b, _, side, _ = planes.shape
+        if (target.device.type != 'cpu' or target.dtype != torch.float32
+                or target.shape != (b, side*side+2) or not target.is_contiguous()
+                or not target.is_pinned()):
+            raise ValueError('expected pinned contiguous CPU float32 prediction rows')
+        try:
+            self._forward(planes, target)
+        except BaseException:
+            # Earlier segments may already be downloading when a later launch
+            # fails. The caller's failure fence must cover those downloads too.
+            caller = torch.cuda.current_stream(self.device)
+            if caller.cuda_stream != self.stream.cuda_stream:
+                caller.wait_stream(self.stream)
+            raise
+        return target
+
+    def _forward(self, planes, target=None):
         b, channels, side, width = planes.shape
         if (channels != 8 or side != width or b < 1 or planes.device != self.device
                 or planes.dtype != torch.bfloat16):
@@ -119,6 +152,8 @@ class ActorGraph:
                 planes.record_stream(self.stream)
             if side not in self.CANVASES:
                 packed = self._fallback(planes)
+                if target is not None:
+                    target.copy_(packed, non_blocking=True)
             else:
                 limit = self._limit(side, self.max_batch)
                 pieces = []
@@ -135,7 +170,11 @@ class ActorGraph:
                             warnings.warn('CUDA graph memory limit reached; new shapes use eager inference',
                                           RuntimeWarning, stacklevel=2)
                     if record is None:
-                        pieces.append(self._fallback(part))
+                        output = self._fallback(part)
+                        if target is None:
+                            pieces.append(output)
+                        else:
+                            target[start:start+rows].copy_(output, non_blocking=True)
                         start += rows
                         continue
                     graph, template, static_input, static_packed = record
@@ -145,16 +184,20 @@ class ActorGraph:
                         static_input.copy_(template)
                         static_input[:rows].copy_(part)
                     graph.replay()
-                    # The clone is queued on the same stream before any graph
-                    # can replay. Callers never observe reusable graph storage.
-                    pieces.append(static_packed[:rows].clone())
+                    # Copy before the next replay on this stream. Tensor callers
+                    # own a clone; pinned targets own their queued download.
+                    if target is None:
+                        pieces.append(static_packed[:rows].clone())
+                    else:
+                        target[start:start+rows].copy_(static_packed[:rows], non_blocking=True)
                     start += rows
-                packed = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+                if target is None:
+                    packed = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
             if not same_stream:
                 caller_stream.wait_stream(self.stream)
-                packed.record_stream(caller_stream)
-        return {'policy': packed[:, :-2], 'far': packed[:, -2],
-                'value_logit': packed[:, -1]}
+                if target is None:
+                    packed.record_stream(caller_stream)
+        return packed if target is None else target
 
     def _fallback(self, planes):
         side = planes.shape[-1]
