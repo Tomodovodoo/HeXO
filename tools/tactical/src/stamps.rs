@@ -2,7 +2,8 @@
 //! attack's windows and every played cell. Guards cover all six-cell windows a
 //! future defender stone can affect; a global check covers the remaining ones.
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::rc::{Rc,Weak};
 use hexo_engine::types::{Coord, Player};
 use hexo_solver::prover::Ctl;
@@ -70,7 +71,8 @@ fn compact_root(cert:&ProofCertificate,root:u32,ctl:&Ctl)->Result<ProofCertifica
             match &mut node {
                 ProofNode::AttackerMove{child,alternatives,..}=>{alternatives.clear();*child=self.visit(*child)?;},
                 ProofNode::DefenderReplies{responses}=>for reply in responses {reply.child=self.visit(reply.child)?;},
-                ProofNode::ImmediateWin{..}|ProofNode::Unstoppable{..}|ProofNode::Stamp{..}=>{},
+                ProofNode::ImmediateWin{..}|ProofNode::Unstoppable{..}=>{},
+                ProofNode::Stamp{source}=>**source=remember((**source).clone(),self.ctl)?.source.clone(),
                 ProofNode::StampLink{source}=>*source=self.visit(*source)?,
                 _=>return Err("stamp source is not independent".into()),
             }
@@ -508,6 +510,23 @@ pub fn verify(source:&StampSource,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Result<u
     }
     Ok(stamp.turns)
 }
+/// Return the strategy checked on this board, including shortening discovered
+/// while compiling the source. The old source's PV can now contain occupied cells.
+pub fn resolved(source:&StampSource,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Result<ProofCertificate,String> {
+    let stamp=remember(source.clone(),ctl)?;
+    let (mover,remaining)=check::phase(n);
+    if stamp.source.winner!=winner || (stamp.source.player,stamp.source.remaining)!=(mover,remaining) {
+        return Err("stamp winner/tempo mismatch".into());
+    }
+    let stones:Vec<_>=b.iter().map(|(&p,&s)|(p,player(s))).collect();
+    if stamp.matches(&|p|b.get(&p).copied().map(player),&stones,player(mover),remaining) {
+        Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Stamp{source:Box::new(stamp.source.clone())}]})
+    } else {
+        let strategy=materialize(&stamp.source.certificate,b,n,winner,ctl)?;
+        check::verify_board(b,n,winner,&strategy,ctl,50000)?;
+        Ok(strategy)
+    }
+}
 pub fn moves(source:&StampSource,b:&Board,n:usize)->Result<Vec<Coord>,String> {
     if check::phase(n).0!=source.winner {return Ok(vec![]);}
     let action=match &source.certificate.nodes[source.certificate.root as usize] {
@@ -533,6 +552,12 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
     if lines.len()>256 || lines.iter().any(|l|l.history.len()>800 || l.winner>1)
         || lines.iter().map(|l|l.history.len()+l.pv.len()).sum::<usize>()>50000 {return Err("replay input limit".into());}
     let (mover,remaining)=check::phase(n);
+    if mover==winner {
+        if let Some(action)=check::completions(board,winner,remaining,ctl)?.into_iter().min_by_key(|a|a.len()) {
+            if let Some(meter)=&ctl.meter {meter.add(1);}
+            return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::ImmediateWin{action}]});
+        }
+    }
     let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
     if let Some(stamp)=LIBRARY.with(|l|l.borrow().iter().find(|s|s.source.winner==winner &&
         s.matches(&|p|board.get(&p).copied().map(player),&stones,player(mover),remaining)).cloned()) {
@@ -541,15 +566,13 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
     }
     // A saved, self-contained stamp can be checked directly after a reload.
     // Conditional exact leaves are deliberately left for move-guided replay.
-    let own:Vec<_>=board.iter().filter(|&(_,s)|*s==winner).map(|(&p,_)|p).collect();
     for line in lines.iter().filter(|l|l.winner==winner && check::phase(l.history.len())==(mover,remaining)) {
-        let mut prior:Vec<_>=line.history.iter().enumerate().filter(|&(i,_)|check::phase(i).0==winner).map(|(_,p)|*p).collect();prior.sort();
-        if prior!=own {continue;}
         if let Some(cert)=&line.certificate {
             if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {
-                if verify(source,board,n,winner,ctl).is_ok() {
+                if source.stones.iter().any(|&(p,s)|s==winner && board.get(&p)!=Some(&winner)) {continue;}
+                if let Ok(strategy)=resolved(source,board,n,winner,ctl) {
                     if let Some(meter)=&ctl.meter {meter.add(1);}
-                    return Ok(ProofCertificate{version:1,width:"wide".into(),root:0,nodes:vec![ProofNode::Stamp{source:source.clone()}]});
+                    return Ok(strategy);
                 }
             }
         }
@@ -564,25 +587,50 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
         let item=(action,enemy);let list=hints.entry((own,remaining)).or_default();
         if !list.contains(&item) {list.push(item);}
     }
-    fn scan(hints:&mut Hints,cert:&ProofCertificate,id:u32,b:&Board,n:usize,winner:u8,ctl:&Ctl,left:&mut usize,depth:usize)->Result<(),String> {
+    fn scan(hints:&mut Hints,cert:&ProofCertificate,id:u32,b:&Board,n:usize,winner:u8,ctl:&Ctl,left:&mut usize,seen:&mut HashSet<u64>,depth:usize)->Result<(),String> {
         control(ctl)?;
-        if *left==0 || depth>=100 {return Err("replay evidence work limit".into());}*left-=1;
+        // Hints are suggestions. An oversized source may exhaust its scan,
+        // without discarding usable evidence already read or later saved PVs.
+        if *left==0 || depth>=100 {return Ok(());}
+        // A shared proof node has the same attacks after the same friendly
+        // stones. Different defensive paths need not re-index that suffix.
+        // Hash collisions can only omit a hint, never establish an outcome.
+        use std::hash::{Hash,Hasher};
+        let own:Vec<_>=b.iter().filter(|&(_,s)|*s==winner).map(|(&p,_)|p).collect();
+        let mut hash=std::collections::hash_map::DefaultHasher::new();
+        (cert as *const ProofCertificate as usize,id,own,check::phase(n)).hash(&mut hash);
+        if !seen.insert(hash.finish()) {return Ok(());}*left-=1;
         let node=cert.nodes.get(id as usize).ok_or("invalid replay edge")?;
         match node {
             ProofNode::ImmediateWin{action}|ProofNode::AttackerMove{action,..}=>{
                 hint(hints,b,n,winner,action.clone());
-                if let ProofNode::AttackerMove{child,..}=node {
-                    if let Ok((post,ply,false))=check::apply(b,n,action) {scan(hints,cert,*child,&post,ply,winner,ctl,left,depth+1)?;}
+                if let ProofNode::AttackerMove{child,alternatives,..}=node {
+                    if let Ok((post,ply,false))=check::apply(b,n,action) {scan(hints,cert,*child,&post,ply,winner,ctl,left,seen,depth+1)?;}
+                    for reply in alternatives {
+                        control(ctl)?;
+                        hint(hints,b,n,winner,reply.action.clone());
+                        if let Ok((post,ply,false))=check::apply(b,n,&reply.action) {scan(hints,cert,reply.child,&post,ply,winner,ctl,left,seen,depth+1)?;}
+                    }
                 }
             },
-            ProofNode::DefenderReplies{responses}|ProofNode::ZoneReplies{responses,..}=>for reply in responses {
-                let mut post=b.clone();let mover=check::phase(n).0;
-                if reply.action.iter().any(|p|!check::legal(&post,*p)) {continue;}
-                for &p in &reply.action {post.insert(p,mover);}
-                scan(hints,cert,reply.child,&post,n+reply.action.len(),winner,ctl,left,depth+1)?;
+            ProofNode::DefenderReplies{responses}|ProofNode::ZoneReplies{responses,..}=>{
+                if let ProofNode::ZoneReplies{fallback,..}=node {
+                    scan(hints,cert,*fallback,b,ply(winner,2),winner,ctl,left,seen,depth+1)?;
+                }
+                for reply in responses {
+                    control(ctl)?;
+                    let mut post=b.clone();let mover=check::phase(n).0;
+                    if reply.action.iter().any(|p|!check::legal(&post,*p)) {continue;}
+                    for &p in &reply.action {post.insert(p,mover);}
+                    scan(hints,cert,reply.child,&post,n+reply.action.len(),winner,ctl,left,seen,depth+1)?;
+                }
             },
-            ProofNode::Stamp{source}=>scan(hints,&source.certificate,source.certificate.root,b,n,winner,ctl,left,depth+1)?,
-            ProofNode::StampLink{source}=>scan(hints,cert,*source,b,n,winner,ctl,left,depth+1)?,
+            ProofNode::Stamp{source}=>{
+                scan(hints,&source.certificate,source.certificate.root,b,n,winner,ctl,left,seen,depth+1)?;
+                let local=source.stones.iter().copied().collect();
+                scan(hints,&source.certificate,source.certificate.root,&local,ply(source.player,source.remaining),winner,ctl,left,seen,depth+1)?;
+            },
+            ProofNode::StampLink{source}=>scan(hints,cert,*source,b,n,winner,ctl,left,seen,depth+1)?,
             _=>{},
         }
         Ok(())
@@ -590,13 +638,15 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
     let _time=measure("replay");
     let mut hints:BTreeMap<HintKey,Vec<(Vec<Coord>,BTreeSet<Coord>)>>=BTreeMap::new();
     let mut input_left=200000;
+    let mut seen=HashSet::new();
     let input_time=measure("replay input");
     for line in lines {
         control(ctl)?;
         if line.winner!=winner {continue;}
         let mut b=check::replay_controlled(&line.history,ctl)?;
-        if let Some(cert)=&line.certificate {scan(&mut hints,cert,cert.root,&b,line.history.len(),winner,ctl,&mut input_left,0)?;}
+        if let Some(cert)=&line.certificate {scan(&mut hints,cert,cert.root,&b,line.history.len(),winner,ctl,&mut input_left,&mut seen,0)?;}
         for (i,&(q,r,s,ply)) in line.pv.iter().enumerate() {
+            control(ctl)?;
             let at=line.history.len()+i;let (mover,remaining)=check::phase(at);
             if ply!=i as u32+1 || s!=mover || !check::legal(&b,(q,r)) {break;}
             if mover==winner && i+remaining as usize<=line.pv.len() {
@@ -635,17 +685,37 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
                 if mover!=self.winner {self.memo.insert(key,None);return Ok(None);}
                 ProofNode::ImmediateWin{action}
             } else if mover==self.winner {
-                let own=b.iter().filter(|&(_,s)|*s==mover).map(|(&p,_)|p).collect();
+                let own:BTreeSet<_>=b.iter().filter(|&(_,s)|*s==mover).map(|(&p,_)|p).collect();
                 let enemy:BTreeSet<_>=b.iter().filter(|&(_,s)|*s!=mover).map(|(&p,_)|p).collect();
-                let mut candidates=self.hints.get(&(own,remaining)).cloned().unwrap_or_default();
-                candidates.sort_by_key(|(_,prior)|prior.symmetric_difference(&enemy).count());
+                let hints=self.hints;let mut contexts=vec![];
+                let direct=(own.iter().copied().collect(),remaining);
+                if let Some(actions)=hints.get(&direct) {contexts.push(actions);}
+                else {
+                    // Only the most specific saved supports apply. Exact
+                    // contexts use the index, without scanning other turns.
+                    let mut most=0;
+                    for ((support,left),actions) in hints {
+                        control(self.ctl)?;
+                        if *left!=remaining || support.len()<most || !support.iter().all(|p|own.contains(p)) {continue;}
+                        if support.len()>most {most=support.len();contexts.clear();}
+                        contexts.push(actions);
+                    }
+                }
+                // Order candidates without cloning every action or doing a
+                // large, non-cancellable sort. The ordinal preserves ties.
+                let mut candidates=BinaryHeap::new();
+                for actions in contexts {for (action,prior) in actions {
+                    control(self.ctl)?;
+                    candidates.push(Reverse((prior.symmetric_difference(&enemy).count(),candidates.len(),action)));
+                }}
                 let mut tried=BTreeSet::new();let mut found=None;
-                for (action,_) in candidates {
+                while let Some(Reverse((_,_,action)))=candidates.pop() {
+                    control(self.ctl)?;
                     if !tried.insert(action.clone()) {continue;}
-                    let Ok((post,ply,terminal))=check::apply(b,n,&action) else {continue;};
-                    if terminal {found=Some(ProofNode::ImmediateWin{action});break;}
+                    let Ok((post,ply,terminal))=check::apply(b,n,action) else {continue;};
+                    if terminal {found=Some(ProofNode::ImmediateWin{action:action.clone()});break;}
                     if let Some(child)=self.walk(&post,ply,depth+1)? {
-                        found=Some(ProofNode::AttackerMove{action,child,alternatives:vec![]});break;
+                        found=Some(ProofNode::AttackerMove{action:action.clone(),child,alternatives:vec![]});break;
                     }
                 }
                 let Some(found)=found else {self.memo.insert(key,None);return Ok(None);};found

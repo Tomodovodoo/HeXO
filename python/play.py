@@ -751,6 +751,27 @@ def proof_plies(proof, history):
         game.close()
 
 
+def proof_line_length(history, winner, pv, offset=0):
+    """Length of a drawn line ending in six; an incomplete line cannot win a distance tie."""
+    if not pv or any(len(p) != 4 for p in pv):
+        return math.inf
+    own = {(q, r) for i, (q, r) in enumerate(history) if player_at(i) == winner}
+    own.update((q, r) for q, r, side, _ in pv if side == winner)
+    q, r, side, ply = pv[-1]
+    if side != winner:
+        return math.inf
+    for dq, dr in ((1, 0), (0, 1), (1, -1)):
+        count = 1
+        for sign in (-1, 1):
+            for i in range(1, 6):
+                if (q + sign*i*dq, r + sign*i*dr) not in own:
+                    break
+                count += 1
+        if count >= 6:
+            return ply - offset
+    return math.inf
+
+
 class Proofs:
     """The proven positions of a game, keyed by `proof_key`: {winner, plies, pv}, where the winner completes six
     within `plies` placements against any defence and `pv` ([q, r, player, ply], ply from 1) is the known line from
@@ -790,10 +811,11 @@ class Proofs:
         key = proof_key(history)
         old = self.entries.get(key)
         witnessed = lambda line: len(line) if all(len(stone) == 4 for stone in line) else 0
-        if old is None or old['winner'] == winner and (plies, -witnessed(pv)) < (old['plies'], -witnessed(old['pv'])):
+        length = proof_line_length(history, winner, pv)
+        if old is None or old['winner'] == winner and (plies, length, -witnessed(pv)) < (old['plies'], old['length'], -witnessed(old['pv'])):
             self.known_cache.clear()
             stones = frozenset((q, r, player_at(i)) for i, (q, r) in enumerate(history))
-            self.entries[key] = dict(history=[list(p) for p in history], winner=int(winner), plies=int(plies), pv=pv, stones=stones)
+            self.entries[key] = dict(history=[list(p) for p in history], winner=int(winner), plies=int(plies), pv=pv, stones=stones, length=length)
             self.sizes.setdefault(len(history), set()).add(key)
 
     def line(self, history, outcome):
@@ -803,9 +825,17 @@ class Proofs:
         current, pv, i = list(history), outcome.get('pv') or [], 0
         with self.lock:
             while i <= len(pv):
+                length = proof_line_length(current, outcome['winner'], pv[i:], i)
+                ready = self.known_cache.get(proof_key(current)) if i else None
+                if (ready is not None and ready['winner'] == outcome['winner'] and ready['plies'] + i <= outcome['plies']
+                        and math.isfinite(proof_line_length(current, ready['winner'], ready['pv']))
+                        and (ready['plies'] + i < outcome['plies'] or proof_line_length(current, ready['winner'], ready['pv']) <= length)):
+                    return pv[:i] + [[*p[:3], p[3]+i] for p in ready['pv']]
                 entry = self.choice(current)
+                replacement = proof_line_length(current, entry['winner'], entry['pv']) if entry is not None else math.inf
                 if (entry is not None and entry['winner'] == outcome['winner'] and entry['plies'] + i <= outcome['plies']
-                        and (entry['plies'] + i < outcome['plies'] or len(entry['pv']) > len(pv) - i)
+                        and (entry['plies'] + i < outcome['plies'] or replacement < length
+                             or replacement == length and len(entry['pv']) > len(pv) - i)
                         and all(len(p) == 4 for p in entry['pv'])):
                     pv = pv[:i] + [[*p[:3], p[3] + i] for p in entry['pv']]
                 if player_at(len(current)) != outcome['winner']:
@@ -867,7 +897,7 @@ class Proofs:
                     if len(missing) != 1 or len(replaced) != 1:
                         continue
                     first, prior = next(iter(missing)), next(iter(replaced))
-                    if first[2] != mover or prior != (*map(int, history[-1]), mover):
+                    if first[2] != mover or prior[2] != mover:
                         continue
                     outcome = dict(winner=entry['winner'], plies=entry['plies'] - 1, pv=[])
                     found[first[:2]] = (entry['winner'], entry['plies'], outcome)
@@ -897,8 +927,9 @@ class Proofs:
         with self.lock:
             entry = self.entries.get(proof_key(history))
             if entry is None and len(history) > 1 and len(history) % 2 == 1:
-                # Either order of the just-completed losing turn has the same
-                # outcome. A scalar win does not supply the next winning move.
+                # A losing half-turn covers adding any legal stone of its mover,
+                # even when that stone was earlier in this reordered history.
+                # A scalar win does not supply the next winning move.
                 base = frozenset((int(q), int(r), player_at(i)) for i, (q, r) in enumerate(history))
                 mover = player_at(len(history))
                 candidates = []
@@ -907,7 +938,7 @@ class Proofs:
                     if loss['winner'] != mover or loss['plies'] < 2 or not loss['stones'] < base:
                         continue
                     missing = next(iter(base - loss['stones']))
-                    if missing not in {(*map(int, p), 1-mover) for p in history[-2:]}:
+                    if missing[2] != 1-mover:
                         continue
                     candidates.append(dict(winner=mover, plies=loss['plies'] - 1, pv=[]))
                 if candidates:
@@ -915,16 +946,23 @@ class Proofs:
         mover = player_at(len(history))
         if entry is not None and entry['winner'] != mover:
             return entry
-        wins = sorted((d, a, o) for a, (w, d, o) in self.edges(history).items() if w == mover)
-        if not wins or entry is not None and (entry['plies'] < wins[0][0] or entry['plies'] == wins[0][0] and entry['pv']):
+        wins = []
+        for action, (winner, _, child) in self.edges(history).items():
+            if winner != mover:
+                continue
+            child = self.known(list(history) + [action]) or child
+            pv = [[*action, mover, 1]] + [[*p[:3], p[3]+1] for p in child['pv']]
+            wins.append((child['plies']+1, proof_line_length(history, mover, pv), action, pv))
+        wins.sort()
+        if not wins or entry is not None and (entry['plies'] < wins[0][0] or entry['plies'] == wins[0][0]
+                                              and entry['pv'] and proof_line_length(history, mover, entry['pv']) <= wins[0][1]):
             return entry
-        distance, action, outcome = wins[0]
-        return dict(winner=mover, plies=distance,
-                    pv=[[*action, mover, 1]] + [[*p[:3], p[3] + 1] for p in outcome['pv']])
+        distance, _, _, pv = wins[0]
+        return dict(winner=mover, plies=distance, pv=pv)
 
     def known(self, history):
         """The best known guarantee and its updated continuation, or None when nothing is proven."""
-        at = tuple(tuple(p) for p in history)
+        at = proof_key(history)
         with self.lock:
             if at in self.known_cache:
                 return self.known_cache[at]
@@ -2058,10 +2096,11 @@ class Session:
                                                         plies=proof_plies(shown['proof'], history), pv=shown.get('pv') or []))
         lost = shown.get('proof') and shown['proof']['winner'] != mover
         remaining = 2 if len(history) % 2 else 1
-        defence = [p[:2] for i, p in enumerate((shown.get('pv') or [])[:remaining])
-                   if len(p) == 4 and p[2] == mover and p[3] == i + 1] if lost else []
-        if len(defence) == remaining:
-            shown['moves'] = defence
+        turn = [p[:2] for i, p in enumerate((shown.get('pv') or [])[:remaining])
+                if len(p) == 4 and p[2] == mover and p[3] == i + 1] if shown.get('proof') else []
+        if len(turn) == remaining:
+            shown['moves'] = turn
+        defence = turn if lost else []
         rows = [list(row) for row in shown.get('top') or []]
         for action, (winner, distance, _) in edges.items():
             row = next((row for row in rows if tuple(row[:2]) == action), None)
