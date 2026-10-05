@@ -170,6 +170,25 @@ int main(){
   gumbel::Path p;p.leaf=c.get();p.edges={{r.get(),0},{a.get(),0}};for(auto [n,i]:p.edges)++n->edges[i].pending;t.backup(p,1);
   // b's only edge leads to the proven win for player 0, so b is proven lost like a.
   assert(c->q==1 && a->q==-1 && b->q==-1 && b->exact_winner==0 && b->edges[0].exact_winner==0 && b->edges[0].distance==2);}
+ // A rarely selected legal edge keeps its weight after eviction, restarts when
+ // its retained summary is absent, and receives proofs after reattachment.
+ {gumbel::Tree t(3);t.graph=true;t.board.make({0,0});auto p=t.root;p->player=t.board.player;p->expanded=true;p->value=.25;
+  auto legal=t.board.legal_moves();for(auto action:legal){gumbel::Edge e;e.action=action;e.prior=1./legal.size();p->edges.push_back(std::move(e));}
+  auto child=std::make_shared<gumbel::Node>(p->memory);child->player=p->player;child->n=3;child->q=.5;
+  auto& edge=p->edges.back();t.attach(*p,edge,child);edge.visits=2;edge.sum=1;t.refresh(*p);
+  assert(std::abs(p->q-1.25/3)<1e-12 && p->edges.size()==legal.size());
+  edge.child.reset();t.refresh(*p);assert(std::abs(p->q-1.25/3)<1e-12);
+  child=std::make_shared<gumbel::Node>(p->memory);child->player=p->player;t.attach(*p,edge,child);t.refresh(*p);
+  assert(edge.visits==0 && edge.sum==0 && p->q==.25);
+  gumbel::Path path;path.leaf=child.get();path.edges={{p.get(),int(p->edges.size()-1)}};edge.pending=1;t.backup(path,.8);
+  assert(edge.visits==1 && edge.pending==0 && std::abs(p->q-.525)<1e-12);
+  child->exact_winner=1-p->player;child->distance=3;t.propagate(*child,nullptr);
+  assert(edge.exact_winner==child->exact_winner && edge.distance==4 && !edge.eligible && p->exact_winner==-1);
+  // One touched losing edge cannot exhaust the untouched legal replies.
+  assert(std::count_if(p->edges.begin(),p->edges.end(),[](const auto& e){return e.eligible;})==int(legal.size())-1);
+  for(auto& e:p->edges)if(e.exact_winner<0){e.exact_winner=child->exact_winner;e.distance=2;}
+  t.settle(*p);assert(p->exact_winner==child->exact_winner && p->distance==4);
+ }
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;
