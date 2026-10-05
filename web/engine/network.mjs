@@ -2,6 +2,7 @@
 import {encode, features, CHANNELS} from './encode.mjs';
 import {cached, json, moduleUrl, pins} from './assets.mjs';
 import {LIMITS, stall} from './stages.mjs';
+import {nextTask} from './tasks.mjs';
 
 /** An adapter whose largest buffer is at most the WebGPU default (256 MiB), as phone GPUs report, is limited. */
 const LIMITED_BYTES = 2 ** 28;
@@ -232,6 +233,9 @@ export class Network {
         if (stop()) return false;
         const prediction = await this.forward(input, count, size);
         batch.decode(group, start, count, prediction);
+        // WASM forwards may resolve only through microtasks. Give worker
+        // cancellation messages a task boundary before admitting more work.
+        await nextTask();
         if (stop()) return false;
       }
     }

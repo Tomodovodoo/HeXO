@@ -125,7 +125,7 @@ if (job.kind === 'encode') {
   const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
   network.maxBatch = job.maxBatch ?? network.maxBatch;
   let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
-  let forwardCalls = 0, decoded = false, packed = false;
+  let forwardCalls = 0, decoded = false, packed = false, messageCancelled = false;
   if (job.stopOnDecode || job.stopOnFeatures || job.expireBeforeInstall) network.evaluateNative = async (batch, options) => {
     const decode = batch.decode.bind(batch), features = batch.features.bind(batch);
     batch.decode = (...args) => {decode(...args); decoded = true;};
@@ -137,6 +137,11 @@ if (job.kind === 'encode') {
   network.forward = async (input, count, size) => {
     forwardCalls++;
     sent += count;
+    if (job.cancelByMessage && forwardCalls === (job.messageCancelAfter ?? 1)) {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {messageCancelled = true;channel.port1.close();channel.port2.close();};
+      channel.port2.postMessage('cancel');
+    }
     if (job.delay) {
       await new Promise(resolve => setTimeout(resolve, job.delay));
       readyBeforeResult = Math.max(readyBeforeResult, Number(owner.m._hxgf_queued(owner.feed)));
@@ -154,7 +159,7 @@ if (job.kind === 'encode') {
   try {
     let result;
     try { result = await owner.search({network, choice: job.choice ?? 'gumbel', batchSize: job.batchSize ?? 16, onBatch: stats => snapshots.push(stats),
-      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(job.stopOnDecode && decoded || job.stopOnFeatures && packed || job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
+      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(messageCancelled || job.stopOnDecode && decoded || job.stopOnFeatures && packed || job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
     catch (error) { if (!job.nonfinite && !job.throwWhilePending) throw error; rejected = /Nonfinite|Control failed/.test(error.message); }
     answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished, forwardCalls};
     owner.close();

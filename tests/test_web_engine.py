@@ -750,6 +750,16 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['stats']['deadline'], 1)
         self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
 
+    def test_native_browser_owner_reads_cancel_messages_between_microtask_forwards(self):
+        for after in (1,3):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, maxBatch=1,
+                               cancelByMessage=True, messageCancelAfter=after))
+            self.assertEqual(answer['forwardCalls'], after)
+            self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+            if after == 1:
+                self.assertEqual(answer['result']['actions'], [])
+                self.assertEqual(answer['stats']['installed'], 0)
+
     def test_native_browser_owner_honors_policy_move_selection(self):
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']

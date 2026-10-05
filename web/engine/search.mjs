@@ -587,11 +587,13 @@ export class NativeOwner {
           const observed = flight.then(() => { settled = true; }, () => { settled = true; });
           while (!settled && !this.done() && this.m._hxgf_queued(this.feed) < BigInt(batchSize)) {
             if (stop()) { this.cancel(); break; }
-            if (!this.step(batchSize)) break;
+            const progress = this.step(batchSize);
             await nextTask();
+            if (!progress) break;
           }
           await observed; const evaluated = await flight; flight = null;
           networkMs += performance.now() - begin;
+          await nextTask();
           if (stop()) this.cancel();
           if (evaluated === false || !this.admit()) {
             // Incomplete or no-longer-admitted batches cannot be installed.
