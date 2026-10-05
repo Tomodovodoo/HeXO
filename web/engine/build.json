@@ -89,14 +89,14 @@
  },
  "artefacts": {
   "gumbel.mjs": "c296698144b9b0ff935a2a62676a9475cd1341c22b594d6a56cdc8564999f579",
-  "gumbel.wasm": "40f45d4490cf1326feb0732780cdf020bc69846e01402c6121ef88b1a2b6c49c",
-  "tactical.wasm": "ea30b764476fc7c1ea02ad421cb1c745d8307626a40a25d2772ce121fb046647",
+  "gumbel.wasm": "48f8545ff651251b5161dd3664248ed5c1b8cce27f3fcab37b55cbffe9e360b6",
+  "tactical.wasm": "6888727eed3249343aa186b302843a1cd8c70092fbf31dfbebfd4a007ac3da67",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
-  "native/native.wasm": "1bcd1d85021001f1afe9a9f62749dc606c7b210ae648ecc15f72fd2b95320dcd",
-  "shrimp/shrimp.wasm": "caeed68606deaee3be330278c8e8c294c05c83e1045169ef203b7e537b1a47d4",
+  "native/native.wasm": "d0218ad42e1223353e629ccf536f55048f637ef93a2140a4c1fa9ebc35587dbb",
+  "shrimp/shrimp.wasm": "cb2faff81b3d598c2c001544480e5389b605244bf10b8344d2bf45bbe4b75cc3",
   "six/six.mjs": "70f1820dbd41982fa3a62827b075a3236b4637d80214bd735e72b7cba43ecc22",
-  "six/six.wasm": "e548d33d3574fa0d4cf174cf0afbb0ce35ef9d198e03d475e44bbdc2bb36d8c2",
-  "strix/strix.wasm": "6cd6889afb0657e94a8761b0cbf7af66740a0c65c283a26e0feed1a9287db471"
+  "six/six.wasm": "0473b82e1966053a32ca985d2d89ad9692d38482675f5a060dc3fa607550f27f",
+  "strix/strix.wasm": "a306a4815911c2c793da83c7ef94d98210ca20e65d4f19eda42e5a1adc9eb529"
  },
  "tools": {
   "emxx": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.10 (d6c521a7f05449857c76bd99e396895583cf2083)",

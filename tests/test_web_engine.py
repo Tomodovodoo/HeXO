@@ -1,5 +1,6 @@
 """Parity of the browser engine bundle (web/engine) with the native engine and the PyTorch network."""
 import base64
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -978,6 +979,9 @@ class Bundle(unittest.TestCase):
         record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))
         self.assertEqual(record['sources'], build_web.sources())
         self.assertEqual(record['artefacts'], {name: build_web.digest(ENGINE/name) for name in record['artefacts']})
+        for name, digest in record['artefacts'].items():
+            if name.endswith('.wasm'):
+                self.assertEqual(digest, hashlib.sha256((ENGINE/name).read_bytes()).hexdigest())
 
     def test_encoder_matches_hexcrop(self):
         model = random_model()

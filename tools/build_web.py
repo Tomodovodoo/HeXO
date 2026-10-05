@@ -82,8 +82,12 @@ SIX_FLAGS = ['-std=c++20', '-O3', '-msimd128', '-fexceptions', '-sASYNCIFY', '-s
 
 
 def digest(path):
-    """SHA-256 of a file with CRLF read as LF, so checkouts with either line ending agree."""
-    return hashlib.sha256(Path(path).read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+    """Hash binary bytes exactly; normalize source/script line endings across checkouts."""
+    path = Path(path)
+    data = path.read_bytes()
+    if path.suffix != '.wasm':
+        data = data.replace(b'\r\n', b'\n')
+    return hashlib.sha256(data).hexdigest()
 
 
 def sources():
