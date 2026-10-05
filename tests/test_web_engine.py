@@ -1104,6 +1104,11 @@ class Bundle(unittest.TestCase):
         self.assertGreater(found['archive']['reused'], 0)
         self.assertGreater(found['archive']['discarded'], 0)
         self.assertLessEqual(found['archive']['bytes'], found['archive']['limit'])
+        growth = found['proofGrowth']
+        self.assertGreaterEqual(growth['before']['nodes'], 2)
+        self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])
+        self.assertLessEqual(growth['after']['bytes'], growth['after']['limit'])
+        self.assertEqual(growth['returnedWinner'], growth['winner'])
 
     def test_a_root_reads_and_resumes_its_deeper_branch(self):
         """A -> B -> A in the browser's GameGraph: after B is searched as a root and found lost for A's mover, A's

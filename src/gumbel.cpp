@@ -819,7 +819,7 @@ struct Tree {
     for(auto& w:std::vector(list->second))if(auto n=w.lock())if(apply(loss,*n)){learn(*n);revise(*n);}
   }
   // A shared graph hands the verdict and the changed value on to the root's stored parents.
-  if(shared){learn(*root);revise(*root);}
+  if(shared){learn(*root);revise(*root);trim_archive();}
  }
  void begin(int simulations,int sample) {owner_access();
   if(!requests.empty()||simulations<1||sample<1)throw std::runtime_error("Invalid search budget or pending requests");
@@ -1106,7 +1106,7 @@ HX_API int hxg_archive(void* p,int64_t bytes){try{
 // Managed dormant payload and estimated index allocations, not pool residency
 // or process RSS. History prefixes are conservatively charged per entry.
 HX_API int hxg_archive_stats(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);auto* a=t.state->archive.get();if(!a)return 0;
- a->refresh();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus_stones())};
+ t.trim_archive();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus_stones())};
  std::copy(values.begin(),values.end(),out);return 1;}
 // Shared graph: moves the root to the position after `history` (n int64 q/r pairs), keeping every node's statistics
 // (Tree::root_at); 0 with the error set for an illegal history, an unshared tree or pending requests.
@@ -1185,7 +1185,7 @@ HX_API int hxg_prove_loss(void* p,int winner,int distance){try{
  auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;
  if(!t.requests.empty() || winner!=1-n.player || distance<1 || (n.exact_winner>=0 && n.exact_winner!=winner))throw std::runtime_error("Invalid root loss proof");
  gumbel::Outcome outcome{n.player,winner,distance,n.stones,true,{}};
- t.apply(outcome,n);t.refresh(n);t.learn(n);t.propagate(n,nullptr);return 1;
+ t.apply(outcome,n);t.refresh(n);t.learn(n);t.propagate(n,nullptr);t.trim_archive();return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // The node estimate, for display when the listed candidates are all refuted.
 HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);return t.root->q;}

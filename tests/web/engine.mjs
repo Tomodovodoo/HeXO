@@ -123,6 +123,20 @@ if (job.kind === 'encode') {
     const after = await graph.search({simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
     answer = {first:first.visits, reused:reused.visits, after:after.visits, credits:graph.credits(), archive:graph.archive(), counters:graph.counters()};
   } finally {graph.close();}
+  const bounded = new GameGraph(native, {history: original, seed: 7, limit: 1, archiveBytes: 65536});
+  const second = original.map(c => [...c]), third = original.map(c => [...c]);
+  [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
+  [third[1],third[9]] = [third[9],third[1]];[third[2],third[10]] = [third[10],third[2]];
+  try {
+    for (const history of [original,second,third]) {
+      bounded.at(history);await bounded.search({simulations:1,rootSamples:1,batchSize:1,evaluate,cache});
+    }
+    bounded.at(third);const before = bounded.archive();
+    const winner = 1-native.game(third).player;
+    bounded.proveLoss(winner,7);const after = bounded.archive();
+    bounded.at(original);
+    answer.proofGrowth = {before,after,winner,returnedWinner:bounded.m._hxg_exact(bounded.ptr)};
+  } finally {bounded.close();}
 } else if (job.kind === 'views') {
   const parent = new GameGraph(native, {history: job.history, seed: 3});
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));

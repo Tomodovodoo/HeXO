@@ -3,6 +3,24 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // A shared loss proof materializes every legal edge in dormant peer contexts.
+ // That growth must be trimmed at delivery, without losing the exact outcome.
+ {gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
+  std::vector<Cell> original{{0,0},{1,1},{2,1},{2,0},{0,3},{0,2},{1,2},{-1,2},{3,1},{-1,0},{0,-1}};
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  auto first=expand(original);auto second_history=original;
+  std::swap(second_history[5],second_history[9]);std::swap(second_history[6],second_history[10]);
+  auto second=expand(second_history);auto third_history=original;
+  std::swap(third_history[1],third_history[9]);std::swap(third_history[2],third_history[10]);
+  auto peer=expand(third_history);t.evict();assert(first->dormant && second->dormant);
+  auto& archive=*t.state->archive;auto discarded=archive.discarded;
+  assert(hxg_prove_loss(&t,1-peer->player,7));
+  assert(archive.total_bytes()<=archive.limit && archive.discarded>discarded);
+  int64_t counts[10];assert(hxg_archive_stats(&t,counts) && counts[1]<=counts[2]);
+  t.root_at(original);assert(t.root->exact_winner==1-peer->player);
+ }
  // A long active history must not consume an empty dormant archive's byte
  // allowance. Consecutive cells alternate colours in pairs and cannot win.
  {gumbel::Archive archive(65536);std::shared_ptr<const gumbel::HistoryLink> history;
