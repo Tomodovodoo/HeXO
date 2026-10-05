@@ -3,6 +3,18 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // Continuation identities include coloured stones, placement phase and the
+ // network's last-turn inputs. Incremental keys must identify the actual board.
+ {Board board;std::vector<Cell> history;std::mt19937_64 rng(31);
+  for(int stones=0;stones<96 && board.winner<0;++stones){
+   auto legal=board.legal_moves();auto parent=gumbel::keys(board).first;
+   for(size_t i=0;i<std::min(size_t(17),legal.size());++i){auto action=legal[i*legal.size()/std::min(size_t(17),legal.size())];
+    Board child=board;child.make(action);
+    assert(gumbel::child_keys(parent,history,action)==gumbel::keys(child));
+   }
+   auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);
+  }
+ }
  // Existing own-turn completions settle before any neural request. Both stones
  // stay legal, the full action list remains present, and no reservation survives.
  for(bool shared:{false,true}){gumbel::Tree t(7);if(shared)assert(hxg_share(&t,16));t.tactics=true;

@@ -85,10 +85,11 @@ struct Owner {
   for(double x:q)total+=std::exp(x-maximum);
   if(!legal || !total)return;
   for(size_t i=0;i<node.edges.size();++i){auto& edge=node.edges[i];if(!edge.read().eligible || (edge.read().child && edge.read().child->exact_winner>=0))continue;
-   auto h=v.history;h.push_back(edge.action);Key key=gumbel::keys(h).second;
+   Key key=gumbel::child_keys(node.position,v.history,edge.action).second;
    if(key==views[0].key)continue;
    if(!candidates.contains(key) && candidates.size()>=16384)continue;
-   auto& c=candidates[key];if(c.history.empty())c.history=std::move(h);
+   auto [it,inserted]=candidates.try_emplace(key);auto& c=it->second;
+   if(inserted || c.history.empty()){c.history=v.history;c.history.push_back(edge.action);}
    c.depth=v.depth+1;c.seen=allocations;
    double share=(1-exploration)*std::exp(q[i]-maximum)/total+exploration/legal;
    double relevance=v.relevance*share*.85;

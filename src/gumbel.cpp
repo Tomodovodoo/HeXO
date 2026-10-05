@@ -48,6 +48,18 @@ std::pair<Key,Key> keys(const Board& board) {
  for(size_t i=start>=2?start-2:0;i<start;++i){auto h=CellHash{}(board.history[i].c);context.a+=mix(h+0x7f1);context.b+=mix(h+0x3c9);}
  return {position,context};
 }
+// Derive a continuation from its parent's coloured set. Only the last turn's
+// input context changes; the earlier stones need neither copying nor hashing.
+std::pair<Key,Key> child_keys(Key parent,const std::vector<Cell>& history,Cell action) {
+ const size_t n=history.size(),size=n+1;const int player=int((n+1)/2%2),remaining=n==0 || n%2==0?1:2;
+ const int next_player=int((size+1)/2%2),next_remaining=size%2==0?1:2;auto h=CellHash{}(action);
+ Key position{parent.a-mix(player*3+remaining+17)+mix(next_player*3+next_remaining+17)+mix(h^mix(player+1)),
+              parent.b-mix(player*3+remaining+71)+mix(next_player*3+next_remaining+71)+mix(h+mix(player+911))};
+ Key context=position;const size_t start=size%2?size:size-1;
+ if(start<size){context.a^=mix(h+0x51);context.b^=mix(h+0x93);}
+ for(size_t i=start>=2?start-2:0;i<start;++i){auto c=CellHash{}(i==n?action:history[i]);context.a+=mix(c+0x7f1);context.b+=mix(c+0x3c9);}
+ return {position,context};
+}
 // The same keys from a placement history, without replaying it: stone i belongs to player ((i + 1) / 2) % 2.
 std::pair<Key,Key> keys(const std::vector<Cell>& history) {
  const size_t n=history.size();const int player=int((n+1)/2%2),remaining=n==0 || n%2==0?1:2;
