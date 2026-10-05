@@ -387,9 +387,12 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
             "infinity":prover::PROOF_NUMBER_INFINITY,"scope":"wide-forcing","game_exact":false})).unwrap_or(Value::Null);
     }
     if req.resume {response["resident_reused"]=json!(resident_reused);}
-    if let Some(mut cert)=cert {
-        match check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)) {
-            Ok((moves,turns,visited))=>{
+    if let Some(cert)=cert {
+        let prepared=if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {
+            stamps::resolved(source,&board,ply,side,&ctl)
+        } else {Ok(cert)};
+        match prepared.and_then(|cert|check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)).map(|checked|(cert,checked))) {
+            Ok((mut cert,(moves,turns,visited)))=>{
                 // Only the primary verified strategy may declare dependencies.
                 // Drop unused nodes/alternatives in certificates containing exact
                 // leaves, so an unchecked fact cannot leak into saved evidence.

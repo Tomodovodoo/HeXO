@@ -125,6 +125,23 @@ export function topRows(actions, policy, values, lead) {
 const sideAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 const shifted = (pv, by) => pv.map(([q, r, side, ply]) => [q, r, side, ply + by]);
 
+// A complete drawn line can break ties between equal proof bounds. A partial
+// line is not a quicker win. Omitted, irrelevant defender stones keep their
+// placement numbers, as in principalVariation's unstoppable ending.
+function lineLength(history, winner, pv, offset = 0) {
+  if (!pv.length || pv.some(p => p.length !== 4)) return Infinity;
+  const own = new Set(history.filter((_, i) => sideAt(i) === winner).map(p => p.join(',')));
+  for (const [q, r, side] of pv) if (side === winner) own.add(`${q},${r}`);
+  const [q, r, side, ply] = pv.at(-1);
+  if (side !== winner) return Infinity;
+  for (const [dq, dr] of [[1, 0], [0, 1], [1, -1]]) {
+    let count = 1;
+    for (const sign of [-1, 1]) for (let i = 1; i < 6 && own.has(`${q + sign * i * dq},${r + sign * i * dr}`); i++) count++;
+    if (count >= 6) return ply - offset;
+  }
+  return Infinity;
+}
+
 /** Compact a query's used premises for saving and later independent checking. */
 export function proofEvidence(result) {
   const dependencies = result.dependencies || [], indices = new Map(dependencies.map((d, i) => [d.fact, i]));
@@ -237,12 +254,14 @@ export class Proofs {
   }
   put(history, winner, plies, pv) {
     const key = proofKey(history), old = this.entries.get(key), witnessed = line => line.every(stone => stone.length === 4) ? line.length : 0;
-    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies && witnessed(pv) > witnessed(old.pv)))) return;
+    const length = lineLength(history, winner, pv);
+    if (old && !(old.winner === winner && (plies < old.plies || plies === old.plies &&
+        (length < old.length || length === old.length && witnessed(pv) > witnessed(old.pv))))) return;
     this.edgeCache.clear();
     this.knownCache.clear();
     this.choiceCache.clear();
     const stones = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
-    this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones});
+    this.entries.set(key, {history: history.map(([q, r]) => [q, r]), winner, plies, pv, stones, length});
     if (!this.sizes.has(history.length)) this.sizes.set(history.length, new Set());
     this.sizes.get(history.length).add(key);
   }
@@ -252,9 +271,18 @@ export class Proofs {
     const current = history.map(p => [...p]);
     let pv = outcome.pv || [];
     for (let i = 0; i <= pv.length; i++) {
+      const length = lineLength(current, outcome.winner, pv.slice(i), i);
+      const ready = i && this.knownCache.get(proofKey(current));
+      if (ready?.winner === outcome.winner && ready.plies + i <= outcome.plies
+          && Number.isFinite(lineLength(current, ready.winner, ready.pv))
+          && (ready.plies + i < outcome.plies || lineLength(current, ready.winner, ready.pv) <= length)) {
+        return [...pv.slice(0, i), ...shifted(ready.pv, i)];
+      }
       const entry = this.choice(current);
+      const replacement = entry ? lineLength(current, entry.winner, entry.pv) : Infinity;
       if (entry?.winner === outcome.winner && entry.plies + i <= outcome.plies
-          && (entry.plies + i < outcome.plies || entry.pv.length > pv.length - i)
+          && (entry.plies + i < outcome.plies || replacement < length
+            || replacement === length && entry.pv.length > pv.length - i)
           && entry.pv.every(p => p.length === 4)) {
         pv = [...pv.slice(0, i), ...shifted(entry.pv, i)];
       }
@@ -284,16 +312,17 @@ export class Proofs {
    * table, or because one more stone by that position's mover reaches a position the mover wins. `distance` counts
    * the stone itself; `outcome` is the position's {winner, plies, pv}. */
   edges(history) {
-    const at = JSON.stringify(history);
+    const at = proofKey(history);
     if (this.edgeCache.has(at)) return this.edgeCache.get(at);
     const size = history.length, base = history.map(([q, r], i) => `${q},${r},${sideAt(i)}`), own = new Set(base), found = new Map();
     // A lost half-turn after A covers A,B in either order. Its saved response
     // need not be B, so carry the verdict without inventing a new PV.
+    // B may be earlier in the supplied history: only board and phase matter.
     if (size && size % 2 === 0) for (const key of this.sizes.get(size) || []) {
       const entry = this.entries.get(key), mover = sideAt(size);
       if (entry.winner === mover || entry.plies < 2) continue;
       const missing = [...entry.stones].filter(p => !own.has(p)), replaced = base.filter(p => !entry.stones.has(p));
-      if (missing.length !== 1 || replaced.length !== 1 || replaced[0] !== `${history.at(-1)},${mover}`) continue;
+      if (missing.length !== 1 || replaced.length !== 1 || Number(replaced[0].split(',')[2]) !== mover) continue;
       const [q, r, side] = missing[0].split(',').map(Number);
       if (side !== mover) continue;
       const outcome = {winner: entry.winner, plies: entry.plies - 1, pv: []};
@@ -320,7 +349,7 @@ export class Proofs {
   }
   /** The tightest stored guarantee, also considering shorter winning continuations. */
   choice(history) {
-    const at = JSON.stringify(history);
+    const at = proofKey(history);
     if (this.choiceCache.has(at)) return this.choiceCache.get(at);
     const found = this.choose(history);
     this.choiceCache.set(at, found);
@@ -331,25 +360,27 @@ export class Proofs {
     let own = this.entries.get(proofKey(history));
     if (!own && history.length > 1 && history.length % 2 === 1) {
       const mover = sideAt(history.length), base = new Set(history.map(([q, r], i) => `${q},${r},${sideAt(i)}`));
-      const last = new Set(history.slice(-2).map(p => `${p},${1-mover}`));
       for (const key of this.sizes.get(history.length - 1) || []) {
         const loss = this.entries.get(key);
         if (loss.winner !== mover || loss.plies < 2 || ![...loss.stones].every(p => base.has(p))) continue;
-        if (![...base].some(p => !loss.stones.has(p) && last.has(p))) continue;
+        if (![...base].some(p => !loss.stones.has(p) && Number(p.split(',')[2]) === 1-mover)) continue;
         if (!own || own.plies > loss.plies - 1) own = {winner: mover, plies: loss.plies - 1, pv: []};
       }
     }
     const mover = sideAt(history.length);
     if (own && own.winner !== mover) return own;
-    const wins = [...this.edges(history).values()].filter(e => e.winner === mover)
-      .sort((a, b) => a.distance - b.distance || a.action[0] - b.action[0] || a.action[1] - b.action[1]);
-    if (!wins.length || own && (own.plies < wins[0].distance || own.plies === wins[0].distance && own.pv.length)) return own || null;
-    const {action, distance, outcome} = wins[0];
-    return {winner: mover, plies: distance, pv: [[...action, mover, 1], ...shifted(outcome.pv, 1)]};
+    const wins = [...this.edges(history).values()].filter(e => e.winner === mover).map(e => {
+      const child = this.known([...history, e.action]) || e.outcome;
+      const pv = [[...e.action, mover, 1], ...shifted(child.pv, 1)];
+      return {winner: mover, plies: child.plies + 1, pv, length: lineLength(history, mover, pv)};
+    }).sort((a, b) => a.plies - b.plies || a.length - b.length || a.pv[0][0] - b.pv[0][0] || a.pv[0][1] - b.pv[0][1]);
+    if (!wins.length || own && (own.plies < wins[0].plies || own.plies === wins[0].plies && own.pv.length
+        && lineLength(history, mover, own.pv) <= wins[0].length)) return own || null;
+    return wins[0];
   }
   /** Best known guarantee with its updated continuation, or null when nothing is proven. */
   known(history) {
-    const at = JSON.stringify(history);
+    const at = proofKey(history);
     if (this.knownCache.has(at)) return this.knownCache.get(at);
     const found = this.choice(history);
     const outcome = found ? {winner: found.winner, plies: found.plies, pv: this.line(history, found)} : null;
@@ -427,9 +458,10 @@ export function proven(known, history, found, remaining, played = null) {
     shown.pv = known.line(history, {winner, plies, pv: shown.pv || []});
   }
   const lost = shown.proof && shown.proof.winner !== mover;
-  const defence = lost ? (shown.pv || []).slice(0, remaining)
+  const turn = shown.proof ? (shown.pv || []).slice(0, remaining)
     .filter((p, i) => p.length === 4 && p[2] === mover && p[3] === i + 1).map(p => p.slice(0, 2)) : [];
-  if (defence.length === remaining) shown.moves = defence;
+  if (turn.length === remaining) shown.moves = turn;
+  const defence = lost ? turn : [];
   const rows = (shown.top || []).map(row => [...row]);
   for (const {action, winner} of edges.values()) {
     let row = rows.find(r => r[0] === action[0] && r[1] === action[1]);

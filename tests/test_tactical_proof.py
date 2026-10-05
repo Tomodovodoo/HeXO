@@ -83,7 +83,73 @@ class NativeStrategy(unittest.TestCase):
             cold = second.history(changed, stamps=True, library=[], nodes=1, ms=5000)
             self.assertEqual((learned['status'], warm['status'], cold['status']),
                              ('PROVEN_WIN', 'PROVEN_WIN', 'UNKNOWN'))
-            self.assertEqual(independent_verify(warm['certificate'], changed), 'PROVEN_WIN')
+        self.assertEqual(independent_verify(warm['certificate'], changed), 'PROVEN_WIN')
+
+    def test_replay_indexes_shared_branches_and_keeps_later_evidence(self):
+        with NativeTactics(independent=True) as native:
+            source = native.history(OPEN_THREE, nodes=20000, ms=5000)['certificate']
+        # These are untrusted move suggestions, deliberately not complete proofs.
+        # The shared suffix formerly consumed the scan's 200,000-path limit;
+        # the deep source must not discard a later, useful strategy either.
+        shared = [dict(kind='defender_replies', responses=[dict(action=[[7+2*i,8+i],[8+2*i,8+i]], child=i+1)]*2)
+                  for i in range(20)] + [dict(kind='exact', fact=0, after=[])]
+        deep = [dict(kind='stamp_link', source=i+1) for i in range(101)] + [dict(kind='exact', fact=0, after=[])]
+        changed = OPEN_THREE[:-1] + [[7,8]]
+        for nodes in (shared, deep):
+            with self.subTest(kind=nodes[0]['kind']), NativeTactics(independent=True) as native:
+                evidence = [dict(history=OPEN_THREE, winner=0, pv=[], certificate=dict(version=1, width='wide', root=0, nodes=nodes)),
+                            dict(history=OPEN_THREE, winner=0, pv=[], certificate=source)]
+                found = native.history(changed, replay=evidence, stamps=True, library=[], nodes=5000, ms=5000)
+                self.assertEqual(found['status'], 'PROVEN_WIN', found['reason'])
+                self.assertFalse(found.get('dependencies'))
+                self.assertEqual(independent_verify(found['certificate'], changed), 'PROVEN_WIN')
+
+    def test_replay_uses_alternate_attacks_and_local_support_as_suggestions(self):
+        with NativeTactics(independent=True) as native:
+            source = native.history(OPEN_THREE, nodes=20000, ms=5000)['certificate']
+        alternate = copy.deepcopy(source)
+        root = alternate['nodes'][alternate['root']]
+        root['alternatives'] = [dict(action=root['action'], child=root['child'])]
+        root['action'] = [[0,0], [1,1]]  # The saved primary move is illegal.
+        zone = copy.deepcopy(source)
+        zone['nodes'].append(dict(kind='zone_replies', zone=[], responses=[], fallback=zone['root']))
+        zone['root'] = len(zone['nodes'])-1
+        changed = OPEN_THREE + [[8,8],[10,8],[8,10],[10,10]]
+        counterwin = [[0,0],[0,8],[1,8],[1,0],[2,0],[2,8],[3,8]]
+        for certificate in (source, alternate, zone):
+            evidence = [dict(history=OPEN_THREE, winner=0, pv=[], certificate=certificate)]
+            with self.subTest(kind=certificate['nodes'][certificate['root']]['kind']), NativeTactics(independent=True) as native:
+                found = native.history(changed, replay=evidence, stamps=True, library=[], nodes=5000, ms=5000)
+                self.assertEqual(found['status'], 'PROVEN_WIN', found['reason'])
+                self.assertEqual(independent_verify(found['certificate'], changed), 'PROVEN_WIN')
+                self.assertEqual(native.history(counterwin, replay=evidence, stamps=True, library=[], nodes=5000, ms=5000)['status'], 'UNKNOWN')
+
+    def test_replay_checks_an_immediate_win_before_reading_saved_strategies(self):
+        # A saved suggestion is irrelevant when this board already completes six.
+        # Its invalid edge would fail evidence scanning if we did that first.
+        evidence = [dict(history=OPEN_THREE, winner=0, pv=[],
+                         certificate=dict(version=1, width='wide', root=0, nodes=[dict(kind='stamp_link', source=999)]))]
+        with NativeTactics(independent=True) as native:
+            found = native.history(IMMEDIATE, replay=evidence, stamps=True, library=[], nodes=1, ms=3000)
+        self.assertEqual(found['status'], 'PROVEN_WIN', found['reason'])
+        self.assertEqual(found['nodes_used'], 1)
+        self.assertEqual(found['proof_turns'], 1)
+        self.assertEqual(independent_verify(found['certificate'], IMMEDIATE), 'PROVEN_WIN')
+
+    def test_large_saved_move_collection_yields_at_its_deadline(self):
+        alternatives = [dict(action=[[0,0],[i,1]],child=0) for i in range(20000)]
+        certificate = dict(version=1,width='wide',root=0,nodes=[dict(kind='attacker_move',
+                           action=[[0,0],[1,1]],child=0,alternatives=alternatives)])
+        evidence = [dict(history=OPEN_THREE,winner=0,pv=[],certificate=certificate)]
+        with NativeTactics(independent=True) as native:
+            start = time.perf_counter()
+            found = native.history(OPEN_THREE,replay=evidence,stamps=True,library=[],nodes=20000,ms=100)
+            self.assertEqual(found['status'],'UNKNOWN')
+            self.assertLess(time.perf_counter()-start,.5)
+            time.sleep(.2)
+            after = native.history(IMMEDIATE,nodes=100,ms=1000)
+            self.assertEqual(after['status'],'PROVEN_WIN')
+            self.assertNotIn('busy',after['reason'])
 
     def test_independent_workers_overlap_and_cancel_only_their_query(self):
         history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
