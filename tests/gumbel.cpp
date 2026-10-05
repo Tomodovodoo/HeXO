@@ -3,24 +3,34 @@
 #include <iostream>
 #include <functional>
 int main(){
- // Interior probabilities match the direct stable softmax with mixed known/unknown edges, proof pruning,
- // graph-shared values, pending visits and logits whose cached exponent underflows or becomes subnormal.
- for(bool graph:{false,true})for(double scale:{5.,700.,1000.})for(double low:{-2.,-710.,-744.,-1000.}){
-  gumbel::Tree t(0);t.graph=graph;gumbel::Node n;n.value=.3;
-  for(int i=0;i<6;++i){gumbel::Edge e;e.logit=i==0?0:low+i*.01;e.write().pending=i%2;
-   if(i==0){e.write().visits=1;e.write().sum=-1;}if(i==2){e.write().visits=2;e.write().sum=1;}if(i==3){e.write().exact_winner=0;e.write().eligible=false;}
-   if(i==4 && graph){e.write().child=std::make_shared<gumbel::Node>();e.read().child->n=1;e.read().child->q=.5;}
-   n.edges.push_back(std::move(e));}
-  auto q=t.transformed(n);for(auto& x:q)x*=scale;auto expected=q;double maximum=-1e300;
-  for(int i=0;i<6;++i){expected[i]=n.edges[i].read().eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
-  for(auto& x:expected)x=std::exp(x-maximum);
-  assert(t.interior(n,q)==6);
-  for(int i=0;i<6;++i){assert(std::isfinite(q[i]));assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));}
-  // The cached weights remain valid as the completed Q changes on another visit.
-  n.edges[1].write().pending=2;q=t.transformed(n);expected=q;maximum=-1e300;
-  for(int i=0;i<6;++i){expected[i]=n.edges[i].read().eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
-  for(auto& x:expected)x=std::exp(x-maximum);assert(t.interior(n,q)==7);
-  for(int i=0;i<6;++i)assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));
+ // Sparse selection maximizes the complete legal stable-softmax score. Cold
+ // mass remains available after dominant priors are refuted, including weights
+ // that underflowed at expansion. Pending children still contribute mass but
+ // cannot be selected; shared child evidence changes Q without a new edge visit.
+ for(bool graph:{false,true})for(double gap:{-2.,-710.,-744.,-1000.})for(double floor:{0.,.1}){
+  gumbel::Tree t(0);t.graph=graph;t.range_floor=floor;gumbel::Node n;n.player=0;n.value=.3;n.expanded=true;
+  for(int i=0;i<97;++i){gumbel::Edge e(&n.empty);e.action={i,0};e.logit=i?gap+(i*17%23)*.01:0;e.weight=std::exp(e.logit);n.policy_mass+=e.weight;n.edges.push_back(std::move(e));}
+  n.edges[1].write().visits=7;n.edges[1].write().sum=-.7;
+  n.edges[2].write().exact_winner=1;n.edges[2].eligibility(false);
+  if(graph){n.edges[4].write().child=std::make_shared<gumbel::Node>();n.edges[4].read().child->player=1;n.edges[4].read().child->n=11;n.edges[4].read().child->q=.6;}
+  n.edges[5].write().pending=3;n.edges[5].write().child=std::make_shared<gumbel::Node>();n.edges[5].read().child->pending=true;
+  n.edges[10].write().visits=100;n.edges[10].write().sum=70;n.edges[31].eligibility(false);n.edges[32].write().pending=2;
+  for(int stage=0;stage<5;++stage){
+   if(stage==1){n.edges[0].write().exact_winner=1;n.edges[0].eligibility(false);}
+   if(stage==2){n.edges[64].write().visits=2;n.edges[64].write().sum=-1.;n.edges[65].write().pending=1;}
+   if(stage==3){n.edges[5].read().child->pending=false;n.edges[5].write().pending=0;if(graph)n.edges[4].read().child->q=-.8;}
+   if(stage==4){n.edges[10].write().visits=10000;n.edges[10].write().sum=-9999.;}
+   auto full=t.transformed(n);auto sparse=t.selection_q(n);
+   for(int i=0;i<int(full.size());++i)assert(std::abs(full[i]-sparse[i])<=1e-12*std::max(1.,std::abs(full[i])));
+   double maximum=-std::numeric_limits<double>::infinity(),mass=0;int visits=0;
+   for(int i=0;i<int(full.size());++i){auto& e=n.edges[i];visits+=e.read().visits+e.read().pending;if(e.read().eligible)maximum=std::max(maximum,full[i]+e.logit);}
+   for(int i=0;i<int(full.size());++i)if(n.edges[i].read().eligible)mass+=std::exp(full[i]+n.edges[i].logit-maximum);
+   std::vector<double> scores(full.size(),-std::numeric_limits<double>::infinity());double best=-std::numeric_limits<double>::infinity();
+   for(int i=0;i<int(full.size());++i){auto& e=n.edges[i];if(!e.read().eligible || (e.read().child && e.read().child->pending))continue;scores[i]=std::exp(full[i]+e.logit-maximum)/mass-double(e.read().visits+e.read().pending)/(1+visits);best=std::max(best,scores[i]);}
+   int chosen=t.select_interior(n,sparse);assert(chosen>=0 && std::isfinite(scores[chosen]) && best-scores[chosen]<=1e-12);
+   assert(n.cold_best>=0 && n.edges[n.cold_best].read().empty && n.cold_mass>=1 && std::isfinite(n.cold_mass));
+   assert(n.edges.size()==97);
+  }
  }
  // Exhaust all player-transition patterns up to four edges and terminal values.
  for(int depth=1;depth<=4;++depth)for(int mask=0;mask<(1<<(depth+1));++mask)for(double value:{-1.,-.25,0.,.75,1.}){
