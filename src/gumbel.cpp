@@ -54,7 +54,7 @@ std::pair<Key,Key> keys(const std::vector<Cell>& history) {
  for(size_t i=start>=2?start-2:0;i<start;++i){auto h=CellHash{}(history[i]);context.a+=mix(h+0x7f1);context.b+=mix(h+0x3c9);}
  return {position,context};
 }
-struct Edge { Cell action;double logit=0,prior=0,sum=0,weight=-1;int visits=0,pending=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::shared_ptr<Node> child; };
+struct Edge { Cell action;double logit=0,prior=0,sum=0,weight=-1;int visits=0,pending=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false,indexed=false;std::shared_ptr<Node> child; };
 // Legal lists are large and live together. Pool their buffers within one game,
 // recycling evicted nodes' blocks instead of making one heap allocation per node.
 // A node retains the resource because it can outlive the GameStore's indices.
@@ -83,8 +83,21 @@ struct EdgeMemory {
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
 // visits and value sum (for its mover) an evicted node of its context had when it left the store, less its own
 // network value, which the node's expansion supplies again.
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::pmr::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents;
- explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),edges(&memory->pool){}
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false;double value=0,q=0,carried_sum=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
+ explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),edges(&memory->pool),tracked(&memory->pool){}
+ // Graph updates need edges that have held a child or visits. This is not an
+ // action cap or a proof-coverage list; `edges` always holds every legal move.
+ const std::pmr::vector<int>& tracked_edges(){
+  if(!indexed){
+   for(size_t i=0;i<edges.size();++i)if(edges[i].child || edges[i].visits){edges[i].indexed=true;tracked.push_back(int(i));}
+   indexed=true;
+  }
+  return tracked;
+ }
+ void track(Edge& edge){
+  tracked_edges();if(edge.indexed)return;
+  int index=int(&edge-edges.data());tracked.insert(std::lower_bound(tracked.begin(),tracked.end(),index),index);edge.indexed=true;
+ }
 };
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
@@ -240,7 +253,8 @@ struct Tree {
   std::vector<std::pair<Node*,size_t>> work{{&top,0}};
   while(!work.empty()){
    auto& [x,i]=work.back();
-   if(i<x->edges.size()){auto& e=x->edges[i++];if(e.child && e.child->dirty)work.emplace_back(e.child.get(),0);continue;}
+   const auto& tracked=x->tracked_edges();
+   if(i<tracked.size()){auto& e=x->edges[tracked[i++]];if(e.child && e.child->dirty)work.emplace_back(e.child.get(),0);continue;}
    Node* done=x;work.pop_back();
    refresh(*done);done->dirty=false;
   }
@@ -250,7 +264,7 @@ struct Tree {
  // child's value, so a child reached by both orders of a turn is not weighted twice.
  void current(Node& node) {
   inherit_half_losses(node);
-  for(auto& e:node.edges)if(e.child)clean(*e.child);
+  for(int i:node.tracked_edges()){auto& e=node.edges[i];if(e.child)clean(*e.child);}
  }
  // Losing after A with one stone left proves every A,B continuation lost.
  // At the sibling half-turn after B, mark A without materializing all pairs.
@@ -293,7 +307,7 @@ struct Tree {
  // stored parents (revise); otherwise the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
   if(e.visits && !child->n && e.exact_winner<0){e.visits=0;e.sum=0;}
-  e.child=child;child->parents.push_back(parent.weak_from_this());
+  e.child=child;parent.track(e);child->parents.push_back(parent.weak_from_this());
   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.exact_winner,e.distance,e.bound)){
    settle(parent);learn(parent);revise(parent);
   }
@@ -338,16 +352,16 @@ struct Tree {
   const size_t target=limit-limit/8;
   while(expanded>target){
    std::vector<Node*> leaves;
-   for(auto& [key,n]:store)if(!state->pinned(n.get()) && !n->pending && std::none_of(n->edges.begin(),n->edges.end(),[](const Edge& e){return bool(e.child);}))leaves.push_back(n.get());
+   for(auto& [key,n]:store)if(!state->pinned(n.get()) && !n->pending && std::none_of(n->tracked_edges().begin(),n->tracked_edges().end(),[&](int i){return bool(n->edges[i].child);}))leaves.push_back(n.get());
    if(leaves.empty())break;
    std::sort(leaves.begin(),leaves.end(),[](const Node* x,const Node* y){return x->used<y->used;});
    for(Node* x:leaves){
     if(expanded<=target)break;
     clean(*x);
-    for(auto& w:x->parents)if(auto p=w.lock())for(auto& e:p->edges)if(e.child.get()==x){
+    for(auto& w:x->parents)if(auto p=w.lock())for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.child.get()==x){
      e.sum=(e.exact_winner>=0?(e.exact_winner==p->player?1:-1):x->player==p->player?x->q:-x->q)*e.visits;
      e.child.reset();
-    }
+    }}
     if(x->n)evicted_stats[x->context]={x->n,x->q,x->value,x->position};
     expanded-=x->expanded;++evicted;store.erase(x->context);
    }
@@ -380,7 +394,7 @@ struct Tree {
  // MCGS value of a graph node for its mover from its network value and its edges' visits and current values.
  void refresh(Node& node) {
   double total=node.value+node.carried_sum;int count=1+node.carried;
-  for(auto& e:node.edges)if(e.visits){total+=e.visits*value(node,e);count+=e.visits;}
+  for(int i:node.tracked_edges()){auto& e=node.edges[i];if(e.visits){total+=e.visits*value(node,e);count+=e.visits;}}
   node.q=node.exact_winner>=0?(node.exact_winner==node.player?1:-1):total/count;
  }
  // After a backup changed `from`, bring its parents other than `skip` (its parent on the backup path) and their
@@ -395,7 +409,7 @@ struct Tree {
    const double before=p->q;const int winner=p->exact_winner,distance=p->distance;const bool bound=p->bound;
    if(c->exact_winner>=0){
     bool changed=false;
-    for(auto& e:p->edges)if(e.child.get()==c)changed|=tighten(c->exact_winner,c->distance+1,c->bound,e.exact_winner,e.distance,e.bound);
+    for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.child.get()==c)changed|=tighten(c->exact_winner,c->distance+1,c->bound,e.exact_winner,e.distance,e.bound);}
     if(changed){settle(*p);learn(*p);}
    }
    // A shared graph marks values stale for the next read and walks on only with a changed verdict.
@@ -623,7 +637,7 @@ struct Tree {
    auto& [node,index]=*i;auto& edge=node->edges[index];
    if(child->player!=node->player)value=-value;
    if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,edge.exact_winner,edge.distance,edge.bound))settle(*node);
-   ++edge.visits;--edge.pending;
+   if(graph)node->track(edge);++edge.visits;--edge.pending;
    if(edge.exact_winner>=0){value=edge.exact_winner==node->player?1:-1;edge.sum=value*edge.visits;}
    else edge.sum+=value;
    if(graph){++node->n;if(shared)renew(*node);else refresh(*node);learn(*node);}
@@ -645,7 +659,7 @@ struct Tree {
     if(e.exact_winner>=0){++e.visits;e.sum=(e.exact_winner==x->player?1:-1)*e.visits;}
     else if(e.child && e.child->n){++e.visits;e.sum+=e.child->player==x->player?e.child->q:-e.child->q;}
     else continue;
-    ++x->n;stale(*x);
+    x->track(e);++x->n;stale(*x);
    }
   }
   if(!path.edges.empty()){++completed;if(path.edges.front().first==root.get() && path.edges.front().second<int(root_edges.size()))++root_edges[path.edges.front().second].credits;}
@@ -685,7 +699,7 @@ struct Tree {
    if(chosen<0)return 0;
    auto& edge=node->edges[chosen];if(edge.child && edge.child->pending)return 0;
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
-   if(!edge.child){if(shared)attach(*node,edge,child_here());else {edge.child=child_here();if(graph)edge.child->parents.push_back(node->weak_from_this());}}
+   if(!edge.child){if(shared)attach(*node,edge,child_here());else {edge.child=child_here();if(graph){node->track(edge);edge.child->parents.push_back(node->weak_from_this());}}}
    node=edge.child.get();path.leaf=node;if(shared)node->used=clock;
    if(board.winner>=0 || edge.exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
@@ -787,7 +801,7 @@ struct Tree {
      if(apply(o,*existing))revise(*existing);
      record(p,o);
      for(auto& w:std::vector(positions[p]))if(auto peer=w.lock())if(peer!=existing)share(*existing,outcomes[p],*peer);
-     for(auto& e:node->edges)if(e.action==witness){e.child=existing;break;}
+     for(auto& e:node->edges)if(e.action==witness){e.child=existing;if(graph)node->track(e);break;}
      return;
     }
    }
@@ -795,7 +809,7 @@ struct Tree {
    auto child=std::make_shared<Node>(state->memory);child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
    child->edges.reserve(next_legal.size());for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
    if(graph){auto [p,c]=keys(position);child->position=p;child->context=c;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);if(shared)store[c]=child;learn(*child);}
-   for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
+   for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);if(graph)node->track(e);break;}
   }
  }
  void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;}}requests.clear();}
