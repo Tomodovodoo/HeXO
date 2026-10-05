@@ -46,6 +46,12 @@ struct Task {
  std::vector<Subscriber> subscribers;Clock::time_point queued;bool flight=false,live=true;
 };
 struct Broker;
+// Completed roots own their numeric records. Consumers never borrow a graph,
+// and the large legal-action table need not pass through an ASCII formatter.
+struct RootEvent {
+ std::string text;std::vector<double> edges;bool has_edges=false;
+ RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
+};
 struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;
  int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;};
 struct Producer:std::enable_shared_from_this<Producer> {
@@ -57,7 +63,7 @@ struct Producer:std::enable_shared_from_this<Producer> {
  std::vector<bool> requested,reported,released;
  Producer(Broker& b,owner::Pool& p,int m,int i):broker(b),pool(p),model(m),index(i),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()){}
  void run()noexcept;
- std::string result(int index,uint64_t token);
+ RootEvent result(int index,uint64_t token);
 };
 // The service owns only immutable snapshots and prediction messages. Producers
 // exclusively mutate their pools. No GPU callback dereferences a graph node.
@@ -75,8 +81,8 @@ struct Broker {
  std::string error;
  std::deque<std::unique_ptr<owner::Pool>> garbage;std::thread reclaimer;
  bool reclaiming=false,reclaim_stop=false;uint64_t reclaimed=0,reclaim_ns=0;
- struct Event {Producer* producer;int game;std::string text;};
- std::deque<Event> events;std::string last_event;
+ struct Event {Producer* producer;int game;RootEvent data;};
+ std::deque<Event> events;RootEvent last_data;std::string last_event;
  Broker(int q,int p,int merge,double latency):quantum(q),pending(p),merge_cells(merge),latency_ms(latency){
   if(q<1 || q>128 || p<1 || p>4 || merge<0 || !std::isfinite(latency) || latency<0 || latency>20)
    throw std::runtime_error("Invalid native inference service limits");
@@ -235,12 +241,28 @@ struct Broker {
   return paused && flights.empty() && std::all_of(producers.begin(),producers.end(),[&](const auto& p){return !p || p->done || (p->pause_ack==pause_epoch && p->completed.empty());});
  }
  std::vector<Command> commands(Producer& p){std::lock_guard lock(mutex);std::vector<Command> out(p.commands.begin(),p.commands.end());p.commands.clear();return out;}
- void publish(Producer& p,int game,uint64_t token,std::string event,bool released=false){
+ void publish(Producer& p,int game,uint64_t token,RootEvent event,bool released=false){
   std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
  }
+ bool next_event(){
+  std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return false;
+  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);return true;
+ }
+ bool event_rows(const char** text,const double** edges,int* count){
+  if(!next_event())return false;
+  *text=last_data.text.c_str();*edges=last_data.edges.data();*count=last_data.has_edges?int(last_data.edges.size()/9):-1;return true;
+ }
  const char* event(){
-  std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return nullptr;
-  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_event=std::move(event.text);return last_event.c_str();
+  if(!next_event())return nullptr;
+  last_event=last_data.text;
+  if(last_data.has_edges){
+   // Preserve the explicit JSON API, but pay its formatting cost only when
+   // requested. The actor's bulk path consumes the owned numeric table.
+   std::ostringstream out;out<<std::setprecision(17);out<<",\"edges\":[";
+   for(size_t i=0;i<last_data.edges.size();i+=9){if(i)out<<',';out<<'[';for(size_t j=0;j<9;++j){if(j)out<<',';out<<last_data.edges[i+j];}out<<']';}
+   out<<"]}";last_event.pop_back();last_event+=out.str();
+  }
+  return last_event.c_str();
  }
  void finish_row(Subscriber s,std::shared_ptr<const Prediction> prediction){
   if(s.job->results[s.row])return;
@@ -438,7 +460,7 @@ inline void Producer::run()noexcept{
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native producer teardown failed");}
  {std::lock_guard lock(broker.mutex);completed.clear();outstanding.clear();done=true;}broker.wake.notify_all();
 }
-inline std::string Producer::result(int index,uint64_t token){
+inline RootEvent Producer::result(int index,uint64_t token){
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
  if(pool.failed[index] || (!n.expanded && o.deadline)){
   int producer=this->index;
@@ -463,13 +485,13 @@ inline std::string Producer::result(int index,uint64_t token){
  out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
  out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.q<<",\"network_value\":";
  if(raw_known)out<<raw;else out<<"null";
- out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"edges\":[";
- for(size_t i=0;i<n.edges.size();++i){if(i)out<<',';auto& e=n.edges[i];out<<'['<<e.action.q<<','<<e.action.r<<','<<e.logit<<','<<q[i]<<','<<t.value(n,e)<<','<<weights[i]/total<<','<<e.visits<<','<<(i<o.direct_root_credits.size()?o.direct_root_credits[i]:0)<<','<<(e.eligible?1:0)<<']';}
- out<<"],\"exact_prefixes\":[";Board prefix;size_t count=0;
+ RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
+ for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i]/total,double(e.visits),double(i<o.direct_root_credits.size()?o.direct_root_credits[i]:0),double(e.eligible)});}
+ out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"exact_prefixes\":[";Board prefix;size_t count=0;
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(gumbel::keys(prefix).first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;
   for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}prefix.make(o.focus[ply]);}
- out<<"]}";return out.str();
+ out<<"]}";result.text=out.str();return result;
 }
 }
 extern "C" {
@@ -487,6 +509,9 @@ HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const in
 HX_API int hxb_release(void* p,int producer,int game,uint64_t expected){try{static_cast<inference::Broker*>(p)->release(producer,game,expected);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+// Borrowed immutable storage lasts until the next event or service destruction.
+// Copy it before continuing. count=-1 denotes a metadata-only lifecycle/error.
+HX_API int hxb_event_rows(void* p,const char** text,const double** edges,int* count){try{return static_cast<inference::Broker*>(p)->event_rows(text,edges,count)?1:0;}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API int hxb_pause(void* p,int paused){try{static_cast<inference::Broker*>(p)->pause(paused!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_paused(void* p){try{return static_cast<inference::Broker*>(p)->fenced();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API uint64_t hxb_installed(void* p){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);return b.installed_messages;}

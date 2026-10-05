@@ -41,6 +41,7 @@ for name, result, args in (
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
     ('join', C.c_int, [ptr]), ('free', C.c_int, [ptr]), ('stats', None, [ptr, ptr]),
     ('continuous', C.c_int, [ptr]), ('event', C.c_char_p, [ptr]),
+    ('event_rows', C.c_int, [ptr, ptr, ptr, ptr]),
     ('pause', C.c_int, [ptr, C.c_int]), ('paused', C.c_int, [ptr]),
     ('installed', C.c_uint64, [ptr]),
     ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
@@ -511,13 +512,23 @@ class InferenceService:
         source.ptr = None
 
     def event(self):
-        """Consume one immutable, position-bound completion. None while roots run."""
+        """Copy one immutable root/lifecycle completion; None while roots run.
+
+        Numeric legal-action records bypass JSON and own their array storage,
+        so later events, replacement and service close cannot invalidate them.
+        """
         import json
-        text = native.hxb_event(self.ptr)
-        if text is None:
+        text, edges, count = C.c_char_p(), C.POINTER(C.c_double)(), C.c_int()
+        status = native.hxb_event_rows(self.ptr,C.byref(text),C.byref(edges),C.byref(count))
+        if status<0:
+            checked(False)
+        if not status:
             self.done()  # Surface producer failures instead of silently waiting forever.
             return None
-        return json.loads(text)
+        result = json.loads(text.value)
+        if count.value>=0:
+            result['edges'] = np.ctypeslib.as_array(edges,shape=(count.value,9)).copy()
+        return result
 
     def pause(self, *, timeout=None):
         """Fence neural forwards and retain queued work; native CPU proofs continue.
