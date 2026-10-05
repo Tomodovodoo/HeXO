@@ -2014,6 +2014,83 @@ class NativeProofs(unittest.TestCase):
         self.assertTrue(pool.games[0].evidence()['eligible'].all())
         self.assertEqual(proofs.records(), [])
 
+    def test_unrelated_facts_preserve_closed_search_and_relevant_facts_reopen_it(self):
+        history = [[0,0],[1,2],[3,-1]]
+        graph = self.graph(history)
+        graph.search(4, root_samples=4, batch_size=4)
+        unrelated = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8],
+                     [3,0],[4,0],[8,8],[10,8]]
+        wrong_color = [[0,0],[3,-1],[0,8],[1,0],[2,0],[2,8],[4,8],
+                       [3,0],[4,0],[6,8],[8,8],[1,2],[0,1],[10,8],[12,8]]
+        relevant = history+[[1,0],[2,0],[0,8],[2,8],[3,0],[4,0],[4,8],[6,8]]
+        for moves in (unrelated, wrong_color, relevant):
+            view = graph.view(moves)
+            self.addCleanup(view.close)
+            self.assertTrue(native.hxg_tactics(view.ptr, 1))
+            view.search(1, root_samples=1, batch_size=1)
+            self.assertEqual(native.hxg_exact(view.ptr), 0)
+        pool = self.pool([graph], quantum=4, views=1, work=4096)
+        proofs = pool.enable_proofs(slice_ms=250, table_mb=1, workers=1, queue=1, tasks=8)
+        def closed():
+            proofs.step()
+            stats = proofs.stats()
+            return stats['unknown'] >= 2 and stats['scope']['closed_scopes'] == 1
+        self.wait(closed)
+        before = proofs.stats()
+        self.assertEqual(before['unknown'], 2)
+        for moves in (unrelated, wrong_color):
+            proofs.offer(0, moves)
+            proofs.step()
+            stats = proofs.stats()
+            self.assertEqual(stats['submitted'], before['submitted'])
+            self.assertEqual(stats['scope']['closed_scopes'], 1)
+        self.assertEqual(proofs.stats()['scope']['unchanged']-before['scope']['unchanged'], 2)
+        proofs.offer(0, relevant)
+        proofs.step()
+        after = proofs.stats()
+        self.assertEqual(after['scope']['closed_scopes'], 0)
+        self.assertEqual(after['submitted'], before['submitted']+1)
+        self.assertEqual(after['scope']['sent_facts']-before['scope']['sent_facts'], 1)
+        # Retrying a changed premise set keeps the effort already invested in this task.
+        self.assertEqual(after['scope']['quantum_ms']-before['scope']['quantum_ms'], 500)
+        proofs.drain()
+        self.assertEqual(native.hxg_exact(graph.ptr), -1)
+        self.assertTrue(pool.games[0].evidence()['eligible'].all())
+
+    def test_evicted_fact_membership_does_not_leak_into_later_jobs(self):
+        from itertools import combinations
+        history = [[0,0],[1,2],[3,-1]]
+        graph = self.graph(history)
+        graph.search(4, root_samples=4, batch_size=4)
+        marker = history+[[1,0],[2,0],[0,8]]
+        view = graph.view(marker)
+        self.addCleanup(view.close)
+        view.search(4, root_samples=4, batch_size=4)
+        pairs = [([0,8],[2,8])]+list(combinations(
+            [[q,r] for q in range(-4,5) for r in range(4,8) if [q,r] not in ([2,7],[3,7])], 2))[:256]
+        facts = []
+        for a,b in pairs:
+            moves = history+[[1,0],[2,0],a,b,[3,0],[4,0],[2,7],[3,7]]
+            child = graph.view(moves)
+            self.addCleanup(child.close)
+            self.assertTrue(native.hxg_tactics(child.ptr, 1))
+            child.search(1, root_samples=1, batch_size=1)
+            self.assertEqual(native.hxg_exact(child.ptr), 0)
+            facts.append(moves)
+        pool = self.pool([graph], quantum=4, views=1, work=4096)
+        proofs = pool.enable_proofs(slice_ms=40, table_mb=1, workers=1, queue=1, tasks=8)
+        for moves in facts:
+            proofs.offer(0, moves)
+        self.assertEqual(proofs.stats()['facts'], 256)
+        proofs.offer(0, marker, relevance=10.)
+        proofs.step()
+        stats = proofs.stats()
+        self.assertEqual(stats['submitted'], 1)
+        self.assertEqual(stats['scope']['available_facts'], 256)
+        self.assertEqual(stats['scope']['sent_facts'], 0)
+        self.assertEqual(stats['scope']['empty_jobs'], 1)
+        proofs.drain()
+
     def test_drain_stops_admission_and_retarget_discards_old_completions(self):
         graph = self.graph(self.opening)
         pool = self.pool([graph], quantum=16, views=1, work=4096)

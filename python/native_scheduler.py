@@ -56,7 +56,7 @@ for name, result, args in (
     ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
     ('drain', C.c_int, [ptr]), ('free', C.c_int, [ptr]),
     ('offer', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_double]),
-    ('stats', None, [ptr, ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
+    ('stats', None, [ptr, ptr, ptr]), ('scope_stats', None, [ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
     ('generation', C.c_uint64, [ptr, C.c_int]), ('effort', C.c_int, [ptr, C.c_int, ptr]),
 ):
     bind('hxp_'+name, result, *args)
@@ -114,7 +114,11 @@ class ProofLoop:
                            'pruned', 'unknown', 'fresh_nodes', 'missing_fresh', 'queued', 'active',
                            'ready', 'tasks', 'facts', 'records'), map(int, out)))
         result.update(zip(('worker_service_ms', 'worker_idle_ms', 'snapshot_ms', 'install_ms'),
-                          map(float, times)))
+                           map(float, times)))
+        scope = np.empty(10, np.uint64)
+        native.hxp_scope_stats(self.ptr, scope.ctypes.data)
+        result['scope'] = dict(zip(('refreshes', 'changed', 'unchanged', 'refresh_ns', 'available_facts',
+                                   'sent_facts', 'empty_jobs', 'quantum_ms', 'indexed_cells', 'closed_scopes'), map(int, scope)))
         return result
 
     def records(self):

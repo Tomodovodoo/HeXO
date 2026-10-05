@@ -3,6 +3,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <bitset>
 namespace proving {
 using Clock=std::chrono::steady_clock;
 using gumbel::Node;using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
@@ -15,25 +16,59 @@ struct API {
   for(int i=0;i<12;++i)if(!f[i])throw std::runtime_error("Missing native proof callback");
  }
 };
+struct Dependency {Key key;int distance;bool operator==(const Dependency&)const=default;};
+using Premises=std::bitset<256>;
 struct Task {
  Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0;
- int side=0,closed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false;Clock::time_point ready{};
+ int side=0,closed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false,scoped=false;Clock::time_point ready{};
+ std::vector<Dependency> scope;
 };
-struct Fact {std::vector<Cell> history;int winner,distance;};
+struct Fact {std::vector<Cell> history;int winner,distance,slot;};
 struct Frontier {
  struct Effort {uint64_t fresh=0,queries=0,missing=0;};
  std::map<uint64_t,Effort> effort;
  std::unordered_map<Key,std::shared_ptr<Task>,KeyHash> tasks;std::unordered_map<Key,Fact,KeyHash> facts;
  std::deque<Key> fact_order;uint64_t generation=1,revision=0,next=0,offers=0;size_t capacity;
+ Premises occupied;std::unordered_map<Cell,std::array<Premises,2>,CellHash> members;
+ uint64_t scope_checks=0,scope_changed=0,scope_unchanged=0,scope_ns=0;
  explicit Frontier(size_t cap):capacity(cap){}
+ void forget(Key key){
+  auto& fact=facts.at(key);
+  for(size_t n=0;n<fact.history.size();++n){auto it=members.find(fact.history[n]);
+   it->second[(n+1)/2%2].reset(fact.slot);if(it->second[0].none() && it->second[1].none())members.erase(it);}
+  occupied.reset(fact.slot);facts.erase(key);
+ }
  void remember(const std::vector<Cell>& history,const Node& node){
   if(node.exact_winner<0 || node.distance<1 || node.distance>10000)return;
   auto key=gumbel::keys(history).first;auto old=facts.find(key);
   if(old!=facts.end()){
    if(old->second.winner!=node.exact_winner)throw std::runtime_error("Conflicting exact frontier facts");
    if(old->second.distance<=node.distance)return;old->second.distance=node.distance;
-  }else{facts.emplace(key,Fact{history,node.exact_winner,node.distance});fact_order.push_back(key);}
-  ++revision;while(facts.size()>256){facts.erase(fact_order.front());fact_order.pop_front();}
+  }else{
+    if(facts.size()==occupied.size()){forget(fact_order.front());fact_order.pop_front();}
+    size_t slot=0;while(occupied[slot])++slot;occupied.set(slot);
+    facts.emplace(key,Fact{history,node.exact_winner,node.distance,int(slot)});fact_order.push_back(key);
+    for(size_t n=0;n<history.size();++n)members[history[n]][(n+1)/2%2].set(slot);
+   }
+   ++revision;
+ }
+ void scope(Task& task,bool stamps){
+  if(task.scoped && task.facts==revision)return;
+  auto began=Clock::now();++scope_checks;auto mask=occupied;
+  // A forward proof walk only adds colored stones. A fact missing any current
+  // stone cannot occur below this task. Start with recent, usually rare cells.
+  for(size_t n=task.history.size();n && mask.any();--n){auto it=members.find(task.history[n-1]);
+   if(it==members.end()){mask.reset();break;}mask&=it->second[n/2%2];}
+  std::vector<Dependency> selected;size_t words=0;
+  if(mask.any())for(auto key:fact_order){auto& fact=facts.at(key);if(!mask[fact.slot])continue;
+   size_t cost=fact.history.size()*2+3;if(words+cost>32768)continue;
+   words+=cost;selected.push_back({key,fact.distance});}
+  // Generalized stamps can apply beyond exact-board containment. Their opt-in
+  // path keeps conservative global invalidation until it has a library epoch.
+  if(!task.scoped || selected!=task.scope || stamps){task.closed=0;task.ready={};++scope_changed;}
+  else ++scope_unchanged;
+  task.scope=std::move(selected);task.facts=revision;task.scoped=true;
+  scope_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-began).count();
  }
  void offer(const std::shared_ptr<Node>& node,const std::vector<Cell>& history,double impact,double change){
   ++offers;remember(history,*node);if(node->exact_winner>=0)return;
@@ -55,7 +90,7 @@ struct Frontier {
 };
 struct Job {
  uint64_t id=0,token=0;size_t game=0;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
- std::vector<Cell> history;std::string context,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
+ std::vector<Cell> history;std::vector<Dependency> scope;std::string context,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
  Clock::time_point queued,started,deadline{};double elapsed=0,wait=0;bool cancelled=false,pruned=false;
  std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;
 };
@@ -65,6 +100,7 @@ struct Loop {
  std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<Job>> queued,done;
  std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table;bool stopping=false,enabled=true,stamps=false;
  uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
+ uint64_t available_facts=0,sent_facts=0,empty_scope_jobs=0,quantum_ms=0;
  std::deque<std::string> records;
  std::string released_effort;
  Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps){
@@ -96,12 +132,11 @@ struct Loop {
   f.offer(path.leaf->shared_from_this(),path.history,std::max(.0001,relevance*share)*forcing,std::abs(path.leaf->q-path.leaf->value));
   for(auto [parent,index]:path.edges)if(parent->exact_winner>=0 && parent->stones<=int(path.history.size()))f.remember(std::vector<Cell>(path.history.begin(),path.history.begin()+parent->stones),*parent);
  }
- std::string context(size_t i,const std::vector<Cell>& history){
+ std::string context(size_t i,const Task& task){
   auto start=Clock::now();auto& f=frontiers[i];std::string text="{\"history\":";
   auto cells=[&](const std::vector<Cell>& h){text+='[';for(size_t n=0;n<h.size();++n){if(n)text+=',';text+='[';text+=std::to_string(h[n].q);text+=',';text+=std::to_string(h[n].r);text+=']';}text+=']';};
-  cells(history);text+=",\"known\":[";size_t words=0,count=0;
-  for(auto key:f.fact_order){auto found=f.facts.find(key);if(found==f.facts.end())continue;auto& fact=found->second;
-   if(words+fact.history.size()*2+3>32768)continue;words+=fact.history.size()*2+3;if(count++)text+=',';
+  cells(task.history);text+=",\"known\":[";size_t count=0;
+  for(auto dependency:task.scope){auto& fact=f.facts.at(dependency.key);if(count++)text+=',';
    text+="{\"history\":";cells(fact.history);text+=",\"winner\":"+std::to_string(fact.winner)+",\"plies\":"+std::to_string(fact.distance)+'}';
   }text+="]}";snapshot_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();return text;
  }
@@ -111,7 +146,7 @@ struct Loop {
    for(auto it=f.tasks.begin();it!=f.tasks.end();){auto task=it->second;auto node=task->node.lock();
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
     if(task->flight || !node)continue;
-    if(task->facts!=f.revision){task->closed=0;task->facts=f.revision;task->attempts={};task->ready={};}
+    f.scope(*task,stamps);
     if(task->closed==3 || task->ready>now)continue;
     bool pending=node->pending;if(auto peers=o.game->positions.find(task->key);peers!=o.game->positions.end())for(auto& weak:peers->second)if(auto peer=weak.lock())pending|=peer->pending;
     if(pending)continue;double age=double(f.next-task->born+1);
@@ -126,7 +161,8 @@ struct Loop {
    size_t i=0;auto task=take(i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
-   job->generation=task->generation;job->facts=frontiers[i].revision;job->queued=Clock::now();job->context=context(i,job->history);
+   job->generation=task->generation;job->facts=frontiers[i].revision;job->scope=task->scope;job->queued=Clock::now();job->context=context(i,*task);
+   available_facts+=frontiers[i].facts.size();sent_facts+=task->scope.size();empty_scope_jobs+=task->scope.empty();quantum_ms+=job->quantum;
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
    task->flight=true;o.game->pins[task.get()]={node.get()};
    {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
@@ -195,9 +231,10 @@ struct Loop {
    if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
   }else{
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
-   if(job.facts==f.revision && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
+   f.scope(task,stamps);bool same_scope=job.scope==task.scope && (!stamps || job.facts==f.revision);
+   if(same_scope && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
    int next_side=1-job.side;task.side=(task.closed&(1<<next_side))?job.side:next_side;
-   task.ready=Clock::now()+std::chrono::milliseconds(slice*int(uint64_t(1)<<std::min(6u,task.attempts[job.side])));
+   task.ready=same_scope?Clock::now()+std::chrono::milliseconds(slice*int(uint64_t(1)<<std::min(6u,task.attempts[job.side]))):Clock::time_point{};
   }
   install_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
  }
@@ -217,7 +254,7 @@ struct Loop {
   {std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))return nullptr;}
   auto& f=frontiers[game];released_effort="[";int count=0;
   for(auto [generation,e]:f.effort){if(count++)released_effort+=',';released_effort+='['+std::to_string(generation)+','+std::to_string(e.fresh)+','+std::to_string(e.queries)+','+std::to_string(e.missing)+']';}
-  released_effort+=']';f.effort.clear();f.tasks.clear();f.facts.clear();f.fact_order.clear();f.next=f.offers=0;++f.revision;
+  released_effort+=']';f.effort.clear();f.tasks.clear();f.facts.clear();f.fact_order.clear();f.members.clear();f.occupied.reset();f.next=f.offers=0;++f.revision;
   auto& store=*pool.games[game]->game;store.evidence=nullptr;store.evidence_owner=nullptr;
   return released_effort.c_str();
  }
@@ -240,6 +277,9 @@ extern "C" HX_API int hxp_offer(void* p,int game,const int64_t* cells,int count,
 extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);uint64_t active=0,tasks=0,facts=0;double service=0,idle=0;for(auto& w:loop.workers){active+=bool(w->active);service+=w->service;idle+=w->idle;}for(auto& f:loop.frontiers){tasks+=f.tasks.size();facts+=f.facts.size();}
  std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;}
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
+extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;
+ for(auto& f:loop.frontiers){checks+=f.scope_checks;changed+=f.scope_changed;unchanged+=f.scope_unchanged;ns+=f.scope_ns;cells+=f.members.size();for(auto& [key,task]:f.tasks)closed+=bool(task->closed&1)+bool(task->closed&2);}
+ std::array<uint64_t,10> values{checks,changed,unchanged,ns,loop.available_facts,loop.sent_facts,loop.empty_scope_jobs,loop.quantum_ms,cells,closed};std::copy(values.begin(),values.end(),out);}
 extern "C" HX_API uint64_t hxp_generation(void* p,int game){return static_cast<proving::Loop*>(p)->frontiers.at(game).generation;}
 extern "C" HX_API const char* hxp_release(void* p,int game){return static_cast<proving::Loop*>(p)->release(game);}
 extern "C" HX_API int hxp_effort(void* p,int game,uint64_t* out){auto& f=static_cast<proving::Loop*>(p)->frontiers.at(game);int i=0;for(auto [generation,e]:f.effort){if(out){std::array<uint64_t,4> row{generation,e.fresh,e.queries,e.missing};std::copy(row.begin(),row.end(),out+4*i);}++i;}return i;}
