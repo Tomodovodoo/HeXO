@@ -242,6 +242,9 @@ if (job.kind === 'encode') {
   const other = new Network(ort,{async release(){}},'fp32',{model_version:'B'},1,{provider:'webgpu',graph:new Uint8Array([7])});
   let baseReleases = 0;
   const faulty = new Network(ort,{async release(){baseReleases++;}},'fp32',{model_version:'C'},1,{provider:'webgpu',graph:new Uint8Array([9])});
+  let evictionBaseReleases=0;
+  const evicting = new Network(ort,{async release(){evictionBaseReleases++;}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+  let replacement;
   try{
     const first=await network.forwardCaptured(input(3,24,2),3,24),second=await network.forwardCaptured(input(3,24,5),3,24);
     const concurrent=await Promise.all([network.forwardCaptured(input(3,24,8),3,24),network.forwardCaptured(input(3,24,11),3,24)]);
@@ -265,8 +268,15 @@ if (job.kind === 'encode') {
     try{await faulty.close();}catch(error){answer.release_error=error.message;}
     answer.release_failure={entries:faulty.captureStats().entries,sessions:sessions.size,base_releases:baseReleases,buffers:buffers.size};
     await faulty.close();await faulty.close();answer.base_releases=baseReleases;
+    await evicting.forwardCaptured(input(1,24,1),1,24);await evicting.forwardCaptured(input(64,24,1),64,24);
+    failRelease=[...sessions].find(s=>s.rows===64);
+    try{await evicting.forwardCaptured(input(32,32,1),32,32);}catch(error){answer.eviction_error=error.message;}
+    answer.poisoned_model=evicting.closed;
+    await evicting.close();answer.eviction_base_releases=evictionBaseReleases;
+    replacement=new Network(ort,{async release(){}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+    answer.reloaded_value=(await replacement.forwardCaptured(input(1,24,2),1,24)).value[0];await replacement.close();
     answer.final={active,freedBusy,mapped,buffers:buffers.size,sessions:sessions.size,created,released,stats:network.captureStats()};
-  }finally{await network.close();await other.close();await faulty.close();}
+  }finally{await network.close();await other.close();await faulty.close();await evicting.close();await replacement?.close();}
 } else if (job.kind === 'owner-profile') {
   // Runtime measurements, not old/new search-row or playing-strength checks.
   answer = {features: [], searches: []};

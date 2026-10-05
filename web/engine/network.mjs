@@ -331,7 +331,7 @@ class Captures {
     while (this.entries.size && (this.entries.size >= slots || this.cells + cells > limit)) {
       const [old, entry] = this.entries.entries().next().value;
       try { await this.release(entry); }
-      catch (error) { this.closed = true; throw error; }
+      catch (error) { this.closed = this.network.closed = true; throw error; }
       this.entries.delete(old); this.cells -= entry.cells; this.counts.evictions++;
     }
     const half = this.network.precision === 'fp16', length = rows * (size * size + 2), features = rows * CHANNELS * size * size;
@@ -350,7 +350,7 @@ class Captures {
       return entry;
     } catch (error) {
       try { await this.release(entry); }
-      catch (failed) { this.closed = true; throw new AggregateError([error, failed], 'Capture creation and cleanup failed'); }
+      catch (failed) { this.closed = this.network.closed = true; throw new AggregateError([error, failed], 'Capture creation and cleanup failed'); }
       this.entries.delete(key); this.cells -= cells;
       throw error;
     } finally { this.counts.setup_ms += performance.now() - start; }
