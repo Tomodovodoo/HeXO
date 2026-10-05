@@ -2118,6 +2118,19 @@ class TurnTrees(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_engine_puzzle_benchmark_checks_serialized_certificates(self):
+        from notation import dumps
+        from tests.test_tactical_proof import IMMEDIATE, NO_THREAT
+        from tools.proof_stamps import engine_benchmark
+        source, target = self.path.with_name('puzzles.txt'), self.path.with_name('results.json')
+        source.write_text(dumps(IMMEDIATE)+'\n'+dumps(NO_THREAT), encoding='utf-8')
+        report = engine_benchmark(source, target, self.path, simulations=4, nodes=1000, ms=5000, stamps=True)
+        self.assertEqual([r['status'] for r in report['rows']], ['PROVEN_WIN', 'UNKNOWN'])
+        self.assertGreater(report['rows'][0]['verified_certificates'], 0)
+        self.assertGreater(report['rows'][0]['verification_ms'], 0)
+        self.assertEqual(report['rows'][1]['verified_certificates'], 0)
+        self.assertEqual(json.loads(target.read_text())['rows'], report['rows'])
+
     def test_play_evaluation_keeps_one_tree_for_the_turn(self):
         import hexnet
         import neural_search

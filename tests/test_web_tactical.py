@@ -67,14 +67,18 @@ class WebTacticalParity(unittest.TestCase):
 
     def test_learned_browser_stamp_keeps_the_real_board_blockers(self):
         proof = NativeTactics().history(LATE_WIN, nodes=50000, ms=3000)
-        learned, reused = wasm_results([
+        learned, reused, shortened = wasm_results([
             (LATE_WIN, dict(certificate=proof['certificate'], stamps=True, library=[], nodes=1, ms=5000)),
             (LATE_WIN, dict(stamps=True, library=[], nodes=1, ms=5000)),
+            (LATE_WIN, dict(shortest=True, stamps=True, library=[], nodes=32768, ms=20000)),
         ])
         self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
         self.assertEqual(reused['status'], 'PROVEN_WIN', reused['reason'])
         self.assertEqual(reused['stamp_hits'], 1)
         self.assertEqual(independent_verify(reused['certificate'], LATE_WIN), 'PROVEN_WIN')
+        self.assertEqual((shortened['status'], shortened['proof_turns'], shortened['shortest']),
+                         ('PROVEN_WIN', 4, True))
+        self.assertEqual(independent_verify(shortened['certificate'], LATE_WIN), 'PROVEN_WIN')
 
     def test_defender_roots_and_exact_graph_premises_match_native(self):
         native = NativeTactics()

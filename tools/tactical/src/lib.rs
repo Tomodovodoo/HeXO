@@ -12,7 +12,7 @@ use std::time::{Duration,Instant};
 use hexo_engine::types::Player;
 use hexo_solver::forcing::Meter;
 use hexo_solver::prover::{self,Ctl,DriverKind,ProverConfig};
-use hexo_solver::prover::io::{Position,PosConfig,Verdict};
+use hexo_solver::prover::io::{Position,PosConfig};
 use hexo_solver::prover::certificate::{ProofCertificate,ProofNode,ProofResponse,ExactFact,ExactScope,exact_at,StampSource,StampScope};
 use serde::Deserialize;
 use serde_json::{json,Value};
@@ -261,7 +261,7 @@ fn shorten(pos:&Position,cert:&ProofCertificate,req:&Request,ctl:&Ctl,meter:&Met
     let cfg=ProverConfig{driver:DriverKind::PdspnShortest,wide:true,node_budget:left,
         tt_mb:(left/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
     let found=prover::guided_pdspn_shortest(pos,cert,&cfg,&ctl).ok()?;
-    Some((found.certificate?,found.verdict==Verdict::Win))
+    Some((found.certificate?,found.stats.cert_tightened))
 }
 /// One query. `nodes` bounds the total search work (IDTT nodes plus PDS-PN level-1
 /// nodes and level-2 expansions), so with `table_mb` 0 the verdict and certificate are a
@@ -366,7 +366,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
                 found.certificate
             };
             match found {
-                Some(cert) if req.shortest && req.known.is_empty() && !req.stamps =>
+                Some(cert) if req.shortest && req.known.is_empty() =>
                     match shorten(&pos,&cert,&req,&ctl,&meter) {
                         Some((tight,minimal)) if check::verify(&req.history,ply,&tight,&ctl,check_nodes(req.nodes)).is_ok() =>
                             {exact=minimal;Some(tight)}

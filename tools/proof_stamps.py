@@ -197,9 +197,14 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
                 queries.append(dict(attacker=options.get('attacker', 'mover'), ms=took,
                                     **{k: answer.get(k) for k in ('status', 'reason', 'nodes_fresh',
                                        'proof_turns', 'shortest', 'stamp_hits', 'native_verified')}))
-                if answer.get('certificate'):
+                certificate = answer.get('certificate')
+                if certificate is None and answer.get('certificate_json'):
+                    certificate = json.loads(answer['certificate_json'])
+                if answer.get('native_verified') and certificate is None:
+                    raise RuntimeError('Verified solver answer is missing its certificate')
+                if certificate is not None:
                     start = time.perf_counter()
-                    independent_verify(answer['certificate'], history, attacker=options.get('attacker', 'mover'),
+                    independent_verify(certificate, history, attacker=options.get('attacker', 'mover'),
                                        known=options.get('known', ()), deadline_seconds=45.)
                     verification_ms += 1000*(time.perf_counter()-start)
                     verified += 1
