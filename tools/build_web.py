@@ -1,6 +1,6 @@
 """Build the browser engine bundle in web/engine.
 
-wasm   src/gumbel.cpp -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/native.mjs + native/native.wasm (em++ on
+wasm   native graph owner/feed/batch -> gumbel.mjs + gumbel.wasm and src/hexo.cpp -> native/native.mjs + native/native.wasm (em++ on
        PATH, or --emxx), tools/tactical -> tactical.wasm, tools/shrimp_web -> shrimp/shrimp.wasm and tools/strix_web ->
        strix/strix.wasm (cargo with the wasm32-wasip1 target), tools/six -> six/six.mjs + six/six.wasm (Six's network
        search, built as Six builds it for its site); build.json binds them to their sources (committed).
@@ -53,7 +53,12 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_q_range_floor', 'hxg_root_noise', 'hxg_round_barrier', 'hxg_exact',
                   'hxg_distance', 'hxg_census', 'hxg_mark_exact', 'hxg_prove', 'hxg_share', 'hxg_archive', 'hxg_archive_forward', 'hxg_archive_stats', 'hxg_root_at', 'hxg_store', 'hxg_q',
                   'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
+                  'hxgo_new', 'hxgo_free', 'hxgo_step', 'hxgo_step_ready', 'hxgo_cancel', 'hxgo_done', 'hxgo_feed', 'hxgo_admit',
+                  'hxgo_root', 'hxgo_install', 'hxgo_choice', 'hxgo_stats', 'hxgo_records', 'hxgo_record_history',
+                  'hxgf_layout', 'hxgf_take', 'hxgf_stats', 'hxgf_queued', 'hxgf_abandon_all',
+                  'hxgp_new', 'hxgp_free', 'hxgp_groups', 'hxgp_group', 'hxgp_features', 'hxgp_decode_split', 'hxgp_outputs',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
+GUMBEL_SOURCES = ('gumbel_owner.cpp', 'gumbel_feed.cpp', 'gumbel_batch.cpp')
 NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')
 WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
@@ -77,13 +82,17 @@ SIX_FLAGS = ['-std=c++20', '-O3', '-msimd128', '-fexceptions', '-sASYNCIFY', '-s
 
 
 def digest(path):
-    """SHA-256 of a file with CRLF read as LF, so checkouts with either line ending agree."""
-    return hashlib.sha256(Path(path).read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+    """Hash binary bytes exactly; normalize source/script line endings across checkouts."""
+    path = Path(path)
+    data = path.read_bytes()
+    if path.suffix != '.wasm':
+        data = data.replace(b'\r\n', b'\n')
+    return hashlib.sha256(data).hexdigest()
 
 
 def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
-    paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
+    paths = [ROOT/'src'/name for name in ('gumbel.cpp', *GUMBEL_SOURCES, 'gumbel_parallel.hpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
     paths.append(TACTICAL/'stamps.json')
     paths += sorted(p for p in SHRIMP.rglob('*') if (p.suffix in ('.rs', '.lock') or p.name == 'Cargo.toml')
@@ -109,8 +118,8 @@ def build_strix(cargo):
 
 def build_wasm(emxx, cargo):
     before = sources()
-    for source, exports, out in (('gumbel.cpp', GUMBEL_EXPORTS, 'gumbel.mjs'), ('hexo.cpp', NATIVE_EXPORTS, 'native/native.mjs')):
-        subprocess.run([emxx, str(ROOT/'src'/source), '-I', str(ROOT/'src'), *WASM_FLAGS,
+    for source, exports, out in ((GUMBEL_SOURCES, GUMBEL_EXPORTS, 'gumbel.mjs'), (('hexo.cpp',), NATIVE_EXPORTS, 'native/native.mjs')):
+        subprocess.run([emxx, *(str(ROOT/'src'/name) for name in source), '-I', str(ROOT/'src'), *WASM_FLAGS,
                         f"-sEXPORTED_FUNCTIONS={','.join('_'+name for name in exports)}", '-o', str(ENGINE/out)], check=True)
     (ENGINE/'six').mkdir(exist_ok=True)
     six = [emxx, '-I', str(SIX/'src'), *(str(SIX/'src'/name) for name in SIX_SOURCES), str(SIX/'web_bot.cpp'), *SIX_FLAGS,

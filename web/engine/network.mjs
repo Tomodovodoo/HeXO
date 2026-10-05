@@ -2,6 +2,7 @@
 import {encode, features, CHANNELS} from './encode.mjs';
 import {cached, json, moduleUrl, pins} from './assets.mjs';
 import {LIMITS, stall} from './stages.mjs';
+import {nextTask} from './tasks.mjs';
 
 /** An adapter whose largest buffer is at most the WebGPU default (256 MiB), as phone GPUs report, is limited. */
 const LIMITED_BYTES = 2 ** 28;
@@ -217,5 +218,27 @@ export class Network {
       }
     }
     return result;
+  }
+
+  /** Compiled graph owner batches already own their crop/context mappings.
+   * Keep JavaScript work at submission granularity and bound feature staging
+   * on large canvases. The ONNX forward still returns its three output arrays. */
+  async evaluateNative(batch, {stop = () => batch.owner.done()} = {}) {
+    for (let group = 0; group < batch.groups.length; group++) {
+      const {size, rows} = batch.groups[group];
+      const limit = Math.min(this.maxBatch, Math.max(1, Math.floor(64 * 32 * 32 / (size * size))));
+      for (let start = 0; start < rows; start += limit) {
+        if (stop()) return false;
+        const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
+        if (stop()) return false;
+        const prediction = await this.forward(input, count, size);
+        batch.decode(group, start, count, prediction);
+        // WASM forwards may resolve only through microtasks. Give worker
+        // cancellation messages a task boundary before admitting more work.
+        await nextTask();
+        if (stop()) return false;
+      }
+    }
+    return true;
   }
 }

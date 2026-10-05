@@ -1,5 +1,6 @@
 """Parity of the browser engine bundle (web/engine) with the native engine and the PyTorch network."""
 import base64
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -659,6 +660,117 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_native_owner_features_keep_the_browser_model_input_contract(self):
+        histories = [[], [[0,0]], [[0,0],[4,0]], [[0,0],[4,0],[7,0]],
+                     [[7*i,0] for i in range(36)]]
+        answers = node(dict(kind='native-features', histories=histories))
+        self.assertTrue(any(answer['far'] for answer in answers))
+        for answer in answers:
+            actual = np.frombuffer(base64.b64decode(answer['features']), np.float32)
+            expected = np.frombuffer(base64.b64decode(answer['reference']), np.float32)
+            np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=0)
+
+    def test_native_browser_owner_preserves_legal_breadth_and_sampling_credits(self):
+        history = [[0,0],[4,0],[7,0]]
+        answer = node(dict(kind='native-owner', history=history, work=512, delay=2, batchSize=4))
+        result, stats = answer['result'], answer['stats']
+        game = play.Game(history)
+        try: self.assertEqual(sorted(result['actions']), sorted([list(p) for p in game.legal_moves()]))
+        finally: game.close()
+        self.assertIn(result['action'], result['actions'])
+        self.assertAlmostEqual(sum(result['policy']), 1.)
+        self.assertGreater(stats['created'], 1)
+        self.assertGreater(stats['depth'], 0)
+        self.assertGreater(stats['root_completed'], 0)
+        self.assertLessEqual(stats['root_completed'], stats['completed'])
+        self.assertLessEqual(stats['last_credits'], stats['root_completed'])
+        self.assertEqual(result['completed'], stats['root_completed'])
+        self.assertEqual(result['all_view_completed'], stats['completed'])
+        self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+        self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+        self.assertEqual(answer['remainingViews'], 1)
+        self.assertGreater(answer['readyBeforeResult'], 0)
+
+    def test_native_browser_owner_drains_late_inference_and_keeps_exact_evidence(self):
+        for mode in ('cancel', 'prove', 'nonfinite', 'throwWhilePending'):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, delay=2, **{mode: True}))
+            stats = answer['stats']
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+            self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+            self.assertEqual(answer['remainingViews'], 1)
+            if mode in ('nonfinite','throwWhilePending'):
+                self.assertTrue(answer['rejected'])
+                self.assertGreater(answer['forwardsFinished'], 0)
+            elif mode == 'cancel': self.assertTrue(answer['blockedClose'])
+            else:
+                self.assertTrue(answer['lateProof'])
+                self.assertEqual(answer['result']['proven'], -1)
+                self.assertEqual(answer['result']['node_value'], -1.)
+
+    def test_native_browser_owner_turn_uses_shared_graph_and_releases_views(self):
+        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0, nativeOwner=True))
+        self.assertEqual(len(result['moves']), 2)
+        self.assertEqual(len(result['native_scheduler']), 2)
+        game = play.Game([[0,0]])
+        try:
+            for move in result['moves']:
+                self.assertTrue(game.legal(*move))
+                game.play(*move)
+        finally: game.close()
+        for stats in result['native_scheduler']:
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+
+    def test_native_browser_owner_stops_split_forwards_at_cancellation_or_proof(self):
+        for control in (dict(cancel=True, cancelAfter=3), dict(stopAfter=3), dict(prove=True, proveAfter=3)):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, maxBatch=1, delay=2, **control))
+            self.assertEqual(answer['forwardCalls'], 3)
+            self.assertEqual(answer['forwardsFinished'], 3)
+            stats = answer['stats']
+            self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+            returned = answer['result']['scheduler']
+            self.assertEqual((returned['pending'], returned['tasks'], returned['subscribers']), (0,0,0))
+            self.assertEqual(answer['remainingViews'], 1)
+            if control.get('prove'):
+                self.assertEqual(answer['result']['proven'], -1)
+
+    def test_native_browser_owner_checks_stop_after_packing_and_decoding(self):
+        for control, forwards in (('stopOnFeatures',0), ('stopOnDecode',1)):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, **{control: True}))
+            self.assertEqual(answer['forwardCalls'], forwards)
+            self.assertEqual(answer['result']['actions'], [])
+            self.assertEqual(answer['result']['completed'], 0)
+            self.assertEqual(answer['stats']['installed'], 0)
+            self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+
+    def test_native_browser_owner_checks_its_clock_before_installation(self):
+        answer = node(dict(kind='native-owner', history=[[0,0]], ms=200, expireBeforeInstall=True))
+        self.assertEqual(answer['forwardCalls'], 1)
+        self.assertEqual(answer['result']['actions'], [])
+        self.assertEqual(answer['stats']['installed'], 0)
+        self.assertEqual(answer['stats']['deadline'], 1)
+        self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+
+    def test_native_browser_owner_reads_cancel_messages_between_microtask_forwards(self):
+        for after in (1,3):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, maxBatch=1,
+                               cancelByMessage=True, messageCancelAfter=after))
+            self.assertEqual(answer['forwardCalls'], after)
+            self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+            if after == 1:
+                self.assertEqual(answer['result']['actions'], [])
+                self.assertEqual(answer['stats']['installed'], 0)
+
+    def test_native_browser_owner_honors_policy_move_selection(self):
+        answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
+        result = answer['result']
+        self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])
+
+    def test_browser_adapter_keeps_native_owner_opt_in(self):
+        ordinary, compiled = node(dict(kind='owner-adapter'))
+        self.assertFalse(ordinary['nativeOwner'])
+        self.assertTrue(compiled['nativeOwner'])
+
     def test_stored_turn_reconnects_proofs_in_either_stone_order(self):
         from tests.test_neural_search import Uniform
         histories = [[[0,0],[1,0],[2,0]], [[0,0],[1,0]], [[0,0],[2,0]]]
@@ -867,6 +979,9 @@ class Bundle(unittest.TestCase):
         record = json.loads((ENGINE/'build.json').read_text(encoding='utf-8'))
         self.assertEqual(record['sources'], build_web.sources())
         self.assertEqual(record['artefacts'], {name: build_web.digest(ENGINE/name) for name in record['artefacts']})
+        for name, digest in record['artefacts'].items():
+            if name.endswith('.wasm'):
+                self.assertEqual(digest, hashlib.sha256((ENGINE/name).read_bytes()).hexdigest())
 
     def test_encoder_matches_hexcrop(self):
         model = random_model()
@@ -1157,6 +1272,14 @@ class Bundle(unittest.TestCase):
             self.assertEqual(case['after']['nodes'], expected)
             self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2-expected)
             self.assertEqual(case['counters']['pending'], 0)
+        for case in found['ownerConflicts']:
+            self.assertEqual(case['before']['nodes'], 2)
+            self.assertLess(case['before']['bytes'], case['before']['limit'])
+            self.assertEqual(case['after']['focus_stones'], 4)
+            self.assertEqual(case['after']['nodes'], 0 if case['forward'] else 2)
+            self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2 if case['forward'] else 0)
+            self.assertEqual(case['counters']['pending'], 0)
+            self.assertEqual(case['counters']['views'], 1)
         for growth in (found['proofGrowth'], found['leafProofGrowth']):
             self.assertGreaterEqual(growth['before']['nodes'], 2)
             self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])

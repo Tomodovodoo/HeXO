@@ -23,13 +23,14 @@
 //   with the stones the proof table it is sent proves marked (see `searched`): the evaluations at ply - 1 after analysis,
 //   undo, another preset and a reload, and `given`, the turn proof.mjs answered gives at ply - 1 from `found`'s table
 import {readFileSync} from 'node:fs';
+import {pathToFileURL} from 'node:url';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, PV_CHECK} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, NativeOwner, PV_CHECK} from '../../web/engine/search.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
-import {defaultThreads} from '../../web/engine/network.mjs';
+import {defaultThreads, Network} from '../../web/engine/network.mjs';
 import {Stages, errorReport, stall} from '../../web/engine/stages.mjs';
 import {BrowserSession, review} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
@@ -105,6 +106,118 @@ if (job.kind === 'encode') {
     s.planes.forEach((v, i) => { if (v) ones.push(i); });
     return {size: s.size, cells: Array.from(s.cells), far: s.far, ones, features: Buffer.from(features(s).buffer).toString('base64')};
   });
+} else if (job.kind === 'native-features') {
+  answer = [];
+  for (const history of job.histories) {
+    const graph = new GameGraph(native, {history, roundBarrier: true}), owner = new NativeOwner(graph, {work: 1, ms: 0, views: 1});
+    let batch;
+    try {
+      owner.step(); batch = owner.take();
+      if (!batch || batch.count !== 1 || batch.groups.length !== 1) throw new Error('Expected one root encoding');
+      const input = batch.features(0, 0, 1), sample = encode(history, native.legal(history));
+      answer.push({size: batch.groups[0].size, features: Buffer.from(input.buffer).toString('base64'),
+        reference: Buffer.from(features(sample).buffer).toString('base64'), far: sample.far});
+    } finally { batch?.close(); owner.close(); graph.close(); }
+  }
+} else if (job.kind === 'native-owner') {
+  const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
+    work: job.ms ? 0 : job.work ?? 256, ms: job.ms ?? 0, views: job.views ?? 8, quantum: 32});
+  const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
+  network.maxBatch = job.maxBatch ?? network.maxBatch;
+  let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
+  let forwardCalls = 0, decoded = false, packed = false, messageCancelled = false;
+  if (job.stopOnDecode || job.stopOnFeatures || job.expireBeforeInstall) network.evaluateNative = async (batch, options) => {
+    const decode = batch.decode.bind(batch), features = batch.features.bind(batch);
+    batch.decode = (...args) => {decode(...args); decoded = true;};
+    batch.features = (...args) => {const input = features(...args); packed = true; return input;};
+    const result = await Network.prototype.evaluateNative.call(network, batch, options);
+    if (job.expireBeforeInstall) await new Promise(resolve => setTimeout(resolve, 2 * job.ms));
+    return result;
+  };
+  network.forward = async (input, count, size) => {
+    forwardCalls++;
+    sent += count;
+    if (job.cancelByMessage && forwardCalls === (job.messageCancelAfter ?? 1)) {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {messageCancelled = true;channel.port1.close();channel.port2.close();};
+      channel.port2.postMessage('cancel');
+    }
+    if (job.delay) {
+      await new Promise(resolve => setTimeout(resolve, job.delay));
+      readyBeforeResult = Math.max(readyBeforeResult, Number(owner.m._hxgf_queued(owner.feed)));
+    }
+    if (job.cancel && forwardCalls >= (job.cancelAfter ?? 1)) {
+      owner.cancel();
+      try { owner.close(); } catch { blockedClose = true; }
+    }
+    if (job.prove && !lateProof && forwardCalls >= (job.proveAfter ?? 1)) {graph.proveLoss(1-native.game(job.history).player, 7);lateProof = true;}
+    const policy = new Float32Array(count * size * size), far = new Float32Array(count), value = new Float32Array(count);
+    if (job.nonfinite) policy[0] = NaN;
+    forwardsFinished++;
+    return {policy, far, value};
+  };
+  try {
+    let result;
+    try { result = await owner.search({network, choice: job.choice ?? 'gumbel', batchSize: job.batchSize ?? 16, onBatch: stats => snapshots.push(stats),
+      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(messageCancelled || job.stopOnDecode && decoded || job.stopOnFeatures && packed || job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
+    catch (error) { if (!job.nonfinite && !job.throwWhilePending) throw error; rejected = /Nonfinite|Control failed/.test(error.message); }
+    answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished, forwardCalls};
+    owner.close();
+    graph.at(job.history);
+    answer.graph = graph.counters();
+    answer.remainingViews = graph.counters().views;
+  } finally { owner.close(); graph.close(); }
+} else if (job.kind === 'owner-adapter') {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({networks: []}));
+  const {BubbleEngine} = await import('../../web/engine/bubble.mjs');
+  globalThis.fetch = fetch;
+  const engine = new BubbleEngine({model:'test'});engine.call = async request => request;
+  answer = [await engine.turn([[0,0]], {simulations:128,solver_nodes:0}),
+    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,native_owner:true})];
+} else if (job.kind === 'owner-profile') {
+  // Runtime measurements, not old/new search-row or playing-strength checks.
+  answer = {features: [], searches: []};
+  for (const history of job.histories) {
+    const graph = new GameGraph(native, {history}), owner = new NativeOwner(graph, {work: 1, ms: 0, views: 1});
+    let batch;
+    try {
+      owner.step(); batch = owner.take();
+      if (!batch) {answer.features.push({history, exact: true});continue;}
+      const sample = encode(history, native.legal(history)), count = job.repeats ?? 40, trials = [];
+      for (let i = 0; i < 5; i++) { features(sample); batch.features(0,0,1); }
+      for (const compiled of [false,true,true,false]) {
+        const begin = performance.now();
+        for (let i = 0; i < count; i++) compiled ? batch.features(0,0,1) : features(sample);
+        trials.push({compiled, ms: performance.now()-begin, rows: count});
+      }
+      answer.features.push({history, size: sample.size, trials});
+    } finally {batch?.close();owner.close();graph.close();}
+  }
+  if (job.model) {
+    const ort = await import(pathToFileURL(job.ort).href);
+    ort.env.wasm.numThreads = 1;
+    const session = await ort.InferenceSession.create(new Uint8Array(readFileSync(job.model)), {executionProviders: ['wasm']});
+    const network = new Network(ort, session, 'fp32', {model_version: job.version}, 1);
+    try {
+      for (const history of job.searchHistories ?? job.histories) {
+        await network.evaluate([{history, actions: native.legal(history)}]);
+        for (const compiled of [false,true,true,false]) {
+          const graph = new GameGraph(native, {history, roundBarrier: compiled, seed: 1740});
+          let owner;
+          try {
+            const begin = performance.now(); let result;
+            if (compiled) {
+              owner = new NativeOwner(graph, {ms: job.ms ?? 1000, work: 0, views: job.views ?? 8});
+              result = await owner.search({network, batchSize: 64});
+            } else result = await graph.search({simulations: 1024, rootSamples: 16, batchSize: 64,
+              evaluate: leaves => network.evaluate(leaves), stop: () => performance.now()-begin >= (job.ms ?? 1000)});
+            answer.searches.push({history, compiled, ms: performance.now()-begin, result});
+          } finally {owner?.close();graph.close();}
+        }
+      }
+    } finally {await session.release();}
+  }
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
@@ -153,6 +266,22 @@ if (job.kind === 'encode') {
       retained.at(opposite ? [[0,0],[4,0],[5,0],[1,0]] : [[0,0],[3,0]]);
       answer.conflicts.push({forward,opposite,before,after:retained.archive(),counters:retained.counters()});
     } finally {retained.close();}
+  }
+  answer.ownerConflicts = [];
+  for (const forward of [false,true]) {
+    const retained = new GameGraph(native, {history: [[0,0]], seed: 7, limit: 1, archiveBytes: 65536, archiveForward: forward});
+    let owner;
+    try {
+      for (const history of [[[0,0]], [[0,0],[1,0],[2,0]], [[0,0],[1,0],[2,0],[3,0]]]) {
+        retained.at(history); native.checked(native.m._hxg_begin(retained.ptr,1,1));
+        const [id,leaf] = retained.request(); retained.fulfill(id,leaf.actions,(await evaluate([leaf]))[0]);
+      }
+      retained.at([[0,0]]);
+      owner = new NativeOwner(retained, {work: 32, ms: 0});
+      owner.close(); const before = retained.archive();
+      for (const point of [[4,0],[5,0],[1,0]]) retained.advance(point);
+      answer.ownerConflicts.push({forward,before,after:retained.archive(),counters:retained.counters()});
+    } finally {owner?.close();retained.close();}
   }
   const second = original.map(c => [...c]), third = original.map(c => [...c]);
   [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
@@ -263,7 +392,7 @@ if (job.kind === 'encode') {
   const messages = [], queries = [], evaluations = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
   const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
   let graph = null;
-  const context = {Native, NeuralSearch, EvaluationCache, PV_CHECK, createModule, principalVariation, topRows,
+  const context = {Native, NeuralSearch, EvaluationCache, GameGraph, NativeOwner, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
     Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
@@ -271,6 +400,8 @@ if (job.kind === 'encode') {
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
+      evaluateNative: Network.prototype.evaluateNative, maxBatch: 64,
+      forward: async (input, count, size) => ({policy: new Float32Array(count*size*size), far: new Float32Array(count), value: new Float32Array(count)}),
       evaluate: async leaves => leaves.map(({history, actions}) => {
         if (messages.some(m => m.type === 'ready')) evaluations.push(history);
         const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;
@@ -323,6 +454,7 @@ if (job.kind === 'encode') {
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
+      nativeOwner: job.nativeOwner ?? false,
       known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');

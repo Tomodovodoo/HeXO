@@ -115,10 +115,12 @@ export class NeuralSearch {
     for (const point of history) this.advance(point);
   }
   close() {
+    if (this.nativeOwner) throw new Error('Close the native owner before its graph');
     if (this.ptr) this.m._hxg_free(this.ptr);
     this.ptr = 0;
   }
   advance([q, r]) {
+    if (this.nativeOwner) throw new Error('Close the native owner before advancing its graph');
     this.n.checked(this.m._hxg_advance(this.ptr, BigInt(q), BigInt(r)));
     this.history.push([q, r]);
   }
@@ -201,6 +203,7 @@ export class NeuralSearch {
    */
   async search({simulations = 128, rootSamples = null, batchSize = 16, evaluate, cache = new EvaluationCache(), version = 'web',
     stop = () => false, onBatch = () => {}, choice = 'policy', prove = null} = {}) {
+    if (this.nativeOwner) throw new Error('Graph already has a native owner');
     if (batchSize < 1 || simulations < 1) throw new Error('Positive search budgets required');
     if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
     const start = performance.now(), stats = {evaluated: 0, hits: 0, batches: 0, largest: 0, network_ms: 0};
@@ -330,6 +333,7 @@ export class GameGraph extends NeuralSearch {
   }
   /** Independent sampling into the same game store. All views belong to the same graph-owner worker. */
   view(history = this.history, seed = 1740) {
+    if (this.nativeOwner) throw new Error('Graph already has a native owner');
     if (!this.ptr) throw new Error('Graph is closed');
     const cells = this.n.cells(history);
     try {
@@ -369,6 +373,7 @@ export class GameGraph extends NeuralSearch {
   }
   /** Moves the root to the position after `history`, keeping every node's statistics. */
   at(history) {
+    if (this.nativeOwner) throw new Error('Close the native owner before moving its graph');
     const cells = this.n.cells(history);
     try {
       this.n.checked(this.m._hxg_root_at(this.ptr, cells, history.length));
@@ -418,6 +423,204 @@ export class GameGraph extends NeuralSearch {
     const result = searched ? passes[2] : {...passes[1], ...this.result(options.choice ?? 'policy')};
     for (const key of ['completed', 'evaluated', 'cache_hits', 'elapsed_ms']) result[key] = passes.reduce((sum, p) => sum + p[key], 0);
     return {...result, stopped: passes.some(p => p.stopped), pv_check: {line: line.slice(root.length), before, after, searched}};
+  }
+}
+
+/** Immutable native row snapshots. Network.forward reads a JS-owned input copy,
+ * so WASM memory growth while it awaits inference cannot detach that input. */
+export class NativeBatch {
+  constructor(owner, count) {
+    this.owner = owner; this.n = owner.n; this.m = owner.m; this.count = count; this.ptr = 0;
+    this.ids = this.n.alloc(8 * count);
+    const trees = this.n.alloc(4 * count), requests = this.n.alloc(4 * count);
+    try {
+      this.n.checked(this.m._hxgf_take(owner.feed, count, this.ids, trees, requests, 0, 0, 0n));
+      this.ptr = this.m._hxgp_new(trees, requests, count, 0);
+      this.n.checked(this.ptr);
+      owner.batches.add(this);
+      this.groups = [];
+      const info = this.n.alloc(16);
+      try {
+        for (let i = 0; i < this.m._hxgp_groups(this.ptr); i++) {
+          this.n.checked(this.m._hxgp_group(this.ptr, i, info));
+          const [size, rows] = Array.from(this.n.view(BigInt64Array, info, 2), Number);
+          this.groups.push({size, rows});
+        }
+      } finally { this.m._free(info); }
+    } catch (error) {
+      // A failed snapshot still leaves submitted feed IDs. Cancel detaches
+      // subscribers; the caller then abandons only after inference has settled.
+      if (this.ptr) this.m._hxgp_free(this.ptr);
+      this.ptr = 0; this.m._free(this.ids); this.ids = 0; owner.cancel();
+      owner.batches.delete(this);
+      throw error;
+    } finally { this.m._free(trees); this.m._free(requests); }
+  }
+  features(group, start, count) {
+    if (!this.ptr) throw new Error('Native batch is closed');
+    const length = count * 20 * this.groups[group].size ** 2, buffer = this.n.alloc(4 * length);
+    try {
+      this.n.checked(this.m._hxgp_features(this.ptr, group, start, count, buffer, BigInt(length)));
+      return this.n.view(Float32Array, buffer, length).slice();
+    } finally { this.m._free(buffer); }
+  }
+  decode(group, start, count, {policy, far, value}) {
+    if (!this.ptr) throw new Error('Native batch is closed');
+    const area = this.groups[group].size ** 2;
+    if (policy.length !== count * area || far.length !== count || value.length !== count) throw new Error('Wrong native prediction shape');
+    // Allocate before making heap views, since any allocation may grow memory.
+    const p = this.n.alloc(4 * policy.length), f = this.n.alloc(4 * count), v = this.n.alloc(4 * count);
+    try {
+      this.n.view(Float32Array, p, policy.length).set(policy);
+      this.n.view(Float32Array, f, count).set(far);
+      this.n.view(Float32Array, v, count).set(value);
+      this.n.checked(this.m._hxgp_decode_split(this.ptr, group, start, count, p, f, v));
+    } finally { this.m._free(p); this.m._free(f); this.m._free(v); }
+  }
+  install() {
+    if (!this.ptr) throw new Error('Native batch is closed');
+    const pointers = this.n.alloc(16);
+    try {
+      this.n.checked(this.m._hxgp_outputs(this.ptr, pointers));
+      const [offsets, actions, logits, values] = this.n.view(Uint32Array, pointers, 4);
+      this.n.checked(this.m._hxgo_install(this.owner.ptr, this.ids, this.count, offsets, actions, logits, values));
+    } finally { this.m._free(pointers); }
+    this.installed = true; this.close();
+  }
+  close() {
+    if (this.ptr && !this.installed) this.owner.cancel();
+    if (this.ptr) this.m._hxgp_free(this.ptr);
+    this.ptr = 0;
+    if (this.ids) this.m._free(this.ids);
+    this.ids = 0; this.owner.batches.delete(this);
+  }
+}
+
+/** The desktop C++ scheduler in one browser graph-owner worker. JavaScript
+ * crosses the boundary per batch, never per selected node. Proof-frontier
+ * dispatch is not part of this adapter yet. */
+export class NativeOwner {
+  constructor(graph, {capacity = 4096, quantum = 32, views = 8, depth = 8, work = 0, ms = 1000, seed = 1740} = {}) {
+    if (!(graph instanceof GameGraph) || !graph.ptr || graph.nativeOwner) throw new Error('A free game graph is required');
+    this.graph = graph; this.n = graph.n; this.m = graph.m; this.batches = new Set(); this.busy = false;
+    this.ptr = this.m._hxgo_new(graph.ptr, capacity, quantum, views, depth, BigInt(work), ms, BigInt(seed));
+    this.n.checked(this.ptr); this.feed = this.m._hxgo_feed(this.ptr);
+    this.root = Object.assign(Object.create(NeuralSearch.prototype), {n: this.n, m: this.m, ptr: this.m._hxgo_root(this.ptr), history: graph.history, nativeOwner: this});
+    graph.nativeOwner = this;
+  }
+  step(readyLimit = 64) {
+    if (!this.ptr) throw new Error('Native owner is closed');
+    const progress = this.m._hxgo_step_ready(this.ptr, readyLimit);
+    if (progress < 0) this.n.checked(0);
+    return progress;
+  }
+  done() { return !this.ptr || Boolean(this.m._hxgo_done(this.ptr)); }
+  cancel() { if (this.ptr) this.m._hxgo_cancel(this.ptr); }
+  admit() {
+    if (!this.ptr) return false;
+    if (this.m._hxg_exact(this.root.ptr) >= 0) this.cancel();
+    return Boolean(this.m._hxgo_admit(this.ptr));
+  }
+  take(limit = 64) {
+    if (!this.ptr) throw new Error('Native owner is closed');
+    const info = this.n.alloc(16);
+    try {
+      if (!this.admit()) return null;
+      this.n.checked(this.m._hxgf_layout(this.feed, limit, info));
+      const count = Number(this.n.view(BigInt64Array, info, 2)[0]);
+      return count ? new NativeBatch(this, count) : null;
+    } finally { this.m._free(info); }
+  }
+  stats() {
+    if (!this.ptr) throw new Error('Native owner is closed');
+    const buffer = this.n.alloc(160);
+    try {
+      this.m._hxgo_stats(this.ptr, buffer);
+      const values = Array.from(this.n.view(BigUint64Array, buffer, 20), Number);
+      const names = ['ticks', 'completed', 'issued', 'cancelled', 'created', 'retired', 'candidates', 'active', 'pending', 'depth',
+        'root_completed', 'deadline', 'step_ns', 'discover_ns', 'records', 'views', 'last_credits', 'root_passes', 'allocations', 'reclaimed'];
+      this.m._hxgf_stats(this.feed, buffer);
+      const feed = Array.from(this.n.view(BigInt64Array, buffer, 6), Number);
+      return {...Object.fromEntries(names.map((name, i) => [name, values[i]])),
+        ...Object.fromEntries(['neural_rows', 'joins', 'cache_hits', 'installed', 'tasks', 'subscribers'].map((name, i) => [name, feed[i]]))};
+    } finally { this.m._free(buffer); }
+  }
+  result(choice = 'gumbel') {
+    if (!this.ptr) throw new Error('Native owner is closed');
+    if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
+    const result = this.root.result(choice), action = this.n.alloc(16);
+    try {
+      const found = this.m._hxgo_choice(this.ptr, action);
+      if (found < 0) this.n.checked(0);
+      const stats = this.stats();
+      return {...result, action: choice === 'policy' ? result.action : found ? this.n.pairs(action, 1)[0] : null, completed: stats.root_completed,
+        all_view_completed: stats.completed};
+    } finally { this.m._free(action); }
+  }
+  close() {
+    if (!this.ptr) return;
+    if (this.busy || this.batches.size) throw new Error('Wait for native inference before closing its owner');
+    this.cancel();
+    this.n.checked(this.m._hxgf_abandon_all(this.feed));
+    this.n.checked(this.m._hxgo_free(this.ptr));
+    this.ptr = 0; this.root.ptr = 0; this.graph.nativeOwner = null;
+    // The scheduler root owned archive focus. Reclaim it before this graph
+    // advances, so permanent colour conflicts follow the played position.
+    this.graph.at(this.graph.history);
+  }
+  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel'}) {
+    if (this.busy || !this.ptr) throw new Error('Native owner is closed or already running');
+    if (!(batchSize > 0)) throw new Error('Positive native batch size required');
+    this.busy = true; const started = performance.now(); let batches = 0, largest = 0, networkMs = 0, batch = null, flight = null;
+    try {
+      while (!this.done()) {
+        if (stop()) { this.cancel(); break; }
+        this.step(batchSize);
+        if (this.done()) break;
+        batch = this.take(batchSize);
+        if (batch) {
+          const begin = performance.now();
+          let settled = false;
+          flight = network.evaluateNative(batch, {stop: () => {
+            if (stop()) this.cancel();
+            return !this.admit();
+          }});
+          // Observe rejection immediately while the owner prepares useful work
+          // for the next batch. Await the same promise before releasing buffers.
+          const observed = flight.then(() => { settled = true; }, () => { settled = true; });
+          while (!settled && !this.done() && this.m._hxgf_queued(this.feed) < BigInt(batchSize)) {
+            if (stop()) { this.cancel(); break; }
+            const progress = this.step(batchSize);
+            await nextTask();
+            if (!progress) break;
+          }
+          await observed; const evaluated = await flight; flight = null;
+          networkMs += performance.now() - begin;
+          await nextTask();
+          if (stop()) this.cancel();
+          if (evaluated === false || !this.admit()) {
+            // Incomplete or no-longer-admitted batches cannot be installed.
+            // The active forward has settled before their storage is released.
+            this.cancel(); batch.close(); batch = null; break;
+          }
+          // Detached subscribers cannot install into a changed/cancelled view.
+          batch.install(); batches++; largest = Math.max(largest, batch.count); batch = null;
+          onBatch(this.stats());
+        }
+        await nextTask();
+      }
+      if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
+      return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
+        batches, largest, network_ms: networkMs};
+    } catch (error) {
+      this.cancel(); throw error;
+    } finally {
+      // evaluateNative resolves/rejects only after its current forward settles.
+      // A host callback/phase can also throw while that forward is still live.
+      if (flight) await flight.catch(() => {});
+      batch?.close(); this.busy = false;
+      if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
+    }
   }
 }
 
