@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -36,6 +37,43 @@ class NativeStrategy(unittest.TestCase):
             cls.engine = NativeTactics()
         except FileNotFoundError:
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+
+    def test_puzzle_archive_preserves_turn_phase_and_repeated_positions(self):
+        from notation import dumps
+        from tools.proof_stamps import load_puzzles
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'puzzles.txt'
+            histories = [OPEN_THREE, OPEN_THREE+[[8,8]], OPEN_THREE]
+            path.write_text('\n\n'.join(dumps(h) for h in histories), encoding='utf-8-sig')
+            archive = load_puzzles(path)
+            rows = archive['cases']
+            self.assertEqual([r['id'] for r in rows], [1,2,3])
+            self.assertEqual([[list(p) for p in r['history']] for r in rows], histories)
+            self.assertEqual([(r['mover'], r['remaining'], r['expected']) for r in rows],
+                             [(0,2,'PROVEN_WIN'), (0,1,'PROVEN_WIN'), (0,2,'PROVEN_WIN')])
+            self.assertEqual(rows[0]['position_sha256'], rows[2]['position_sha256'])
+            self.assertNotEqual(rows[0]['position_sha256'], rows[1]['position_sha256'])
+            self.assertEqual(archive['input_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            path.write_text(dumps(IMMEDIATE+[[5,0]]), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'already terminal'):
+                load_puzzles(path)
+            path.write_text('version[1]; 1. [0,0][1,0];', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_puzzles(path)
+
+    def test_puzzle_benchmark_keeps_unknowns_and_checks_wins(self):
+        from notation import dumps
+        from tools.proof_stamps import puzzle_benchmark
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory)/'puzzles.txt', Path(directory)/'results.json'
+            source.write_text(dumps(IMMEDIATE)+'\n'+dumps(NO_THREAT), encoding='utf-8')
+            result = puzzle_benchmark(source, target, nodes=1, ms=5000, stamps=False)
+            self.assertEqual(result['summary']['completed'], 2)
+            self.assertEqual(result['summary']['solved'], 1)
+            self.assertEqual([r['status'] for r in result['rows']], ['PROVEN_WIN', 'UNKNOWN'])
+            self.assertGreater(result['rows'][0]['verification_ms'], 0)
+            self.assertEqual(result['build_hash'], self.engine.metadata['binary_sha256'])
+            self.assertEqual(json.loads(target.read_text())['rows'], result['rows'])
 
     def test_saved_moves_reprove_changed_positions_without_trusting_their_verdict(self):
         with NativeTactics(independent=True) as native:
