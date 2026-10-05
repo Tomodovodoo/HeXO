@@ -796,12 +796,14 @@ class Proofs:
             return
         current = [tuple(map(int, p)) for p in history]
         plies, pv = proof_plies(proof, current), [list(p) for p in record.get('pv') or []]
+        # A turn bound can outlast this line; do not export its finished board as a solver premise.
+        end = min(plies, proof_line_length(current, proof['winner'], pv))
         with self.lock:
             if line is not None:
                 self.seen.add(line)
             self.put(current, proof['winner'], plies, pv)
             for i, stone in enumerate(pv):
-                if len(stone) != 4 or stone[3] != i + 1 or stone[2] != player_at(len(current)) or stone[3] >= plies:
+                if len(stone) != 4 or stone[3] != i + 1 or stone[2] != player_at(len(current)) or stone[3] >= end:
                     break
                 q, r, _, ply = stone
                 current.append((q, r))

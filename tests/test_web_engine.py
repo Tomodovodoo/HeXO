@@ -210,6 +210,23 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+    def test_padded_proof_bound_does_not_send_a_finished_board_to_the_solver(self):
+        from tests.test_tactical_proof import IMMEDIATE
+        source = """import {readFileSync} from 'node:fs';
+import {Proofs} from './web/engine/proof.mjs';
+import {loadTactical} from './web/engine/tactical.mjs';
+const history=JSON.parse(readFileSync(0,'utf8')),table=new Proofs();
+table.add(history,{proof:{winner:0,plies:6},pv:[[5,0,0,1]]});
+const facts=new Proofs(table.list()).facts(history),solver=await loadTactical(readFileSync('web/engine/tactical.wasm'));
+const found=solver.history(history,{known:facts.map(({history,winner,plies})=>({history,winner,plies})),nodes:1,ms:1000});
+console.log(JSON.stringify({facts,found:{status:found.status,reason:found.reason},plies:table.known(history).plies}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT, input=json.dumps(IMMEDIATE),
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertEqual([f['history'] for f in result['facts']], [IMMEDIATE])
+        self.assertEqual(result['plies'], 6)
+        self.assertEqual(result['found']['status'], 'PROVEN_WIN', result['found']['reason'])
+
 
     def test_large_archive_storage_and_compressed_files_keep_all_evidence(self):
         source = """import {PlayStorage} from './web/engine/storage.mjs';
