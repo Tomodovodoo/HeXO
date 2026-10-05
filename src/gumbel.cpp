@@ -211,9 +211,9 @@ struct Archive {
  std::array<Entry,slots> entries;
  std::unordered_map<Key,size_t,KeyHash> contexts;
  std::unordered_map<ColouredCell,std::bitset<slots>,ColouredHash> membership;
- std::bitset<slots> occupied,compatible;
+ std::bitset<slots> occupied,compatible,conflicting;
  std::shared_ptr<const HistoryLink> focus;
- size_t limit,bytes=0;bool dirty=false;uint64_t retained=0,reused=0,discarded=0;
+ size_t limit,bytes=0;bool dirty=false,forward=false;uint64_t retained=0,reused=0,discarded=0;
  explicit Archive(size_t budget):limit(budget){}
  ~Archive(){for(auto& e:entries)if(e.node)e.node->archive_dirty=nullptr;}
  static size_t payload(const Node& n){
@@ -233,8 +233,12 @@ struct Archive {
  int focus_stones()const{return focus?focus->stones:0;}
  void set_focus(std::shared_ptr<const HistoryLink> h){
   focus=std::move(h);
-  compatible=occupied;
-  for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end()){compatible.reset();break;}compatible&=found->second;}
+  compatible=occupied;conflicting.reset();
+  for(auto p=focus;p;p=p->before){int player=(p->stones/2)%2;
+   auto same=membership.find({p->cell,player});if(same==membership.end())compatible.reset();else compatible&=same->second;
+   if(forward){auto opposite=membership.find({p->cell,1-player});if(opposite!=membership.end())conflicting|=opposite->second;}
+   else if(compatible.none())break;
+  }
  }
  void refresh(){bytes=0;for(auto& e:entries)if(e.node){e.bytes=payload(*e.node);bytes+=e.bytes;}dirty=false;}
  void insert(const std::shared_ptr<Node>& node){
@@ -242,11 +246,15 @@ struct Archive {
   if(slot==slots)throw std::runtime_error("Dormant archive has no free slot");
   auto& entry=entries[slot];entry={node,payload(*node)};bytes+=entry.bytes;contexts.emplace(node->context,slot);occupied.set(slot);compatible.set(slot);
   for(auto p=node->history;p;p=p->before)membership[{p->cell,(p->stones/2)%2}].set(slot);
-  for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end() || !found->second[slot]){compatible.reset(slot);break;}}
+  for(auto p=focus;p;p=p->before){int player=(p->stones/2)%2;
+   auto same=membership.find({p->cell,player});if(same==membership.end() || !same->second[slot])compatible.reset(slot);
+   if(forward){auto opposite=membership.find({p->cell,1-player});if(opposite!=membership.end() && opposite->second[slot])conflicting.set(slot);}
+   else if(!compatible[slot])break;
+  }
   node->dormant=true;node->archive_dirty=&dirty;++retained;
  }
  std::shared_ptr<Node> remove(size_t slot){
-  auto node=std::move(entries[slot].node);node->archive_dirty=nullptr;bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);
+  auto node=std::move(entries[slot].node);node->archive_dirty=nullptr;bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);conflicting.reset(slot);
   for(auto p=node->history;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});found->second.reset(slot);if(found->second.none())membership.erase(found);}
   if(occupied.none()){contexts.rehash(0);membership.rehash(0);}
   return node;
@@ -534,8 +542,17 @@ struct Tree {
  void trim_archive(bool need_slot=false,bool refresh=true){
   if(!state->archive)return;
   auto& archive=*state->archive;if(refresh || archive.dirty)archive.refresh();
-  while(archive.occupied.any() && (archive.total_bytes()>archive.limit || (need_slot && archive.occupied.all()))){
-   size_t slot=archive.victim([&](const Node* n){return !n->pending && !state->pinned(n);});
+  auto allowed=[&](const Node* n){return !n->pending && !state->pinned(n);};
+  while(archive.occupied.any()){
+   size_t slot=Archive::slots;
+   // Coloured stones cannot change in forward play. Missing stones can still
+   // be supplied by a descendant; only opposite-colour occupation is final.
+   if(archive.forward && archive.conflicting.any())for(size_t i=0;i<Archive::slots;++i)
+    if(archive.conflicting[i] && allowed(archive.entries[i].node.get())){slot=i;break;}
+   if(slot==Archive::slots){
+    if(archive.total_bytes()<=archive.limit && !(need_slot && archive.occupied.all()))break;
+    slot=archive.victim(allowed);
+   }
    if(slot==Archive::slots)break;
    auto node=archive.remove(slot);discard(node);++archive.discarded;if(archive.dirty)archive.refresh();
   }
@@ -1129,6 +1146,15 @@ HX_API int hxg_archive(void* p,int64_t bytes){try{
   throw std::runtime_error("Archive needs an unexpanded shared graph and at least 64 KiB");
  t.state->archive=std::make_unique<gumbel::Archive>(size_t(bytes));
  t.archive_focus();return 1;
+ }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Forward-only games can release colour-conflicting dormant nodes without byte
+// pressure. Primary focus owns this policy; pending/pinned views delay disposal.
+// The default archive keeps incompatible evidence for undo and analysis.
+HX_API int hxg_archive_forward(void* p,int enabled){try{
+ auto& t=*static_cast<gumbel::Tree*>(p);t.owner_access();
+ if(!t.state->archive || t.state->primary!=&t || (enabled!=0 && enabled!=1))
+  throw std::runtime_error("Forward retention needs the primary archived graph and a boolean mode");
+ auto& a=*t.state->archive;a.forward=enabled;a.set_focus(a.focus);t.trim_archive();return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Managed dormant payload and estimated index allocations, not pool residency
 // or process RSS. History prefixes are conservatively charged per entry.

@@ -94,10 +94,11 @@ export class EvaluationCache {
  * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise. `limit`,
  * when given, makes the tree a shared game graph keeping at most that many expanded nodes (see GameGraph).
  * `archiveBytes` optionally retains up to 256 dormant expansions under a payload/index allowance of at least 64 KiB;
- * active nodes and allocator residency are separate.
+ * active nodes and allocator residency are separate. `archiveForward` releases permanent colour conflicts with
+ * the primary played board at safe owner points; leave it false to retain analysis for undo.
  */
 export class NeuralSearch {
-  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null, archiveBytes = 0} = {}) {
+  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null, archiveBytes = 0, archiveForward = false} = {}) {
     this.n = native;
     this.m = native.m;
     this.ptr = this.m._hxg_new(BigInt(seed));
@@ -107,6 +108,7 @@ export class NeuralSearch {
     native.checked(this.m._hxg_graph(this.ptr, graph ? 1 : 0));
     if (limit !== null) native.checked(this.m._hxg_share(this.ptr, BigInt(limit)));
     if (archiveBytes) native.checked(this.m._hxg_archive(this.ptr, BigInt(archiveBytes)));
+    if (archiveForward) native.checked(this.m._hxg_archive_forward(this.ptr, 1));
     native.checked(this.m._hxg_q_range_floor(this.ptr, qRangeFloor));
     native.checked(this.m._hxg_root_noise(this.ptr, rootNoise));
     for (const point of history) this.advance(point);
