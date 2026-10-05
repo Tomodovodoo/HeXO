@@ -1926,6 +1926,20 @@ class FreeplayClock(unittest.TestCase):
 
 
 class Proofs(unittest.TestCase):
+    def test_padded_proof_bound_does_not_index_a_finished_board(self):
+        from play import Proofs
+        from tactical_proof import NativeTactics
+        from tests.test_tactical_proof import IMMEDIATE
+        history = IMMEDIATE
+        table = Proofs()
+        table.add(history, dict(proof=dict(winner=0, plies=6), pv=[[5,0,0,1]]))
+        self.assertEqual(len(table.facts(history)), 1)
+        self.assertEqual(table.facts(history)[0]['history'], history)
+        self.assertEqual(table.known(history)['plies'], 6)
+        result = NativeTactics().history(history, known=[
+            {k:f[k] for k in ('history', 'winner', 'plies')} for f in table.facts(history)], nodes=1, ms=1000)
+        self.assertEqual(result['status'], 'PROVEN_WIN', result['reason'])
+
     def test_tighter_scalar_proof_does_not_suggest_half_a_turn(self):
         from play import Proofs
         from types import SimpleNamespace

@@ -244,10 +244,13 @@ export class Proofs {
     const current = history.map(([q, r]) => [q, r]), pv = record.pv || [];
     const remaining = current.length % 2 ? 2 : 1, mover = sideAt(current.length);
     const plies = proof.plies || remaining + (proof.winner === mover ? 0 : 2) + 4 * (proof.turns - 1);
+    // The conservative bound can extend past the winning stone of this line.
+    // A finished board is not a future solver premise.
+    const end = Math.min(plies, lineLength(current, proof.winner, pv));
     this.put(current, proof.winner, plies, pv);
     for (let i = 0; i < pv.length; i++) {
       const [q, r, side, ply] = pv[i];
-      if (pv[i].length !== 4 || ply !== i + 1 || side !== sideAt(current.length) || ply >= plies) break;
+      if (pv[i].length !== 4 || ply !== i + 1 || side !== sideAt(current.length) || ply >= end) break;
       current.push([q, r]);
       this.put(current, proof.winner, plies - ply, shifted(pv.slice(i + 1), -ply));
     }
