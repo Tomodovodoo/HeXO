@@ -3,6 +3,34 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // Existing own-turn completions settle before any neural request. Both stones
+ // stay legal, the full action list remains present, and no reservation survives.
+ for(bool shared:{false,true}){gumbel::Tree t(7);if(shared)assert(hxg_share(&t,16));t.tactics=true;
+  std::vector<Cell> h{{0,0},{0,3},{1,3},{1,0},{2,0},{2,3},{3,3},{3,0},{7,4},{4,3},{5,4}};
+  for(auto c:h)t.advance(c);t.begin(32,8);assert(t.request()==-1 && t.done());
+  assert(t.requests.empty() && !t.root->pending && t.root->exact_winner==0 && t.root->distance==2);
+  assert(t.completed==0 && t.issued==0 && t.root->edges.size()==t.board.legal_moves().size());
+  for(int stone=0;stone<2;++stone){
+   auto it=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.read().eligible;});
+   assert(it!=t.root->edges.end() && it->read().exact_winner==0 && t.board.legal(it->action));
+   t.advance(it->action);t.begin(32,8);assert(t.request()<=0 && t.requests.empty());
+  }
+  assert(t.board.winner==0);
+ }
+ // An immediate interior win completes one selected simulation and comparison
+ // credit. It refutes that move, not the unresolved parent, after the mover flips.
+ {gumbel::Tree t(7);assert(hxg_share(&t,16));
+  std::vector<Cell> h{{0,0},{0,3},{1,3},{1,0},{2,0},{2,3},{3,3},{3,0},{7,4},{4,3}};
+  for(auto c:h)t.advance(c);t.begin(1,1);int id=t.request();assert(id>0);
+  auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;std::vector<double> logits,q(legal.size());
+  for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);logits.push_back(c==Cell{5,4}?100:-100);}
+  t.fulfill(id,cells.data(),logits.data(),q.data(),int(legal.size()));t.tactics=true;
+  assert(t.request()==-1 && t.done() && t.completed==1 && t.issued==1 && t.requests.empty());
+  auto it=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.action==Cell{5,4};});
+  assert(it!=t.root->edges.end() && it->read().visits==1 && it->read().pending==0);
+  assert(it->read().exact_winner==0 && it->read().distance==3 && it->read().child->distance==2);
+  assert(t.root_edges[it-t.root->edges.begin()].credits==1 && t.root->exact_winner<0);
+ }
  // A shared loss proof materializes every legal edge in dormant peer contexts.
  // That growth must be trimmed at delivery, without losing the exact outcome.
  for(bool leaf_proof:{false,true}){gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));

@@ -128,7 +128,8 @@ class PUCTSearch:
         try:
             checked(native.hxg_begin(oracle.ptr, 1, 1))
             rid, _ = oracle.request()
-            oracle.fulfill(rid, prediction)
+            if rid > 0:
+                oracle.fulfill(rid, prediction)
             result = oracle.result(0., 0., 0, 0)
         finally:
             oracle.close()
