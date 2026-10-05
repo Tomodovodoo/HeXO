@@ -319,7 +319,7 @@ struct Broker {
   for(;;){
    if(!error.empty())throw std::runtime_error(error);
    if(cancelled || paused)return 0;
-   if(flights.size()>=2){if(!wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
+   if(flights.size()>=2){if(!events.empty() || !wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
    std::erase_if(ready,[](const auto& t){return !t->live || t->flight;});
    if(!ready.empty()){
     int selected=ready.front()->model;int count=int(std::count_if(ready.begin(),ready.end(),[&](const auto& t){return t->model==selected;}));
@@ -340,9 +340,11 @@ struct Broker {
      }
      *token=id;*model=selected;*snapshot=packed;return int(rows.size());
     }
-    if(!wait_ms)return 0;wake.wait_until(lock,std::min(until,due));
+    // Launch ready batches first. A control event need not wait for a partial
+    // batch's latency allowance, and must not flush that batch prematurely.
+    if(!events.empty() || !wait_ms)return 0;wake.wait_until(lock,std::min(until,due));
    }else{
-    if(done_locked() || Clock::now()>=until)return 0;wake.wait_until(lock,until);
+    if(!events.empty() || done_locked() || Clock::now()>=until)return 0;wake.wait_until(lock,until);
    }
   }
  }
