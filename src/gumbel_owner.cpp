@@ -189,6 +189,7 @@ struct Owner {
 extern "C" HX_API void* hxgo_new(void* tree,int capacity,int quantum,int views,int depth,uint64_t work,double ms,uint64_t seed){try{if(!tree)throw std::runtime_error("Missing source tree");return new owner::Owner(*static_cast<gumbel::Tree*>(tree),capacity,quantum,views,depth,work,ms,seed);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 extern "C" HX_API int hxgo_free(void* p){auto& o=*static_cast<owner::Owner*>(p);if(!o.owned_feed){gumbel::error="Borrowed owner belongs to its pool";return 0;}o.stop();int64_t stats[6];hxgf_stats(o.feed,stats);if(stats[4]){gumbel::error="Drain or abandon submitted batches after their GPU fence before freeing owner";return 0;}delete &o;return 1;}
 extern "C" HX_API int hxgo_step(void* p){try{return static_cast<owner::Owner*>(p)->step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+extern "C" HX_API int hxgo_step_ready(void* p,int limit){try{if(limit<1)throw std::runtime_error("Positive native ready limit required");return static_cast<owner::Owner*>(p)->step(limit);}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API void hxgo_cancel(void* p){static_cast<owner::Owner*>(p)->stop();}
 extern "C" HX_API int hxgo_done(void* p){return static_cast<owner::Owner*>(p)->stopped;}
 extern "C" HX_API void* hxgo_feed(void* p){return static_cast<owner::Owner*>(p)->feed;}
@@ -353,5 +354,7 @@ extern "C" HX_API int hxgm_record_history(void* p,int game,int record,int64_t* o
 
 extern "C" HX_API int hxgo_history(void* p,int64_t* out){auto& h=static_cast<owner::Owner*>(p)->focus;if(out)for(size_t i=0;i<h.size();++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
 
+#ifndef __EMSCRIPTEN__
 #include "gumbel_broker.hpp"
+#endif
 extern "C" HX_API int hxgo_record_history(void* p,int record,int64_t* out){auto& o=*static_cast<owner::Owner*>(p);if(record<0 || record>=int(o.records.size()))return -1;auto& h=o.records[record].history;if(out)for(size_t i=0;i<h.size();++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}

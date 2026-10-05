@@ -170,17 +170,56 @@ struct Batch {
   std::reverse(planned.begin(),planned.end());groups=std::move(planned);
  }
  Group& group(int index){if(index<0 || index>=int(groups.size()))throw std::runtime_error("Invalid packed batch group");return groups[index];}
- void pack(int index,uint8_t* output,int64_t capacity){auto& g=group(index);int area=g.side*g.side;
-  int64_t bytes=8*int64_t(area)*g.rows.size();
+ void pack_range(int index,int start,int count,uint8_t* output,int64_t capacity){auto& g=group(index);int area=g.side*g.side;
+  if(start<0 || count<1 || start>int(g.rows.size())-count)throw std::runtime_error("Invalid packed feature rows");
+  int64_t bytes=8*int64_t(area)*count;
   if(!output || capacity<bytes)throw std::runtime_error("Packed plane buffer too small");
   sealed=true;
   std::memset(output,0,size_t(bytes));
-  for(size_t i=0;i<g.rows.size();++i){auto* row=info.data()+12*int64_t(g.rows[i]);int side=int(row[0]);
+  for(int i=0;i<count;++i){auto* row=info.data()+12*int64_t(g.rows[start+i]);int side=int(row[0]);
    const auto* src=planes.data()+row[10];auto* dst=output+8*int64_t(area)*i;
    if(side==g.side)std::memcpy(dst,src,8*size_t(area));
    else for(int channel=0;channel<8;++channel)for(int y=0;y<side;++y)
     std::memcpy(dst+channel*area+y*g.side,src+channel*side*side+y*side,size_t(side));
   }
+ }
+ void pack(int index,uint8_t* output,int64_t capacity){pack_range(index,0,int(group(index).rows.size()),output,capacity);}
+ // The browser ONNX model consumes LineFeatures rather than the eight raw
+ // planes used by the native fused backend. Preserve that input contract in
+ // one compiled call, including crop masks, padded canvases and zero channels.
+ void features(int index,int start,int count,float* output,int64_t capacity){
+  auto& g=group(index);int side=g.side,area=side*side;int64_t stride=20*int64_t(area);
+  if(!output || count<1 || capacity<stride*count)throw std::runtime_error("Packed feature buffer too small");
+  std::vector<uint8_t> input(8*int64_t(area)*count);pack_range(index,start,count,input.data(),int64_t(input.size()));
+  std::fill(output,output+stride*count,0.f);
+  std::vector<uint8_t> open(2*area),best(2*area);
+  auto inside=[&](int x,int y){return x>=0 && y>=0 && x<side && y<side;};
+  constexpr int axes[3][2]={{1,0},{0,1},{1,-1}};
+  for(int row=0;row<count;++row){auto* src=input.data()+8*int64_t(area)*row;auto* out=output+stride*row;
+   auto* own=src;auto* opp=src+area;auto* mask=src+3*area;std::fill(best.begin(),best.end(),0);
+   for(int channel=0;channel<8;++channel)for(int j=0;j<area;++j)out[channel*area+j]=float(src[channel*area+j]*mask[j]);
+   for(int axis=0;axis<3;++axis){int dx=axes[axis][0],dy=axes[axis][1];std::fill(open.begin(),open.end(),0);
+    for(int y=0;y<side;++y)for(int x=0;x<side;++x){int o=0,p=0,m=0;
+     for(int i=0;i<6;++i){int u=x+i*dx,v=y+i*dy;if(!inside(u,v))break;int j=v*side+u;o+=own[j];p+=opp[j];m+=mask[j];}
+     if(m==6){int j=y*side+x;if(!p)open[j]=uint8_t(o);if(!o)open[area+j]=uint8_t(p);}
+    }
+    for(int player=0;player<2;++player)for(int y=0;y<side;++y)for(int x=0;x<side;++x){uint8_t b=0;
+     for(int i=0;i<6;++i){int u=x-i*dx,v=y-i*dy;if(inside(u,v))b=std::max(b,open[player*area+v*side+u]);}
+     int j=y*side+x;out[(8+3*player+axis)*area+j]=(float(b)/6.f)*float(mask[j]);best[player*area+j]=std::max(best[player*area+j],b);
+    }
+   }
+   for(int j=0;j<area;++j)if(mask[j] && !own[j] && !opp[j]){
+    out[14*area+j]=best[j]>=4;out[15*area+j]=best[area+j]>=4;
+    out[16*area+j]=best[j]>=5;out[17*area+j]=best[area+j]>=5;
+   }
+  }
+ }
+ void decode_row(const Group& g,int id,const float* policy,float far_logit,float value){
+  auto* row=info.data()+12*int64_t(id);int side=int(row[0]);double q=std::tanh(double(value)/2);
+  double far=double(far_logit)-(row[9]?std::log(double(row[9])):0);
+  for(int64_t j=offsets[id];j<offsets[id+1];++j){int64_t cell=cells[j];
+   logits[j]=cell<0?far:double(policy[cell/side*g.side+cell%side]);values[j]=q;
+  }decoded[id]=1;
  }
  void decode(int index,int start,int count,const float* output,int64_t capacity){auto& g=group(index);int stride=g.side*g.side+2;
   if(start<0 || count<1 || start>int(g.rows.size())-count || !output || capacity<int64_t(count)*stride)
@@ -188,14 +227,16 @@ struct Batch {
   // Validate before writing, including grid cells outside the legal mask.
   for(int64_t i=0;i<int64_t(count)*stride;++i)if(!std::isfinite(output[i]))throw std::runtime_error("Nonfinite dense model predictions");
   for(int i=start;i<start+count;++i)if(decoded[g.rows[i]])throw std::runtime_error("Duplicate packed row completion");
-  for(int i=0;i<count;++i){int id=g.rows[start+i];auto* row=info.data()+12*int64_t(id);int side=int(row[0]);
-   const float* prediction=output+int64_t(i)*stride;double q=std::tanh(double(prediction[stride-1])/2);
-   double far=double(prediction[stride-2])-(row[9]?std::log(double(row[9])):0);
-   for(int64_t j=offsets[id];j<offsets[id+1];++j){int64_t cell=cells[j];
-    logits[j]=cell<0?far:double(prediction[cell/side*g.side+cell%side]);values[j]=q;
-   }
-   decoded[id]=1;
+  for(int i=0;i<count;++i){const float* prediction=output+int64_t(i)*stride;decode_row(g,g.rows[start+i],prediction,prediction[stride-2],prediction[stride-1]);}
+ }
+ void decode_split(int index,int start,int count,const float* policy,const float* far,const float* value){auto& g=group(index);int area=g.side*g.side;
+  if(start<0 || count<1 || start>int(g.rows.size())-count || !policy || !far || !value)throw std::runtime_error("Invalid split prediction buffers");
+  for(int64_t i=0;i<int64_t(count)*area;++i)if(!std::isfinite(policy[i]))throw std::runtime_error("Nonfinite dense model predictions");
+  for(int i=0;i<count;++i){
+   if(!std::isfinite(far[i]) || !std::isfinite(value[i]))throw std::runtime_error("Nonfinite dense model predictions");
+   if(decoded[g.rows[start+i]])throw std::runtime_error("Duplicate packed row completion");
   }
+  for(int i=0;i<count;++i)decode_row(g,g.rows[start+i],policy+int64_t(i)*area,far[i],value[i]);
  }
  void outputs(void** out){if(!out || std::find(decoded.begin(),decoded.end(),0)!=decoded.end())throw std::runtime_error("Incomplete packed batch");
   out[0]=offsets.data();out[1]=actions.data();out[2]=logits.data();out[3]=values.data();
@@ -225,6 +266,8 @@ HX_API int hxgp_group(void* p,int index,int64_t* out){try{
  auto& g=static_cast<packing::Batch*>(p)->group(index);out[0]=g.side;out[1]=int64_t(g.rows.size());return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgp_pack(void* p,int index,uint8_t* out,int64_t capacity){try{static_cast<packing::Batch*>(p)->pack(index,out,capacity);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxgp_features(void* p,int index,int start,int count,float* out,int64_t capacity){try{static_cast<packing::Batch*>(p)->features(index,start,count,out,capacity);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxgp_decode_split(void* p,int index,int start,int count,const float* policy,const float* far,const float* value){try{static_cast<packing::Batch*>(p)->decode_split(index,start,count,policy,far,value);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgp_decode(void* p,int index,int start,int count,const float* out,int64_t capacity){try{static_cast<packing::Batch*>(p)->decode(index,start,count,out,capacity);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Borrowed output buffers remain valid until hxgp_free. No tree is accessed by decoding.
 HX_API int hxgp_outputs(void* p,void** out){try{static_cast<packing::Batch*>(p)->outputs(out);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

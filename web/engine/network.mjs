@@ -218,4 +218,19 @@ export class Network {
     }
     return result;
   }
+
+  /** Compiled graph owner batches already own their crop/context mappings.
+   * Keep JavaScript work at submission granularity and bound feature staging
+   * on large canvases. The ONNX forward still returns its three output arrays. */
+  async evaluateNative(batch) {
+    for (let group = 0; group < batch.groups.length; group++) {
+      const {size, rows} = batch.groups[group];
+      const limit = Math.min(this.maxBatch, Math.max(1, Math.floor(64 * 32 * 32 / (size * size))));
+      for (let start = 0; start < rows; start += limit) {
+        const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
+        const prediction = await this.forward(input, count, size);
+        batch.decode(group, start, count, prediction);
+      }
+    }
+  }
 }

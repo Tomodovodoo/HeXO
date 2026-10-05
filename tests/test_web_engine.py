@@ -659,6 +659,76 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_native_owner_features_keep_the_browser_model_input_contract(self):
+        histories = [[], [[0,0]], [[0,0],[4,0]], [[0,0],[4,0],[7,0]],
+                     [[7*i,0] for i in range(36)]]
+        answers = node(dict(kind='native-features', histories=histories))
+        self.assertTrue(any(answer['far'] for answer in answers))
+        for answer in answers:
+            actual = np.frombuffer(base64.b64decode(answer['features']), np.float32)
+            expected = np.frombuffer(base64.b64decode(answer['reference']), np.float32)
+            np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=0)
+
+    def test_native_browser_owner_preserves_legal_breadth_and_sampling_credits(self):
+        history = [[0,0],[4,0],[7,0]]
+        answer = node(dict(kind='native-owner', history=history, work=512, delay=2, batchSize=4))
+        result, stats = answer['result'], answer['stats']
+        game = play.Game(history)
+        try: self.assertEqual(sorted(result['actions']), sorted([list(p) for p in game.legal_moves()]))
+        finally: game.close()
+        self.assertIn(result['action'], result['actions'])
+        self.assertAlmostEqual(sum(result['policy']), 1.)
+        self.assertGreater(stats['created'], 1)
+        self.assertGreater(stats['depth'], 0)
+        self.assertGreater(stats['root_completed'], 0)
+        self.assertLessEqual(stats['root_completed'], stats['completed'])
+        self.assertLessEqual(stats['last_credits'], stats['root_completed'])
+        self.assertEqual(result['completed'], stats['root_completed'])
+        self.assertEqual(result['all_view_completed'], stats['completed'])
+        self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+        self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+        self.assertEqual(answer['remainingViews'], 1)
+        self.assertGreater(answer['readyBeforeResult'], 0)
+
+    def test_native_browser_owner_drains_late_inference_and_keeps_exact_evidence(self):
+        for mode in ('cancel', 'prove', 'nonfinite', 'throwWhilePending'):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, delay=2, **{mode: True}))
+            stats = answer['stats']
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+            self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+            self.assertEqual(answer['remainingViews'], 1)
+            if mode in ('nonfinite','throwWhilePending'):
+                self.assertTrue(answer['rejected'])
+                self.assertGreater(answer['forwardsFinished'], 0)
+            elif mode == 'cancel': self.assertTrue(answer['blockedClose'])
+            else:
+                self.assertTrue(answer['lateProof'])
+                self.assertEqual(answer['result']['proven'], -1)
+                self.assertEqual(answer['result']['node_value'], -1.)
+
+    def test_native_browser_owner_turn_uses_shared_graph_and_releases_views(self):
+        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0, nativeOwner=True))
+        self.assertEqual(len(result['moves']), 2)
+        self.assertEqual(len(result['native_scheduler']), 2)
+        game = play.Game([[0,0]])
+        try:
+            for move in result['moves']:
+                self.assertTrue(game.legal(*move))
+                game.play(*move)
+        finally: game.close()
+        for stats in result['native_scheduler']:
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+
+    def test_native_browser_owner_honors_policy_move_selection(self):
+        answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
+        result = answer['result']
+        self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])
+
+    def test_browser_adapter_keeps_native_owner_opt_in(self):
+        ordinary, compiled = node(dict(kind='owner-adapter'))
+        self.assertFalse(ordinary['nativeOwner'])
+        self.assertTrue(compiled['nativeOwner'])
+
     def test_stored_turn_reconnects_proofs_in_either_stone_order(self):
         from tests.test_neural_search import Uniform
         histories = [[[0,0],[1,0],[2,0]], [[0,0],[1,0]], [[0,0],[2,0]]]

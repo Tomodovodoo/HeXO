@@ -8,6 +8,18 @@
 #include <vector>
 
 namespace feeding {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// The browser's graph owner lives in one Web Worker. Inference and the solver
+// use separate workers; no shared-memory C++ graph writers are created here.
+class Workers {
+public:
+ explicit Workers(int count=1){if(count!=1)throw std::runtime_error("Browser graph phases have one owner");}
+ int size()const{return 1;}
+ void run(int jobs,void(*work)(void*,int),void* data,bool(*admit)(void*,int)=nullptr){
+  for(int i=0;i<jobs;++i)if(!admit || admit(data,i))work(data,i);
+ }
+};
+#else
 // Persistent host workers. Each phase assigns disjoint game stores; public
 // control, proof dispatch and GPU admission run only after the phase joins.
 class Workers {
@@ -60,4 +72,5 @@ public:
   wake.notify_all();done.wait(lock,[&]{return !active;});if(error)std::rethrow_exception(error);
  }
 };
+#endif
 }
