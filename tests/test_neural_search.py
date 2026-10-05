@@ -1381,6 +1381,61 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
         self.assertEqual(native.hxg_exact(native.hxgo_root(pool.games[0].ptr)),-1)
 
+    def test_native_service_installs_a_returned_row_while_its_snapshot_tail_waits(self):
+        import time
+        from types import SimpleNamespace
+        from native_scheduler import InferenceService
+        import native_dense
+        for cancel_tail in (False,True):
+            with self.subTest(cancel_tail=cancel_tail):
+                pool=self.pool([self.graph(),self.graph([(0,0),(4,0),(7,0)])],
+                               quantum=16,views=1,work=16,cache=0)
+                service=InferenceService([pool],[SimpleNamespace(model_version='scheduler')],
+                                         batch_size=1,quantum=16,latency_ms=20.)
+                try:
+                    service.start()
+                    until=time.monotonic()+1
+                    while service.stats()['unique_rows']<2 and time.monotonic()<until:
+                        time.sleep(.001)
+                    self.assertEqual(service.stats()['unique_rows'],2)
+                    token,model,rows=service.take(1000)
+                    self.assertEqual(rows.count,1)
+                    for group,(side,count) in enumerate(rows.groups):
+                        output=np.zeros((count,side*side+2),np.float32)
+                        self.assertTrue(native.hxgp_decode(rows.ptr,group,0,count,
+                                                         output.ctypes.data,output.size))
+                    service.complete(token,rows)
+                    # The other cold root remains unsent. Its neighbor must
+                    # install this result and supply useful continuations.
+                    until=time.monotonic()+1
+                    while service.stats()['unique_rows']<=2 and time.monotonic()<until:
+                        time.sleep(.001)
+                    self.assertEqual(service.stats()['subscriber_deliveries'],1)
+                    self.assertEqual(service.stats()['installed_message_rows'],1)
+                    self.assertGreater(service.stats()['unique_rows'],2)
+                    if not cancel_tail:
+                        for _ in range(1000):
+                            if service.done():break
+                            batch=service.take(50)
+                            if batch is None:continue
+                            token,model,rows=batch
+                            for group,(side,count) in enumerate(rows.groups):
+                                output=np.zeros((count,side*side+2),np.float32)
+                                self.assertTrue(native.hxgp_decode(rows.ptr,group,0,count,
+                                                                 output.ctypes.data,output.size))
+                            service.complete(token,rows)
+                        else:self.fail('Partial native delivery did not finish both searches')
+                finally:
+                    service.close()
+                self.assertEqual(service.stats()['pending_rows'],0)
+                self.assertEqual(service.stats()['active_producers'],0)
+                self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+                if not cancel_tail:
+                    for game in pool.games:
+                        self.assertEqual(game.stats()['completed'],16)
+                        self.assertEqual(int(game.evidence()['lifetime_credits'].sum()),16)
+                pool.close()
+
     def graph(self, history=((0, 0),), version='scheduler'):
         graph = GameGraph(Uniform(), version, history, limit=96)
         self.addCleanup(graph.close)
