@@ -719,6 +719,18 @@ class Bundle(unittest.TestCase):
         for stats in result['native_scheduler']:
             self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
 
+    def test_native_browser_owner_stops_split_forwards_at_cancellation_or_proof(self):
+        for control in (dict(cancel=True, cancelAfter=3), dict(stopAfter=3), dict(prove=True, proveAfter=3)):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, maxBatch=1, delay=2, **control))
+            self.assertEqual(answer['forwardCalls'], 3)
+            self.assertEqual(answer['forwardsFinished'], 3)
+            stats = answer['stats']
+            self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
+            self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+            self.assertEqual(answer['remainingViews'], 1)
+            if control.get('prove'):
+                self.assertEqual(answer['result']['proven'], -1)
+
     def test_native_browser_owner_honors_policy_move_selection(self):
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']

@@ -516,11 +516,16 @@ export class NativeOwner {
   }
   done() { return !this.ptr || Boolean(this.m._hxgo_done(this.ptr)); }
   cancel() { if (this.ptr) this.m._hxgo_cancel(this.ptr); }
+  admit() {
+    if (!this.ptr) return false;
+    if (this.m._hxg_exact(this.root.ptr) >= 0) this.cancel();
+    return Boolean(this.m._hxgo_admit(this.ptr));
+  }
   take(limit = 64) {
     if (!this.ptr) throw new Error('Native owner is closed');
     const info = this.n.alloc(16);
     try {
-      if (!this.m._hxgo_admit(this.ptr)) return null;
+      if (!this.admit()) return null;
       this.n.checked(this.m._hxgf_layout(this.feed, limit, info));
       const count = Number(this.n.view(BigInt64Array, info, 2)[0]);
       return count ? new NativeBatch(this, count) : null;
@@ -573,7 +578,10 @@ export class NativeOwner {
         if (batch) {
           const begin = performance.now();
           let settled = false;
-          flight = network.evaluateNative(batch);
+          flight = network.evaluateNative(batch, {stop: () => {
+            if (stop()) this.cancel();
+            return !this.admit();
+          }});
           // Observe rejection immediately while the owner prepares useful work
           // for the next batch. Await the same promise before releasing buffers.
           const observed = flight.then(() => { settled = true; }, () => { settled = true; });
@@ -582,9 +590,14 @@ export class NativeOwner {
             if (!this.step(batchSize)) break;
             await nextTask();
           }
-          await observed; await flight; flight = null;
+          await observed; const evaluated = await flight; flight = null;
           networkMs += performance.now() - begin;
           if (stop()) this.cancel();
+          if (evaluated === false) {
+            // A partially decoded batch cannot be installed. Only its current
+            // forward was allowed to finish; remaining chunks never launched.
+            this.cancel(); batch.close(); batch = null; break;
+          }
           // Detached subscribers cannot install into a changed/cancelled view.
           batch.install(); batches++; largest = Math.max(largest, batch.count); batch = null;
           onBatch(this.stats());

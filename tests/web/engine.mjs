@@ -123,18 +123,21 @@ if (job.kind === 'encode') {
   const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
     work: job.ms ? 0 : job.work ?? 256, ms: job.ms ?? 0, views: job.views ?? 8, quantum: 32});
   const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
+  network.maxBatch = job.maxBatch ?? network.maxBatch;
   let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
+  let forwardCalls = 0;
   network.forward = async (input, count, size) => {
+    forwardCalls++;
     sent += count;
     if (job.delay) {
       await new Promise(resolve => setTimeout(resolve, job.delay));
       readyBeforeResult = Math.max(readyBeforeResult, Number(owner.m._hxgf_queued(owner.feed)));
     }
-    if (job.cancel) {
+    if (job.cancel && forwardCalls >= (job.cancelAfter ?? 1)) {
       owner.cancel();
       try { owner.close(); } catch { blockedClose = true; }
     }
-    if (job.prove && !lateProof) {graph.proveLoss(1-native.game(job.history).player, 7);lateProof = true;}
+    if (job.prove && !lateProof && forwardCalls >= (job.proveAfter ?? 1)) {graph.proveLoss(1-native.game(job.history).player, 7);lateProof = true;}
     const policy = new Float32Array(count * size * size), far = new Float32Array(count), value = new Float32Array(count);
     if (job.nonfinite) policy[0] = NaN;
     forwardsFinished++;
@@ -143,9 +146,9 @@ if (job.kind === 'encode') {
   try {
     let result;
     try { result = await owner.search({network, choice: job.choice ?? 'gumbel', batchSize: job.batchSize ?? 16, onBatch: stats => snapshots.push(stats),
-      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return false;}}); }
+      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
     catch (error) { if (!job.nonfinite && !job.throwWhilePending) throw error; rejected = /Nonfinite|Control failed/.test(error.message); }
-    answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished};
+    answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished, forwardCalls};
     owner.close();
     graph.at(job.history);
     answer.graph = graph.counters();
