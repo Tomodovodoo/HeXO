@@ -81,10 +81,10 @@ struct Owner {
    size_t drop=std::min(size_t(2048),victims.size());for(size_t i=0;i<drop;++i){candidates.erase(victims[i].second);++reclaimed;}
   }
   t.current(node);auto q=t.transformed(node);double maximum=-1e300,total=0;int legal=0;
-  for(size_t i=0;i<q.size();++i){q[i]=node.edges[i].eligible?q[i]+node.edges[i].logit:-std::numeric_limits<double>::infinity();if(node.edges[i].eligible){maximum=std::max(maximum,q[i]);++legal;}}
+  for(size_t i=0;i<q.size();++i){q[i]=node.edges[i].read().eligible?q[i]+node.edges[i].logit:-std::numeric_limits<double>::infinity();if(node.edges[i].read().eligible){maximum=std::max(maximum,q[i]);++legal;}}
   for(double x:q)total+=std::exp(x-maximum);
   if(!legal || !total)return;
-  for(size_t i=0;i<node.edges.size();++i){auto& edge=node.edges[i];if(!edge.eligible || (edge.child && edge.child->exact_winner>=0))continue;
+  for(size_t i=0;i<node.edges.size();++i){auto& edge=node.edges[i];if(!edge.read().eligible || (edge.read().child && edge.read().child->exact_winner>=0))continue;
    auto h=v.history;h.push_back(edge.action);Key key=gumbel::keys(h).second;
    if(key==views[0].key)continue;
    if(!candidates.contains(key) && candidates.size()>=16384)continue;
@@ -94,7 +94,7 @@ struct Owner {
    double relevance=v.relevance*share*.85;
    // Evidence under another incoming path may improve relevance; no legal move is deleted by this ranking.
    c.relevance=std::max(c.relevance,relevance);
-   if(edge.child && edge.child->n)c.cost=std::max(1.,double(edge.child->edges.size())/256.);
+   if(edge.read().child && edge.read().child->n)c.cost=std::max(1.,double(edge.read().child->edges.size())/256.);
   }
   v.discovered=true;discover_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
  }
@@ -167,9 +167,9 @@ struct Owner {
   // Deeper same-position values may refresh the choice, but an incomplete new
   // comparison does not replace the last completed root sampling credits.
   const auto& epochs=last_root.empty()?t.root_edges:last_root;int maximum=0,seen=0;
-  for(size_t i=0;i<n.edges.size() && i<epochs.size();++i){seen=std::max(seen,epochs[i].epoch);if(n.edges[i].eligible)maximum=std::max(maximum,epochs[i].epoch);}
+  for(size_t i=0;i<n.edges.size() && i<epochs.size();++i){seen=std::max(seen,epochs[i].epoch);if(n.edges[i].read().eligible)maximum=std::max(maximum,epochs[i].epoch);}
   double best=-1e300;int selected=-1;
-  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];if(!e.eligible)continue;
+  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];if(!e.read().eligible)continue;
    if(n.exact_winner<0 && seen && (i>=epochs.size() || epochs[i].epoch!=maximum))continue;
    double score=e.logit+q[i]+t.bonus(e);if(seen && i<epochs.size())score+=epochs[i].gumbel;
    if(score>best){best=score;selected=int(i);}
@@ -196,7 +196,7 @@ extern "C" HX_API int hxgo_records(void* p,uint64_t* metadata,double* values){au
 // Diagnostic only: preserve shared Q while exposing which count drives its temperature.
 extern "C" HX_API int hxgo_policy_audit(void* p,double* out){auto& o=*static_cast<owner::Owner*>(p);auto& t=*o.views[0].tree;auto& node=*t.root;if(!node.expanded)return 0;t.current(node);int maximum=0;auto raw=t.completed_q(node,maximum);
  if(out)for(size_t i=0;i<node.edges.size();++i){auto& e=node.edges[i];uint64_t direct=i<o.direct_root_credits.size()?o.direct_root_credits[i]:0;if(o.views[0].active && i<t.root_edges.size())direct+=t.root_edges[i].credits;
-  std::array<double,9> row{double(e.action.q),double(e.action.r),e.logit,raw[i],double(e.visits),double(i<t.root_edges.size()?t.root_edges[i].credits:0),double(i<o.last_root.size()?o.last_root[i].credits:0),e.eligible?1.:0.,double(direct)};std::copy(row.begin(),row.end(),out+9*i);}return int(node.edges.size());}
+  std::array<double,9> row{double(e.action.q),double(e.action.r),e.logit,raw[i],double(e.read().visits),double(i<t.root_edges.size()?t.root_edges[i].credits:0),double(i<o.last_root.size()?o.last_root[i].credits:0),e.read().eligible?1.:0.,double(direct)};std::copy(row.begin(),row.end(),out+9*i);}return int(node.edges.size());}
 
 // One writer per game and one neural queue across independent games of one model.
 namespace owner {
