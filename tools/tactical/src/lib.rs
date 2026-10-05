@@ -341,6 +341,8 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
     let mut exact=false;
     let mut proof_numbers=None;
     let mut resident_reused=false;
+    let mut frontier_reused_nodes=0;
+    let mut frontier_bytes=0;
     let mut incomplete=None;
     let cert=if !req.replay.is_empty() {
         match stamps::replay(&req.replay,&board,ply,side,&ctl,req.nodes) {Ok(cert)=>Some(cert),Err(reason)=>{incomplete=Some(reason);None}}
@@ -369,6 +371,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
             let found=if ctl.expired() {None} else {
                 let found={let _time=stamps::measure("search");prover::pdspn::solve(&pos,&cfg,&ctl)};
                 proof_numbers=found.proof_numbers;resident_reused=found.resident_reused;
+                frontier_reused_nodes=found.frontier_reused_nodes;frontier_bytes=found.frontier_bytes;
                 found.certificate
             };
             match found {
@@ -392,7 +395,11 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         response["proof_numbers"]=proof_numbers.map(|(pn,dn)|json!({"pn":pn,"dn":dn,
             "infinity":prover::PROOF_NUMBER_INFINITY,"scope":"wide-forcing","game_exact":false})).unwrap_or(Value::Null);
     }
-    if req.resume {response["resident_reused"]=json!(resident_reused);}
+    if req.resume {
+        response["resident_reused"]=json!(resident_reused);
+        response["frontier_reused_nodes"]=json!(frontier_reused_nodes);
+        response["frontier_bytes"]=json!(frontier_bytes);
+    }
     if let Some(cert)=cert {
         let prepared=if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {
             stamps::resolved(source,&board,ply,side,&ctl)
@@ -826,6 +833,24 @@ mod tests {
             assert!(reused,"a resize retains usable search entries");
             assert!(spent<cold,"verified warm proof uses less fresh work: {spent} vs {cold}");
         }
+        prover::dfpn::set_resident(0);
+    }
+    #[test]
+    fn resident_search_state_isolated_by_kernel_configuration() {
+        prover::dfpn::set_resident(0);
+        prover::dfpn::set_resident_resume(1);
+        let (pos,cfg,ctl,_)=setup(100000);
+        let first=prover::pdspn::solve(&pos,&cfg,&ctl);
+        assert!(!first.resident_reused);
+        let same=prover::pdspn::solve(&pos,&cfg,&ctl);
+        assert!(same.resident_reused);
+        let narrow=ProverConfig{wide:false,..cfg};
+        let other=prover::pdspn::solve(&pos,&narrow,&ctl);
+        assert!(!other.resident_reused,"changing the forcing generator clears cached estimates and frontiers");
+        let mut different_rules=pos;
+        different_rules.config.win_length=5;
+        let other=prover::pdspn::solve(&different_rules,&narrow,&ctl);
+        assert!(!other.resident_reused,"different rules cannot borrow search evidence");
         prover::dfpn::set_resident(0);
     }
     #[test]

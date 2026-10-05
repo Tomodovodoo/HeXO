@@ -132,7 +132,12 @@ class NativeTactics:
     when dispatched work ends without returning its meter. `bounds=True`
     returns `proof_numbers` for the wide forcing model, not a game verdict.
     `resume=True` needs a positive `table_mb` and keeps worker-local entries and
-    proven witnesses through resizes. Level-2 trees and seed attempts are per query.
+    proven witnesses through resizes. Unresolved level-2 frontiers retain an
+    additional accounted capacity of at most `table_mb` MiB per attacker.
+    `frontier_reused_nodes` counts recovered nodes across this attempt's seeds;
+    `frontier_bytes` reports cached capacity after a driver attempt, excluding
+    allocator metadata; it is zero when the query bypasses the driver.
+    Premise-dependent queries and recursive level-1 frames are not retained.
     """
 
     accepts_cancel_event = True
