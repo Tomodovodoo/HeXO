@@ -125,11 +125,13 @@ struct ColdBlock {double mass=0;int best=-1;bool dirty=true;};
 struct HistoryLink {std::shared_ptr<const HistoryLink> before;Cell cell;int stones;
  HistoryLink(std::shared_ptr<const HistoryLink> p,Cell c):before(std::move(p)),cell(c),stones(before?before->stones+1:1){}
 };
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false;double value=0,q=0,carried_sum=0,policy_mass=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false;bool* archive_dirty=nullptr;double value=0,q=0,carried_sum=0,policy_mass=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
  std::pmr::vector<int> active;std::pmr::vector<ColdBlock> cold;bool selective=false,cold_dirty=true;int cold_best=-1;double cold_mass=0;
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->pool),tracked(&memory->pool),active(&memory->pool),cold(&memory->pool){empty.owner=this;}
+ void archive_changed(){if(archive_dirty)*archive_dirty=true;}
  void activate(Edge& edge){
+  archive_changed();
   if(!selective)return;
   int i=int(&edge-edges.data());active.insert(std::lower_bound(active.begin(),active.end(),i),i);
   cold[i/block_size].dirty=true;cold_dirty=true;
@@ -169,6 +171,7 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
  // action cap or a proof-coverage list; `edges` always holds every legal move.
  const std::pmr::vector<int>& tracked_edges(){
   if(!indexed){
+   archive_changed();
    for(size_t i=0;i<edges.size();++i)if(edges[i].read().child || edges[i].read().visits){edges[i].write().indexed=true;tracked.push_back(int(i));}
    indexed=true;
   }
@@ -176,6 +179,7 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
  }
  void track(Edge& edge){
   tracked_edges();if(edge.read().indexed)return;
+  archive_changed();
   int index=int(&edge-edges.data());tracked.insert(std::lower_bound(tracked.begin(),tracked.end(),index),index);edge.write().indexed=true;
  }
 };
@@ -197,8 +201,9 @@ struct Archive {
  std::unordered_map<ColouredCell,std::bitset<slots>,ColouredHash> membership;
  std::bitset<slots> occupied,compatible;
  std::shared_ptr<const HistoryLink> focus;
- size_t limit,bytes=0;uint64_t retained=0,reused=0,discarded=0;
+ size_t limit,bytes=0;bool dirty=false;uint64_t retained=0,reused=0,discarded=0;
  explicit Archive(size_t budget):limit(budget){}
+ ~Archive(){for(auto& e:entries)if(e.node)e.node->archive_dirty=nullptr;}
  static size_t payload(const Node& n){
   size_t states=n.selective?n.active.size():std::count_if(n.edges.begin(),n.edges.end(),[](const Edge& e){return !e.read().empty;});
   // Charge every history link conservatively even when prefixes are shared.
@@ -219,17 +224,17 @@ struct Archive {
   compatible=occupied;
   for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end()){compatible.reset();break;}compatible&=found->second;}
  }
- void refresh(){bytes=0;for(auto& e:entries)if(e.node){e.bytes=payload(*e.node);bytes+=e.bytes;}}
+ void refresh(){bytes=0;for(auto& e:entries)if(e.node){e.bytes=payload(*e.node);bytes+=e.bytes;}dirty=false;}
  void insert(const std::shared_ptr<Node>& node){
   size_t slot=0;while(slot<slots && occupied[slot])++slot;
   if(slot==slots)throw std::runtime_error("Dormant archive has no free slot");
   auto& entry=entries[slot];entry={node,payload(*node)};bytes+=entry.bytes;contexts.emplace(node->context,slot);occupied.set(slot);compatible.set(slot);
   for(auto p=node->history;p;p=p->before)membership[{p->cell,(p->stones/2)%2}].set(slot);
   for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end() || !found->second[slot]){compatible.reset(slot);break;}}
-  node->dormant=true;++retained;
+  node->dormant=true;node->archive_dirty=&dirty;++retained;
  }
  std::shared_ptr<Node> remove(size_t slot){
-  auto node=std::move(entries[slot].node);bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);
+  auto node=std::move(entries[slot].node);node->archive_dirty=nullptr;bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);
   for(auto p=node->history;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});found->second.reset(slot);if(found->second.none())membership.erase(found);}
   if(occupied.none()){contexts.rehash(0);membership.rehash(0);}
   return node;
@@ -464,7 +469,7 @@ struct Tree {
  // stored parents (revise); otherwise the parent's value becomes stale.
  void attach(Node& parent,Edge& e,const std::shared_ptr<Node>& child) {
   if(e.read().visits && !child->n && e.read().exact_winner<0){e.write().visits=0;e.write().sum=0;}
-  e.write().child=child;parent.track(e);child->parents.push_back(parent.weak_from_this());
+  e.write().child=child;parent.track(e);child->archive_changed();child->parents.push_back(parent.weak_from_this());
   if(child->exact_winner>=0 && tighten(child->exact_winner,child->distance+1,child->bound,e.write().exact_winner,e.write().distance,e.write().bound)){
    settle(parent);learn(parent);revise(parent);
   }
@@ -516,11 +521,11 @@ struct Tree {
  }
  void trim_archive(bool need_slot=false,bool refresh=true){
   if(!state->archive)return;
-  auto& archive=*state->archive;if(refresh)archive.refresh();
+  auto& archive=*state->archive;if(refresh || archive.dirty)archive.refresh();
   while(archive.occupied.any() && (archive.total_bytes()>archive.limit || (need_slot && archive.occupied.all()))){
    size_t slot=archive.victim([&](const Node* n){return !n->pending && !state->pinned(n);});
    if(slot==Archive::slots)break;
-   auto node=archive.remove(slot);discard(node);++archive.discarded;
+   auto node=archive.remove(slot);discard(node);++archive.discarded;if(archive.dirty)archive.refresh();
   }
  }
  void evict() {
@@ -1000,7 +1005,7 @@ struct Tree {
     // An existing node of this turn context takes the second stone as its witness instead of being replaced.
     auto [p,c]=keys(position);
     if(auto existing=nodes[c].lock()){
-     existing->parents.push_back(node->weak_from_this());
+     existing->archive_changed();existing->parents.push_back(node->weak_from_this());
      const Outcome o{player,player,distance-1,int(position.cells.size()),true,{EdgeProof{Cell{moves[2],moves[3]},player,distance-1,true}}};
      // The outcome keeps the witness even while the node is unexpanded; its parents and peers take the proof.
      if(apply(o,*existing))revise(*existing);
@@ -1129,7 +1134,7 @@ HX_API int hxg_storage(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>
 }
 // Completed Q in value units for the root's mover, per root edge in hxg_stats order (Tree::completed_q); the edge
 // count, 0 before the root is expanded.
-HX_API int hxg_q(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);int maximum=0;auto& q=t.completed_q(n,maximum);if(out)std::copy(q.begin(),q.end(),out);return int(q.size());}
+HX_API int hxg_q(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);int maximum=0;auto& q=t.completed_q(n,maximum);if(out)std::copy(q.begin(),q.end(),out);t.trim_archive(false,false);return int(q.size());}
 // Sets the least Q range of the completed-Q rescale (0, the default, keeps 1e-8) for every later search and target;
 // 0 with no change when `floor` is negative or not finite.
 HX_API int hxg_q_range_floor(void* p,double floor){if(!std::isfinite(floor) || floor<0){gumbel::error="Invalid Q range floor";return 0;}static_cast<gumbel::Tree*>(p)->range_floor=floor;return 1;}
@@ -1188,18 +1193,18 @@ HX_API int hxg_prove_loss(void* p,int winner,int distance){try{
  t.apply(outcome,n);t.refresh(n);t.learn(n);t.propagate(n,nullptr);t.trim_archive();return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // The node estimate, for display when the listed candidates are all refuted.
-HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);return t.root->q;}
-HX_API int hxg_begin(void* p,int simulations,int sample){try{static_cast<gumbel::Tree*>(p)->begin(simulations,sample);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxg_next(void* p){try{return static_cast<gumbel::Tree*>(p)->request();}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
+HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);t.trim_archive(false,false);return t.root->q;}
+HX_API int hxg_begin(void* p,int simulations,int sample){try{auto& t=*static_cast<gumbel::Tree*>(p);t.begin(simulations,sample);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxg_next(void* p){try{auto& t=*static_cast<gumbel::Tree*>(p);int result=t.request();t.trim_archive(false,false);return result;}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
 // Legal moves of a pending request in sorted (q, r) order, the actions hxg_fulfill must be given.
 HX_API int hxg_legal(void* p,int id,int64_t* out){auto& l=static_cast<gumbel::Tree*>(p)->requests.at(id).legal;if(out)for(int i=0;i<int(l.size());++i){out[2*i]=l[i].q;out[2*i+1]=l[i].r;}return int(l.size());}
-HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{static_cast<gumbel::Tree*>(p)->fulfill(id,a,logits,q,n);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{auto& t=*static_cast<gumbel::Tree*>(p);t.fulfill(id,a,logits,q,n);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Caller must independently verify the strategy certificate before this entry.
 // Exact history and placement phase prevent applying it to a different request.
-HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count,int turns){try{static_cast<gumbel::Tree*>(p)->prove(id,h,n,player,remaining,moves,count,turns);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count,int turns){try{auto& t=*static_cast<gumbel::Tree*>(p);t.prove(id,h,n,player,remaining,moves,count,turns);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxg_cancel(void* p){static_cast<gumbel::Tree*>(p)->cancel();}
-HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{static_cast<gumbel::Tree*>(p)->advance({q,r});return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{auto& t=*static_cast<gumbel::Tree*>(p);t.advance({q,r});t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Final selection among eligible edges at the highest epoch this search reached; when proofs removed every visited edge
 // the unvisited survivors compete. No simulation started (an expired budget) scores nothing.
 HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){
@@ -1209,9 +1214,9 @@ HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double*
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];auto& local=t.root_edges[i];if(actions){
   actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.read().visits;values[i]=t.value(n,e);
   scores[i]=e.read().eligible && (n.exact_winner>=0 || (searched && local.epoch==max_epoch))?local.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();
- }}return int(n.edges.size());
+ }}t.trim_archive(false,false);return int(n.edges.size());
 }
-HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].read().eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;return int(q.size());}
+HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].read().eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;t.trim_archive(false,false);return int(q.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
 // Completion includes an exact root, but never permits advancement while leaf reservations are outstanding.
 HX_API int hxg_done(void* p){return static_cast<gumbel::Tree*>(p)->done();}

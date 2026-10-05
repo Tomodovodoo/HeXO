@@ -5,7 +5,7 @@
 int main(){
  // A shared loss proof materializes every legal edge in dormant peer contexts.
  // That growth must be trimmed at delivery, without losing the exact outcome.
- {gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
+ for(bool leaf_proof:{false,true}){gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
   std::vector<Cell> original{{0,0},{1,1},{2,1},{2,0},{0,3},{0,2},{1,2},{-1,2},{3,1},{-1,0},{0,-1}};
   auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
    auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
@@ -14,12 +14,20 @@ int main(){
   std::swap(second_history[5],second_history[9]);std::swap(second_history[6],second_history[10]);
   auto second=expand(second_history);auto third_history=original;
   std::swap(third_history[1],third_history[9]);std::swap(third_history[2],third_history[10]);
-  auto peer=expand(third_history);t.evict();assert(first->dormant && second->dormant);
+  auto peer=expand(third_history);t.evict();
+  int request=0;
+  if(leaf_proof){third_history=original;std::swap(third_history[5],third_history[9]);
+   t.root_at(third_history);t.begin(1,1);request=t.request();assert(request>0);peer=t.root;}
+  assert(first->dormant && second->dormant);
   auto& archive=*t.state->archive;auto discarded=archive.discarded;
-  assert(hxg_prove_loss(&t,1-peer->player,7));
-  assert(archive.total_bytes()<=archive.limit && archive.discarded>discarded);
+  int winner=leaf_proof?peer->player:1-peer->player;
+  if(leaf_proof){std::vector<int64_t> history;for(auto c:third_history){history.push_back(c.q);history.push_back(c.r);}
+   auto legal=t.requests.at(request).legal;int64_t moves[4]{legal[0].q,legal[0].r,legal[1].q,legal[1].r};
+   assert(hxg_prove(&t,request,history.data(),int(third_history.size()),peer->player,peer->remaining,moves,2,2));
+  }else assert(hxg_prove_loss(&t,winner,7));
+  assert(!archive.dirty && archive.total_bytes()<=archive.limit && archive.discarded>discarded);
   int64_t counts[10];assert(hxg_archive_stats(&t,counts) && counts[1]<=counts[2]);
-  t.root_at(original);assert(t.root->exact_winner==1-peer->player);
+  t.root_at(original);assert(t.root->exact_winner==winner);
  }
  // A long active history must not consume an empty dormant archive's byte
  // allowance. Consecutive cells alternate colours in pairs and cannot win.
