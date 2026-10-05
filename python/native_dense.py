@@ -192,7 +192,7 @@ def submit(evaluator, rows, max_cells=48*48*48):
             step = evaluator.max_batch if graphed else max(1, min(evaluator.max_batch, max_cells//(side*side)))
             if observe and graphed:
                 pieces = [cap for start in range(0, count, step)
-                          for _, cap in graph._segments(min(step, count-start), graph._limit(side, graph.max_batch))]
+                          for _, cap in graph._segments(min(step, count-start), graph._limit(side, graph.max_batch), side)]
                 if all((side, cap) in graph.graphs for cap in pieces):
                     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     begin.record()

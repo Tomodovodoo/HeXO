@@ -119,7 +119,8 @@ class HexcropTests(unittest.TestCase):
         fit=costs.stats();self.assertTrue(fit['fitted'])
         self.assertAlmostEqual(fit['cell_ms'],.00013);self.assertAlmostEqual(fit['launch_ms'],.7)
         limits=[(s,ActorGraph._limit(s,128)) for s in sides]
-        for counts in ([64,64,0,0,0],[0,0,16,16,0],[4,4,8,1,1],[64,32,32,8,0]):
+        for counts in ([64,64,0,0,0],[0,0,16,16,0],[4,4,8,1,1],[64,32,32,8,0],
+                       [33,15,0,0,0],[65,15,0,0,0],[80,16,0,0,0],[0,33,16,0,0],[0,0,49,7,0],[0,0,56,1,0]):
             ids=np.asarray([i if i<4 else 4+j%2 for i,n in enumerate(counts) for j in range(n)],np.int32)
             source=np.full(len(ids),bank.ptr,np.uintp)
             for step in (8,19,128):
@@ -135,10 +136,10 @@ class HexcropTests(unittest.TestCase):
                             count+=n
                             if i==len(original)-1 or split&(1<<i):candidate.append((s,count));count=0
                         parts=[(s,cap) for s,n in candidate for start in range(0,n,step)
-                               for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128))]
+                               for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128),s)]
                         scores.append(sum(s*s*cap*.00013+.7 for s,cap in parts))
                     parts=[(s,cap) for s,n in rows.groups for start in range(0,n,step)
-                           for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128))]
+                           for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128),s)]
                     self.assertAlmostEqual(sum(s*s*cap*.00013+.7 for s,cap in parts),min(scores))
                     self.assertEqual(sum(n for _,n in rows.groups),len(ids))
                     for index,(side,count) in enumerate(rows.groups):
@@ -927,7 +928,8 @@ class FusedCudaTests(unittest.TestCase):
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
-        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (64, 24), (128, 24), (64, 32), (64, 40)):
+        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
+                           (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
             x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
@@ -940,7 +942,7 @@ class FusedCudaTests(unittest.TestCase):
             saved.append({name: value.clone() for name, value in out.items()})
         self.assertIn((24, 128), runner.graphs)
         self.assertIn((32, 64), runner.graphs)
-        self.assertNotIn((40, 64), runner.graphs)
+        self.assertIn((40, 64), runner.graphs)
         for i in reversed(range(len(inputs))):
             out = runner(inputs[i])
             for name in out:
@@ -3612,10 +3614,14 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_actor_graph_batches_keep_small_tails_and_canvas_limits(self):
         from hexnet_graphs import ActorGraph
         for side, rows, expected in ((24, 128, [(128, 128)]), (32, 128, [(64, 64), (64, 64)]),
-                                      (40, 128, [(32, 32)]*4), (64, 32, [(16, 16)]*2),
+                                      (40, 128, [(64, 64)]*2), (64, 32, [(16, 16)]*2),
+                                      (24, 33, [(32, 32), (1, 1)]), (32, 48, [(32, 32), (16, 16)]),
+                                      (24, 49, [(49, 64)]), (40, 49, [(32, 32), (16, 16), (1, 1)]),
+                                      (24, 65, [(64, 64), (1, 1)]), (24, 96, [(64, 64), (32, 32)]),
+                                      (40, 56, [(32, 32), (16, 16), (8, 8)]), (40, 57, [(57, 64)]),
                                       (24, 147, [(128, 128), (16, 16), (3, 4)]),
                                       (32, 83, [(64, 64), (16, 16), (3, 4)])):
-            parts = list(ActorGraph._segments(rows, ActorGraph._limit(side, 128)))
+            parts = list(ActorGraph._segments(rows, ActorGraph._limit(side, 128), side))
             self.assertEqual(parts, expected)
             self.assertEqual(sum(n for n, _ in parts), rows)
             self.assertTrue(all(n <= cap and cap*side*side <= ActorGraph.MAX_CELLS for n, cap in parts))

@@ -142,6 +142,8 @@ struct Batch {
   auto units=[&](int rows,int side,int limit){double cells=0;int launches=0;
    while(rows){int chunk=std::min(rows,step);rows-=chunk;
     while(chunk>limit){cells+=double(limit)*side*side;++launches;chunk-=limit;}
+    if(limit>=128 && chunk>64 && chunk<=96){cells+=64.*side*side;++launches;chunk-=64;}
+    if(limit>=64 && chunk>32 && chunk<=(side==40?56:48)){cells+=32.*side*side;++launches;chunk-=32;}
     if(chunk>16 && chunk<=24){cells+=16.*side*side;++launches;chunk-=16;}
     if(chunk){int cap=1;while(cap<chunk)cap*=2;cells+=double(cap)*side*side;++launches;}
    }
