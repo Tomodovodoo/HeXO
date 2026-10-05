@@ -177,6 +177,25 @@ class NeuralTree(unittest.TestCase):
             self.assertEqual(result['proven'], 1)
             search.advance(result['action'])
         self.assertEqual(search.game.winner, 0)
+        # A completed native oracle still has to validate the supplied
+        # prediction before PUCT consumes its arrays in legal-action order.
+        for changed in ('actions', 'logit_shape', 'q_shape', 'logits', 'q', 'range'):
+            prediction = Uniform().evaluate([history])[0]
+            if changed == 'actions':
+                prediction['actions'] = prediction['actions'][::-1]
+            elif changed == 'logit_shape':
+                prediction['logits'] = prediction['logits'][:-1]
+            elif changed == 'q_shape':
+                prediction['q'] = prediction['q'][:,None]
+            elif changed == 'range':
+                prediction['q'][0] = 2
+            else:
+                prediction[changed][0] = np.nan
+            invalid = PUCTSearch(Uniform(), 'puct-invalid', history, tactics=True)
+            self.addCleanup(invalid.close)
+            invalid.begin(8)
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'Invalid evaluation'):
+                invalid.fulfill(invalid.request(), prediction)
 
     @unittest.skipUnless(importlib.util.find_spec('torch'), 'Timed Bubble turns require torch')
     def test_timed_turn_reserves_simulations_for_both_stones(self):

@@ -131,6 +131,16 @@ class PUCTSearch:
             if rid > 0:
                 oracle.fulfill(rid, prediction)
             result = oracle.result(0., 0., 0, 0)
+            if rid <= 0:
+                actions = np.asarray(prediction['actions'])
+                logits, values = (np.asarray(prediction[k], np.float64) for k in ('logits', 'q'))
+                if actions.dtype.kind not in 'iu':
+                    raise ValueError('Evaluator coordinates must be integers within +/- 10^12')
+                if (not np.array_equal(actions, result['actions']) or logits.shape != (len(result['actions']),)
+                        or values.shape != logits.shape or not np.isfinite(logits).all()
+                        or not np.isfinite(values).all() or (np.abs(values) > 1).any()):
+                    raise ValueError('Invalid evaluation')
+                prediction = dict(prediction, logits=logits, q=values)
         finally:
             oracle.close()
         node.actions = result['actions']
