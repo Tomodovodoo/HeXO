@@ -1,8 +1,10 @@
 #include "hexo.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,13 +57,32 @@ extern "C" HX_API int hxg_encode_many(void* const* trees,const int* ids,int coun
 
 namespace packing {
 struct Group { int side;std::vector<int> rows; };
+// Recent warmed GPU service observations fit milliseconds per executed cell
+// and per launch. The bounded window adapts to the model/device/load without
+// making a first-use graph capture look like ordinary inference cost.
+struct Costs {
+ std::array<std::array<double,3>,64> samples{};int count=0,next=0;
+ double cc=0,cl=0,ll=0,cy=0,ly=0,cell=0,launch=0;bool fitted=false;
+ void learn(const double* rows,int size){
+  if(size<0 || (size && !rows))throw std::runtime_error("Missing inference cost observations");
+  for(int i=0;i<size;++i)for(int j=0;j<3;++j)if(!std::isfinite(rows[3*i+j]) || rows[3*i+j]<=0)
+   throw std::runtime_error("Invalid inference cost observation");
+  auto add=[&](const std::array<double,3>& s,double sign){double c=s[0],l=s[1],y=s[2];cc+=sign*c*c;cl+=sign*c*l;ll+=sign*l*l;cy+=sign*c*y;ly+=sign*l*y;};
+  for(int i=0;i<size;++i){if(count==int(samples.size()))add(samples[next],-1);else ++count;
+   samples[next]={rows[3*i],rows[3*i+1],rows[3*i+2]};add(samples[next],1);next=(next+1)%samples.size();}
+  double det=cc*ll-cl*cl;if(count<4 || det<=1e-12*cc*ll)return;
+  double a=(cy*ll-ly*cl)/det,b=(ly*cc-cy*cl)/det;
+  if(b<0){b=0;a=cy/cc;}
+  if(a>0 && std::isfinite(a) && std::isfinite(b)){cell=a;launch=b;fitted=true;}
+ }
+};
 // Snapshot the pending requests while their trees are alive. Afterwards this object owns
 // all encoding and output mappings, so a cancelled subscriber need not keep a tree alive.
 struct Batch {
  std::vector<int64_t> info,offsets,cells,actions;
  std::vector<uint8_t> planes,decoded;
  std::vector<double> logits,values;
- std::vector<Group> groups;
+ std::vector<Group> groups;bool sealed=false,mixed=false;
  Batch(void* const* trees,const int* requests,int count,int merge_cells):info(12*int64_t(count)),offsets(count+1),decoded(count) {
   if(count<1 || merge_cells<0)throw std::runtime_error("Invalid packed batch size");
   if(!hxg_encode_many(trees,requests,count,info.data(),nullptr,0,nullptr,nullptr,0))throw std::runtime_error(gumbel::error);
@@ -97,6 +118,7 @@ struct Batch {
   regroup(std::move(by_size),merge_cells);
  }
  void regroup(std::map<int,std::vector<int>> by_size,int merge_cells){
+  mixed=by_size.size()>1;
   for(auto it=by_size.begin();it!=by_size.end();){auto next=std::next(it);if(next==by_size.end())break;
    if(int64_t(it->second.size())*(next->first*next->first-it->first*it->first)<merge_cells){
     next->second.insert(next->second.begin(),it->second.begin(),it->second.end());by_size.erase(it);
@@ -105,10 +127,51 @@ struct Batch {
   }
   for(auto& [side,rows]:by_size)groups.push_back({side,std::move(rows)});
  }
+ void plan(const Costs& cost,const int64_t* limits,int size,int step){
+  if(sealed)throw std::runtime_error("Packed layout already submitted");
+  if(size<0 || (size && !limits) || step<1)throw std::runtime_error("Missing inference capture limits");
+  std::map<int,int> caps;
+  for(int i=0;i<size;++i){int64_t s=limits[2*i],cap=limits[2*i+1];
+   if(s<1 || s>256 || cap<1 || cap>128 || (cap&(cap-1)))throw std::runtime_error("Invalid inference capture limit");
+   caps[int(s)]=int(cap);}
+  std::map<int,std::vector<int>> by_size;
+  for(int i=0;i<int(decoded.size());++i){int side=int(info[12*int64_t(i)]);if(side<1)continue;
+   if(decoded[i])throw std::runtime_error("Packed prediction already completed");by_size[side].push_back(i);}
+  groups.clear();for(auto& [side,rows]:by_size)groups.push_back({side,std::move(rows)});
+  if(!cost.fitted)return;
+  auto units=[&](int rows,int side,int limit){double cells=0;int launches=0;
+   while(rows){int chunk=std::min(rows,step);rows-=chunk;
+    while(chunk>limit){cells+=double(limit)*side*side;++launches;chunk-=limit;}
+    if(chunk>16 && chunk<=24){cells+=16.*side*side;++launches;chunk-=16;}
+    if(chunk){int cap=1;while(cap<chunk)cap*=2;cells+=double(cap)*side*side;++launches;}
+   }
+   return std::pair{cells,launches};
+  };
+  // A partition may merge adjacent sizes into its largest canvas. Score the
+  // actual capture segments, including padding; retain every original row.
+  std::vector<double> best(groups.size()+1,std::numeric_limits<double>::infinity());std::vector<int> before(best.size());best[0]=0;
+  for(int end=1;end<int(best.size());++end){int rows=0;
+   for(int start=end-1;start>=0;--start){rows+=int(groups[start].rows.size());
+    auto cap=caps.find(groups[end-1].side);if(cap==caps.end()){
+     if(start==end-1){best[end]=best[start];before[end]=start;}break;
+    }
+    if(!caps.contains(groups[start].side))break;
+    auto [cells,launches]=units(rows,groups[end-1].side,cap->second);double score=best[start]+cost.cell*cells+cost.launch*launches;
+    if(score<best[end]){best[end]=score;before[end]=start;}
+   }
+  }
+  std::vector<Group> planned;
+  for(int end=int(groups.size());end;){int start=before[end];Group g{groups[end-1].side,{}};
+   for(int i=start;i<end;++i)g.rows.insert(g.rows.end(),groups[i].rows.begin(),groups[i].rows.end());
+   planned.push_back(std::move(g));end=start;
+  }
+  std::reverse(planned.begin(),planned.end());groups=std::move(planned);
+ }
  Group& group(int index){if(index<0 || index>=int(groups.size()))throw std::runtime_error("Invalid packed batch group");return groups[index];}
  void pack(int index,uint8_t* output,int64_t capacity){auto& g=group(index);int area=g.side*g.side;
   int64_t bytes=8*int64_t(area)*g.rows.size();
   if(!output || capacity<bytes)throw std::runtime_error("Packed plane buffer too small");
+  sealed=true;
   std::memset(output,0,size_t(bytes));
   for(size_t i=0;i<g.rows.size();++i){auto* row=info.data()+12*int64_t(g.rows[i]);int side=int(row[0]);
    const auto* src=planes.data()+row[10];auto* dst=output+8*int64_t(area)*i;
@@ -139,6 +202,11 @@ struct Batch {
 }
 
 extern "C" {
+HX_API void* hxgp_costs_new(){try{return new packing::Costs;}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+HX_API void hxgp_costs_free(void* p){delete static_cast<packing::Costs*>(p);}
+HX_API int hxgp_costs_learn(void* p,const double* rows,int count){try{auto& c=*static_cast<packing::Costs*>(p);c.learn(rows,count);return c.fitted?2:1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API void hxgp_costs_stats(void* p,double* out){auto& c=*static_cast<packing::Costs*>(p);out[0]=c.count;out[1]=c.cell;out[2]=c.launch;out[3]=c.fitted;}
+HX_API int hxgp_plan(void* p,void* costs,const int64_t* limits,int count,int step){try{static_cast<packing::Batch*>(p)->plan(*static_cast<packing::Costs*>(costs),limits,count,step);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void* hxgp_new(void* const* trees,const int* requests,int count,int merge_cells){try{
  if(count<1 || !trees || !requests)throw std::runtime_error("Invalid packed batch inputs");
  return new packing::Batch(trees,requests,count,merge_cells);
@@ -149,6 +217,7 @@ HX_API void* hxgp_combine(void* const* sources,const int* rows,int count,int mer
 }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 HX_API void hxgp_free(void* p){delete static_cast<packing::Batch*>(p);}
 HX_API int hxgp_groups(void* p){return int(static_cast<packing::Batch*>(p)->groups.size());}
+HX_API int hxgp_mixed(void* p){return static_cast<packing::Batch*>(p)->mixed;}
 HX_API int hxgp_group(void* p,int index,int64_t* out){try{
  if(!out)throw std::runtime_error("Missing packed group output");
  auto& g=static_cast<packing::Batch*>(p)->group(index);out[0]=g.side;out[1]=int64_t(g.rows.size());return 1;

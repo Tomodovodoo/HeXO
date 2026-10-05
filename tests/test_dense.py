@@ -96,6 +96,76 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 
 class HexcropTests(unittest.TestCase):
+    def test_native_cost_planner_retains_rows_and_minimizes_capture_cost(self):
+        import ctypes as C
+        from native_dense import PackedRows, PackingCosts
+        from neural_search import GameGraph, native, checked, bind, ptr
+        from hexnet_graphs import ActorGraph
+        bind('hxgp_combine', ptr, ptr, ptr, C.c_int, C.c_int)
+        histories=[line_history(n,4) for n in (1,3,5,7,11)]+[line_history(31)]
+        samples=[hexcrop.encode(h) for h in histories]
+        sides=[s.size for s in samples[:5]]
+        self.assertEqual(sides,[24,32,40,48,64]);self.assertGreater(samples[-1].far,0)
+        trees=[GameGraph(None,'packing-cost',h,tactics=False) for h in histories]
+        self.addCleanup(lambda: [t.close() for t in trees])
+        requests=[]
+        for tree in trees:
+            checked(native.hxg_begin(tree.ptr,1,1));requests.append(native.hxg_next(tree.ptr))
+        bank=PackedRows(np.asarray([t.ptr for t in trees],np.uintp),np.asarray(requests,np.int32),0)
+        self.addCleanup(bank.close)
+        costs=PackingCosts();self.addCleanup(costs._free)
+        observations=np.asarray([[576,1],[1024,1],[4096,2],[65536,1]],np.float64)
+        costs.learn(np.c_[observations, observations[:,0]*.00013+observations[:,1]*.7])
+        fit=costs.stats();self.assertTrue(fit['fitted'])
+        self.assertAlmostEqual(fit['cell_ms'],.00013);self.assertAlmostEqual(fit['launch_ms'],.7)
+        limits=[(s,ActorGraph._limit(s,128)) for s in sides]
+        for counts in ([64,64,0,0,0],[0,0,16,16,0],[4,4,8,1,1],[64,32,32,8,0]):
+            ids=np.asarray([i if i<4 else 4+j%2 for i,n in enumerate(counts) for j in range(n)],np.int32)
+            source=np.full(len(ids),bank.ptr,np.uintp)
+            for step in (8,19,128):
+                pointer=native.hxgp_combine(source.ctypes.data,ids.ctypes.data,len(ids),32768)
+                rows=PackedRows.from_native(pointer,len(ids))
+                try:
+                    rows.plan(costs,limits,step)
+                    original=[(s,n) for s,n in zip(sides,counts) if n]
+                    scores=[]
+                    for split in range(1<<(len(original)-1)):
+                        candidate=[];count=0
+                        for i,(s,n) in enumerate(original):
+                            count+=n
+                            if i==len(original)-1 or split&(1<<i):candidate.append((s,count));count=0
+                        parts=[(s,cap) for s,n in candidate for start in range(0,n,step)
+                               for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128))]
+                        scores.append(sum(s*s*cap*.00013+.7 for s,cap in parts))
+                    parts=[(s,cap) for s,n in rows.groups for start in range(0,n,step)
+                           for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128))]
+                    self.assertAlmostEqual(sum(s*s*cap*.00013+.7 for s,cap in parts),min(scores))
+                    self.assertEqual(sum(n for _,n in rows.groups),len(ids))
+                    for index,(side,count) in enumerate(rows.groups):
+                        planes=np.empty((count,8,side,side),np.uint8);rows.pack(index,planes)
+                        prediction=np.zeros((count,side*side+2),np.float32)
+                        prediction[:,:-2]=np.fromfunction(lambda y,x:y*100+x,(side,side)).reshape(-1)
+                        prediction[:,-2]=123;prediction[:,-1]=.4
+                        rows.decode(index,0,prediction)
+                    with self.assertRaisesRegex(ValueError,'already submitted'):
+                        rows.plan(costs,limits,step)
+                    pointers=rows.outputs()
+                    offsets=np.ctypeslib.as_array(C.cast(pointers[0],C.POINTER(C.c_int64)),shape=(len(ids)+1,))
+                    logits=np.ctypeslib.as_array(C.cast(pointers[2],C.POINTER(C.c_double)),shape=(int(offsets[-1]),))
+                    values=np.ctypeslib.as_array(C.cast(pointers[3],C.POINTER(C.c_double)),shape=(int(offsets[-1]),))
+                    for row,source_id in enumerate(ids):
+                        sample=samples[source_id];cells=sample.cells
+                        expected=np.where(cells<0,123-np.log(max(1,sample.far)),cells//sample.size*100+cells%sample.size)
+                        np.testing.assert_array_equal(logits[offsets[row]:offsets[row+1]],expected)
+                        np.testing.assert_allclose(values[offsets[row]:offsets[row+1]],np.tanh(.4/2),atol=1e-8)
+                finally:
+                    rows.close()
+        # Old load observations leave the bounded window as the device changes.
+        for _ in range(16):
+            costs.learn(np.c_[observations, observations[:,0]*.0002+observations[:,1]*.1])
+        fit=costs.stats();self.assertEqual(fit['samples'],64)
+        self.assertAlmostEqual(fit['cell_ms'],.0002);self.assertAlmostEqual(fit['launch_ms'],.1)
+
     def test_packed_crops_and_predictions_follow_encoder_contract_after_tree_close(self):
         import ctypes as C
         from neural_search import native, checked
