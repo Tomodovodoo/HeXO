@@ -14,7 +14,7 @@ import torch
 class ActorGraph:
     CANVASES = (24, 32, 40, 48, 64)
     BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
-    LARGE_BATCHES = {24: 128, 32: 64}
+    LARGE_BATCHES = {24: 128, 32: 64, 40: 64}
     MAX_CELLS = 110592
     STREAMS = {}
     LOCK = threading.Lock()
@@ -80,10 +80,18 @@ class ActorGraph:
         return self.graphs[key]
 
     @staticmethod
-    def _segments(rows, limit):
+    def _segments(rows, limit, side=24):
         while rows > limit:
             yield limit, limit
             rows -= limit
+        # Partial large captures execute their padded rows too. Larger canvases
+        # benefit from splitting a slightly wider tail before their 64-row replay.
+        if limit >= 128 and 64 < rows <= 96:
+            yield 64, 64
+            rows -= 64
+        if limit >= 64 and 32 < rows <= (56 if side == 40 else 48):
+            yield 32, 32
+            rows -= 32
         if 16 < rows <= 24:
             yield 16, 16
             rows -= 16
@@ -115,7 +123,7 @@ class ActorGraph:
                 limit = self._limit(side, self.max_batch)
                 pieces = []
                 start = 0
-                for rows, capacity in self._segments(b, limit):
+                for rows, capacity in self._segments(b, limit, side):
                     part = planes[start:start+rows]
                     record = self.graphs.get((side, capacity))
                     if record is None and not self.budget_exhausted:
