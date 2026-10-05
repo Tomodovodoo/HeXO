@@ -727,6 +727,8 @@ class Bundle(unittest.TestCase):
             stats = answer['stats']
             self.assertEqual(stats['issued'], stats['completed'] + stats['cancelled'])
             self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
+            returned = answer['result']['scheduler']
+            self.assertEqual((returned['pending'], returned['tasks'], returned['subscribers']), (0,0,0))
             self.assertEqual(answer['remainingViews'], 1)
             if control.get('prove'):
                 self.assertEqual(answer['result']['proven'], -1)

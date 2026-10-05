@@ -604,6 +604,7 @@ export class NativeOwner {
         }
         await nextTask();
       }
+      if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
       return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
         batches, largest, network_ms: networkMs};
     } catch (error) {

@@ -230,7 +230,6 @@ export class Network {
         if (stop()) return false;
         const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
         const prediction = await this.forward(input, count, size);
-        if (stop()) return false;
         batch.decode(group, start, count, prediction);
       }
     }
