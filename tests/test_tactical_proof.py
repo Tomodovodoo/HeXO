@@ -744,6 +744,22 @@ class NodeBudget(unittest.TestCase):
         finally:
             self.engine.history(NO_THREAT, nodes=1, table_mb=0)
 
+    def test_unfinished_frontiers_reuse_nodes_with_a_new_work_allowance(self):
+        history = FIXTURE['positions']['1790591506645044:16:209']
+        with NativeTactics(independent=True) as worker:
+            attempts = [worker.history(history, nodes=2048, ms=10000, bounds=True, resume=True, table_mb=4)
+                        for _ in range(6)]
+        self.assertTrue(any(r['frontier_reused_nodes'] > 0 for r in attempts[1:]))
+        self.assertTrue(any(r['status'] == 'PROVEN_WIN' and r['native_verified'] for r in attempts))
+        for result in attempts:
+            self.assertLessEqual(result['frontier_bytes'], 4*1024*1024)
+            self.assertLessEqual(result['nodes_fresh'], 2048)
+            if result['native_verified']:
+                self.assertEqual(independent_verify(result['certificate'], history), 'PROVEN_WIN')
+            else:
+                self.assertEqual(result['status'], 'UNKNOWN')
+                self.assertIsNone(result['certificate'])
+
     def test_same_budget_same_result_in_fresh_processes(self):
         """Verdict, certificate hash and work agree across fresh processes for the control and 20 shard positions."""
         runs = [subprocess.run([sys.executable, '-m', 'tests.test_tactical_proof', 'determinism'], capture_output=True,

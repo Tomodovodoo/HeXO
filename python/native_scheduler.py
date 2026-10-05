@@ -66,7 +66,8 @@ class ProofLoop:
     """Native frontier and immutable jobs; Python never dispatches individual queries.
 
     A slice is a CPU scheduling quantum. UNKNOWN remains unknown. Resident tables
-    survive slices and retargets; this does not restore a complete interrupted PN tree.
+    and bounded best-first frontiers survive compatible slices and retargets.
+    Recursive level-1 frames and kernel memos are still rebuilt per query.
     """
     def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
                  tasks=256, stamps=False):

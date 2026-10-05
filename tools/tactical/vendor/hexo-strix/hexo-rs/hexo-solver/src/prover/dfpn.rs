@@ -47,14 +47,55 @@ const MOVE_RANK_BIAS: u32 = 0;
 /// `BUDGET_EXCEEDED` rather than risk unbounded board growth / stack use.
 const MAX_PLY: u32 = 1024;
 
-/// Resident search state of one attacker: table and proven witnesses.
-type Resident = (ProofTt, FxHashSet<u64>);
+/// Resident state belongs to one attacker and one kernel rule configuration.
+struct Resident {
+    tt: ProofTt,
+    proven: FxHashSet<u64>,
+    scope: Option<(u8, i32, bool)>,
+    frontiers: Vec<(u64, PnSearch, usize)>,
+}
+
+fn frontier_bytes(frontiers: &Vec<(u64, PnSearch, usize)>) -> usize {
+    frontiers.capacity() * std::mem::size_of::<(u64, PnSearch, usize)>()
+        + frontiers.iter().map(|f| f.2 - std::mem::size_of::<PnSearch>()).sum::<usize>()
+}
+
+fn trim_frontiers(frontiers: &mut Vec<(u64, PnSearch, usize)>, bytes: usize) {
+    let entry_bytes = std::mem::size_of::<(u64, PnSearch, usize)>();
+    let mut payload_bytes = frontiers.iter()
+        .map(|f| f.2 - std::mem::size_of::<PnSearch>()).sum::<usize>();
+    if frontiers.capacity() * entry_bytes + payload_bytes <= bytes { return; }
+    let mut remove = 0;
+    for frontier in frontiers.iter() {
+        if (frontiers.len() - remove) * entry_bytes + payload_bytes <= bytes { break; }
+        payload_bytes -= frontier.2 - std::mem::size_of::<PnSearch>();
+        remove += 1;
+    }
+    frontiers.drain(..remove);
+    frontiers.shrink_to_fit();
+    // Allocators may retain excess capacity after shrink_to_fit. Never let it
+    // defeat the bound, or repeatedly copy the surviving graphs to shrink it.
+    if frontiers.capacity() * entry_bytes + payload_bytes > bytes {
+        *frontiers = Vec::new();
+    }
+}
+
+impl Resident {
+    fn new(mb: usize) -> Self {
+        Self { tt: ProofTt::new(mb), proven: FxHashSet::default(), scope: None, frontiers: Vec::new() }
+    }
+
+    fn trim_frontiers(&mut self, bytes: usize) {
+        trim_frontiers(&mut self.frontiers, bytes);
+    }
+}
 /// Proven-node keys kept per resident megabyte; past that the whole state is dropped, since the table's
 /// resolved entries need their proven witnesses for certificate reconstruction.
 const PROVEN_PER_MB: usize = 32768;
 
 thread_local! {
     static RESIDENT_MB: Cell<usize> = const { Cell::new(0) };
+    static RESIDENT_RESUME: Cell<bool> = const { Cell::new(false) };
     static RESIDENT: RefCell<Vec<(bool, Resident)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -64,25 +105,30 @@ thread_local! {
 /// searches, and a kept proven node still has to be re-walked into a certificate that is verified. A search is
 /// then no longer a function of its position and budget alone.
 pub fn set_resident(mb: usize) {
+    RESIDENT_RESUME.with(|c| c.set(false));
     if RESIDENT_MB.with(|c| c.replace(mb)) != mb {
         RESIDENT.with(|r| r.borrow_mut().clear());
     }
+    RESIDENT.with(|r| { for (_, state) in r.borrow_mut().iter_mut() { state.frontiers = Vec::new(); } });
 }
 
 /// Slice mode keeps usable search entries when changing table size. A shrink
 /// can evict entries, and the witness/seed limit can still discard a state.
-/// The disposable level-2 search trees are not retained.
+/// Unresolved level-2 graphs survive with an additional accounted-byte limit
+/// of `mb` MiB per attacker. Eviction affects performance, never proof soundness.
 pub fn set_resident_resume(mb: usize) {
     if mb == 0 {
         set_resident(0);
         return;
     }
+    RESIDENT_RESUME.with(|c| c.set(true));
     if RESIDENT_MB.with(|c| c.replace(mb)) != mb {
         RESIDENT.with(|r| {
             let mut states = r.borrow_mut();
-            states.retain(|(_, state)| state.1.len() <= mb * PROVEN_PER_MB);
+            states.retain(|(_, state)| state.proven.len() <= mb * PROVEN_PER_MB);
             for (_, state) in states.iter_mut() {
-                state.0.resize(mb);
+                state.tt.resize(mb);
+                state.trim_frontiers(mb * 1024 * 1024);
             }
         });
     }
@@ -98,14 +144,14 @@ fn take_resident(attacker: Player) -> Option<Resident> {
         let mut r = r.borrow_mut();
         Some(match r.iter().position(|e| e.0 == side) {
             Some(i) => r.swap_remove(i).1,
-            None => (ProofTt::new(mb), FxHashSet::default()),
+            None => Resident::new(mb),
         })
     })
 }
 
 fn keep_resident(attacker: Player, state: Resident) {
     let mb = RESIDENT_MB.with(|c| c.get());
-    if state.1.len() <= mb * PROVEN_PER_MB {
+    if state.proven.len() <= mb * PROVEN_PER_MB {
         RESIDENT.with(|r| r.borrow_mut().push((attacker == Player::P1, state)));
     }
 }
@@ -118,17 +164,61 @@ mod resident_tests {
     fn an_oversized_proven_set_drops_the_whole_state() {
         set_resident(1);
         let mut state = take_resident(Player::P1).unwrap();
-        state.1.insert(1);
+        state.proven.insert(1);
         keep_resident(Player::P1, state);
-        assert_eq!(take_resident(Player::P1).unwrap().1.len(), 1, "a small state is kept");
+        assert_eq!(take_resident(Player::P1).unwrap().proven.len(), 1, "a small state is kept");
         let mut state = take_resident(Player::P1).unwrap();
-        state.1.extend(0..(PROVEN_PER_MB as u64 + 1));
-        state.0.store(7, 0, INF, 1);
+        state.proven.extend(0..(PROVEN_PER_MB as u64 + 1));
+        state.tt.store(7, 0, INF, 1);
         keep_resident(Player::P1, state);
         let fresh = take_resident(Player::P1).unwrap();
-        assert!(fresh.1.is_empty(), "the proven set starts empty");
-        let mut table = fresh.0;
+        assert!(fresh.proven.is_empty(), "the proven set starts empty");
+        let mut table = fresh.tt;
         assert_eq!(table.probe(7), None, "and so does the table");
+        set_resident(0);
+    }
+
+    #[test]
+    fn sliced_seeds_keep_distinct_frontiers_and_resume_without_reexpanding_the_root() {
+        set_resident_resume(1);
+        let stones = [((0,0),Player::P1),((0,8),Player::P2),((2,8),Player::P2),
+            ((1,0),Player::P1),((2,0),Player::P1),((4,8),Player::P2),((6,8),Player::P2)];
+        let root = Node::Or { placements: 2 };
+        let cfg = ProverConfig { pn2_nodes: 1, tt_mb: 1, ..Default::default() };
+        let ctl = Ctl::new(0.0);
+        let hints = Rc::new(WinDepthHints::default());
+        let weak = Rc::downgrade(&hints);
+        let mut d = Dfpn::new(KernelCtx::new_wide(&stones,Player::P1,6,8,true).unwrap(),
+            &cfg,&ctl,true,Some(hints.clone()),take_resident(Player::P1));
+        d.pn_seed(root,None);
+        assert_eq!(d.frontiers.len(),1);
+        let key = d.frontiers[0].0;
+        let before = d.frontiers[0].1.retained_nodes();
+        keep_resident(Player::P1,Resident { tt:d.tt,proven:d.proven,scope:Some((6,8,true)),frontiers:d.frontiers });
+        drop(d.hints);
+        drop(hints);
+        assert!(weak.upgrade().is_none(),"the resident cache cannot pin query-local hints");
+        set_resident_resume(2);
+        let state = take_resident(Player::P1).unwrap();
+        let mut d = Dfpn::new(KernelCtx::new_wide(&stones,Player::P1,6,8,true).unwrap(),
+            &cfg,&ctl,true,None,Some(state));
+        d.pn_seed(root,None);
+        assert_eq!(d.frontier_reused_nodes,before as u64);
+        assert_eq!(d.frontiers[0].0,key);
+        assert!(d.frontiers[0].1.retained_nodes() >= before);
+        let shifted: Vec<_> = stones.iter().map(|&(p,s)|((p.0+20,p.1),s)).collect();
+        d.k = KernelCtx::new_wide(&shifted,Player::P1,6,8,true).unwrap();
+        d.pn_seed(root,None);
+        assert_eq!(d.frontiers.len(),2,"retargeting keeps the first useful frontier");
+        let mut state = Resident { tt:d.tt,proven:d.proven,scope:Some((6,8,true)),frontiers:d.frontiers };
+        let last_bytes=state.frontiers[1].2 + std::mem::size_of::<(u64, PnSearch, usize)>() - std::mem::size_of::<PnSearch>();
+        state.trim_frontiers(last_bytes);
+        assert_eq!(state.frontiers.len(),1,"evict older work when the accounted limit shrinks");
+        assert!(frontier_bytes(&state.frontiers) <= last_bytes,"outer capacity counts toward the limit");
+        assert_ne!(state.frontiers[0].0,key);
+        keep_resident(Player::P1,state);
+        set_resident(2);
+        assert!(take_resident(Player::P1).unwrap().frontiers.is_empty(),"legacy mode drops retained graphs");
         set_resident(0);
     }
 }
@@ -150,10 +240,14 @@ pub struct Dfpn<'a> {
     max_depth: u32,
     /// PDS-PN mode: when true, the first descent into a frontier node runs a
     /// bounded level-2 best-first PN search to seed its `(pn, dn)` (PN²-style; the
-    /// PN tree is discarded, only the node's numbers persist in the TT). df-pn
+    /// PN graph can be retained in slice mode; numbers always enter the TT). df-pn
     /// leaves this off and uses the cheap `(1, n)` estimate.
     pds_mode: bool,
     pn: PnSearch,
+    frontiers: Vec<(u64, PnSearch, usize)>,
+    frontier_bytes: usize,
+    frontier_limit: usize,
+    frontier_reused_nodes: u64,
     pn2_nodes: u64,
     pn2_scale: u64,
     pn2_scale_inverse: bool,
@@ -176,16 +270,19 @@ impl<'a> Dfpn<'a> {
         hints: Option<Rc<WinDepthHints>>,
         resident: Option<Resident>,
     ) -> Dfpn<'a> {
-        let (tt, proven) = resident.unwrap_or_else(||
-            (ProofTt::new(cfg.tt_mb), FxHashSet::default()));
+        let state = resident.unwrap_or_else(|| Resident::new(cfg.tt_mb));
+        let frontier_limit = if RESIDENT_RESUME.with(|c| c.get()) {
+            RESIDENT_MB.with(|c| c.get()) * 1024 * 1024
+        } else { 0 };
+        let frontier_bytes = frontier_bytes(&state.frontiers);
         Dfpn {
             k,
-            tt,
+            tt: state.tt,
             ctl,
             nodes: 0,
             budget: cfg.node_budget,
             exceeded: false,
-            proven,
+            proven: state.proven,
             kids: Vec::new(),
             max_depth: 0,
             pds_mode,
@@ -194,6 +291,10 @@ impl<'a> Dfpn<'a> {
                 pn.set_limits(ctl.forcing_limits());
                 pn
             },
+            frontiers: state.frontiers,
+            frontier_bytes,
+            frontier_limit,
+            frontier_reused_nodes: 0,
             pn2_nodes: cfg.pn2_nodes,
             pn2_scale: cfg.pn2_scale,
             pn2_scale_inverse: cfg.pn2_scale_inverse,
@@ -207,8 +308,8 @@ impl<'a> Dfpn<'a> {
 
     /// PDS-PN level-2 seed: on the first descent into `node` (board at its
     /// position), run a bounded best-first PN search and cache the resulting
-    /// `(pn, dn)` in the TT. The temporary graph is discarded after exporting
-    /// its expanded estimates and subproof witnesses. No-op in df-pn mode or on a
+    /// `(pn, dn)` in the TT. Slice mode retains unresolved graphs after exporting
+    /// their expanded estimates and subproof witnesses. No-op in df-pn mode or on a
     /// node already seeded/resolved.
     fn pn_seed(&mut self, node: Node, remaining: Option<u8>) {
         if !self.pds_mode {
@@ -223,6 +324,14 @@ impl<'a> Dfpn<'a> {
         {
             return; // already resolved
         }
+        let reused = self.frontiers.iter().position(|f| f.0 == key).map(|i| {
+            let (_, pn, _) = self.frontiers.remove(i);
+            self.frontier_bytes = frontier_bytes(&self.frontiers);
+            self.frontier_reused_nodes += pn.retained_nodes() as u64;
+            self.pn = pn;
+        }).is_some();
+        self.pn.set_limits(self.ctl.forcing_limits());
+        self.pn.set_max_nodes(self.pn2_nodes);
         // Adaptive leaf budget: scale the level-2 node cap by the branching
         // factor at the seed node ("number of options at this level"). The
         // "1 and n" init already encodes the branching factor — OR nodes seed
@@ -245,7 +354,11 @@ impl<'a> Dfpn<'a> {
         // Every target shares the kernel memos with level 1, so the work meter and
         // the verdict are the same on wasm32 as on native builds.
         self.pn.set_hints(self.hints.clone());
-        let (pn, dn) = self.pn.search_at(&mut self.k, node, remaining, Some(&mut self.tt));
+        let (pn, dn) = if reused {
+            self.pn.continue_at(&mut self.k, node, remaining, Some(&mut self.tt))
+        } else {
+            self.pn.search_at(&mut self.k, node, remaining, Some(&mut self.tt))
+        };
         self.leaf_solves += 1;
         // A bounded seed can settle descendants without settling its root. Keep
         // their witnesses when the temporary tree is discarded so later seeds
@@ -256,6 +369,19 @@ impl<'a> Dfpn<'a> {
         }
         // Store with high work so the (expensive) PN result is retained.
         self.tt.store(key, pn, dn, self.pn2_nodes.min(INF as u64) as u32);
+        if pn != 0 && dn != 0 && self.frontier_limit > 0 && (reused || self.pn.expansions() > 0) {
+            // Controls and guided-certificate maps are query-local, not cached.
+            self.pn.set_limits(Default::default());
+            self.pn.set_hints(None);
+            let bytes = self.pn.retained_bytes();
+            let overhead = std::mem::size_of::<(u64, PnSearch, usize)>() - std::mem::size_of::<PnSearch>();
+            if bytes + overhead <= self.frontier_limit {
+                let search = std::mem::replace(&mut self.pn, PnSearch::new(self.pn2_nodes));
+                self.frontiers.push((key, search, bytes));
+                trim_frontiers(&mut self.frontiers, self.frontier_limit);
+                self.frontier_bytes = frontier_bytes(&self.frontiers);
+            }
+        }
     }
 
     /// Certificate-derived hint lookup for the node whose position the board
@@ -850,9 +976,16 @@ pub(crate) fn solve_mode_at_guided(
         Some(c) => c,
         None => return DriverResult::new(Verdict::BudgetExceeded),
     };
-    let resident = take_resident(pos.attacker);
+    let mut resident = take_resident(pos.attacker);
     let keep = resident.is_some();
-    let resident_reused = resident.as_ref().is_some_and(|state| state.0.has_entries());
+    let scope = (wl, pos.config.placement_radius, cfg.wide);
+    if let Some(state) = &mut resident {
+        if state.scope.is_some_and(|old| old != scope) {
+            *state = Resident::new(RESIDENT_MB.with(|c| c.get()));
+        }
+        state.scope = Some(scope);
+    }
+    let resident_reused = resident.as_ref().is_some_and(|state| state.tt.has_entries());
     let mut d = Dfpn::new(ctx, cfg, ctl, pds_mode, hints, resident);
     let root = Node::Or { placements: pos.placements_remaining };
     // `Instant::now()` traps at runtime on wasm32-unknown-unknown (no monotonic
@@ -958,8 +1091,10 @@ pub(crate) fn solve_mode_at_guided(
         }
     }
     res.stats = d.stats(elapsed);
+    res.frontier_reused_nodes = d.frontier_reused_nodes;
+    res.frontier_bytes = d.frontier_bytes as u64;
     if keep {
-        keep_resident(pos.attacker, (d.tt, d.proven));
+        keep_resident(pos.attacker, Resident { tt: d.tt, proven: d.proven, scope: Some(scope), frontiers: d.frontiers });
     }
     res
 }

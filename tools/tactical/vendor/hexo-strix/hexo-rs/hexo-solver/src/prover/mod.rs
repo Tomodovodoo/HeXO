@@ -223,6 +223,10 @@ pub struct DriverResult {
     pub proof_numbers: Option<(u32, u32)>,
     /// This attempt began with entries retained by this worker.
     pub resident_reused: bool,
+    /// Existing level-2 nodes recovered by this attempt, not fresh expansion.
+    pub frontier_reused_nodes: u64,
+    /// Accounted resident frontier capacity, excluding allocator metadata.
+    pub frontier_bytes: u64,
 }
 
 impl DriverResult {
@@ -236,6 +240,8 @@ impl DriverResult {
             certificate: None,
             proof_numbers: None,
             resident_reused: false,
+            frontier_reused_nodes: 0,
+            frontier_bytes: 0,
         }
     }
 }

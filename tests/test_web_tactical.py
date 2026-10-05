@@ -121,6 +121,21 @@ class WebTacticalParity(unittest.TestCase):
             wasm_results([(NO_THREAT, dict(nodes=1, resume=True))])
         self.assertIn('positive table_mb', error.exception.stderr)
 
+    def test_browser_frontiers_reuse_nodes_without_manufacturing_an_outcome(self):
+        history = FIXTURE['positions']['1790591506645044:16:209']
+        options = dict(nodes=2048, ms=20000, bounds=True, resume=True, table_mb=4)
+        attempts = wasm_results([(history, options)]*6)
+        self.assertTrue(any(r['frontier_reused_nodes'] > 0 for r in attempts[1:]))
+        self.assertTrue(any(r['status'] == 'PROVEN_WIN' and r['native_verified'] for r in attempts))
+        for result in attempts:
+            self.assertLessEqual(result['frontier_bytes'], 4*1024*1024)
+            self.assertLessEqual(result['nodes_fresh'], 2048)
+            if result['native_verified']:
+                self.assertEqual(independent_verify(result['certificate'], history), 'PROVEN_WIN')
+            else:
+                self.assertEqual(result['status'], 'UNKNOWN')
+                self.assertIsNone(result['certificate'])
+
     def test_wasm_matches_native(self):
         native = NativeTactics()
         queries = [(history, dict(options, ms=20000)) for history, options in QUERIES]

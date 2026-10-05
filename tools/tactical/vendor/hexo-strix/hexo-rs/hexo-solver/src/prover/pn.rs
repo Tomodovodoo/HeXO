@@ -290,13 +290,14 @@ struct PnNode {
     work: u32,
 }
 
-/// Bounded best-first PN over a graph of turn-context keys. The temporary graph
-/// is discarded after each call; expanded estimates and settled subproofs enter
-/// level 1's existing bounded table. All parents share a transposed node's work.
+/// Bounded best-first PN over a graph of turn-context keys. Ordinary calls start
+/// fresh; resident slice mode can continue an unresolved graph. Expanded
+/// estimates and settled subproofs enter level 1's bounded table.
 pub(crate) struct PnSearch {
     arena: Vec<PnNode>,
     index: FxHashMap<u64, usize>,
     backups: BinaryHeap<(usize, usize)>,
+    backup_start: Option<usize>,
     max_nodes: u64,
     expansions: u64,
     /// Certificate-derived win-depth hints (guided probes only). A hit closes a
@@ -314,6 +315,7 @@ impl PnSearch {
             arena: Vec::new(),
             index: FxHashMap::default(),
             backups: BinaryHeap::new(),
+            backup_start: None,
             max_nodes: max_nodes.max(1),
             expansions: 0,
             hints: None,
@@ -341,6 +343,18 @@ impl PnSearch {
         self.expansions
     }
 
+    pub(crate) fn retained_nodes(&self) -> usize { self.arena.len() }
+
+    /// Capacity accounting for the bounded resident cache, excluding allocator
+    /// metadata. Hash storage is conservatively counted at twice its capacity.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.arena.capacity() * std::mem::size_of::<PnNode>()
+            + self.index.capacity() * 2 * (std::mem::size_of::<(u64, usize)>() + 1)
+            + self.backups.capacity() * std::mem::size_of::<(usize, usize)>()
+            + self.arena.iter().map(|n| n.children.capacity() * std::mem::size_of::<PnEdge>()
+                + n.parents.capacity() * std::mem::size_of::<usize>()).sum::<usize>()
+    }
+
     /// Run PN search from `root_node` (board in `k` must be at that position).
     /// Returns `(pn, dn)` of the root when it is (dis)proved or the node cap is
     /// hit. The board is restored to the root position on return.
@@ -354,11 +368,12 @@ impl PnSearch {
         k: &mut KernelCtx,
         root_node: Node,
         remaining: Option<u8>,
-        mut tt: Option<&mut ProofTt>,
+        tt: Option<&mut ProofTt>,
     ) -> (u32, u32) {
         self.arena.clear();
         self.index.clear();
-        self.expansions = 0;
+        self.backups.clear();
+        self.backup_start = None;
         self.arena.push(PnNode {
             node: root_node,
             remaining,
@@ -374,6 +389,23 @@ impl PnSearch {
             work: 0,
         });
         self.index.insert(self.arena[0].key, 0);
+        self.continue_at(k, root_node, remaining, tt)
+    }
+
+    /// Continue a retained frontier with fresh limits and a fresh work meter.
+    /// Every deferred backup must finish before selecting another leaf.
+    pub(crate) fn continue_at(
+        &mut self,
+        k: &mut KernelCtx,
+        root_node: Node,
+        remaining: Option<u8>,
+        mut tt: Option<&mut ProofTt>,
+    ) -> (u32, u32) {
+        assert_eq!(self.arena[0].key, node_key_at(k.hash(), root_node, remaining));
+        self.expansions = 0;
+        if !self.drain_backups(&mut tt) {
+            return (self.arena[0].pn, self.arena[0].dn);
+        }
         let mut applied: Vec<PnEdge> = Vec::new();
         let mut selected = Vec::new();
         loop {
@@ -601,22 +633,40 @@ impl PnSearch {
     /// Every transposed parent sees a changed child. Stones only accumulate, so
     /// decreasing depth visits a parent after all affected children, once.
     fn backup(&mut self, start: usize, tt: &mut Option<&mut ProofTt>) -> bool {
+        debug_assert!(self.backups.is_empty());
         self.backups.clear();
         self.backups.push((self.arena[start].depth, start));
         self.arena[start].pending = true;
-        while let Some((_, cur)) = self.backups.pop() {
+        self.backup_start = Some(start);
+        self.drain_backups(tt)
+    }
+
+    fn drain_backups(&mut self, tt: &mut Option<&mut ProofTt>) -> bool {
+        while let Some(&(_, cur)) = self.backups.peek() {
             if self.limits.expired() { return false; }
+            self.backups.pop();
             self.arena[cur].pending = false;
             let before = (self.arena[cur].pn, self.arena[cur].dn);
-            if !self.recompute(cur) { return false; }
+            if !self.recompute(cur) {
+                self.backups.push((self.arena[cur].depth, cur));
+                self.arena[cur].pending = true;
+                return false;
+            }
             self.arena[cur].work = self.arena[cur].work.saturating_add(1);
             let n = &self.arena[cur];
             if (n.pn == 0 || n.dn == 0) && let Some(t) = tt.as_deref_mut() {
                 t.store(n.key, n.pn, n.dn, n.work);
             }
-            if cur != start && before == (n.pn, n.dn) { continue; }
+            if Some(cur) != self.backup_start && before == (n.pn, n.dn) { continue; }
             for i in 0..self.arena[cur].parents.len() {
-                if i % 256 == 0 && self.limits.expired() { return false; }
+                if i % 256 == 0 && self.limits.expired() {
+                    // Recompute has committed, but not every parent was queued.
+                    // Force propagation when this node is retried, even unchanged.
+                    self.backup_start = Some(cur);
+                    self.backups.push((self.arena[cur].depth, cur));
+                    self.arena[cur].pending = true;
+                    return false;
+                }
                 let p = self.arena[cur].parents[i];
                 if !self.arena[p].pending {
                     self.arena[p].pending = true;
@@ -624,6 +674,7 @@ impl PnSearch {
                 }
             }
         }
+        self.backup_start = None;
         true
     }
 
@@ -701,7 +752,7 @@ mod tests {
             assert_eq!((search.arena[0].pn, search.arena[0].dn), (1,1));
             assert!(search.arena.iter().all(|n| n.work == 0));
             search.set_limits(Limits::default());
-            assert!(search.backup(3, &mut Some(&mut table)));
+            assert!(search.drain_backups(&mut Some(&mut table)));
             assert_eq!((search.arena[0].pn, search.arena[0].dn), (0,INF));
             search.set_limits(Limits { cancel: Some(Arc::new(AtomicBool::new(true))), ..Limits::default() });
             let mut witnesses = FxHashSet::default();
@@ -710,6 +761,68 @@ mod tests {
                 assert_eq!(table.peek(key), Some((0,INF)));
                 assert!(witnesses.contains(&key), "cached proof {key} lost its witness after cancellation");
             }
+        }
+    }
+
+    #[test]
+    fn a_retained_frontier_advances_with_a_new_meter_and_restores_the_board() {
+        let history = [(0,0),(0,8),(2,8),(1,0),(2,0),(4,8),(6,8)];
+        let stones: Vec<_> = history.into_iter().enumerate().map(|(i, p)|
+            (p, if (i+1)/2%2 == 0 { Player::P1 } else { Player::P2 })).collect();
+        let mut k = KernelCtx::new_wide(&stones, Player::P1, 6, 8, true).unwrap();
+        let original = k.canonical_stones();
+        let root = Node::Or { placements: 2 };
+        let mut search = PnSearch::new(1);
+        let mut table = ProofTt::new(1);
+        search.search_at(&mut k, root, None, Some(&mut table));
+        let mut expanded = search.arena.iter().filter(|n| n.expanded).count();
+        assert!(search.retained_nodes() > 1);
+        for _ in 0..8 {
+            if search.arena[0].pn == 0 || search.arena[0].dn == 0 { break; }
+            let meter = crate::forcing::Meter::new(1);
+            search.set_limits(Limits { meter: Some(meter.clone()), ..Default::default() });
+            search.continue_at(&mut k, root, None, Some(&mut table));
+            assert_eq!(search.expansions(), 1, "the new slice advances an unexpanded leaf");
+            assert_eq!(meter.spent(), 1, "old expansions do not charge fresh work");
+            let next = search.arena.iter().filter(|n| n.expanded).count();
+            assert!(next > expanded);
+            expanded = next;
+            assert_eq!(k.canonical_stones(), original);
+        }
+        assert!(search.retained_bytes() >= search.retained_nodes() * std::mem::size_of::<PnNode>());
+    }
+
+    #[test]
+    fn resuming_partly_queued_parents_reaches_every_shared_ancestor() {
+        let mut search = PnSearch::new(1);
+        for id in 0..=701 {
+            search.arena.push(PnNode { node: if id == 0 || id == 701 { Node::Or { placements: 2 } } else { Node::And },
+                remaining: None,pn:1,dn:1,expanded:true,children:Vec::new(),parents:Vec::new(),
+                depth:if id == 701 {2} else {usize::from(id != 0)},pending:false,terminal:id == 701,key:id as u64,work:0 });
+        }
+        for parent in 1..=700 {
+            search.arena[0].children.push(PnEdge { child:parent,mv:CellSet2::one((parent as i32,0)) });
+            search.arena[parent].parents.push(0);
+            search.arena[parent].children.push(PnEdge { child:701,mv:CellSet2::one((0,1)) });
+            search.arena[701].parents.push(parent);
+        }
+        search.set_terminal(701,0,INF);
+        // State at a cancellation after committing the child and queuing only
+        // the first parent block. Retrying must not skip unchanged child values.
+        search.backup_start=Some(701);
+        search.arena[701].pending=true;
+        search.backups.push((2,701));
+        for parent in 1..=256 {
+            search.arena[parent].pending=true;
+            search.backups.push((1,parent));
+        }
+        let mut table=ProofTt::new(1);
+        assert!(search.drain_backups(&mut Some(&mut table)));
+        assert!(search.backups.is_empty());
+        for id in 0..=701 {
+            assert_eq!((search.arena[id].pn,search.arena[id].dn),(0,INF));
+            assert!(!search.arena[id].pending);
+            assert_eq!(table.peek(id as u64),Some((0,INF)));
         }
     }
 }
