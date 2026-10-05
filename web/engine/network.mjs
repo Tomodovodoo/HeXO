@@ -229,8 +229,10 @@ export class Network {
       for (let start = 0; start < rows; start += limit) {
         if (stop()) return false;
         const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
+        if (stop()) return false;
         const prediction = await this.forward(input, count, size);
         batch.decode(group, start, count, prediction);
+        if (stop()) return false;
       }
     }
     return true;

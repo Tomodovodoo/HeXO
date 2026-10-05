@@ -733,6 +733,23 @@ class Bundle(unittest.TestCase):
             if control.get('prove'):
                 self.assertEqual(answer['result']['proven'], -1)
 
+    def test_native_browser_owner_checks_stop_after_packing_and_decoding(self):
+        for control, forwards in (('stopOnFeatures',0), ('stopOnDecode',1)):
+            answer = node(dict(kind='native-owner', history=[[0,0]], work=512, **{control: True}))
+            self.assertEqual(answer['forwardCalls'], forwards)
+            self.assertEqual(answer['result']['actions'], [])
+            self.assertEqual(answer['result']['completed'], 0)
+            self.assertEqual(answer['stats']['installed'], 0)
+            self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+
+    def test_native_browser_owner_checks_its_clock_before_installation(self):
+        answer = node(dict(kind='native-owner', history=[[0,0]], ms=200, expireBeforeInstall=True))
+        self.assertEqual(answer['forwardCalls'], 1)
+        self.assertEqual(answer['result']['actions'], [])
+        self.assertEqual(answer['stats']['installed'], 0)
+        self.assertEqual(answer['stats']['deadline'], 1)
+        self.assertEqual((answer['result']['scheduler']['pending'], answer['result']['scheduler']['tasks']), (0,0))
+
     def test_native_browser_owner_honors_policy_move_selection(self):
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']

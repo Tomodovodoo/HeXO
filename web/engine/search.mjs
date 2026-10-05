@@ -593,9 +593,9 @@ export class NativeOwner {
           await observed; const evaluated = await flight; flight = null;
           networkMs += performance.now() - begin;
           if (stop()) this.cancel();
-          if (evaluated === false) {
-            // A partially decoded batch cannot be installed. Only its current
-            // forward was allowed to finish; remaining chunks never launched.
+          if (evaluated === false || !this.admit()) {
+            // Incomplete or no-longer-admitted batches cannot be installed.
+            // The active forward has settled before their storage is released.
             this.cancel(); batch.close(); batch = null; break;
           }
           // Detached subscribers cannot install into a changed/cancelled view.

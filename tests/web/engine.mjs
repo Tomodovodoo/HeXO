@@ -125,7 +125,15 @@ if (job.kind === 'encode') {
   const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
   network.maxBatch = job.maxBatch ?? network.maxBatch;
   let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
-  let forwardCalls = 0;
+  let forwardCalls = 0, decoded = false, packed = false;
+  if (job.stopOnDecode || job.stopOnFeatures || job.expireBeforeInstall) network.evaluateNative = async (batch, options) => {
+    const decode = batch.decode.bind(batch), features = batch.features.bind(batch);
+    batch.decode = (...args) => {decode(...args); decoded = true;};
+    batch.features = (...args) => {const input = features(...args); packed = true; return input;};
+    const result = await Network.prototype.evaluateNative.call(network, batch, options);
+    if (job.expireBeforeInstall) await new Promise(resolve => setTimeout(resolve, 2 * job.ms));
+    return result;
+  };
   network.forward = async (input, count, size) => {
     forwardCalls++;
     sent += count;
@@ -146,7 +154,7 @@ if (job.kind === 'encode') {
   try {
     let result;
     try { result = await owner.search({network, choice: job.choice ?? 'gumbel', batchSize: job.batchSize ?? 16, onBatch: stats => snapshots.push(stats),
-      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
+      stop: () => {if (job.throwWhilePending && sent) throw new Error('Control failed during inference');return Boolean(job.stopOnDecode && decoded || job.stopOnFeatures && packed || job.stopAfter && forwardsFinished >= job.stopAfter);}}); }
     catch (error) { if (!job.nonfinite && !job.throwWhilePending) throw error; rejected = /Nonfinite|Control failed/.test(error.message); }
     answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished, forwardCalls};
     owner.close();
