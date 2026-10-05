@@ -2,7 +2,8 @@
 //! attack's windows and every played cell. Guards cover all six-cell windows a
 //! future defender stone can affect; a global check covers the remaining ones.
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::rc::{Rc,Weak};
 use hexo_engine::types::{Coord, Player};
 use hexo_solver::prover::Ctl;
@@ -606,6 +607,7 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
                 if let ProofNode::AttackerMove{child,alternatives,..}=node {
                     if let Ok((post,ply,false))=check::apply(b,n,action) {scan(hints,cert,*child,&post,ply,winner,ctl,left,seen,depth+1)?;}
                     for reply in alternatives {
+                        control(ctl)?;
                         hint(hints,b,n,winner,reply.action.clone());
                         if let Ok((post,ply,false))=check::apply(b,n,&reply.action) {scan(hints,cert,reply.child,&post,ply,winner,ctl,left,seen,depth+1)?;}
                     }
@@ -616,6 +618,7 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
                     scan(hints,cert,*fallback,b,ply(winner,2),winner,ctl,left,seen,depth+1)?;
                 }
                 for reply in responses {
+                    control(ctl)?;
                     let mut post=b.clone();let mover=check::phase(n).0;
                     if reply.action.iter().any(|p|!check::legal(&post,*p)) {continue;}
                     for &p in &reply.action {post.insert(p,mover);}
@@ -643,6 +646,7 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
         let mut b=check::replay_controlled(&line.history,ctl)?;
         if let Some(cert)=&line.certificate {scan(&mut hints,cert,cert.root,&b,line.history.len(),winner,ctl,&mut input_left,&mut seen,0)?;}
         for (i,&(q,r,s,ply)) in line.pv.iter().enumerate() {
+            control(ctl)?;
             let at=line.history.len()+i;let (mover,remaining)=check::phase(at);
             if ply!=i as u32+1 || s!=mover || !check::legal(&b,(q,r)) {break;}
             if mover==winner && i+remaining as usize<=line.pv.len() {
@@ -683,20 +687,35 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
             } else if mover==self.winner {
                 let own:BTreeSet<_>=b.iter().filter(|&(_,s)|*s==mover).map(|(&p,_)|p).collect();
                 let enemy:BTreeSet<_>=b.iter().filter(|&(_,s)|*s!=mover).map(|(&p,_)|p).collect();
-                let mut candidates:Vec<_>=self.hints.iter().filter(|((support,left),_)|*left==remaining && support.iter().all(|p|own.contains(p)))
-                    .flat_map(|((support,_),actions)|actions.iter().map(|(action,prior)|
-                        (own.len()-support.len(),prior.symmetric_difference(&enemy).count(),action.clone()))).collect();
-                candidates.sort_by(|a,b|a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-                // Prefer the most specific saved context. Mixing in every
-                // earlier turn's attacks needlessly widens a failed replay.
-                if let Some(&(extra,..))=candidates.first() {candidates.retain(|c|c.0==extra);}
+                let hints=self.hints;let mut contexts=vec![];
+                let direct=(own.iter().copied().collect(),remaining);
+                if let Some(actions)=hints.get(&direct) {contexts.push(actions);}
+                else {
+                    // Only the most specific saved supports apply. Exact
+                    // contexts use the index, without scanning other turns.
+                    let mut most=0;
+                    for ((support,left),actions) in hints {
+                        control(self.ctl)?;
+                        if *left!=remaining || support.len()<most || !support.iter().all(|p|own.contains(p)) {continue;}
+                        if support.len()>most {most=support.len();contexts.clear();}
+                        contexts.push(actions);
+                    }
+                }
+                // Order candidates without cloning every action or doing a
+                // large, non-cancellable sort. The ordinal preserves ties.
+                let mut candidates=BinaryHeap::new();
+                for actions in contexts {for (action,prior) in actions {
+                    control(self.ctl)?;
+                    candidates.push(Reverse((prior.symmetric_difference(&enemy).count(),candidates.len(),action)));
+                }}
                 let mut tried=BTreeSet::new();let mut found=None;
-                for (_,_,action) in candidates {
+                while let Some(Reverse((_,_,action)))=candidates.pop() {
+                    control(self.ctl)?;
                     if !tried.insert(action.clone()) {continue;}
-                    let Ok((post,ply,terminal))=check::apply(b,n,&action) else {continue;};
-                    if terminal {found=Some(ProofNode::ImmediateWin{action});break;}
+                    let Ok((post,ply,terminal))=check::apply(b,n,action) else {continue;};
+                    if terminal {found=Some(ProofNode::ImmediateWin{action:action.clone()});break;}
                     if let Some(child)=self.walk(&post,ply,depth+1)? {
-                        found=Some(ProofNode::AttackerMove{action,child,alternatives:vec![]});break;
+                        found=Some(ProofNode::AttackerMove{action:action.clone(),child,alternatives:vec![]});break;
                     }
                 }
                 let Some(found)=found else {self.memo.insert(key,None);return Ok(None);};found

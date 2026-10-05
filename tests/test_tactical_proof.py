@@ -136,6 +136,21 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(found['proof_turns'], 1)
         self.assertEqual(independent_verify(found['certificate'], IMMEDIATE), 'PROVEN_WIN')
 
+    def test_large_saved_move_collection_yields_at_its_deadline(self):
+        alternatives = [dict(action=[[0,0],[i,1]],child=0) for i in range(20000)]
+        certificate = dict(version=1,width='wide',root=0,nodes=[dict(kind='attacker_move',
+                           action=[[0,0],[1,1]],child=0,alternatives=alternatives)])
+        evidence = [dict(history=OPEN_THREE,winner=0,pv=[],certificate=certificate)]
+        with NativeTactics(independent=True) as native:
+            start = time.perf_counter()
+            found = native.history(OPEN_THREE,replay=evidence,stamps=True,library=[],nodes=20000,ms=100)
+            self.assertEqual(found['status'],'UNKNOWN')
+            self.assertLess(time.perf_counter()-start,.5)
+            time.sleep(.2)
+            after = native.history(IMMEDIATE,nodes=100,ms=1000)
+            self.assertEqual(after['status'],'PROVEN_WIN')
+            self.assertNotIn('busy',after['reason'])
+
     def test_independent_workers_overlap_and_cancel_only_their_query(self):
         history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
         with NativeTactics(independent=True) as first, NativeTactics(independent=True) as second:
