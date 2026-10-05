@@ -1377,6 +1377,108 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual(pool.games[0].stats()['completed'], 16)
         self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
 
+    def test_cached_search_progress_is_live_without_new_neural_rows(self):
+        history = [(0,0)]
+        graph = self.graph(history)
+        pool = self.pool([graph], quantum=4, views=1, work=4, cache=1024)
+        from neural_search import checked
+        root = Uniform().evaluate([history])[0]
+        # Prime one complete legal ply from another independent graph. The
+        # scheduler must consume these cached predictions without idling.
+        for cells in [history]+[[*history,tuple(map(int,a))] for a in root['actions']]:
+            child = GameGraph(Uniform(), 'scheduler', cells)
+            try:
+                prediction = Uniform().evaluate([cells])[0]
+                h = np.asarray(cells,np.int64)
+                checked(native.hxgf_begin(pool.feed.ptr,child.ptr,h.ctypes.data,len(h)))
+                checked(native.hxgf_seed(pool.feed.ptr,child.ptr,prediction['actions'].ctypes.data,
+                                        prediction['logits'].ctypes.data,prediction['q'].ctypes.data,
+                                        len(prediction['actions'])))
+                native.hxgf_detach(pool.feed.ptr,child.ptr)
+            finally:
+                child.close()
+        self.assertGreater(pool.step(), 0)
+        self.assertIsNone(pool.feed.take(128))
+        self.assertEqual(pool.feed.stats()['new_rows'], 0)
+        self.assertGreater(pool.feed.stats()['cache_hits'], 0)
+        self.finish(pool)
+        stats = pool.games[0].stats()
+        self.assertEqual((stats['completed'],stats['cancelled']), (4,0))
+        self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()), 4)
+
+    def test_native_service_delivers_zero_row_root_and_release_without_batch_wait(self):
+        import ctypes as C
+        import time
+        from types import SimpleNamespace
+        from neural_search import checked, ptr
+        from native_scheduler import InferenceService
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = self.graph(history)
+        checked(native.hxg_tactics(graph.ptr, True))
+        pool = self.pool([graph], quantum=16, views=1, work=16, cache=0)
+        service = InferenceService([pool],[SimpleNamespace(model_version='scheduler')])
+        try:
+            service.start(continuous=True)
+            service.retarget(0,0,history,work=16,views=1)
+            token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
+            start = time.monotonic()
+            self.assertEqual(native.hxb_take(service.ptr,128,1000.,C.byref(token),C.byref(model),C.byref(snapshot)),0)
+            self.assertLess(time.monotonic()-start, .5)
+            event = service.event()
+            self.assertEqual((event['token'],event['exact_winner']), (1,0))
+            self.assertIsNone(service.event())
+            self.assertEqual(service.stats()['unique_rows'], 0)
+            self.assertFalse(service.done())
+            # With no remaining event or ready work, take really waits.
+            start = time.monotonic()
+            self.assertEqual(native.hxb_take(service.ptr,128,20.,C.byref(token),C.byref(model),C.byref(snapshot)),0)
+            self.assertGreaterEqual(time.monotonic()-start, .01)
+            service.release(0,0,expected=1)
+            start = time.monotonic()
+            self.assertEqual(native.hxb_take(service.ptr,128,1000.,C.byref(token),C.byref(model),C.byref(snapshot)),0)
+            self.assertLess(time.monotonic()-start, .5)
+            event = service.event()
+            self.assertEqual((event['kind'],event['token']), ('released',2))
+            self.assertIsNone(service.event())
+        finally:
+            service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['active_producers']), (0,0))
+
+    def test_native_service_pending_root_event_does_not_block_ready_inference(self):
+        import ctypes as C
+        import time
+        from types import SimpleNamespace
+        from neural_search import checked, ptr
+        from native_scheduler import InferenceService
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = self.graph(history)
+        checked(native.hxg_tactics(graph.ptr, True))
+        pool = self.pool([graph,self.graph()], quantum=16, views=1, work=16, cache=0)
+        service = InferenceService([pool],[SimpleNamespace(model_version='scheduler')], latency_ms=20.)
+        token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
+        try:
+            service.start(continuous=True)
+            service.retarget(0,0,history,work=16,views=1)
+            service.retarget(0,1,[(0,0)],work=16,views=1)
+            counts = np.empty(10,np.uint64)
+            until = time.monotonic()+2
+            while time.monotonic()<until:
+                native.hxb_stats(service.ptr,counts.ctypes.data)
+                if counts[0]:break
+                time.sleep(.001)
+            self.assertEqual(counts[0], 1)
+            # The one-row batch is full at this requested limit. Deliver it
+            # even though the exact neighbor's root event is still pending.
+            self.assertEqual(native.hxb_take(service.ptr,1,1000.,C.byref(token),C.byref(model),C.byref(snapshot)),1)
+            event = service.event()
+            self.assertEqual((event['game'],event['exact_winner']), (0,0))
+        finally:
+            if token.value:
+                checked(native.hxb_abort(service.ptr,token))
+                native.hxgp_free(snapshot)
+            service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
+
     def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
         import ctypes as C
         from neural_search import bind, ptr
@@ -1980,10 +2082,9 @@ class NativeScheduler(unittest.TestCase):
         graph = self.graph(history)
         checked(native.hxg_tactics(graph.ptr, True))
         pool = self.pool([graph], quantum=16, views=8, work=128)
-        pool.step()
-        self.assertIsNone(pool.feed.take(128))
-        self.finish(pool)
+        self.assertGreater(pool.step(), 0)
         self.assertTrue(pool.done())
+        self.assertIsNone(pool.feed.take(128))
         self.assertEqual(pool.feed.stats()['new_rows'], 0)
         self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
         self.assertEqual(pool.games[0].stats()['root_completed'], 0)

@@ -137,7 +137,10 @@ struct Owner {
    auto& v=views[(first+visited++)%views.size()];if(!v.active)continue;
    if(expired()){deadline=true;stop();return 0;}int64_t out[4];int status=hxgf_gather(feed,v.tree.get(),out);
    admitted=false;
-   if(status==-2)throw std::runtime_error(gumbel::error);progress+=int(out[0]);if(expired()){deadline=true;stop();return 0;}
+   if(status==-2)throw std::runtime_error(gumbel::error);
+   // Cached fulfillments and exact edges advance search without adding NN rows.
+   progress+=int(out[0])+int(out[3]);if(expired()){deadline=true;stop();return 0;}
+   if(root.tree->board.winner>=0 || (root.tree->root->expanded && root.tree->root->exact_winner>=0)){stop();break;}
   }
   // Pause between whole gathers, never inside a root visit layer. Resume with
   // the next view so deeper work remains eligible when the queue has space.
