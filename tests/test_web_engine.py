@@ -659,6 +659,27 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_immediate_turn_keeps_a_complete_policy_without_neural_batches(self):
+        history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
+        cases = [dict(history=history, seed=7, tactics=True, limit=16 if shared else None,
+                      steps=[dict(simulations=32,root_samples=8,batch_size=16)]*(1 if shared else 2),batches=[])
+                 for shared in (False,True)]
+        results = node(dict(kind='search',cases=cases))
+        for case,turns in zip(cases,results):
+            self.assertEqual(len(turns), len(case['steps']))
+            game = play.Game(history)
+            try:
+                for turn in turns:
+                    self.assertEqual(turn['proven'], 1)
+                    self.assertEqual(len(turn['policy']),len(game.legal_moves()))
+                    self.assertTrue(np.isfinite(turn['policy']).all())
+                    self.assertAlmostEqual(sum(turn['policy']), 1.)
+                    game.play(*turn['action'])
+                if len(turns)==2:
+                    self.assertEqual(game.winner, 0)
+            finally:
+                game.close()
+
     def test_late_marks_tighten_proven_browser_roots_and_shared_parents(self):
         from tests.test_neural_search import Uniform
         network = Uniform()

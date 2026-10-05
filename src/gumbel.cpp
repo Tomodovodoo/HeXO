@@ -922,7 +922,17 @@ struct Tree {
   node->pending=true;node->player=board.player;capture(path);
   for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;
   if(!path.edges.empty()){++root_edges[path.edges.front().second].epoch;++started;++issued;}
-  int id=next_id++;requests.emplace(id,std::move(path));return id;
+  const bool immediate=!path.own.empty();
+  int id=next_id++;requests.emplace(id,std::move(path));
+  if(immediate){
+   // capture already found a legal win within this turn. Materialize the complete legal policy and
+   // install its exact evidence through the ordinary fulfillment/backup path, without requesting NN work.
+   const auto& legal=requests.at(id).legal;std::vector<int64_t> actions;actions.reserve(2*legal.size());
+   for(auto c:legal){actions.push_back(c.q);actions.push_back(c.r);}
+   std::vector<double> zeros(legal.size());fulfill(id,actions.data(),zeros.data(),zeros.data(),int(legal.size()));
+   return -1;
+  }
+  return id;
  }
  // Exact evidence from another view dominates a late prediction. Finish this view's reservation once.
  bool proof_closed(Path& path){

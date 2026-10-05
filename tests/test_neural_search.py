@@ -177,6 +177,25 @@ class NeuralTree(unittest.TestCase):
             self.assertEqual(result['proven'], 1)
             search.advance(result['action'])
         self.assertEqual(search.game.winner, 0)
+        # A completed native oracle still has to validate the supplied
+        # prediction before PUCT consumes its arrays in legal-action order.
+        for changed in ('actions', 'logit_shape', 'q_shape', 'logits', 'q', 'range'):
+            prediction = Uniform().evaluate([history])[0]
+            if changed == 'actions':
+                prediction['actions'] = prediction['actions'][::-1]
+            elif changed == 'logit_shape':
+                prediction['logits'] = prediction['logits'][:-1]
+            elif changed == 'q_shape':
+                prediction['q'] = prediction['q'][:,None]
+            elif changed == 'range':
+                prediction['q'][0] = 2
+            else:
+                prediction[changed][0] = np.nan
+            invalid = PUCTSearch(Uniform(), 'puct-invalid', history, tactics=True)
+            self.addCleanup(invalid.close)
+            invalid.begin(8)
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'Invalid evaluation'):
+                invalid.fulfill(invalid.request(), prediction)
 
     @unittest.skipUnless(importlib.util.find_spec('torch'), 'Timed Bubble turns require torch')
     def test_timed_turn_reserves_simulations_for_both_stones(self):
@@ -324,12 +343,22 @@ class NeuralTree(unittest.TestCase):
         self.assertEqual(result['proof_status'], 'PROVEN_WIN')
         self.assertEqual(result['completed'], 0)
         self.assertEqual(result['proven'], 1)
+        self.assertEqual(result['evaluated'], 0)
+        game = Game(history)
+        try:
+            self.assertEqual(result['actions'].tolist(), [list(p) for p in game.legal_moves()])
+        finally:
+            game.close()
+        self.assertTrue(np.isfinite(result['policy']).all())
+        self.assertAlmostEqual(float(result['policy'].sum()), 1.)
         self.assertEqual(search.search(65536)['evaluated'], 0)
         search.advance(result['action'])
         game = Game(search.history)
         if game.winner < 0:
             game.close()
-            search.advance(search.search(8)['action'])
+            second = search.search(8)
+            self.assertEqual(second['evaluated'], 0)
+            search.advance(second['action'])
             game = Game(search.history)
         self.assertEqual(game.winner, 0)
         game.close()
@@ -494,20 +523,18 @@ class NeuralTree(unittest.TestCase):
             result = search.search(8)
             self.assertEqual((result['exact_winner'], result['completed']), (winner, 0))
 
-    def test_a_longer_certificate_keeps_the_shorter_tactical_win(self):
-        # Player 0 completes six with one stone; a (stub-verified) certificate names a slower turn elsewhere.
+    def test_immediate_win_does_not_query_a_slower_certificate(self):
+        # Player 0 completes six with one stone. Existing exact evidence must
+        # settle this root before a solver or the network receives work.
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
         class Slow:
             def history(self, history, ms, certificate=None, **kwargs):
-                return dict(status='PROVEN_WIN', native_verified=True, attacker='mover',
-                            moves=[[-3,-3],[-3,-2]], proof_turns=3)
+                raise AssertionError('An immediate win does not need a solver query')
         search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True, proof_solver=Slow())
         self.addCleanup(search.close)
-        self.assertTrue(native.hxg_begin(search.ptr, 8, 4))
-        request, pending = search.request()
-        self.assertTrue(search.fulfill_proof(request, pending, dict()))
         result = search.search(8)
         self.assertEqual((result['proven'], result['proof_plies']), (1, 1))
+        self.assertEqual(result['evaluated'], 0)
         self.assertIn(result['action'], [[-1,0],[5,0]])
 
     def searcher(self, history=(), seed=7, evaluator=None):
@@ -1945,6 +1972,23 @@ class NativeScheduler(unittest.TestCase):
         pool.cancel()
         record = pool.games[0].records()[0]
         self.assertEqual((record['exact_winner'], record['root_estimate']), (0, 1.))
+        self.assertIsNone(record['raw_value'])
+
+    def test_immediate_turn_never_enters_the_inference_queue_or_invents_a_raw_value(self):
+        from neural_search import checked
+        history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
+        graph = self.graph(history)
+        checked(native.hxg_tactics(graph.ptr, True))
+        pool = self.pool([graph], quantum=16, views=8, work=128)
+        pool.step()
+        self.assertIsNone(pool.feed.take(128))
+        self.finish(pool)
+        self.assertTrue(pool.done())
+        self.assertEqual(pool.feed.stats()['new_rows'], 0)
+        self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
+        self.assertEqual(pool.games[0].stats()['root_completed'], 0)
+        record = pool.games[0].records()[0]
+        self.assertEqual((record['exact_winner'],record['root_estimate']), (0,1.))
         self.assertIsNone(record['raw_value'])
 
 
