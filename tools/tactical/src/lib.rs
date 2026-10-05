@@ -361,7 +361,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
             }
             // Only PDS-PN emits an all-defense DAG. An IDTT PV is never enough.
             let found=if ctl.expired() {None} else {
-                let found=prover::pdspn::solve(&pos,&cfg,&ctl);
+                let found={let _time=stamps::measure("search");prover::pdspn::solve(&pos,&cfg,&ctl)};
                 proof_numbers=found.proof_numbers;resident_reused=found.resident_reused;
                 found.certificate
             };
@@ -391,7 +391,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         let prepared=if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {
             stamps::resolved(source,&board,ply,side,&ctl)
         } else {Ok(cert)};
-        match prepared.and_then(|cert|check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)).map(|checked|(cert,checked))) {
+        match prepared.and_then(|cert|{let _time=stamps::measure("verify result");check::verify_for(&req.history,ply,side,&cert,&ctl,check_nodes(req.nodes)).map(|checked|(cert,checked))}) {
             Ok((mut cert,(moves,turns,visited)))=>{
                 // Only the primary verified strategy may declare dependencies.
                 // Drop unused nodes/alternatives in certificates containing exact

@@ -114,18 +114,24 @@ impl Stamp {
         if root.len()!=source.stones.len() || root.iter().any(|(&p,&s)|s>1 || p.0.unsigned_abs()>check::LIMIT as u32
             || p.1.unsigned_abs()>check::LIMIT as u32 || check::won(&root,p,s)) {return Err("invalid stamp position".into());}
         let start=ply(source.player,source.remaining);
-        check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?;
+        let (_,mut turns,_)={let _time=measure("compile verify");check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?};
         let composed=source.certificate.nodes.iter().any(|n|matches!(n,ProofNode::Stamp{..}|ProofNode::StampLink{..}));
         source.certificate=compact(&source.certificate,ctl)?;
-        let (_,turns,used)=check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?;
-        if used.len()>4096 {return Err("stamp strategy size limit".into());}
+        // For ordinary proofs compaction only renumbers identical suffixes and
+        // drops unchecked attack alternatives. Nested stamps can be shortened
+        // during compilation, so their resulting strategy needs another check.
+        if composed {
+            let _time=measure("compile verify");
+            turns=check::verify_board(&root,start,source.winner,&source.certificate,ctl,50000)?.1;
+        }
+        if source.certificate.nodes.len()>4096 {return Err("stamp strategy size limit".into());}
         let bytes=serde_json::to_vec(&source).map_err(|e|e.to_string())?.len();
         if bytes>MAX_BYTES/2 {return Err("stamp size limit".into());}
         let mut stamp=Self{portable:Cell::new(false),source,turns,required:BTreeSet::new(),empty:BTreeSet::new(),guards:BTreeMap::new(),
             before:BTreeSet::new(),allowance:0,bytes};
         let cert=stamp.source.certificate.clone();
         let start=ply(stamp.source.player,stamp.source.remaining);
-        stamp.collect(&root,&root,start,cert.root,&cert,&mut 50000,ctl)?;
+        {let _time=measure("collect strategy");stamp.collect(&root,&root,start,cert.root,&cert,&mut 50000,ctl)?;}
         if stamp.required.is_empty() || stamp.empty.len()>4096 || stamp.guards.len()>8192 {return Err("stamp footprint limit".into());}
         // Discard the rest of the original game. Replaying the strategy with
         // only its supporting stones also removes now-obsolete defense branches.
@@ -255,8 +261,16 @@ impl Stamp {
     pub fn matches(&self,get:StoneAt<'_>,stones:&[(Coord,Player)],mover:Player,remaining:u8)->bool {
         let _time=measure("match");
         if side(mover)!=self.source.player || remaining!=self.source.remaining {return false;}
+        self.blocker(get).is_none() && self.safe(get,stones)
+    }
+    fn blocker(&self,get:StoneAt<'_>)->Option<Coord> {
         let winner=player(self.source.winner);
-        if self.required.iter().any(|&p|get(p)!=Some(winner)) || self.empty.iter().any(|&p|get(p).is_some()) {return false;}
+        self.required.iter().find(|&&p|get(p)!=Some(winner))
+            .or_else(||self.empty.iter().find(|&&p|get(p).is_some())).copied()
+    }
+    fn safe(&self,get:StoneAt<'_>,stones:&[(Coord,Player)])->bool {
+        let _time=measure("threat guards");
+        let winner=player(self.source.winner);
         if self.allowance>0 {
             // Windows unaffected by any later defensive placement can only
             // become safer. Check them once, after the common attacker prefix.
@@ -306,6 +320,7 @@ impl Stamp {
     }
 
     pub fn key(&self)->String {
+        let _time=measure("key");
         // Coordinates of the supporting stones, checked empty cells and every
         // counter-threat guard belong to the key, together with the real phase.
         (0..12).map(|sym| {
@@ -351,6 +366,7 @@ fn distance(a:Coord,b:Coord)->i64 {let (q,r)=(i64::from(a.0)-i64::from(b.0),i64:
 /// Save the actual primary strategy, not ever-growing chains of earlier sources.
 /// Recompute the response set: extra friendly stones may end a branch earlier.
 fn materialize(cert:&ProofCertificate,b:&Board,n:usize,winner:u8,ctl:&Ctl)->Result<ProofCertificate,String> {
+    let _time=measure("materialize");
     fn walk(out:&mut ProofCertificate,cert:&ProofCertificate,id:u32,b:&Board,n:usize,winner:u8,ctl:&Ctl,depth:usize)->Result<u32,String> {
         control(ctl)?;
         if depth>128 || out.nodes.len()>=4096 {return Err("expanded stamp size/depth limit".into());}
@@ -398,6 +414,7 @@ thread_local! {
 }
 pub fn seed(ctl:&Ctl)->Result<(),String> {
     if SEEDED.with(Cell::get)==usize::MAX {return Ok(());}
+    let _time=measure("seed");
     #[derive(serde::Deserialize)] struct Primitive {source:StampSource}
     let entries:Vec<Primitive>=serde_json::from_str(include_str!("../stamps.json")).map_err(|e|e.to_string())?;
     // A leaf query may expire between entries. Keep completed imports rather
@@ -768,24 +785,36 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
 }
 
 type Pattern=(Vec<Coord>,Vec<(usize,u8,Coord)>);
+type PatternGroup=(Option<Coord>,Vec<Pattern>);
 type Frame=(u8,Coord,bool);
 struct Candidates {
     found:Vec<BTreeSet<Frame>>,
-    active:Vec<[BTreeSet<Frame>;2]>,
-    blocked:HashMap<Coord,Vec<(usize,Frame)>>,
+    active:[BTreeSet<(usize,Frame)>;4],
+    fixed:[BTreeSet<usize>;4],
+    phases:Vec<usize>,
+    blocked:HashMap<Coord,Vec<(usize,Option<Frame>)>>,
     previous:Vec<(Coord,Player)>,
     board:HashMap<Coord,Player>,
 }
 impl Candidates {
-    fn new(count:usize,stones:Vec<(Coord,Player)>)->Self {
-        Self{found:vec![BTreeSet::new();count],active:vec![Default::default();count],blocked:HashMap::new(),
+    fn new(entries:&[Rc<Stamp>],stones:Vec<(Coord,Player)>)->Self {
+        let phases:Vec<_>=entries.iter().map(|s|phase(s.source.player,s.source.remaining)).collect();
+        let mut fixed:[BTreeSet<usize>;4]=Default::default();
+        for (id,&phase) in phases.iter().enumerate() {fixed[phase].insert(id);}
+        Self{found:vec![BTreeSet::new();entries.len()],active:Default::default(),fixed,phases,blocked:HashMap::new(),
             board:stones.iter().copied().collect(),previous:stones}
     }
     fn insert(&mut self,id:usize,frame:Frame) {
-        if self.found[id].len()<512 && self.found[id].insert(frame) {self.active[id][usize::from(frame.2)].insert(frame);}
+        if self.found[id].len()<512 && self.found[id].insert(frame) {self.wake(id,Some(frame));}
     }
-    fn block(&mut self,key:(usize,Frame),at:Coord) {
-        if self.active[key.0][usize::from(key.1.2)].remove(&key.1) {self.blocked.entry(at).or_default().push(key);}
+    fn wake(&mut self,id:usize,frame:Option<Frame>) {
+        if let Some(frame)=frame {self.active[self.phases[id]^(2*usize::from(frame.2))].insert((id,frame));}
+        else {self.fixed[self.phases[id]].insert(id);}
+    }
+    fn block(&mut self,id:usize,frame:Option<Frame>,at:Coord) {
+        let removed=if let Some(frame)=frame {self.active[self.phases[id]^(2*usize::from(frame.2))].remove(&(id,frame))}
+            else {self.fixed[self.phases[id]].remove(&id)};
+        if removed {self.blocked.entry(at).or_default().push((id,frame));}
     }
     fn sync(&mut self,stones:&[(Coord,Player)],get:StoneAt<'_>)->Vec<(Coord,Player)> {
         let _time=measure("sync");
@@ -801,28 +830,35 @@ impl Candidates {
             if self.board.get(&at).copied()==now {continue;}
             if let Some(owner)=now {self.board.insert(at,owner);added.push((at,owner));}else{self.board.remove(&at);}
             if let Some(waiting)=self.blocked.remove(&at) {
-                for (id,frame) in waiting {self.active[id][usize::from(frame.2)].insert(frame);}
+                for (id,frame) in waiting {
+                    if let Some(frame)=frame {self.active[self.phases[id]^(2*usize::from(frame.2))].insert((id,frame));}
+                    else {self.fixed[self.phases[id]].insert(id);}
+                }
             }
         }
         self.previous.truncate(common);self.previous.extend_from_slice(&stones[common..]);added
     }
 }
-fn locate(patterns:&[Pattern],entries:&[Rc<Stamp>],stones:&[(Coord,Player)],get:StoneAt<'_>,
+fn phase(mover:u8,remaining:u8)->usize {2*mover as usize+remaining as usize-1}
+fn locate(patterns:&[PatternGroup],entries:&[Rc<Stamp>],stones:&[(Coord,Player)],get:StoneAt<'_>,
     candidates:&mut Candidates,ctl:&Ctl) {
     let _time=measure("locate");
     for &(at,owner) in stones {
         if ctl.expired() {return;}
-        for (offsets,uses) in patterns {
-            if offsets.iter().any(|&(q,r)|get((at.0+q,at.1+r))!=Some(owner)) {continue;}
-            for &(id,sym,anchor) in uses {
-                candidates.insert(id,(sym,(at.0-anchor.0,at.1-anchor.1),side(owner)!=entries[id].source.winner));
+        for (first,rest) in patterns {
+            if first.is_some_and(|(q,r)|get((at.0+q,at.1+r))!=Some(owner)) {continue;}
+            for (offsets,uses) in rest {
+                if offsets.iter().any(|&(q,r)|get((at.0+q,at.1+r))!=Some(owner)) {continue;}
+                for &(id,sym,anchor) in uses {
+                    candidates.insert(id,(sym,(at.0-anchor.0,at.1-anchor.1),side(owner)!=entries[id].source.winner));
+                }
             }
         }
     }
 }
 
 pub struct Oracle {entries:Vec<Rc<Stamp>>, instances:RefCell<Vec<(usize,u8,Coord,bool)>>,
-    candidates:RefCell<Candidates>, patterns:Vec<Pattern>,
+    candidates:RefCell<Candidates>, patterns:Vec<PatternGroup>,
     misses:RefCell<HashSet<(u64,u8,u8)>>, pub hits:Cell<u64>,ctl:Ctl}
 impl Oracle {
     pub fn new(ctl:&Ctl,root:&Board)->Rc<Self> {
@@ -839,19 +875,27 @@ impl Oracle {
                 patterns.entry(offsets).or_default().push((id,sym,anchor));
             }
         }}}
-        let patterns:Vec<_>=patterns.into_iter().collect();
+        // Shapes often ask about the same neighboring cell. Read that cell
+        // once before testing their remaining support offsets.
+        let mut grouped:BTreeMap<Option<Coord>,Vec<Pattern>>=BTreeMap::new();
+        for (mut offsets,uses) in patterns {
+            let first=(!offsets.is_empty()).then(||offsets.remove(0));
+            grouped.entry(first).or_default().push((offsets,uses));
+        }
+        let patterns:Vec<_>=grouped.into_iter().collect();
         let stones:Vec<_>=root.iter().map(|(&p,&s)|(p,player(s))).collect();
-        let mut candidates=Candidates::new(entries.len(),stones.clone());
+        let mut candidates=Candidates::new(&entries,stones.clone());
         locate(&patterns,&entries,&stones,&|p|root.get(&p).copied().map(player),&mut candidates,ctl);
         for (id,found) in candidates.found.iter_mut().enumerate() {
             found.retain(|&(sym,offset,_)|entries[id].empty.iter().all(|&p|!root.contains_key(&transform(p,sym,offset))));
         }
-        for (id,colours) in candidates.active.iter_mut().enumerate() {
-            for active in colours {active.retain(|frame|candidates.found[id].contains(frame));}
-        }
-        let patterns=patterns.into_iter().filter_map(|(offsets,uses)| {
-            let uses:Vec<_>=uses.into_iter().filter(|&(id,_,_)|entries[id].portable.get()).collect();
-            (!uses.is_empty()).then_some((offsets,uses))
+        for active in &mut candidates.active {active.retain(|(id,frame)|candidates.found[*id].contains(frame));}
+        let patterns=patterns.into_iter().filter_map(|(first,rest)| {
+            let rest:Vec<_>=rest.into_iter().filter_map(|(offsets,uses)| {
+                let uses:Vec<_>=uses.into_iter().filter(|&(id,_,_)|entries[id].portable.get()).collect();
+                (!uses.is_empty()).then_some((offsets,uses))
+            }).collect();
+            (!rest.is_empty()).then_some((first,rest))
         }).collect();
         Rc::new(Self{entries,candidates:RefCell::new(candidates),patterns,instances:RefCell::new(vec![]),
             misses:RefCell::new(HashSet::new()),hits:Cell::new(0),ctl:ctl.clone()})
@@ -861,37 +905,40 @@ impl StampOracle for Oracle {
     fn lookup(&self,hash:u64,stones:&[(Coord,Player)],get:StoneAt<'_>,mover:Player,remaining:u8)->Option<(usize,Player,u32)> {
         let _time=measure("lookup");
         if self.ctl.expired() || self.misses.borrow().contains(&(hash,side(mover),remaining)) {return None;}
-        for (id,stamp) in self.entries.iter().enumerate() {if stamp.matches(get,stones,mover,remaining) {
-            self.hits.set(self.hits.get()+1);return Some((id,player(stamp.source.winner),stamp.turns));
-        }}
-        // Small primitive shapes can occur anywhere and in either colour.
-        // A cheap supporting-stone/mask match precedes the global threat guards.
         let mut candidates=self.candidates.borrow_mut();
         let added=candidates.sync(stones,get);
         locate(&self.patterns,&self.entries,&added,get,&mut candidates,&self.ctl);
+        let phase=phase(side(mover),remaining);
+        let fixed:Vec<_>=candidates.fixed[phase].iter().copied().collect();
+        for id in fixed {
+            let stamp=&self.entries[id];
+            if let Some(at)=stamp.blocker(get) {candidates.block(id,None,at);continue;}
+            if stamp.safe(get,stones) {
+                self.hits.set(self.hits.get()+1);return Some((id,player(stamp.source.winner),stamp.turns));
+            }
+        }
+        // Small primitive shapes can occur anywhere and in either colour.
+        // A cheap supporting-stone/mask match precedes the global threat guards.
         let _geometry=measure("geometry");
         // Copy only awake candidates so failed masks can put themselves to
         // sleep during this pass. Each stores at most one blocking cell;
         // counter-threat guards are deliberately not cached this way.
-        for (id,stamp) in self.entries.iter().enumerate() {
-            if stamp.source.remaining!=remaining {continue;}
+        let active:Vec<_>=candidates.active[phase].iter().copied().collect();
+        for (id,(sym,offset,colour)) in active {
+            let stamp=&self.entries[id];
             let swap=side(mover)!=stamp.source.player;
             let winner=player(stamp.source.winner^u8::from(swap));
-            let active:Vec<_>=candidates.active[id][usize::from(swap)].iter().copied().collect();
-            for (sym,offset,colour) in active {
-                let mapped=|p|get(transform(p,sym,offset)).map(|s|if swap{s.opponent()}else{s});
-                if let Some(&at)=stamp.required.iter().find(|&&p|mapped(p)!=Some(player(stamp.source.winner)))
-                    .or_else(||stamp.empty.iter().find(|&&p|mapped(p).is_some())) {
-                    candidates.block((id,(sym,offset,colour)),transform(at,sym,offset));continue;
-                }
-                let local:Vec<_>=stones.iter().map(|&(p,s)|(inverse(p,sym,offset),if swap{s.opponent()}else{s})).collect();
-                if !stamp.matches(&mapped,&local,player(stamp.source.player),remaining) {continue;}
-                let key=(id,sym,offset,swap);let mut list=self.instances.borrow_mut();
-                let index=if let Some(i)=list.iter().position(|k|*k==key) {i} else {
-                    if list.len()>=64 {continue;}let i=list.len();list.push(key);i
-                };
-                self.hits.set(self.hits.get()+1);return Some((self.entries.len()+index,winner,stamp.turns));
+            let mapped=|p|get(transform(p,sym,offset)).map(|s|if swap{s.opponent()}else{s});
+            if let Some(at)=stamp.blocker(&mapped) {
+                candidates.block(id,Some((sym,offset,colour)),transform(at,sym,offset));continue;
             }
+            let local:Vec<_>=stones.iter().map(|&(p,s)|(inverse(p,sym,offset),if swap{s.opponent()}else{s})).collect();
+            if !stamp.safe(&mapped,&local) {continue;}
+            let key=(id,sym,offset,swap);let mut list=self.instances.borrow_mut();
+            let index=if let Some(i)=list.iter().position(|k|*k==key) {i} else {
+                if list.len()>=64 {continue;}let i=list.len();list.push(key);i
+            };
+            self.hits.set(self.hits.get()+1);return Some((self.entries.len()+index,winner,stamp.turns));
         }
         let mut misses=self.misses.borrow_mut();if misses.len()>=16384 {misses.clear();}misses.insert((hash,side(mover),remaining));None
     }
@@ -911,6 +958,30 @@ impl StampOracle for Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_mask_wakes_only_when_its_blocking_cell_changes() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let source=StampSource{stones:(0..5).map(|q|((q,0),0)).collect(),player:0,remaining:1,winner:0,
+            certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
+                nodes:vec![ProofNode::ImmediateWin{action:vec![(5,0)]}]}};
+        import(source.clone(),&ctl).unwrap();
+        let mut board:Board=source.stones.into_iter().collect();board.insert((5,0),1);
+        let oracle=Oracle::new(&ctl,&board);
+        for (hash,changed,owner,remaining,expected) in [(1,(50,50),Some(1),1,false),
+            (2,(5,0),None,2,false),(3,(50,50),None,1,true),(4,(1,0),Some(1),1,false),
+            (5,(1,0),Some(0),1,true),(6,(5,0),Some(1),1,false)] {
+            if let Some(s)=owner {board.insert(changed,s);} else {board.remove(&changed);}
+            let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+            let result=oracle.lookup(hash,&stones,&|p|board.get(&p).copied().map(player),Player::P1,remaining);
+            assert_eq!(result.is_some(),expected);
+            if let Some((id,_,turns))=result {
+                assert_eq!(check::verify_board(&board,ply(0,remaining),0,&oracle.source(id).certificate,&ctl,50000).unwrap().1,turns);
+            }
+        }
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
 
     #[test]
     fn candidate_watches_follow_backtracking_and_changed_branches() {
