@@ -527,6 +527,19 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(independent_verify(tight['certificate'], LATE_WIN), 'PROVEN_WIN')
         again = self.engine.history(LATE_WIN, nodes=32768, ms=20000, shortest=True)
         self.assertEqual((again['cache_hit'], again['shortest'], again['certificate']), (True, True, tight['certificate']))
+        for learned in (False, True):
+            with self.subTest(learned_stamp=learned), NativeTactics(independent=True) as native:
+                if learned:
+                    native.history(LATE_WIN, certificate=loose['certificate'], stamps=True, library=[], nodes=1, ms=20000)
+                    limited = native.history(LATE_WIN, shortest=True, stamps=True, library=[], nodes=1, ms=20000)
+                    self.assertEqual((limited['status'], limited['proof_turns'], limited['shortest']),
+                                     ('PROVEN_WIN', 5, False))
+                    self.assertEqual(independent_verify(limited['certificate'], LATE_WIN), 'PROVEN_WIN')
+                stamped = native.history(LATE_WIN, shortest=True, stamps=True, library=[], nodes=32768, ms=20000)
+                self.assertEqual((stamped['status'], stamped['proof_turns'], stamped['shortest'], stamped['moves']),
+                                 ('PROVEN_WIN', 4, True, tight['moves']))
+                self.assertLessEqual(stamped['nodes_fresh'], 32768)
+                self.assertEqual(independent_verify(stamped['certificate'], LATE_WIN), 'PROVEN_WIN')
         refused = self.engine.history(LATE_WIN * 2000, nodes=32768, ms=20000, shortest=True)
         self.assertEqual((refused['status'], refused['shortest']), ('UNKNOWN', False))
 
