@@ -37,7 +37,7 @@ struct Job {
  std::vector<uint64_t> ids;std::vector<Key> keys;
  std::vector<std::shared_ptr<const Prediction>> results;
  std::vector<bool> installed;
- int remaining=0;
+ int remaining=0;bool completion_queued=false;
 };
 struct Completion {std::shared_ptr<Job> job;std::vector<int> rows;bool finished;};
 struct Subscriber {std::shared_ptr<Job> job;int row;};
@@ -246,7 +246,10 @@ struct Broker {
   if(s.job->results[s.row])return;
   s.job->results[s.row]=std::move(prediction);
   s.job->owner->pause_ack=0;
-  if(!--s.job->remaining)s.job->owner->completed.push_back(s.job);
+  --s.job->remaining;
+  // A snapshot can span device batches. Wake its native owner after any
+  // returned row, without waiting for unrelated rows or queueing it twice.
+  if(!s.job->completion_queued){s.job->completion_queued=true;s.job->owner->completed.push_back(s.job);}
  }
  void enqueue(const std::shared_ptr<Job>& job){
   std::lock_guard lock(mutex);
@@ -276,11 +279,8 @@ struct Broker {
  std::vector<Completion> completions(Producer& producer){
   std::lock_guard lock(mutex);std::vector<std::shared_ptr<Job>> jobs(producer.completed.begin(),producer.completed.end());
   producer.completed.clear();
-  // A producer snapshot may span several device batches. Pausing must install
-  // the rows already returned without launching the snapshot's remaining rows.
-  if(paused)for(auto& job:producer.outstanding)if(std::find(jobs.begin(),jobs.end(),job)==jobs.end())jobs.push_back(job);
   std::vector<Completion> out;
-  for(auto& job:jobs){Completion c{job,{},job->remaining==0};
+  for(auto& job:jobs){job->completion_queued=false;Completion c{job,{},job->remaining==0};
    for(size_t row=0;row<job->results.size();++row)if(job->results[row] && !job->installed[row]){c.rows.push_back(int(row));job->installed[row]=true;}
    if(!c.rows.empty() || c.finished)out.push_back(std::move(c));
   }

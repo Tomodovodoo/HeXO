@@ -1381,6 +1381,88 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
         self.assertEqual(native.hxg_exact(native.hxgo_root(pool.games[0].ptr)),-1)
 
+    def test_native_service_installs_a_returned_row_while_its_snapshot_tail_waits(self):
+        import ctypes as C
+        import time
+        from neural_search import bind, ptr
+        bind('hxgp_groups', C.c_int, ptr)
+        bind('hxgp_group', C.c_int, ptr, C.c_int, ptr)
+        bind('hxgp_decode', C.c_int, ptr, C.c_int, C.c_int, C.c_int, ptr, C.c_int64)
+        bind('hxgp_outputs', C.c_int, ptr, ptr)
+        bind('hxgp_free', None, ptr)
+        for cancel_tail in (False,True):
+            with self.subTest(cancel_tail=cancel_tail):
+                pool=self.pool([self.graph(),self.graph([(0,0),(4,0),(7,0)])],
+                               quantum=16,views=1,work=16,cache=0)
+                service=native.hxb_new(16,2,0,20.)
+                token,model,snapshot=C.c_uint64(),C.c_int(),ptr()
+                counters=np.empty(10,np.uint64)
+                try:
+                    self.assertTrue(native.hxb_attach(service,pool.ptr,0))
+                    self.assertTrue(native.hxb_start(service,0.))
+                    until=time.monotonic()+1
+                    while time.monotonic()<until:
+                        native.hxb_stats(service,counters.ctypes.data)
+                        if counters[0]>=2:break
+                        time.sleep(.001)
+                    self.assertEqual(counters[0],2)
+                    count=native.hxb_take(service,1,1000.,C.byref(token),C.byref(model),C.byref(snapshot))
+                    self.assertEqual(count,1)
+                    for group in range(native.hxgp_groups(snapshot)):
+                        info=np.empty(2,np.int64)
+                        self.assertTrue(native.hxgp_group(snapshot,group,info.ctypes.data))
+                        side,rows=map(int,info)
+                        output=np.zeros((rows,side*side+2),np.float32)
+                        self.assertTrue(native.hxgp_decode(snapshot,group,0,rows,
+                                                         output.ctypes.data,output.size))
+                    outputs=(ptr*4)()
+                    self.assertTrue(native.hxgp_outputs(snapshot,outputs))
+                    self.assertTrue(native.hxb_complete(service,token,*outputs))
+                    native.hxgp_free(snapshot)
+                    token.value=0
+                    # The other cold root remains unsent. Its neighbor must
+                    # install this result and supply useful continuations.
+                    until=time.monotonic()+1
+                    while time.monotonic()<until:
+                        native.hxb_stats(service,counters.ctypes.data)
+                        if counters[0]>2 and native.hxb_installed(service)==1:break
+                        time.sleep(.001)
+                    self.assertEqual(counters[3],1)
+                    self.assertEqual(native.hxb_installed(service),1)
+                    self.assertGreater(counters[0],2)
+                    if not cancel_tail:
+                        for _ in range(1000):
+                            if native.hxb_done(service):break
+                            count=native.hxb_take(service,1,50.,C.byref(token),C.byref(model),C.byref(snapshot))
+                            self.assertGreaterEqual(count,0)
+                            if not count:continue
+                            for group in range(native.hxgp_groups(snapshot)):
+                                self.assertTrue(native.hxgp_group(snapshot,group,info.ctypes.data))
+                                side,rows=map(int,info)
+                                output=np.zeros((rows,side*side+2),np.float32)
+                                self.assertTrue(native.hxgp_decode(snapshot,group,0,rows,
+                                                                 output.ctypes.data,output.size))
+                            self.assertTrue(native.hxgp_outputs(snapshot,outputs))
+                            self.assertTrue(native.hxb_complete(service,token,*outputs))
+                            native.hxgp_free(snapshot)
+                            token.value=0
+                        else:self.fail('Partial native delivery did not finish both searches')
+                finally:
+                    native.hxb_cancel(service)
+                    if token.value:
+                        native.hxb_abort(service,token)
+                        native.hxgp_free(snapshot)
+                    self.assertTrue(native.hxb_join(service))
+                    native.hxb_stats(service,counters.ctypes.data)
+                    self.assertTrue(native.hxb_free(service))
+                self.assertEqual(tuple(counters[7:]),(0,0,0))
+                self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
+                if not cancel_tail:
+                    for game in pool.games:
+                        self.assertEqual(game.stats()['completed'],16)
+                        self.assertEqual(int(game.evidence()['lifetime_credits'].sum()),16)
+                pool.close()
+
     def graph(self, history=((0, 0),), version='scheduler'):
         graph = GameGraph(Uniform(), version, history, limit=96)
         self.addCleanup(graph.close)
