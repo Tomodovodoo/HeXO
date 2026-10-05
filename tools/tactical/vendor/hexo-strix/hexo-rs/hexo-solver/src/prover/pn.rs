@@ -451,8 +451,10 @@ impl PnSearch {
     /// (whose tree is otherwise discarded). Sound: every such node is a genuine
     /// forced win under the shared kernel rules.
     pub(crate) fn collect_proven(&self, out: &mut FxHashSet<u64>) {
-        for (i, n) in self.arena.iter().enumerate() {
-            if i % 256 == 0 && self.limits.expired() { break; }
+        // Mandatory cleanup even after cancellation: backup may already have
+        // cached positive facts. Retaining one without its witness would make
+        // later resident queries unable to reconstruct the reused proof.
+        for n in &self.arena {
             if n.pn == 0 {
                 out.insert(n.key);
             }
@@ -694,12 +696,20 @@ mod tests {
             }
             search.set_terminal(3, 0, INF);
             search.set_limits(limits);
-            assert!(!search.backup(3, &mut None));
+            let mut table = ProofTt::new(1);
+            assert!(!search.backup(3, &mut Some(&mut table)));
             assert_eq!((search.arena[0].pn, search.arena[0].dn), (1,1));
             assert!(search.arena.iter().all(|n| n.work == 0));
             search.set_limits(Limits::default());
-            assert!(search.backup(3, &mut None));
+            assert!(search.backup(3, &mut Some(&mut table)));
             assert_eq!((search.arena[0].pn, search.arena[0].dn), (0,INF));
+            search.set_limits(Limits { cancel: Some(Arc::new(AtomicBool::new(true))), ..Limits::default() });
+            let mut witnesses = FxHashSet::default();
+            search.collect_proven(&mut witnesses);
+            for key in 0..4 {
+                assert_eq!(table.peek(key), Some((0,INF)));
+                assert!(witnesses.contains(&key), "cached proof {key} lost its witness after cancellation");
+            }
         }
     }
 }
