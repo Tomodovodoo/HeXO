@@ -391,3 +391,31 @@ position and its turn context, input and build hashes, caps, per-puzzle time,
 fresh nodes, verdict and independent-check time. It is rewritten after each
 completed puzzle. The same positions and labels can be reused for the later
 GPU-assisted solver; unknown results stay visible in the score.
+
+## Checking and stamp compilation
+
+The raw-coordinate checker and stamp compiler now scan each six-cell window
+from its first friendly stone. They reject blocked or too-empty windows before
+allocating gap lists, and keep the same completion sets and stamp footprints.
+Completion gaps are at most five steps from their anchor, so they need no
+separate radius-eight legality scan. Cancellation is checked at each anchor.
+The checker also avoids repeating the defender counterwin test before the
+defense enumerator performs it.
+
+On the same archive and CPU, including the full query cost:
+
+| Workload | After graph reuse | After checking changes | Verdicts |
+|---|---:|---:|---|
+| All 66 puzzles, 8,192 nodes | 18.36 s | 12.76 s | Same 43 wins |
+| All 66 puzzles, 131,072 nodes | 58.02 s | 52.44 s | Same 47 wins |
+| The 47 solved puzzles at 131,072 nodes | 18.43 s | 12.33 s | All retained |
+| Six recorded games, 546 queries | 16.69 s | 14.91 s | Same 213 wins |
+| Browser WASM, all 66 puzzles at 8,192 nodes | 28.67 s | 17.58 s | Same 43 wins |
+
+Compared with the original reference, the combined changes give a 1.84x
+speedup over the entire larger-budget archive and 2.85x over its solved
+positions. Fresh-node counts, proof bounds and the returned puzzle
+certificates are unchanged by the checking changes. The recorded-game replay
+also retains identical stamp hits and accounted library sizes. All benchmark
+wins pass the independent Python checker. These measurements include unresolved
+cases and use the same caps; no query reaches its deadline.
