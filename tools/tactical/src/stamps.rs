@@ -265,8 +265,10 @@ impl Stamp {
     }
     fn blocker(&self,get:StoneAt<'_>)->Option<Coord> {
         let winner=player(self.source.winner);
-        self.required.iter().find(|&&p|get(p)!=Some(winner))
-            .or_else(||self.empty.iter().find(|&&p|get(p).is_some())).copied()
+        // An occupied empty cell stays invalid throughout its descendants.
+        // Missing support can reappear often as search switches branches.
+        self.empty.iter().find(|&&p|get(p).is_some())
+            .or_else(||self.required.iter().find(|&&p|get(p)!=Some(winner))).copied()
     }
     fn safe(&self,get:StoneAt<'_>,stones:&[(Coord,Player)])->bool {
         let _time=measure("threat guards");
