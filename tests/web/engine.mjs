@@ -107,6 +107,45 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'archive') {
+  const original = [[0,0],[1,1],[2,1],[2,0],[0,3],[0,2],[1,2],[-1,2],[3,1],[-1,0],[0,-1]];
+  const current = [...original.slice(0,3), ...original.slice(7,9), ...original.slice(5,7)];
+  const returned = [...current, ...original.slice(3,5), ...original.slice(9,11)];
+  const graph = new GameGraph(native, {history: original, seed: 51, limit: 4, archiveBytes: 262144});
+  const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
+  const cache = new EvaluationCache(0);
+  try {
+    const first = await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    graph.at(current);
+    await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    await graph.search({simulations:4, rootSamples:4, batchSize:16, evaluate, cache});
+    graph.at(returned);const reused = graph.result();
+    const after = await graph.search({simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
+    answer = {first:first.visits, reused:reused.visits, after:after.visits, credits:graph.credits(), archive:graph.archive(), counters:graph.counters()};
+  } finally {graph.close();}
+  const second = original.map(c => [...c]), third = original.map(c => [...c]);
+  [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
+  [third[1],third[9]] = [third[9],third[1]];[third[2],third[10]] = [third[10],third[2]];
+  for (const leafProof of [false,true]) {
+   const bounded = new GameGraph(native, {history: original, seed: 7, limit: 1, archiveBytes: 65536});
+   try {
+    for (const history of [original,second,third]) {
+      bounded.at(history);await bounded.search({simulations:1,rootSamples:1,batchSize:1,evaluate,cache});
+    }
+    const target = leafProof ? original.map(c => [...c]) : third;
+    if (leafProof) [target[5],target[9]] = [target[9],target[5]];
+    bounded.at(target);const before = bounded.archive();
+    const winner = leafProof ? native.game(target).player : 1-native.game(target).player;
+    if (leafProof) {
+      native.checked(bounded.m._hxg_begin(bounded.ptr,1,1));
+      const [id,leaf] = bounded.request();
+      bounded.fulfillProof(id,leaf,{attacker:'mover',moves:leaf.actions.slice(0,2),proof_turns:2});
+    } else bounded.proveLoss(winner,7);
+    const after = bounded.archive();
+    bounded.at(original);
+    answer[leafProof ? 'leafProofGrowth' : 'proofGrowth'] = {before,after,winner,returnedWinner:bounded.m._hxg_exact(bounded.ptr)};
+   } finally {bounded.close();}
+  }
 } else if (job.kind === 'views') {
   const parent = new GameGraph(native, {history: job.history, seed: 3});
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));

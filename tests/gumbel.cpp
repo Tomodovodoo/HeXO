@@ -3,6 +3,62 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // A shared loss proof materializes every legal edge in dormant peer contexts.
+ // That growth must be trimmed at delivery, without losing the exact outcome.
+ for(bool leaf_proof:{false,true}){gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
+  std::vector<Cell> original{{0,0},{1,1},{2,1},{2,0},{0,3},{0,2},{1,2},{-1,2},{3,1},{-1,0},{0,-1}};
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  auto first=expand(original);auto second_history=original;
+  std::swap(second_history[5],second_history[9]);std::swap(second_history[6],second_history[10]);
+  auto second=expand(second_history);auto third_history=original;
+  std::swap(third_history[1],third_history[9]);std::swap(third_history[2],third_history[10]);
+  auto peer=expand(third_history);t.evict();
+  int request=0;
+  if(leaf_proof){third_history=original;std::swap(third_history[5],third_history[9]);
+   t.root_at(third_history);t.begin(1,1);request=t.request();assert(request>0);peer=t.root;}
+  assert(first->dormant && second->dormant);
+  auto& archive=*t.state->archive;auto discarded=archive.discarded;
+  int winner=leaf_proof?peer->player:1-peer->player;
+  if(leaf_proof){std::vector<int64_t> history;for(auto c:third_history){history.push_back(c.q);history.push_back(c.r);}
+   auto legal=t.requests.at(request).legal;int64_t moves[4]{legal[0].q,legal[0].r,legal[1].q,legal[1].r};
+   assert(hxg_prove(&t,request,history.data(),int(third_history.size()),peer->player,peer->remaining,moves,2,2));
+  }else assert(hxg_prove_loss(&t,winner,7));
+  assert(!archive.dirty && archive.total_bytes()<=archive.limit && archive.discarded>discarded);
+  int64_t counts[10];assert(hxg_archive_stats(&t,counts) && counts[1]<=counts[2]);
+  t.root_at(original);assert(t.root->exact_winner==winner);
+ }
+ // A long active history must not consume an empty dormant archive's byte
+ // allowance. Consecutive cells alternate colours in pairs and cannot win.
+ {gumbel::Archive archive(65536);std::shared_ptr<const gumbel::HistoryLink> history;
+  for(int i=0;i<4096;++i)history=std::make_shared<gumbel::HistoryLink>(history,Cell{i,0});
+  archive.set_focus(history);assert(archive.focus_stones()==4096 && archive.total_bytes()<=archive.limit);
+  archive.focus.reset();while(history){auto before=history->before;history.reset();history=std::move(before);}
+ }
+ // Dormant descendants survive a cut ancestor. Proofs propagate through
+ // retained links, and beginning a descendant comparison promotes/pins its
+ // lineage so another view cannot free a raw backup pointer.
+ {gumbel::Tree t(7);assert(hxg_share(&t,1));assert(hxg_archive(&t,65536));
+  auto expand=[&](std::vector<Cell> h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> z(legal.size());t.fulfill(id,cells.data(),z.data(),z.data(),int(legal.size()));return t.root;};
+  auto a=expand({{0,0}}),b=expand({{0,0},{1,0}}),c=expand({{0,0},{1,0},{2,0}});
+  t.root_at({{0,0}});assert(b->dormant && c->dormant);
+  {gumbel::Tree view(11,t.state);view.shared=view.graph=true;view.root_at({{0,0},{1,0},{2,0}});view.begin(4,2);
+   assert(!b->dormant && t.state->pinned(b.get()));t.evict();t.trim_archive();
+   assert(t.nodes.at(b->context).lock()==b && t.state->pinned(b.get()));
+  }
+  t.evict();assert(b->dormant && c->dormant);
+  c->exact_winner=1;c->distance=3;t.learn(*c);t.revise(*c);
+  assert(b->exact_winner==1 && a->exact_winner==1);
+  auto& archive=*t.state->archive;
+  auto cut=archive.remove(archive.contexts.at(b->context));t.discard(cut);cut.reset();b.reset();
+  assert(archive.contexts.contains(c->context));
+  t.root_at({{0,0},{1,0},{2,0}});assert(t.root==c && !c->dormant && c->exact_winner==1);
+  assert(c->edges.size()==t.board.legal_moves().size());
+  assert(archive.total_bytes()<=archive.limit);
+ }
  // Sparse selection maximizes the complete legal stable-softmax score. Cold
  // mass remains available after dominant priors are refuted, including weights
  // that underflowed at expansion. Pending children still contribute mass but

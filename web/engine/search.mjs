@@ -93,9 +93,11 @@ export class EvaluationCache {
  * the least Q range of the completed-Q rescale (0 keeps mctx's) and `rootNoise` the uniform share of the root's
  * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise. `limit`,
  * when given, makes the tree a shared game graph keeping at most that many expanded nodes (see GameGraph).
+ * `archiveBytes` optionally retains up to 256 dormant expansions under a payload/index allowance of at least 64 KiB;
+ * active nodes and allocator residency are separate.
  */
 export class NeuralSearch {
-  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null} = {}) {
+  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null, archiveBytes = 0} = {}) {
     this.n = native;
     this.m = native.m;
     this.ptr = this.m._hxg_new(BigInt(seed));
@@ -104,6 +106,7 @@ export class NeuralSearch {
     native.checked(this.m._hxg_tactics(this.ptr, tactics ? 1 : 0));
     native.checked(this.m._hxg_graph(this.ptr, graph ? 1 : 0));
     if (limit !== null) native.checked(this.m._hxg_share(this.ptr, BigInt(limit)));
+    if (archiveBytes) native.checked(this.m._hxg_archive(this.ptr, BigInt(archiveBytes)));
     native.checked(this.m._hxg_q_range_floor(this.ptr, qRangeFloor));
     native.checked(this.m._hxg_root_noise(this.ptr, rootNoise));
     for (const point of history) this.advance(point);
@@ -341,6 +344,16 @@ export class GameGraph extends NeuralSearch {
       this.m._hxg_view_counters(this.ptr, pointer);
       const values = Array.from(this.n.view(BigUint64Array, pointer, 6), Number);
       return Object.fromEntries(['issued', 'completed', 'cancelled', 'pending', 'retired', 'views'].map((name, i) => [name, values[i]]));
+    } finally { this.m._free(pointer); }
+  }
+  /** Dormant payload/index estimates; excludes allocator pools and process memory. */
+  archive() {
+    const pointer = this.n.alloc(80);
+    try {
+      if (!this.m._hxg_archive_stats(this.ptr, pointer)) return null;
+      const values = Array.from(this.n.view(BigInt64Array, pointer, 10), Number);
+      return Object.fromEntries(['nodes', 'bytes', 'limit', 'retained', 'reused', 'discarded', 'compatible',
+        'index_bytes', 'indexed_cells', 'focus_stones'].map((name, i) => [name, values[i]]));
     } finally { this.m._free(pointer); }
   }
   /** Direct completed comparison credits, excluding inherited visits, in result() action order. */

@@ -34,7 +34,7 @@ struct Owner {
   for(auto& u:source.board.history)focus.push_back(u.c);views.reserve(max_views);
   View root;root.tree=std::make_unique<Tree>(rng(),game);root.tree->shared=root.tree->graph=true;
   root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;
-  root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
+  game->primary=root.tree.get();root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
   start(views[0]);game->scheduler_owner=this;
  }
  ~Owner(){stop();if(game->scheduler_owner==this)game->scheduler_owner=nullptr;}
@@ -144,6 +144,7 @@ struct Owner {
   if(ready_limit)view_cursor=(first+visited)%views.size();
   bool active=false;for(auto& v:views)active|=v.active;
   if(!active)stop();
+  views[0].tree->trim_archive(false,false);
   step_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();return progress;
  }
  void stop(){
@@ -157,13 +158,14 @@ struct Owner {
    }
    hxgf_detach(feed,v.tree.get());v.tree->cancel();if(active){cancelled+=v.tree->cancelled;v.cancelled+=v.tree->cancelled;}v.active=false;
   }
+  views[0].tree->trim_archive(false,false);
  }
  int install(const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){
   std::vector<void*> failures(views.size());int stopped_count=hxgf_install(feed,ids,count,offsets,actions,logits,values,failures.data(),int(failures.size()));
   if(stopped_count<0)throw std::runtime_error(gumbel::error);if(stopped_count){stop();throw std::runtime_error("Inference failed for native owner view");}return 1;
  }
  int choice(int64_t* action){
-  auto& t=*views[0].tree;t.proof_root();auto& n=*t.root;if(!n.expanded)return 0;t.current(n);auto q=t.transformed(n);
+  auto& t=*views[0].tree;t.proof_root();auto& n=*t.root;if(!n.expanded)return 0;t.current(n);auto q=t.transformed(n);t.trim_archive(false,false);
   // Deeper same-position values may refresh the choice, but an incomplete new
   // comparison does not replace the last completed root sampling credits.
   const auto& epochs=last_root.empty()?t.root_edges:last_root;int maximum=0,seen=0;

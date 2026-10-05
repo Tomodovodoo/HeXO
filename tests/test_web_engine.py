@@ -1094,6 +1094,22 @@ class Bundle(unittest.TestCase):
         self.assertEqual(found['retired']['retired'], 1)
         self.assertEqual(found['proofValue'], -1.)
 
+    def test_dormant_evidence_reconnects_after_different_turn_order(self):
+        found = node(dict(kind='archive'))
+        self.assertEqual(found['reused'], found['first'])
+        self.assertEqual(sum(found['reused']), 128)
+        self.assertEqual(sum(found['after']), 136)
+        self.assertEqual(sum(found['credits']), 8)
+        self.assertEqual(found['counters']['pending'], 0)
+        self.assertGreater(found['archive']['reused'], 0)
+        self.assertGreater(found['archive']['discarded'], 0)
+        self.assertLessEqual(found['archive']['bytes'], found['archive']['limit'])
+        for growth in (found['proofGrowth'], found['leafProofGrowth']):
+            self.assertGreaterEqual(growth['before']['nodes'], 2)
+            self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])
+            self.assertLessEqual(growth['after']['bytes'], growth['after']['limit'])
+            self.assertEqual(growth['returnedWinner'], growth['winner'])
+
     def test_a_root_reads_and_resumes_its_deeper_branch(self):
         """A -> B -> A in the browser's GameGraph: after B is searched as a root and found lost for A's mover, A's
         statistics for B hold that, A stops preferring B, and A's next search continues its counts."""

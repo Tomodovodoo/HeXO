@@ -145,7 +145,7 @@ struct Loop {
   for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped)continue;
    for(auto it=f.tasks.begin();it!=f.tasks.end();){auto task=it->second;auto node=task->node.lock();
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
-    if(task->flight || !node)continue;
+    if(task->flight || !node || node->dormant)continue;
     f.scope(*task,stamps);
     if(task->closed==3 || task->ready>now)continue;
     bool pending=node->pending;if(auto peers=o.game->positions.find(task->key);peers!=o.game->positions.end())for(auto& weak:peers->second)if(auto peer=weak.lock())pending|=peer->pending;
@@ -227,7 +227,7 @@ struct Loop {
     if(job.move_count==2){Board second=view.board;second.make(first);publish(view,second,{player,player,distance-1,int(second.cells.size()),true,{{Cell{job.moves[2],job.moves[3]},player,distance-1,true}}});}
     publish(view,view.board,{player,player,distance,int(job.history.size()),true,{{first,player,distance,true}}});view.proof_root();
    }else if(!hxg_prove_loss(&view,1-player,4*int(job.info[2])+2))throw std::runtime_error(gumbel::error);
-   f.remember(job.history,*view.root);f.tasks.erase(task.key);++installed;
+   view.trim_archive();f.remember(job.history,*view.root);f.tasks.erase(task.key);++installed;
    if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
   }else{
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
