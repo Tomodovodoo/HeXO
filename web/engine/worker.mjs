@@ -19,6 +19,7 @@ let native, ort, network, cache, games, device, solver = null, solverCalls = 0;
 /** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
  * another turn advances, searches or evicts a game tree. */
 let gameTurn = Promise.resolve();
+let modelUse = Promise.resolve();
 const held = new Map();
 const cancelled = new Set(), solverWaits = new Map();
 
@@ -117,7 +118,8 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, nativeOwner = false}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, nativeOwner = false, nativeCapture = false}) {
+  if (nativeCapture && !nativeOwner) throw new Error('Native captures require the native graph owner');
   if (nativeOwner && leafBudget) throw new Error('Native browser owner has no leaf-proof dispatcher yet');
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
@@ -264,13 +266,13 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         if (nativeOwner) {
           const owner = new NativeOwner(tree, {work: timed ? 0 : simulations, ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
           try {
-            searchedResult = await owner.search({network, batchSize, choice, stop: () => cancelled.has(id), onBatch: stats => {
+            searchedResult = await owner.search({network, batchSize, choice, capture: nativeCapture, stop: () => cancelled.has(id), onBatch: stats => {
               if (line != null) touched = tree.id;
               postMessage({type: 'progress', id, fraction: timed ? Math.min(1, (performance.now() - start) / ms)
                 : Math.min(1, (stone + stats.completed / simulations) / state.remaining),
                 ...(stone ? {} : {live: rootRows(owner.root, choice)})});
             }});
-            scheduler.push(searchedResult.scheduler);
+            scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference, ...(nativeCapture ? {capture_pool: searchedResult.capture_pool} : {})});
           } finally { owner.close(); }
         } else searchedResult = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           ...(line == null ? {} : {pvCheck: PV_CHECK}),
@@ -347,19 +349,31 @@ async function bench({batches = [1, 16, 64], sizes = [24, 32], repeats = 10}) {
 /** Searches with the network whose manifest is `model` (relative to web/engine) from now on, reporting its download and
  * session to `stages`; the two most recently used stay loaded. */
 async function use(model, stages) {
-  if (held.has(model)) {
-    network = held.get(model);
-    held.delete(model);
+  const previous = modelUse; let release;
+  modelUse = new Promise(resolve => { release = resolve; });
+  await previous;
+  try {
+    if (held.has(model)) {
+      network = held.get(model);
+      if (network.closed) {
+        await network.close();
+        held.delete(model);
+      } else {
+        held.delete(model);
+        held.set(model, network);
+        return;
+      }
+    }
+    // Retire before admitting another model. A failed close retains its retry
+    // owner without allowing subsequent requests to grow the cache.
+    while (held.size >= 2) {
+      const [old, released] = held.entries().next().value;
+      await released.close();
+      held.delete(old);
+    }
+    network = await stages.run(() => Network.create({model, device, ort, stages}));
     held.set(model, network);
-    return;
-  }
-  network = await stages.run(() => Network.create({model, device, ort, stages}));
-  held.set(model, network);
-  while (held.size > 2) {
-    const [old, released] = held.entries().next().value;
-    held.delete(old);
-    await released.session.release();
-  }
+  } finally { release(); }
 }
 
 /** Probes the device, starts ONNX Runtime and the search, loads `options.model` and warms both up, reporting each
