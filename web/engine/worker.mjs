@@ -354,11 +354,12 @@ async function use(model, stages) {
   await previous;
   try {
     if (held.has(model)) {
-      network = held.get(model);
-      if (network.closed) {
-        await network.close();
+      const kept = held.get(model);
+      if (kept.closed) {
+        await kept.close();
         held.delete(model);
       } else {
+        network = kept;
         held.delete(model);
         held.set(model, network);
         return;

@@ -181,14 +181,17 @@ if (job.kind === 'encode') {
   const context={onmessage:null,Stages,errorReport,URL,performance,setTimeout,clearTimeout,postMessage:m=>messages.push(m),
     Network:{async create({model}){
       await new Promise(resolve=>setTimeout(resolve,1));created.push(model);live.add(model);largest=Math.max(largest,live.size);
-      return {closed:false,async close(){this.closed=true;attempts.push(model);if(model==='A'&&fail)throw Error('Persistent session release failure');live.delete(model);}};
+      return {closed:false,async time(){if(this.closed)throw Error('Closed active network');return model;},
+        async close(){this.closed=true;attempts.push(model);if(model==='A'&&fail)throw Error('Persistent session release failure');live.delete(model);}};
     }}};
   const source=readFileSync(workerUrl,'utf8').replace(/^import .*;\r?$/gm,'').replaceAll('import.meta.url',JSON.stringify(workerUrl.href));
   runInNewContext(source,context);
   let id=0;const use=model=>context.onmessage({data:{type:'use',id:++id,model}});
   try {
-    await use('A');await use('B');await Promise.all(['C','D','E'].map(use));
+    await use('A');await use('B');await Promise.all(['C','D','E'].map(use));await use('A');
+    const bench=++id;await context.onmessage({data:{type:'bench',id:bench,batches:[1],sizes:[24],repeats:1}});
     answer={blocked:{created:[...created],live:[...live],errors:messages.filter(m=>m.type==='error').map(m=>m.message)}};
+    answer.active_model=messages.find(m=>m.id===bench&&m.type==='result')?.result['24']['1'];
     fail=false;await Promise.all(['F','G','H'].map(use));
     answer.recovered={created:[...created],live:[...live],largest,attempts:[...attempts]};
   }finally{fail=false;await runInNewContext('Promise.all([...held.values()].map(n=>n.close()))',context);}
