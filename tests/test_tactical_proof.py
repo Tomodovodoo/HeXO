@@ -300,6 +300,58 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(result['status'], 'PROVEN_WIN', result['reason'])
         self.assertEqual(independent_verify(result['certificate'], other_colour), 'PROVEN_WIN')
 
+    def test_retained_stamp_reuses_remote_stones_without_recompiling(self):
+        with NativeTactics(independent=True) as native, NativeTactics(independent=True) as reference:
+            learned = native.history(LATE_WIN, stamps=True, library=[], nodes=20000, ms=5000, bounds=True)
+            self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
+            self.assertGreater(learned['stamp_timings']['compile verify'][0], 0)
+            q, r = max(LATE_WIN)
+            # Each stone is legal but at least eight cells from every earlier
+            # stone, so none can block the proof or create a counter-threat.
+            remote = [[q+8*(i+1), r] for i in range(8)]
+            for count in (2, 4, 8):
+                with self.subTest(stones=count):
+                    history = LATE_WIN + remote[:count]
+                    # Two placements change the mover. Query the original
+                    # attacker's next turn; four and eight preserve the phase.
+                    attacker = 'opponent' if count == 2 else 'mover'
+                    reused = native.history(history, attacker=attacker, stamps=True, library=[],
+                                            nodes=1, ms=5000, bounds=True)
+                    cold = reference.history(history, attacker=attacker, nodes=1, ms=5000)
+                    self.assertEqual(reused['status'], 'PROVEN_WIN', reused['reason'])
+                    self.assertEqual(cold['status'], 'UNKNOWN', cold)
+                    self.assertEqual(reused['nodes_fresh'], 1)
+                    self.assertEqual(reused['stamp_hits'], 1)
+                    self.assertEqual(reused['stamp_timings'].get('compile verify', [0])[0], 0)
+                    self.assertEqual(independent_verify(reused['certificate'], history, attacker=attacker), 'PROVEN_WIN')
+
+    def test_retained_stamp_closes_a_descendant_search_branch(self):
+        with NativeTactics(independent=True) as native, NativeTactics(independent=True) as reference:
+            found = reference.history(OPEN_THREE, nodes=20000, ms=5000)
+            self.assertEqual(found['status'], 'PROVEN_WIN', found['reason'])
+            certificate = copy.deepcopy(found['certificate'])
+            root = certificate['nodes'][certificate['root']]
+            reply = certificate['nodes'][root['child']]['responses'][0]
+            child = OPEN_THREE + root['action'] + reply['action']
+            certificate['root'] = reply['child']
+            learned = native.history(child, certificate=certificate, stamps=True, library=[], nodes=1, ms=5000)
+            self.assertEqual(learned['status'], 'PROVEN_WIN', learned['reason'])
+            # Only the child proof is retained. It needs stones missing at the
+            # parent, so this exercises a stamp reached during search.
+            self.assertTrue(set(map(tuple, learned['stamp_learned']['required'])) - set(map(tuple, OPEN_THREE)))
+            q, r = max(OPEN_THREE)
+            history = OPEN_THREE + [[q+8*(i+1), r] for i in range(4)]
+            warm = native.history(history, stamps=True, library=[], nodes=4096, ms=5000)
+            cold = reference.history(history, nodes=4096, ms=5000)
+            for result in (warm, cold):
+                self.assertEqual(result['status'], 'PROVEN_WIN', result['reason'])
+                cert = result['certificate']
+                self.assertEqual(cert['nodes'][cert['root']]['kind'], 'attacker_move')
+                self.assertEqual(independent_verify(cert, history), 'PROVEN_WIN')
+            self.assertGreater(warm['stamp_hits'], 0)
+            self.assertLess(warm['nodes_fresh'], cold['nodes_fresh'])
+            self.assertEqual(warm['proof_turns'], cold['proof_turns'])
+
     def test_imported_stamp_requires_a_complete_checked_strategy(self):
         learned = self.engine.history(OPEN_THREE, stamps=True, nodes=20000, ms=5000)
         warm = self.engine.history(OPEN_THREE, stamps=True, nodes=1, ms=3000)
