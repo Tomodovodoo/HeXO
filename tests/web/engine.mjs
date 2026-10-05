@@ -107,6 +107,23 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
+} else if (job.kind === 'rounds') {
+  const tree = new GameGraph(native, {history: [[0,0]], seed: 23, roundBarrier: true});
+  const predict = leaf => ({logits: leaf.actions.map(() => 0), q: leaf.actions.map(() => 0)});
+  const install = ([id, leaf]) => tree.fulfill(id, leaf.actions, predict(leaf));
+  try {
+    native.checked(native.m._hxg_begin(tree.ptr,128,8));install(tree.request());
+    const first = Array.from({length:8}, () => tree.request());
+    const blocked = tree.request()[0];install(first[0]);const extra = tree.request();
+    const lost = first[1][1].history.at(-1);
+    native.checked(native.m._hxg_mark_exact(tree.ptr, BigInt(lost[0]), BigInt(lost[1]),0,4));
+    const replacement = tree.request();install(first[1]);
+    native.m._hxg_cancel(tree.ptr);
+    const retired = tree.counters();
+    const result = await tree.search({simulations:32,rootSamples:8,batchSize:128,evaluate:async leaves => leaves.map(predict)});
+    answer = {blocked,extra:extra[0]>0,replacement:replacement[0]>0,retired,
+      completed:result.completed,mass:result.policy.reduce((a,b) => a+b,0),action:result.action};
+  } finally { tree.close(); }
 } else if (job.kind === 'archive') {
   const original = [[0,0],[1,1],[2,1],[2,0],[0,3],[0,2],[1,2],[-1,2],[3,1],[-1,0],[0,-1]];
   const current = [...original.slice(0,3), ...original.slice(7,9), ...original.slice(5,7)];

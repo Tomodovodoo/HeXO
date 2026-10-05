@@ -23,7 +23,7 @@ struct FeedDeleter {void operator()(void* p)const{if(p)hxgf_free(p);}};
 struct Owner {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;std::shared_ptr<gumbel::GameStore> game;std::vector<View> views;std::unordered_map<Key,Candidate,KeyHash> candidates;
  std::deque<Record> records;std::vector<gumbel::RootEdge> last_root;
- std::vector<uint64_t> direct_root_credits;
+ std::vector<uint64_t> direct_root_credits;std::vector<int> last_members;
  std::vector<Cell> focus;std::mt19937_64 rng;uint64_t next_id=1,ticks=0,allocations=0,reclaimed=0,completed=0,issued=0,cancelled=0,created=0,retired=0,step_ns=0,discover_ns=0;
  int quantum,max_views,max_depth,sample_limit=16;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
  bool stopped=false,deadline=false,root_raw_known=false;double exploration=.2,root_raw=0;
@@ -33,7 +33,7 @@ struct Owner {
   for(auto& [key,weak]:game->nodes)if(auto n=weak.lock())if(n->pending)throw std::runtime_error("Game has external pending neural work");
   for(auto& u:source.board.history)focus.push_back(u.c);views.reserve(max_views);
   View root;root.tree=std::make_unique<Tree>(rng(),game);root.tree->shared=root.tree->graph=true;
-  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;
+  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;root.tree->round_barrier=source.round_barrier;
   game->primary=root.tree.get();root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
   start(views[0]);game->scheduler_owner=this;
  }
@@ -69,7 +69,7 @@ struct Owner {
   if(!v.depth)save_credits(t);
   auto& c=candidates[v.key];c.history=v.history;c.depth=v.depth;c.relevance=std::max(c.relevance,v.relevance);c.completed+=credits;c.last=allocations;c.seen=allocations;
   record(v,credits);
-  if(v.depth==0 && t.completed)last_root=t.root_edges;
+  if(v.depth==0 && t.completed){last_root=t.root_edges;last_members=t.round.members;}
   discover(v);
  }
  void discover(View& v){
@@ -118,7 +118,7 @@ struct Owner {
   auto history=c->history;double relevance=c->relevance;int depth=c->depth;c->last=allocations;
   if(slot<views.size()){hxgf_detach(feed,views[slot].tree.get());views[slot].tree->cancel();++retired;}
   View v;v.tree=std::make_unique<Tree>(rng(),game);v.tree->shared=v.tree->graph=true;
-  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;
+  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->round_barrier=views[0].tree->round_barrier;
   v.tree->root_at(history);v.history=std::move(history);v.key=key;v.depth=depth;v.relevance=relevance;v.id=next_id++;++created;
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
   return start(views[slot]);
@@ -157,7 +157,7 @@ struct Owner {
     auto& t=*v.tree;if(t.root->expanded)t.renew(*t.root);completed+=t.completed;issued+=t.issued;v.completed+=t.completed;v.issued+=t.issued;
     if(!v.depth)save_credits(t);
     // The last install may complete a lease before step() calls finish().
-    if(t.done()){++v.passes;if(!v.depth && t.completed)last_root=t.root_edges;}
+    if(t.done()){++v.passes;if(!v.depth && t.completed){last_root=t.root_edges;last_members=t.round.members;}}
     record(v,t.completed);
    }
    hxgf_detach(feed,v.tree.get());v.tree->cancel();if(active){cancelled+=v.tree->cancelled;v.cancelled+=v.tree->cancelled;}v.active=false;
@@ -174,9 +174,12 @@ struct Owner {
   // comparison does not replace the last completed root sampling credits.
   const auto& epochs=last_root.empty()?t.root_edges:last_root;int maximum=0,seen=0;
   for(size_t i=0;i<n.edges.size() && i<epochs.size();++i){seen=std::max(seen,epochs[i].epoch);if(n.edges[i].read().eligible)maximum=std::max(maximum,epochs[i].epoch);}
+  const auto& members=last_root.empty()?t.round.members:last_members;
+  bool round_survivor=t.round_barrier && std::any_of(members.begin(),members.end(),[&](int i){return i>=0 && n.edges[i].read().eligible;});
   double best=-1e300;int selected=-1;
   for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];if(!e.read().eligible)continue;
-   if(n.exact_winner<0 && seen && (i>=epochs.size() || epochs[i].epoch!=maximum))continue;
+   bool finalist=round_survivor?std::find(members.begin(),members.end(),int(i))!=members.end():i<epochs.size() && epochs[i].epoch==maximum;
+    if(n.exact_winner<0 && seen && !finalist)continue;
    double score=e.logit+q[i]+t.bonus(e);if(seen && i<epochs.size())score+=epochs[i].gumbel;
    if(score>best){best=score;selected=int(i);}
   }if(selected<0)return 0;action[0]=n.edges[selected].action.q;action[1]=n.edges[selected].action.r;return 1;
@@ -290,7 +293,7 @@ struct Pool {
   // already own their encoding snapshot; cancelled subscribers never install late.
   root.tree->root_at(history);root.history=history;root.key=gumbel::keys(history).second;
   root.completed=root.issued=root.cancelled=0;root.passes=0;root.active=root.discovered=false;
-  o.focus=std::move(history);o.candidates.clear();o.last_root.clear();o.direct_root_credits.clear();
+  o.focus=std::move(history);o.candidates.clear();o.last_root.clear();o.last_members.clear();o.direct_root_credits.clear();
   o.root_raw_known=false;o.root_raw=0;
   o.completed=o.issued=o.cancelled=o.ticks=o.allocations=o.reclaimed=o.retired=o.step_ns=o.discover_ns=0;o.created=1;o.view_cursor=0;
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;

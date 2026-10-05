@@ -15,6 +15,45 @@ int main(){
    auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);
   }
  }
+ // Round sampling remains explicit while useful work crosses visit layers.
+ for(bool shared:{false,true}){gumbel::Tree t(23);if(shared)assert(hxg_share(&t,256));t.advance({0,0});t.begin(128,8);
+  auto install=[&](int id){auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}
+   std::vector<double> zeros(legal.size());t.fulfill(id,cells.data(),zeros.data(),zeros.data(),int(legal.size()));};
+  install(t.request());assert(hxg_round_barrier(&t,1));std::vector<int> first;for(int i=0;i<8;++i){int id=t.request();assert(id>0);first.push_back(id);}
+  assert(t.request()==0 && t.round.active==0 && t.started==8 && t.completed==0);
+  install(first[0]);int next=t.request();assert(next>0 && t.round.active==0 && t.started==9 && t.completed==1);
+  // An in-flight refutation may replace its slot, but it never transfers credit.
+  int old=t.requests.at(first[1]).edges.front().second;uint64_t credits=t.root_edges[old].credits;
+  t.mark(t.root->edges[old].action,1-t.root->player,4);
+  int replacement=t.request();assert(replacement>0 && t.round.active==0);
+  assert(std::find(t.round.members.begin(),t.round.members.end(),old)==t.round.members.end());
+  assert(t.root_edges[old].credits==credits);
+  install(first[1]);assert(t.root_edges[old].credits==credits+1);
+  assert(!t.root->edges[old].read().child->expanded);
+  // Cancelling old and replacement reservations releases exactly their slots.
+  t.cancel();assert(t.started==t.completed && t.requests.empty());
+  for(int c:t.round.counts)assert(c>=0);
+  int loops=0;while(!t.done()){
+   assert(++loops<256);std::vector<int> pending;
+   for(int i=0;i<128;++i){int before=t.round.active;size_t outstanding=t.requests.size();int id=t.request();if(id>0)pending.push_back(id);else if(id==0)break;
+    if(t.round.active!=before)assert(outstanding==0);}
+   assert(!pending.empty() || t.done());for(auto i=pending.rbegin();i!=pending.rend();++i)install(*i);
+   for(size_t i=0;i<t.round.counts.size();++i)assert(t.round.counts[i]>=0 && t.round.counts[i]<=t.round.limits[i]);
+  }
+  uint64_t completed=0;for(auto& e:t.root_edges)completed+=e.credits;assert(completed==128 && t.completed==128 && t.started==128);
+  assert(t.requests.empty());for(auto& e:t.root->edges)assert(e.read().pending==0);
+  std::vector<double> scores(t.root->edges.size()),values(scores.size());std::vector<int> visits(scores.size());std::vector<int64_t> actions(2*scores.size());
+  hxg_stats(&t,actions.data(),visits.data(),values.data(),scores.data());
+  for(size_t i=0;i<scores.size();++i)if(std::isfinite(scores[i]))assert(t.root->edges[i].read().eligible && std::find(t.round.members.begin(),t.round.members.end(),int(i))!=t.round.members.end());
+ }
+ // Changing sampling contracts invalidates old comparison sessions, not graph evidence.
+ {gumbel::Tree t(23);assert(hxg_share(&t,96));t.root_at({{0,0}});t.begin(16,4);
+  int id=t.request();auto legal=t.requests.at(id).legal;std::vector<int64_t> cells;for(auto c:legal){cells.push_back(c.q);cells.push_back(c.r);}std::vector<double> zeros(legal.size());
+  t.fulfill(id,cells.data(),zeros.data(),zeros.data(),int(legal.size()));int pending=t.request();assert(pending>0);t.cancel();auto original=t.root;
+  t.root_at({{0,0},{2,0}});assert(hxg_round_barrier(&t,1));t.root_at({{0,0}});
+  assert(t.root==original && t.root->expanded && t.budget==0 && t.started==0);
+  t.begin(16,4);assert(t.request()>0);t.cancel();
+ }
  // Existing own-turn completions settle before any neural request. Both stones
  // stay legal, the full action list remains present, and no reservation survives.
  for(bool shared:{false,true}){gumbel::Tree t(7);if(shared)assert(hxg_share(&t,16));t.tactics=true;
