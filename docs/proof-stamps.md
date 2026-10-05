@@ -332,3 +332,90 @@ The boundary construction follows the purpose of
 [relevance-zone proof search](https://scholar.nycu.edu.tw/en/publications/relevance-zone-oriented-proof-search-for-connect6/),
 with HeXO's actual one/two-placement phase, legal frontier, and independently
 checked strategy as the obligations. Neither source supplies our verdicts.
+
+## Puzzle archive benchmark
+
+The proof search now shares turn-context nodes inside each bounded level-2
+search. Changes propagate to every parent. Expanded estimates and proved
+subpositions survive in the existing bounded table even when the seed root
+remains unresolved. Positive entries retain their reconstruction witnesses.
+Consecutive searches leave their shared board prefix in place, and table hits
+use the child hash without applying and undoing its stones. Stamp lookup runs
+when a candidate is expanded and before discarding a forcing dead end.
+
+The October 5 archive has 66 HTTTX entries, representing 64 distinct boards.
+Each expects a win for the actual mover, including one-stone turn contexts
+when supplied. This expectation is a benchmark label, never a proof premise.
+The archive SHA-256 is
+`49e6823458f15797184ac8fe6f2d05d20cd2498f48e956451a9999556d8c5e2c`.
+
+Against main `caa20c8`, on a Ryzen 9 5900X at BelowNormal priority with two CPU
+threads allowed and no GPU, the native results were:
+
+| Workload | Before | After | Verified wins |
+|---|---:|---:|---:|
+| All 66 puzzles, 8,192 nodes each | 19.38 s / 219,913 nodes | 18.15 s / 185,074 nodes | 37 → 43 |
+| All 66 puzzles, 131,072 nodes each | 96.25 s / 1,578,571 nodes | 58.02 s / 1,263,228 nodes | 47 → 47 |
+| The 47 solved puzzles at the larger budget | 35.13 s / 388,860 nodes | 18.43 s / 170,126 nodes | All 47 retained |
+| Six recorded games, 546 queries at 8,192 nodes | 22.39 s / 329,076 nodes | 16.69 s / 265,044 nodes | 210 → 213 |
+| Browser WASM, all 66 puzzles at 8,192 nodes | 28.31 s / 219,913 nodes | 28.67 s / 185,074 nodes | 37 → 43 |
+
+Each puzzle starts with a fresh worker and stamps enabled. The safety caps are
+5 seconds for the small budget and 15 seconds for the larger one; none fired.
+Times include native checking, stamp compilation and response decoding. Every
+positive result also passed the independent Python checker outside the timed
+query. These are solver measurements, not new games/hour measurements.
+The six-game replay keeps one worker through the recorded positions from shard
+`1791050712484684`, episodes 0–5, as in the earlier comparisons. It retains every
+previous win and the same 97 stamp hits.
+The browser row uses the player's WASM library through Node, with the same
+cold-worker policy and a 15-second safety cap. Its total time is slightly higher
+while producing six additional checked proofs. Its per-puzzle verdicts and
+fresh node counts agree with native; it is not a measurement of page rendering.
+
+The unresolved puzzles remain in both totals. Eight still exhaust 524,288
+nodes in a follow-up probe; the others stop without a complete forcing proof.
+These results do not establish that the selective forcing model can solve the
+entire archive. There are no puzzle-specific search rules or larger default
+budgets in this change.
+
+Run the archive with the existing benchmark tool:
+
+```powershell
+$env:PYTHONPATH = 'python;.'
+python tools/proof_stamps.py --puzzles "$env:USERPROFILE/Downloads/puzzles-HeXO.txt" --benchmark artifacts/puzzles.json --nodes 131072 --ms 15000
+```
+
+Use `--no-stamps` for the reference stamp mode. The JSON output preserves every
+position and its turn context, input and build hashes, caps, per-puzzle time,
+fresh nodes, verdict and independent-check time. It is rewritten after each
+completed puzzle. The same positions and labels can be reused for the later
+GPU-assisted solver; unknown results stay visible in the score.
+
+## Checking and stamp compilation
+
+The raw-coordinate checker and stamp compiler now scan each six-cell window
+from its first friendly stone. They reject blocked or too-empty windows before
+allocating gap lists, and keep the same completion sets and stamp footprints.
+Completion gaps are at most five steps from their anchor, so they need no
+separate radius-eight legality scan. Cancellation is checked at each anchor.
+The checker also avoids repeating the defender counterwin test before the
+defense enumerator performs it.
+
+On the same archive and CPU, including the full query cost:
+
+| Workload | After graph reuse | After checking changes | Verdicts |
+|---|---:|---:|---|
+| All 66 puzzles, 8,192 nodes | 18.36 s | 12.76 s | Same 43 wins |
+| All 66 puzzles, 131,072 nodes | 58.02 s | 52.44 s | Same 47 wins |
+| The 47 solved puzzles at 131,072 nodes | 18.43 s | 12.33 s | All retained |
+| Six recorded games, 546 queries | 16.69 s | 14.91 s | Same 213 wins |
+| Browser WASM, all 66 puzzles at 8,192 nodes | 28.67 s | 17.58 s | Same 43 wins |
+
+Compared with the original reference, the combined changes give a 1.84x
+speedup over the entire larger-budget archive and 2.85x over its solved
+positions. Fresh-node counts, proof bounds and the returned puzzle
+certificates are unchanged by the checking changes. The recorded-game replay
+also retains identical stamp hits and accounted library sizes. All benchmark
+wins pass the independent Python checker. These measurements include unresolved
+cases and use the same caps; no query reaches its deadline.

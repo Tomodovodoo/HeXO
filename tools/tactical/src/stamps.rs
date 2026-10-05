@@ -208,11 +208,21 @@ impl Stamp {
             ProofNode::DefenderReplies{..}|ProofNode::Unstoppable{..}=>{
                 if mover==winner {return Err("stamp defender phase".into());}
                 let mut threats:BTreeMap<Vec<Coord>,Window>=BTreeMap::new();
-                for (&p,&s) in b {if s==winner {for w in windows(p) {
-                    let points=cells(w);
-                    if points.iter().any(|p|b.get(p)==Some(&(1-winner))) {continue;}
-                    let mut empty:Vec<_>=points.into_iter().filter(|p|!b.contains_key(p)).collect();empty.sort();
-                    if !empty.is_empty() && empty.len()<=2 {threats.entry(empty).or_insert(w);}
+                for (&p,&s) in b {if s==winner {
+                    control(ctl)?;
+                    'window: for w in windows(p) {
+                    let mut gaps=[(0,0);2];let mut count=0;
+                    for at in cells(w) {match b.get(&at) {
+                        // Keep the same first window for each gap set as the
+                        // ordered scan, without rescanning its later anchors.
+                        Some(&s) if s!=winner || at<p=>continue 'window,
+                        Some(_)=>{},
+                        None=>{
+                            if count==2 {continue 'window;}
+                            gaps[count]=at;count+=1;
+                        },
+                    }}
+                    if count>0 {let mut empty=gaps[..count].to_vec();empty.sort();threats.entry(empty).or_insert(w);}
                 }}}
                 let sets=threats.keys().cloned().collect();
                 if check::covers(&sets,ctl)?.iter().any(|c|c.len()<remaining as usize) {

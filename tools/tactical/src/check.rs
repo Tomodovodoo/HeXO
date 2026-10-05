@@ -51,22 +51,29 @@ fn check(ctl: &Ctl) -> Result<(),String> {
     else if ctl.expired() {Err("verification deadline".into())} else {Ok(())}
 }
 pub(crate) fn completions(b:&Board, side:u8, allowance:u8, ctl:&Ctl) -> Result<BTreeSet<Vec<Point>>,String> {
-    let mut segments=BTreeSet::new();
+    let mut out=BTreeSet::new();
     for (&(q,r),&owner) in b {
         check(ctl)?;
         if owner!=side {continue;}
-        for (dq,dr) in AXES {for offset in 0..6 {segments.insert((q-offset*dq,r-offset*dr,dq,dr));}}
-    }
-    let mut out=BTreeSet::new();
-    for (q,r,dq,dr) in segments {
-        check(ctl)?;
-        let points:Vec<_>=(0..6).map(|k|(q+k*dq,r+k*dr)).collect();
-        if points.iter().any(|p| b.get(p)==Some(&(1-side))) {continue;}
-        let mut empty:Vec<_>=points.into_iter().filter(|p|!b.contains_key(p)).collect();
-        // Every completion gap is within five of an existing same-color stone.
-        if !empty.is_empty() && empty.len()<=allowance as usize && empty.iter().all(|&p|legal(b,p)) {
-            empty.sort();out.insert(empty);
-        }
+        for (dq,dr) in AXES {'window: for offset in 0..6 {
+            let mut gaps=[(0,0);6];let mut count=0;
+            for k in 0..6 {
+                let p=(q+(k-offset)*dq,r+(k-offset)*dr);
+                match b.get(&p) {
+                    // The first friendly stone on this axis owns the window.
+                    // Other anchors would only repeat the same six cells.
+                    Some(&s) if s!=side || k<offset=>continue 'window,
+                    Some(_)=>{},
+                    None=>{
+                        if count>=allowance as usize {continue 'window;}
+                        gaps[count]=p;count+=1;
+                    },
+                }
+            }
+            // Each gap is empty and at most five hex steps from the anchor,
+            // hence legal under the radius-eight rule without a frontier scan.
+            if count>0 {let mut empty=gaps[..count].to_vec();empty.sort();out.insert(empty);}
+        }}
     }
     Ok(out)
 }
@@ -225,7 +232,6 @@ pub(crate) fn verify_board(board:&Board, start:usize, attacker:u8, cert:&ProofCe
                 }
                 ProofNode::DefenderReplies{responses} => {
                     if side==self.attacker {return Err("defender phase mismatch".into());}
-                    if !completions(b,side,remaining,self.ctl)?.is_empty() {return Err("defender counterwin".into());}
                     let required=defenses_at(b,self.attacker,remaining,self.ctl)?;
                     if required.is_empty() {return Err("defenses supplied for unstoppable position".into());}
                     if responses.len()!=required.len() {return Err("missing defense branch including free-second coverage".into());}
@@ -266,6 +272,50 @@ pub(crate) fn verify_board(board:&Board, start:usize, attacker:u8, cert:&ProofCe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completions_match_exhaustive_windows() {
+        fn exhaustive(b:&Board, side:u8, allowance:u8) -> BTreeSet<Vec<Point>> {
+            let mut segments=BTreeSet::new();
+            for &(q,r) in b.keys() {
+                for (dq,dr) in AXES {for k in 0..6 {segments.insert((q-k*dq,r-k*dr,dq,dr));}}
+            }
+            let mut result=BTreeSet::new();
+            for (q,r,dq,dr) in segments {
+                let cells:Vec<_>=(0..6).map(|k|(q+k*dq,r+k*dr)).collect();
+                if !cells.iter().any(|p|b.get(p)==Some(&side)) || cells.iter().any(|p|b.get(p)==Some(&(1-side))) {continue;}
+                let mut empty:Vec<_>=cells.into_iter().filter(|p|!b.contains_key(p)).collect();
+                if !empty.is_empty() && empty.len()<=allowance as usize && empty.iter().all(|&p|legal(b,p)) {
+                    empty.sort();result.insert(empty);
+                }
+            }
+            result
+        }
+        let ctl=Ctl::new(0.0);
+        let compare=|b:&Board| {
+            for side in 0..2 {for allowance in 0..=2 {
+                assert_eq!(completions(b,side,allowance,&ctl).unwrap(),exhaustive(b,side,allowance),
+                    "side={side} allowance={allowance} board={b:?}");
+            }}
+        };
+        for (dq,dr) in AXES {for pattern in 0..729 {
+            let mut code=pattern;let mut b=Board::new();
+            for k in 0..6 {
+                let state=code%3;code/=3;
+                if state!=0 {b.insert((-9+k*dq,7+k*dr),state as u8-1);}
+            }
+            compare(&b);
+        }}
+        let mut rng=42_u64;
+        for sample in 0..64 {
+            let mut b=Board::new();
+            for q in -4..=4 {for r in -4..=4 {
+                rng=rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let state=(rng>>32)%3;
+                if state!=0 {b.insert((q-1000*sample,r+997*sample),state as u8-1);}
+            }}
+            compare(&b);
+        }
+    }
     #[test]
     fn free_filler_frontier_expands_after_mandatory_block() {
         for sign in [-1,1] {
