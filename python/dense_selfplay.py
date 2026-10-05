@@ -713,6 +713,9 @@ class SelfPlayGame:
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
                                         settings.q_range_floor, settings.game_graph)
                       for k, model in enumerate(dict.fromkeys(sides))}
+        if settings.native_round_barrier:
+            for tree in self.trees.values():
+                checked(native.hxg_round_barrier(tree.ptr, 1))
         self.check = None
         self.game, self.moves, self.rows = Game(forced), forced, []
         self.values, self.full = [None]*len(forced), [False]*len(forced)

@@ -32,6 +32,7 @@ class ActorSettings:
     native_feed: bool = False    # compiled selection, context cache and batch installation
     native_packing: bool = False # native crop packing/output decoding; requires native_feed
     native_scheduler: bool = False # persistent native owners, one model-keyed inference queue
+    native_round_barrier: bool = False # explicit root sets, drain only before halving
     native_producers: int = 4
     native_quantum: int = 32
     native_views: int = 8
@@ -119,6 +120,8 @@ class ActorSettings:
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
+        if self.native_round_barrier and not self.native_scheduler:
+            raise ValueError('native_round_barrier requires native_scheduler')
         if not 1 <= self.native_producers <= 16 or not 4 <= self.native_quantum <= 128 or not 1 <= self.native_views <= 64 or not 1 <= self.native_depth <= 32:
             raise ValueError('Invalid native scheduler worker, quantum, view or depth setting')
         if not 0 <= self.native_proof_workers <= 16 or not 0 < self.native_proof_slice_ms <= 1000:

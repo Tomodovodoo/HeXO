@@ -98,7 +98,7 @@ export class EvaluationCache {
  * the primary played board at safe owner points; leave it false to retain analysis for undo.
  */
 export class NeuralSearch {
-  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null, archiveBytes = 0, archiveForward = false} = {}) {
+  constructor(native, {seed = 1740, tactics = false, graph = false, qRangeFloor = 0, rootNoise = 0, history = [], limit = null, archiveBytes = 0, archiveForward = false, roundBarrier = false} = {}) {
     this.n = native;
     this.m = native.m;
     this.ptr = this.m._hxg_new(BigInt(seed));
@@ -111,6 +111,7 @@ export class NeuralSearch {
     if (archiveForward) native.checked(this.m._hxg_archive_forward(this.ptr, 1));
     native.checked(this.m._hxg_q_range_floor(this.ptr, qRangeFloor));
     native.checked(this.m._hxg_root_noise(this.ptr, rootNoise));
+    native.checked(this.m._hxg_round_barrier(this.ptr, roundBarrier ? 1 : 0));
     for (const point of history) this.advance(point);
   }
   close() {

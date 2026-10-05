@@ -3,6 +3,7 @@ from collections import deque
 import numpy as np
 from native_scheduler import SearchPool, InferenceService
 from dense_selfplay import record_network_values
+from neural_search import checked, native
 
 
 def label_prefixes(game, prefixes):
@@ -148,6 +149,8 @@ class NativeGames:
         for index,game in enumerate(self.games):
             s = game.settings
             source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
+            if s.native_round_barrier:
+                checked(native.hxg_round_barrier(source.ptr, 1))
             placeholders[index] = source
             sources.append(source)
         workers = self.allocate(model.sha).get(model.sha,1) if self.service else self.options['workers']

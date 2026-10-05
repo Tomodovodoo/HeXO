@@ -1365,6 +1365,25 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class NativeScheduler(unittest.TestCase):
+    def test_round_choice_survives_refuted_finalists_and_new_root_lease(self):
+        graph = GameGraph(Uniform(), 'scheduler', [(0,0)], limit=96, round_barrier=True)
+        self.addCleanup(graph.close)
+        pool = self.pool([graph], quantum=128, views=1, work=128, cache=0)
+        self.finish(pool)
+        game = pool.games[0]
+        root = native.hxgo_root(game.ptr)
+        from neural_search import checked
+        checked(native.hxg_begin(root,32,8))
+        # The completed comparison remains usable while a new one has no credits.
+        chosen = []
+        for _ in range(5):
+            action = game.choice()
+            self.assertIsNotNone(action)
+            self.assertNotIn(action,chosen)
+            chosen.append(action)
+            checked(native.hxg_mark_exact(root,*action,0,4))  # P2-to-play continuation refuted.
+        self.assertEqual(int(game.evidence()['lifetime_credits'].sum()),128)
+
     def test_scheduled_primary_owns_archive_focus_after_source_closes(self):
         history = [(0,0),(1,1),(2,1)]
         graph = GameGraph(Uniform(), 'scheduler', history, limit=4, archive_bytes=65536, archive_forward=True)

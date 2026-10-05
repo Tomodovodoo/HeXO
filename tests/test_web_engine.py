@@ -1103,6 +1103,16 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['fresh'][0], 0)
         self.assertEqual(answer['lines'], ['b', 'c', 'd'])
 
+    def test_round_admission_proof_retirement_and_normalized_policy(self):
+        found = node(dict(kind='rounds'))
+        self.assertEqual(found['blocked'],0)
+        self.assertTrue(found['extra'])
+        self.assertTrue(found['replacement'])
+        self.assertEqual(found['retired']['pending'],0)
+        self.assertEqual(found['completed'],32)
+        self.assertAlmostEqual(found['mass'],1.)
+        self.assertEqual(len(found['action']),2)
+
     def test_independent_views_share_proofs_and_keep_sampling_credits(self):
         from tests.test_neural_search import recorded_position
         found = node(dict(kind='views', history=recorded_position(11)))

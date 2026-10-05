@@ -50,7 +50,7 @@ ORT_FILES = ('ort.webgpu.min.mjs', 'ort-wasm-simd-threaded.asyncify.mjs', 'ort-w
              'ort.wasm.min.mjs', 'ort-wasm-simd-threaded.mjs', 'ort-wasm-simd-threaded.wasm')
 GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_begin', 'hxg_next', 'hxg_history',
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_completed',
-                  'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_q_range_floor', 'hxg_root_noise', 'hxg_exact',
+                  'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_q_range_floor', 'hxg_root_noise', 'hxg_round_barrier', 'hxg_exact',
                   'hxg_distance', 'hxg_census', 'hxg_mark_exact', 'hxg_prove', 'hxg_share', 'hxg_archive', 'hxg_archive_forward', 'hxg_archive_stats', 'hxg_root_at', 'hxg_store', 'hxg_q',
                   'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')

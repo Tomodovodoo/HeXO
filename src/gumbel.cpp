@@ -198,7 +198,7 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
 void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
-struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
+struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
 struct Summary { int n=0;double q=0,value=0;Key position; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
@@ -311,10 +311,13 @@ struct GameStore {
  }
 };
 struct RootEdge { double gumbel=0,opening_q=0;int epoch=0;uint64_t credits=0; };
+struct RootRound {
+ std::vector<int> widths,ends,members,counts,limits;std::vector<double> opening;int active=-1;
+};
 struct RootSession {
  std::vector<RootEdge> edges;bool prepared=false,hold=false;
  int budget=0,started=0,completed=0,samples=0,last=0;uint64_t issued=0,cancelled=0;
- std::vector<int> sequence;std::vector<Cell> priority;std::map<Cell,double> defence;
+ std::vector<int> sequence;std::vector<Cell> priority;std::map<Cell,double> defence;RootRound round;
 };
 struct Tree {
  Board board;std::shared_ptr<Node> root;std::map<int,Path> requests;
@@ -341,7 +344,8 @@ struct Tree {
  std::vector<Cell> priority;
  std::map<Cell,double> defence;
  double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
- double root_noise=0;   // uniform share of the root's candidate sampling distribution (sampling)
+  bool round_barrier=false;RootRound round;
+  double root_noise=0;   // uniform share of the root's candidate sampling distribution (sampling)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  std::vector<double> work;
  explicit Tree(uint64_t seed,std::shared_ptr<GameStore> game=std::make_shared<GameStore>()):
@@ -353,14 +357,14 @@ struct Tree {
  void pin(){if(!shared)return;reactivate(root);auto& list=state->pins[this];list.clear();list.push_back(root.get());
   for(auto [node,index]:lineage){reactivate(node->shared_from_this());list.push_back(node);}
  }
- void save_root(){if(shared && root_prepared)root_sessions[keys(board).second]={root_edges,true,hold,budget,started,completed,samples,last,issued,cancelled,sequence,priority,defence};}
+  void save_root(){if(shared && root_prepared)root_sessions[keys(board).second]={root_edges,true,hold,budget,started,completed,samples,last,issued,cancelled,sequence,priority,defence,round};}
  void restore_root(){
   root_edges.clear();root_prepared=false;hold=false;budget=started=completed=samples=last=0;issued=cancelled=0;
-  sequence.clear();priority.clear();defence.clear();
+   sequence.clear();priority.clear();defence.clear();round={};
   if(auto old=root_sessions.find(keys(board).second);old!=root_sessions.end() && root->expanded && old->second.edges.size()==root->edges.size()){
    auto& r=old->second;root_edges=r.edges;root_prepared=r.prepared;hold=r.hold;
    budget=r.budget;started=r.started;completed=r.completed;samples=r.samples;last=r.last;issued=r.issued;cancelled=r.cancelled;
-   sequence=r.sequence;priority=r.priority;defence=r.defence;
+    sequence=r.sequence;priority=r.priority;defence=r.defence;round=r.round;
   }
   if(shared && completed<budget){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);lineage=this->prefixes(history);}
  }
@@ -778,12 +782,63 @@ struct Tree {
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
  // budget when the schedule never halves.
  void schedule(int count) {
-  sequence.clear();last=budget;int m=std::min({std::max(samples,int(defence.size())),budget,count});if(!m)return;
+   sequence.clear();round={};last=budget;int m=std::min({std::max(samples,int(defence.size())),budget,count});if(!m)return;
   std::vector<int> v(m);int considered=m,previous=-1,halving=0,rounds=std::max(1,int(std::ceil(std::log2(m))));
-  while(int(sequence.size())<budget){if(considered!=previous){halving=int(sequence.size());previous=considered;}int extra=std::max(1,budget/(rounds*considered));for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}considered=m==1?1:std::max(2,considered/2);}
+   while(int(sequence.size())<budget){
+    if(considered!=previous){halving=int(sequence.size());previous=considered;if(round_barrier){round.widths.push_back(considered);round.ends.push_back(halving);}}
+    int extra=std::max(1,budget/(rounds*considered));
+    for(int k=0;k<extra && int(sequence.size())<budget;++k)for(int i=0;i<considered;++i){
+     sequence.push_back(v[i]++);if(int(sequence.size())==budget)break;}
+    if(round_barrier)round.ends.back()=int(sequence.size());considered=m==1?1:std::max(2,considered/2);
+   }
   if(halving)last=halving;
- }
- // Leaf data classify needs, taken while the tree's board stands at the leaf.
+  }
+  // A round owns a fixed sampled set. Its reservations can advance while earlier
+  // leaves are in flight; the halving decision waits for completed evidence.
+  int select_round(Node& node,const SelectionQ& q,const std::vector<int>& blocked){
+   const int phase=int(std::upper_bound(round.ends.begin(),round.ends.end(),started)-round.ends.begin()),width=round.widths[phase];
+   if(phase==0 && round.opening.empty())round.opening=sampling(node);
+   auto score=[&](int i){auto& e=node.edges[i];bool first=phase==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();
+    return root_edges[i].gumbel+(phase?e.logit:round.opening[i])+(phase?q[i]:root_edges[i].opening_q)+(first?1e6:0)+bonus(e);};
+   auto better=[&](int a,int b){bool da=phase==0 && defence.contains(node.edges[a].action),db=phase==0 && defence.contains(node.edges[b].action);
+    if(da!=db)return da;double x=score(a),y=score(b);return x!=y?x>y:a<b;};
+   if(round.active!=phase){
+    if(!requests.empty())return -1;
+    std::vector<int> rank;
+    if(round.active<0){for(int i=0;i<int(node.edges.size());++i)if(node.edges[i].read().eligible)rank.push_back(i);}
+    else for(int i:round.members)if(i>=0 && node.edges[i].read().eligible)rank.push_back(i);
+    std::stable_sort(rank.begin(),rank.end(),better);if(rank.size()>size_t(width))rank.resize(width);
+    round.members=std::move(rank);round.active=phase;round.counts.assign(width,0);round.limits.assign(width,0);
+    const int work=round.ends[phase]-started;
+    for(int i=0;i<width;++i)round.limits[i]=work/width+(i<work%width);
+   }
+   // A refutation replaces a slot's remaining allowance. Completed credits stay
+   // on the old action, and cancellation uses the original reservation's slot.
+   for(int& i:round.members)if(i>=0 && !node.edges[i].read().eligible)i=-1;
+   while(round.members.size()<size_t(width))round.members.push_back(-1);
+   for(int& slot:round.members)if(slot<0){
+    int best=-1;
+    for(int i=0;i<int(node.edges.size());++i)if(node.edges[i].read().eligible && std::find(round.members.begin(),round.members.end(),i)==round.members.end())
+     if(best<0 || root_edges[i].epoch>root_edges[best].epoch || (root_edges[i].epoch==root_edges[best].epoch && better(i,best)))best=i;
+    slot=best;
+   }
+   for(size_t i=0;i<round.members.size();++i)if(round.members[i]<0 && round.counts[i]<round.limits[i]){
+    int recipient=-1;for(size_t j=0;j<round.members.size();++j)if(round.members[j]>=0 && (recipient<0 || round.limits[j]<round.limits[recipient]))recipient=int(j);
+    if(recipient>=0){round.limits[recipient]+=round.limits[i]-round.counts[i];round.limits[i]=round.counts[i];}
+   }
+   int chosen=-1,least=std::numeric_limits<int>::max();
+   for(size_t slot=0;slot<round.members.size();++slot){int i=round.members[slot];if(i<0 || round.counts[slot]>=round.limits[slot] || std::find(blocked.begin(),blocked.end(),i)!=blocked.end())continue;
+    auto& e=node.edges[i];if(!e.read().eligible || (e.read().child && e.read().child->pending))continue;
+    if(round.counts[slot]<least || (round.counts[slot]==least && (chosen<0 || better(i,chosen)))){least=round.counts[slot];chosen=i;}
+   }return chosen;
+  }
+  int reserve_root(int edge){
+   ++root_edges[edge].epoch;++started;++issued;
+   if(!round_barrier)return -1;
+   auto i=std::find(round.members.begin(),round.members.end(),edge);if(i==round.members.end())throw std::runtime_error("Root work outside its round");
+   int slot=int(i-round.members.begin());++round.counts[slot];return slot;
+  }
+  // Leaf data classify needs, taken while the tree's board stands at the leaf.
  void capture(Path& path) {
   path.legal=board.legal_moves();path.player=board.player;path.remaining=board.remaining;
   if(!tactics)return;
@@ -913,7 +968,7 @@ struct Tree {
   if(hold && started==last)return requests.empty()?-3:0;
   if(started>=budget)return 0;
   // Descends by make on the tree's own board; Restore undoes every placement on return.
-  Restore restore(board);Node* node=root.get();Path path;path.leaf=node;
+  Restore restore(board);Node* node=root.get();Path path;path.leaf=node;std::vector<int> blocked;
   for(auto& u:board.history)path.history.push_back(u.c);
   if(shared)++clock;
   while(node->expanded){
@@ -921,6 +976,8 @@ struct Tree {
    if(shared){current(*node);node->used=clock;}
    auto q=selection_q(*node);int chosen=-1;double best=-1e300;
    if(node==root.get()){
+    if(round_barrier)chosen=select_round(*node,q,blocked);
+    else {
     int considered=sequence[started];
     // Finish each visit layer before its values decide the next halving round.
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
@@ -933,8 +990,13 @@ struct Tree {
     // Proofs may leave fewer survivors than this round scheduled. If all survivors already finished its
     // layer, continue the least-visited survivor rather than waiting for an eliminated action forever.
     if(chosen<0){int least=std::numeric_limits<int>::max();for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.read().eligible)continue;double score=root_edges[i].gumbel+e.logit+q[i]+bonus(e);if(root_edges[i].epoch<least || (root_edges[i].epoch==least && score>best)){least=root_edges[i].epoch;best=score;chosen=i;}}}
+   }
    } else chosen=select_interior(*node,q);
-   if(chosen<0)return 0;
+   if(chosen<0){
+    if(!round_barrier || path.edges.empty())return 0;
+    blocked.push_back(path.edges.front().second);for(size_t i=0;i<path.edges.size();++i)board.undo();
+    path.history.resize(path.history.size()-path.edges.size());path.edges.clear();node=root.get();path.leaf=node;continue;
+   }
    auto& edge=node->edges[chosen];if(edge.read().child && edge.read().child->pending)return 0;
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
    if(!edge.read().child){if(shared)attach(*node,edge,child_here(node->history,true));else {edge.write().child=child_here();if(graph){node->track(edge);edge.read().child->parents.push_back(node->weak_from_this());}}}
@@ -943,14 +1005,14 @@ struct Tree {
    if(board.winner>=0 || edge.read().exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
     else if(edge.read().exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.read().exact_winner;node->distance=edge.read().distance-1;node->bound=edge.read().bound;}
-    int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;++root_edges[path.edges.front().second].epoch;++started;++issued;backup(path,winner==node->player?1:-1);return -1;}
+    int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,winner==node->player?1:-1);return -1;}
    // A transposed child already holds more visits than this edge: take its value without evaluating (MCGS).
-   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;++root_edges[path.edges.front().second].epoch;++started;++issued;backup(path,node->q,false);return -1;}
+   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,node->q,false);return -1;}
   }
   if(node->pending)return 0;
   node->pending=true;node->player=board.player;capture(path);
   for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;
-  if(!path.edges.empty()){++root_edges[path.edges.front().second].epoch;++started;++issued;}
+  if(!path.edges.empty()){path.round_slot=reserve_root(path.edges.front().second);}
   const bool immediate=!path.own.empty();
   int id=next_id++;requests.emplace(id,std::move(path));
   if(immediate){
@@ -1062,7 +1124,7 @@ struct Tree {
    for(auto& e:node->edges)if(e.action==witness){e.write().child=std::move(child);if(graph)node->track(e);break;}
   }
  }
- void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].write().pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;}}requests.clear();}
+ void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].write().pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;if(round_barrier && path.round_slot>=0)--round.counts[path.round_slot];}}requests.clear();}
  void advance(Cell action){owner_access();if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::shared_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;
   for(auto& e:root->edges)if(e.action==action){winner=e.read().exact_winner;distance=e.read().distance;bound=e.read().bound;next=shared?e.read().child:std::move(e.write().child);break;}
   save_root();auto before=root->history;board.make(action);root=next?std::move(next):child_here(std::move(before),true);reactivate(root);root->player=board.player;restore_root();
@@ -1188,6 +1250,9 @@ HX_API int hxg_q(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);aut
 HX_API int hxg_q_range_floor(void* p,double floor){if(!std::isfinite(floor) || floor<0){gumbel::error="Invalid Q range floor";return 0;}static_cast<gumbel::Tree*>(p)->range_floor=floor;return 1;}
 // Sets the uniform share of the root's candidate sampling (Tree::sampling; 0, the default, samples by the prior)
 // for every later search; 0 with no change unless 0 <= `noise` < 1.
+HX_API int hxg_round_barrier(void* p,int enabled){try{auto& t=*static_cast<gumbel::Tree*>(p);t.owner_access();
+ if((enabled!=0 && enabled!=1) || t.started || !t.requests.empty())throw std::runtime_error("Configure rounds before search work");
+ if(t.round_barrier!=bool(enabled))t.root_sessions.clear();t.round_barrier=enabled;if(t.budget)t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](const auto& e){return e.read().eligible;})):int(t.board.legal_moves().size()));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_root_noise(void* p,double noise){if(!(noise>=0 && noise<1)){gumbel::error="Invalid root noise";return 0;}static_cast<gumbel::Tree*>(p)->root_noise=noise;return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
 // context was already expanded elsewhere (tree duplicates; 0 in a graph)}.
@@ -1258,10 +1323,12 @@ HX_API int hxg_advance(void* p,int64_t q,int64_t r){try{auto& t=*static_cast<gum
 HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double* scores){
  auto& t=*static_cast<gumbel::Tree*>(p);t.proof_root();auto& n=*t.root;if(!n.expanded)return 0;
  t.prepare_root();if(t.shared)t.current(n);auto q=t.transformed(n);int max_epoch=0,searched=0;
+ bool round_survivor=t.round_barrier && std::any_of(t.round.members.begin(),t.round.members.end(),[&](int i){return i>=0 && n.edges[i].read().eligible;});
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];auto& local=t.root_edges[i];searched=std::max(searched,local.epoch);if(e.read().eligible)max_epoch=std::max(max_epoch,local.epoch);}
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];auto& local=t.root_edges[i];if(actions){
   actions[2*i]=e.action.q;actions[2*i+1]=e.action.r;visits[i]=e.read().visits;values[i]=t.value(n,e);
-  scores[i]=e.read().eligible && (n.exact_winner>=0 || (searched && local.epoch==max_epoch))?local.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();
+  bool finalist=round_survivor?std::find(t.round.members.begin(),t.round.members.end(),int(i))!=t.round.members.end():searched && local.epoch==max_epoch;
+ scores[i]=e.read().eligible && (n.exact_winner>=0 || finalist)?local.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();
  }}t.trim_archive(false,false);return int(n.edges.size());
 }
 HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].read().eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;t.trim_archive(false,false);return int(q.size());}
@@ -1293,7 +1360,7 @@ extern "C" HX_API void* hxg_view(void* source,const int64_t* history,int count,u
   auto& original=*static_cast<gumbel::Tree*>(source);
   if(!original.shared || count<0)throw std::runtime_error("View needs a shared graph and valid history");
   auto view=std::make_unique<gumbel::Tree>(seed,original.state);view->shared=view->graph=true;
-  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;
+  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->round_barrier=original.round_barrier;
   std::vector<Cell> h;for(int i=0;i<count;++i)h.push_back({history[2*i],history[2*i+1]});view->root_at(h);
   return view.release();
  }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}

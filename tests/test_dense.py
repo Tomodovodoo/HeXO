@@ -3990,7 +3990,7 @@ class EngineTests(unittest.TestCase):
         from native_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'rotate-{k}',f'fixed-{k}','cpu',64,128) for k in range(3)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_views=4,
+        settings = dense_config.ActorSettings(native_scheduler=True,native_round_barrier=True,native_producers=2,native_views=4,
             native_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,full_fraction=.5,
             max_plies=9,leaf_batch=64,opening_random_plies=0.)
         engine = ActorEngine(settings)
