@@ -46,6 +46,7 @@ async function search(item) {
   const batches = item.batches.slice(), tree = item.limit == null ? new NeuralSearch(native, options) : new GameGraph(native, {...options, limit: item.limit});
   const cache = new EvaluationCache(), out = [];
   const evaluate = async leaves => {
+    if (item.uniform) return leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
     const batch = batches.shift();
     if (!batch || batch.length !== leaves.length) throw new Error('Batch shape differs from the native run');
     return leaves.map((leaf, i) => {
