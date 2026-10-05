@@ -303,8 +303,8 @@ pub(crate) struct PnSearch {
     /// node at its current horizon without expansion, mirroring the level-1
     /// `Dfpn::hint_val` check.
     hints: Option<Rc<WinDepthHints>>,
-    /// Wall-clock deadline and cancel flag, checked before every expansion so a
-    /// level-2 search never outlives its caller's budget.
+    /// Wall-clock deadline and cancel flag, checked before expansion and while
+    /// propagating results through transposed parents.
     limits: Limits,
 }
 
@@ -425,13 +425,16 @@ impl PnSearch {
             self.expansions += 1;
             // Back up the proof numbers; restore only the differing board suffix
             // on the next iteration, including if an ancestor just settled.
-            self.backup(cur, &mut tt);
+            if !self.backup(cur, &mut tt) {
+                break;
+            }
         }
         for edge in applied.iter().rev() {
             k.unplace(&edge.mv);
         }
         if let Some(t) = tt {
-            for n in &self.arena {
+            for (i, n) in self.arena.iter().enumerate() {
+                if i % 256 == 0 && self.limits.expired() { break; }
                 if n.expanded {
                     t.store(n.key, n.pn, n.dn, n.work);
                 }
@@ -448,7 +451,8 @@ impl PnSearch {
     /// (whose tree is otherwise discarded). Sound: every such node is a genuine
     /// forced win under the shared kernel rules.
     pub(crate) fn collect_proven(&self, out: &mut FxHashSet<u64>) {
-        for n in &self.arena {
+        for (i, n) in self.arena.iter().enumerate() {
+            if i % 256 == 0 && self.limits.expired() { break; }
             if n.pn == 0 {
                 out.insert(n.key);
             }
@@ -562,18 +566,19 @@ impl PnSearch {
     }
 
     /// Recompute a node's pn/dn from its children (OR: pn=min, dn=sum; AND swap).
-    fn recompute(&mut self, cur: usize) {
+    fn recompute(&mut self, cur: usize) -> bool {
         if self.arena[cur].terminal {
-            return;
+            return true;
         }
         let is_or = self.arena[cur].node.is_or();
         let children = &self.arena[cur].children;
         if children.is_empty() {
-            return;
+            return true;
         }
         let (mut min_pn, mut sum_pn) = (INF, 0u32);
         let (mut min_dn, mut sum_dn) = (INF, 0u32);
-        for &c in children {
+        for (i, &c) in children.iter().enumerate() {
+            if i % 256 == 0 && self.limits.expired() { return false; }
             let cc = &self.arena[c.child];
             min_pn = min_pn.min(cc.pn);
             sum_pn = sat_add(sum_pn, cc.pn);
@@ -588,18 +593,20 @@ impl PnSearch {
             n.pn = sum_pn;
             n.dn = min_dn;
         }
+        true
     }
 
     /// Every transposed parent sees a changed child. Stones only accumulate, so
     /// decreasing depth visits a parent after all affected children, once.
-    fn backup(&mut self, start: usize, tt: &mut Option<&mut ProofTt>) {
+    fn backup(&mut self, start: usize, tt: &mut Option<&mut ProofTt>) -> bool {
         self.backups.clear();
         self.backups.push((self.arena[start].depth, start));
         self.arena[start].pending = true;
         while let Some((_, cur)) = self.backups.pop() {
+            if self.limits.expired() { return false; }
             self.arena[cur].pending = false;
             let before = (self.arena[cur].pn, self.arena[cur].dn);
-            self.recompute(cur);
+            if !self.recompute(cur) { return false; }
             self.arena[cur].work = self.arena[cur].work.saturating_add(1);
             let n = &self.arena[cur];
             if (n.pn == 0 || n.dn == 0) && let Some(t) = tt.as_deref_mut() {
@@ -607,6 +614,7 @@ impl PnSearch {
             }
             if cur != start && before == (n.pn, n.dn) { continue; }
             for i in 0..self.arena[cur].parents.len() {
+                if i % 256 == 0 && self.limits.expired() { return false; }
                 let p = self.arena[cur].parents[i];
                 if !self.arena[p].pending {
                     self.arena[p].pending = true;
@@ -614,6 +622,7 @@ impl PnSearch {
                 }
             }
         }
+        true
     }
 
 }
@@ -659,6 +668,38 @@ mod tests {
             table.store(key, pn, dn, 1);
             table.store(key, 1, 1, u32::MAX);
             assert_eq!(table.peek(key), Some((pn, dn)));
+        }
+    }
+
+    #[test]
+    fn cancelled_parent_propagation_leaves_root_unresolved() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Instant;
+        for limits in [
+            Limits { cancel: Some(Arc::new(AtomicBool::new(true))), ..Limits::default() },
+            Limits { deadline: Some(Instant::now()), ..Limits::default() },
+        ] {
+            let mut search = PnSearch::new(1000);
+            for id in 0..4 {
+                search.arena.push(PnNode {
+                    node: if id == 1 || id == 2 { Node::And } else { Node::Or { placements: 2 } },
+                    remaining: None, pn: 1, dn: 1, expanded: true,
+                    children: Vec::new(), parents: Vec::new(), depth: if id == 3 { 2 } else { usize::from(id != 0) },
+                    pending: false, terminal: id == 3, key: id as u64, work: 0,
+                });
+            }
+            for (parent, child) in [(0,1), (0,2), (1,3), (2,3)] {
+                search.arena[parent].children.push(PnEdge { child, mv: CellSet2::one((child as i32,0)) });
+                search.arena[child].parents.push(parent);
+            }
+            search.set_terminal(3, 0, INF);
+            search.set_limits(limits);
+            assert!(!search.backup(3, &mut None));
+            assert_eq!((search.arena[0].pn, search.arena[0].dn), (1,1));
+            assert!(search.arena.iter().all(|n| n.work == 0));
+            search.set_limits(Limits::default());
+            assert!(search.backup(3, &mut None));
+            assert_eq!((search.arena[0].pn, search.arena[0].dn), (0,INF));
         }
     }
 }
