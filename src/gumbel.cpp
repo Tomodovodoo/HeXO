@@ -1,6 +1,7 @@
 // Native placement-tree scheduling. Algorithm reference: DeepMind mctx.
 #include "hexo.cpp"
 #include <memory>
+#include <memory_resource>
 #include <random>
 #include <map>
 #include <numeric>
@@ -54,6 +55,26 @@ std::pair<Key,Key> keys(const std::vector<Cell>& history) {
  return {position,context};
 }
 struct Edge { Cell action;double logit=0,prior=0,sum=0,weight=-1;int visits=0,pending=0,exact_winner=-1,distance=-1;bool eligible=true,bound=false;std::shared_ptr<Node> child; };
+// Legal lists are large and live together. Pool their buffers within one game,
+// recycling evicted nodes' blocks instead of making one heap allocation per node.
+// A node retains the resource because it can outlive the GameStore's indices.
+struct EdgeMemory {
+#ifdef HEXO_RECLAIM_PROFILE
+ struct Upstream : std::pmr::memory_resource {
+  uint64_t bytes=0,peak=0,allocations=0;
+  void* do_allocate(size_t n,size_t alignment)override {auto p=std::pmr::new_delete_resource()->allocate(n,alignment);bytes+=n;peak=std::max(peak,bytes);++allocations;return p;}
+  void do_deallocate(void* p,size_t n,size_t alignment)override {bytes-=n;std::pmr::new_delete_resource()->deallocate(p,n,alignment);}
+  bool do_is_equal(const std::pmr::memory_resource& other)const noexcept override {return this==&other;}
+ } upstream;
+ std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144},&upstream};
+ ~EdgeMemory(){auto start=std::chrono::steady_clock::now();pool.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"edge_memory\",\"peak_bytes\":%llu,\"allocations\":%llu,\"remaining_bytes\":%llu,\"release_ns\":%llu}\n",
+   (unsigned long long)upstream.peak,(unsigned long long)upstream.allocations,(unsigned long long)upstream.bytes,(unsigned long long)ns);
+ }
+#else
+ std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144}};
+#endif
+};
 // An exact winner comes with a distance: the placements within which that winner completes six from this position
 // (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
 // loser's. It is exact for terminal and tactical results; `bound` marks an upper bound, which certificates give.
@@ -62,12 +83,15 @@ struct Edge { Cell action;double logit=0,prior=0,sum=0,weight=-1;int visits=0,pe
 // the last search step that touched the node, `context` its key in the store, and `carried` and `carried_sum` the
 // visits and value sum (for its mover) an evicted node of its context had when it left the store, less its own
 // network value, which the node's expansion supplies again.
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents; };
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false;double value=0,q=0,carried_sum=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::pmr::vector<Edge> edges;std::vector<std::weak_ptr<Node>> parents;
+ explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),edges(&memory->pool){}
+};
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1;std::vector<std::vector<Cell>> own,threats; };
 struct Summary { int n=0;double q=0,value=0;Key position; };
 struct GameStore {
+ std::shared_ptr<EdgeMemory> memory=std::make_shared<EdgeMemory>();
  std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;
  std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;
  std::unordered_map<Key,Outcome,KeyHash> outcomes;
@@ -87,7 +111,7 @@ struct GameStore {
    for(auto& edge:node->edges)children+=bool(edge.child);}
   auto inventory=ns(start);std::array<uint64_t,6> times;
   start=Clock::now();for(auto& [key,node]:store)node->edges.clear();auto edges_ns=ns(start);
-  start=Clock::now();for(auto& [key,node]:store)std::vector<Edge>().swap(node->edges);auto edge_free_ns=ns(start);
+  start=Clock::now();for(auto& [key,node]:store)std::pmr::vector<Edge>(node->edges.get_allocator()).swap(node->edges);auto edge_free_ns=ns(start);
   start=Clock::now();pins.clear();times[0]=ns(start);
   start=Clock::now();evicted_stats.clear();times[1]=ns(start);
   start=Clock::now();store.clear();times[2]=ns(start);
@@ -111,7 +135,7 @@ struct RootSession {
  std::vector<int> sequence;std::vector<Cell> priority;std::map<Cell,double> defence;
 };
 struct Tree {
- Board board;std::shared_ptr<Node> root=std::make_shared<Node>();std::map<int,Path> requests;
+ Board board;std::shared_ptr<Node> root;std::map<int,Path> requests;
  // Graph search (opt-in): nodes shared by turn-context key, proven outcomes shared by
  // position key. Tree search gives every edge its own child and keeps both tables empty.
  std::shared_ptr<GameStore> state;
@@ -139,7 +163,7 @@ struct Tree {
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  std::vector<double> work;
  explicit Tree(uint64_t seed,std::shared_ptr<GameStore> game=std::make_shared<GameStore>()):
-  state(std::move(game)),nodes(state->nodes),positions(state->positions),outcomes(state->outcomes),
+  root(std::make_shared<Node>(game->memory)),state(std::move(game)),nodes(state->nodes),positions(state->positions),outcomes(state->outcomes),
   limit(state->limit),clock(state->clock),evicted(state->evicted),store(state->store),evicted_stats(state->evicted_stats),rng(seed){pin();}
  ~Tree(){cancel();state->pins.erase(this);}
  Tree(const Tree&)=delete;
@@ -184,10 +208,10 @@ struct Tree {
  // The node for the tree's board as a new child: a fresh node, or with graph search the shared node of this turn
  // context, created with any outcome already proven for the position.
  std::shared_ptr<Node> child_here() {
-  if(!graph){auto n=std::make_shared<Node>();n->player=board.player;return n;}
+  if(!graph){auto n=std::make_shared<Node>(state->memory);n->player=board.player;return n;}
   auto [position,context]=keys(board);auto& slot=nodes[context];
   if(auto n=slot.lock())return n;
-  auto n=std::make_shared<Node>();n->player=board.player;n->remaining=board.remaining;n->position=position;n->context=context;n->stones=int(board.cells.size());
+  auto n=std::make_shared<Node>(state->memory);n->player=board.player;n->remaining=board.remaining;n->position=position;n->context=context;n->stones=int(board.cells.size());
   if(board.remaining==1 && !board.history.empty())n->first=board.history.back().c;
   slot=n;positions[position].push_back(n);
   if(shared){
@@ -695,7 +719,7 @@ struct Tree {
   if(o==outcomes.end() || (o->second.winner==root->player && !o->second.witnessed()))return;
   auto legal=board.legal_moves();root->expanded=true;root->remaining=board.remaining;root_prepared=false;
   root->value=root->q=root->exact_winner==root->player?1:-1;
-  for(auto c:legal){Edge e;e.action=c;e.prior=1./legal.size();root->edges.push_back(std::move(e));}
+  root->edges.reserve(legal.size());for(auto c:legal){Edge e;e.action=c;e.prior=1./legal.size();root->edges.push_back(std::move(e));}
   apply(o->second,*root);settle(*root);learn(*root);revise(*root);
  }
  void fulfill(int id,const int64_t* actions,const double* logits,const double* values,int count,int exact=-1,Cell witness={},int distance=-1){
@@ -768,8 +792,8 @@ struct Tree {
     }
    }
    auto next_legal=position.legal_moves();
-   auto child=std::make_shared<Node>();child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
-   for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
+   auto child=std::make_shared<Node>(state->memory);child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
+   child->edges.reserve(next_legal.size());for(auto c:next_legal){Edge e;e.action=c;e.prior=1./next_legal.size();e.eligible=c==Cell{moves[2],moves[3]};if(e.eligible){e.exact_winner=player;e.distance=distance-1;e.bound=true;}child->edges.push_back(std::move(e));}
    if(graph){auto [p,c]=keys(position);child->position=p;child->context=c;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);if(shared)store[c]=child;learn(*child);}
    for(auto& e:node->edges)if(e.action==witness){e.child=std::move(child);break;}
   }
@@ -797,7 +821,7 @@ struct Tree {
   const bool witnessed=shared!=outcomes.end() && shared->second.player==root->player && shared->second.witnessed();
   if((winner==root->player || root->exact_winner==root->player) && !root->expanded && board.winner<0 && !witnessed){
    root->exact_winner=-1;
-   if(tactics){Path path;capture(path);if(!path.own.empty()){root_prepared=false;root->expanded=true;root->remaining=path.remaining;for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
+   if(tactics){Path path;capture(path);if(!path.own.empty()){root_prepared=false;root->expanded=true;root->remaining=path.remaining;root->edges.reserve(path.legal.size());for(auto c:path.legal){Edge e;e.action=c;e.prior=1./path.legal.size();root->edges.push_back(std::move(e));}classify(path,*root);}}
   }
  }
 };
