@@ -3,7 +3,7 @@
 //! future defender stone can affect; a global check covers the remaining ones.
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::rc::{Rc,Weak};
 use hexo_engine::types::{Coord, Player};
 use hexo_solver::prover::Ctl;
@@ -758,21 +758,61 @@ pub fn replay(lines:&[Replay],board:&Board,n:usize,winner:u8,ctl:&Ctl,budget:u64
 }
 
 type Pattern=(Vec<Coord>,Vec<(usize,u8,Coord)>);
+type Frame=(u8,Coord,bool);
+struct Candidates {
+    found:Vec<BTreeSet<Frame>>,
+    active:Vec<[BTreeSet<Frame>;2]>,
+    blocked:HashMap<Coord,Vec<(usize,Frame)>>,
+    previous:Vec<(Coord,Player)>,
+    board:HashMap<Coord,Player>,
+}
+impl Candidates {
+    fn new(count:usize,stones:Vec<(Coord,Player)>)->Self {
+        Self{found:vec![BTreeSet::new();count],active:vec![Default::default();count],blocked:HashMap::new(),
+            board:stones.iter().copied().collect(),previous:stones}
+    }
+    fn insert(&mut self,id:usize,frame:Frame) {
+        if self.found[id].len()<512 && self.found[id].insert(frame) {self.active[id][usize::from(frame.2)].insert(frame);}
+    }
+    fn block(&mut self,key:(usize,Frame),at:Coord) {
+        if self.active[key.0][usize::from(key.1.2)].remove(&key.1) {self.blocked.entry(at).or_default().push(key);}
+    }
+    fn sync(&mut self,stones:&[(Coord,Player)],get:StoneAt<'_>)->Vec<(Coord,Player)> {
+        let _time=measure("sync");
+        let common=self.previous.iter().zip(stones).take_while(|(a,b)|a==b).count();
+        // One failed predicate suffices to rule a candidate out. Wake it only
+        // when that cell changes, including removals on backtracking. A jump
+        // between branches may replace more than the last two placements.
+        let mut added=vec![];
+        for &(at,_) in self.previous[common..].iter().chain(&stones[common..]) {
+            let now=get(at);
+            // Different solver contexts may list unchanged stones in another
+            // order. Neither waking nor geometry discovery is needed for them.
+            if self.board.get(&at).copied()==now {continue;}
+            if let Some(owner)=now {self.board.insert(at,owner);added.push((at,owner));}else{self.board.remove(&at);}
+            if let Some(waiting)=self.blocked.remove(&at) {
+                for (id,frame) in waiting {self.active[id][usize::from(frame.2)].insert(frame);}
+            }
+        }
+        self.previous.truncate(common);self.previous.extend_from_slice(&stones[common..]);added
+    }
+}
 fn locate(patterns:&[Pattern],entries:&[Rc<Stamp>],stones:&[(Coord,Player)],get:StoneAt<'_>,
-    candidates:&mut [BTreeSet<(u8,Coord,bool)>],ctl:&Ctl) {
+    candidates:&mut Candidates,ctl:&Ctl) {
+    let _time=measure("locate");
     for &(at,owner) in stones {
         if ctl.expired() {return;}
         for (offsets,uses) in patterns {
             if offsets.iter().any(|&(q,r)|get((at.0+q,at.1+r))!=Some(owner)) {continue;}
-            for &(id,sym,anchor) in uses {if candidates[id].len()<512 {
-                candidates[id].insert((sym,(at.0-anchor.0,at.1-anchor.1),side(owner)!=entries[id].source.winner));
-            }}
+            for &(id,sym,anchor) in uses {
+                candidates.insert(id,(sym,(at.0-anchor.0,at.1-anchor.1),side(owner)!=entries[id].source.winner));
+            }
         }
     }
 }
 
 pub struct Oracle {entries:Vec<Rc<Stamp>>, instances:RefCell<Vec<(usize,u8,Coord,bool)>>,
-    base_len:usize, candidates:RefCell<Vec<BTreeSet<(u8,Coord,bool)>>>, patterns:Vec<Pattern>,
+    candidates:RefCell<Candidates>, patterns:Vec<Pattern>,
     misses:RefCell<HashSet<(u64,u8,u8)>>, pub hits:Cell<u64>,ctl:Ctl}
 impl Oracle {
     pub fn new(ctl:&Ctl,root:&Board)->Rc<Self> {
@@ -790,17 +830,20 @@ impl Oracle {
             }
         }}}
         let patterns:Vec<_>=patterns.into_iter().collect();
-        let mut candidates=vec![BTreeSet::new();entries.len()];
         let stones:Vec<_>=root.iter().map(|(&p,&s)|(p,player(s))).collect();
+        let mut candidates=Candidates::new(entries.len(),stones.clone());
         locate(&patterns,&entries,&stones,&|p|root.get(&p).copied().map(player),&mut candidates,ctl);
-        for (id,found) in candidates.iter_mut().enumerate() {
+        for (id,found) in candidates.found.iter_mut().enumerate() {
             found.retain(|&(sym,offset,_)|entries[id].empty.iter().all(|&p|!root.contains_key(&transform(p,sym,offset))));
+        }
+        for (id,colours) in candidates.active.iter_mut().enumerate() {
+            for active in colours {active.retain(|frame|candidates.found[id].contains(frame));}
         }
         let patterns=patterns.into_iter().filter_map(|(offsets,uses)| {
             let uses:Vec<_>=uses.into_iter().filter(|&(id,_,_)|entries[id].portable.get()).collect();
             (!uses.is_empty()).then_some((offsets,uses))
         }).collect();
-        Rc::new(Self{entries,candidates:RefCell::new(candidates),patterns,base_len:root.len(),instances:RefCell::new(vec![]),
+        Rc::new(Self{entries,candidates:RefCell::new(candidates),patterns,instances:RefCell::new(vec![]),
             misses:RefCell::new(HashSet::new()),hits:Cell::new(0),ctl:ctl.clone()})
     }
 }
@@ -813,25 +856,24 @@ impl StampOracle for Oracle {
         }}
         // Small primitive shapes can occur anywhere and in either colour.
         // A cheap supporting-stone/mask match precedes the global threat guards.
-        // SolverBoard preserves the query's root stones as a prefix. Every
-        // searched edge adds at most two stones; an occurrence created there
-        // contains one of them. Retain candidate geometry across branches and
-        // recheck its full mask on every use. An unusual jump can only miss an
-        // optimization, never establish a proof without that check.
-        let added=&stones[self.base_len.min(stones.len()).max(stones.len().saturating_sub(2))..];
         let mut candidates=self.candidates.borrow_mut();
-        locate(&self.patterns,&self.entries,added,get,&mut candidates,&self.ctl);
+        let added=candidates.sync(stones,get);
+        locate(&self.patterns,&self.entries,&added,get,&mut candidates,&self.ctl);
+        let _geometry=measure("geometry");
+        // Copy only awake candidates so failed masks can put themselves to
+        // sleep during this pass. Each stores at most one blocking cell;
+        // counter-threat guards are deliberately not cached this way.
         for (id,stamp) in self.entries.iter().enumerate() {
-            if stamp.required.len()>4 || stamp.source.remaining!=remaining {continue;}
+            if stamp.source.remaining!=remaining {continue;}
             let swap=side(mover)!=stamp.source.player;
             let winner=player(stamp.source.winner^u8::from(swap));
-            // Every new occurrence contains a newly played stone; `locate`
-            // tried each supporting cell as its anchor without rescanning root stones.
-            for &(sym,offset,colour) in &candidates[id] {
-                if colour!=swap {continue;}
+            let active:Vec<_>=candidates.active[id][usize::from(swap)].iter().copied().collect();
+            for (sym,offset,colour) in active {
                 let mapped=|p|get(transform(p,sym,offset)).map(|s|if swap{s.opponent()}else{s});
-                if stamp.required.iter().any(|&p|mapped(p)!=Some(player(stamp.source.winner)))
-                    || stamp.empty.iter().any(|&p|mapped(p).is_some()) {continue;}
+                if let Some(&at)=stamp.required.iter().find(|&&p|mapped(p)!=Some(player(stamp.source.winner)))
+                    .or_else(||stamp.empty.iter().find(|&&p|mapped(p).is_some())) {
+                    candidates.block((id,(sym,offset,colour)),transform(at,sym,offset));continue;
+                }
                 let local:Vec<_>=stones.iter().map(|&(p,s)|(inverse(p,sym,offset),if swap{s.opponent()}else{s})).collect();
                 if !stamp.matches(&mapped,&local,player(stamp.source.player),remaining) {continue;}
                 let key=(id,sym,offset,swap);let mut list=self.instances.borrow_mut();
@@ -859,6 +901,70 @@ impl StampOracle for Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_watches_follow_backtracking_and_changed_branches() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let source=StampSource{stones:(0..4).map(|q|((q,0),0)).collect(),player:0,remaining:2,winner:0,
+            certificate:ProofCertificate{version:1,width:"wide".into(),root:0,
+                nodes:vec![ProofNode::ImmediateWin{action:vec![(4,0),(5,0)]}]}};
+        import(source,&ctl).unwrap();
+        let mut board:Board=[((20,-10),0),((21,-10),0),((19,-10),1),((24,-10),1)].into_iter().collect();
+        let oracle=Oracle::new(&ctl,&board);let mut hash=0;
+        let mut query=|board:&Board,mover:Player,remaining,expected| {
+            hash+=1;
+            let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+            let result=oracle.lookup(hash,&stones,&|p|board.get(&p).copied().map(player),mover,remaining);
+            assert_eq!(result.is_some(),expected);
+            if let Some((id,winner,turns))=result {
+                assert_eq!(winner,mover);
+                assert_eq!(verify(&oracle.source(id),board,ply(side(mover),remaining),side(winner),&ctl).unwrap(),turns);
+            }
+        };
+        query(&board,Player::P1,2,false);
+        board.insert((22,-10),0);board.insert((23,-10),0);
+        query(&board,Player::P1,2,false); // both ends blocked
+        board.insert((60,60),1);
+        query(&board,Player::P1,2,false); // unrelated move cannot wake a failed mask
+        board.remove(&(19,-10));
+        query(&board,Player::P1,2,true);
+        query(&board,Player::P1,1,false); // same stones, different turn allowance
+        board.remove(&(22,-10));
+        query(&board,Player::P1,2,false);
+        board.insert((22,-10),1);
+        query(&board,Player::P1,2,false);
+        board.insert((22,-10),0);
+        query(&board,Player::P1,2,true);
+        // A replacement branch can introduce an entire shape between lookups,
+        // in another orientation and colour, rather than just two new stones.
+        board=[((40,40),1),((40,41),1),((40,42),1),((40,43),1)].into_iter().collect();
+        query(&board,Player::P2,2,true);
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
+
+    #[test]
+    fn active_geometry_still_checks_remote_counterthreats() {
+        LIBRARY.with(|l|l.borrow_mut().clear());
+        let ctl=Ctl::new(0.0);
+        let entries:serde_json::Value=serde_json::from_str(include_str!("../stamps.json")).unwrap();
+        let source:StampSource=serde_json::from_value(entries[0]["source"].clone()).unwrap();
+        import(source.clone(),&ctl).unwrap();
+        let source=transformed_source(&source,3,(20,-10),true);
+        let mut board:Board=source.stones.iter().copied().collect();
+        let oracle=Oracle::new(&ctl,&board);
+        for (hash,count,expected) in [(1,0,true),(2,4,false),(3,3,true)] {
+            for q in 0..4 {board.remove(&(q,40));}
+            for q in 0..count {board.insert((q,40),source.winner^1);}
+            let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();
+            let result=oracle.lookup(hash,&stones,&|p|board.get(&p).copied().map(player),player(source.player),source.remaining);
+            assert_eq!(result.is_some(),expected);
+            if let Some((id,winner,turns))=result {
+                assert_eq!(verify(&oracle.source(id),&board,ply(source.player,source.remaining),side(winner),&ctl).unwrap(),turns);
+            }
+        }
+        LIBRARY.with(|l|l.borrow_mut().clear());
+    }
 
     #[test]
     fn composed_stamp_checks_changed_defenses_and_remote_tempo() {
@@ -1010,8 +1116,8 @@ mod tests {
             assert!(LIBRARY.with(|l|l.borrow().iter().all(|s|!s.portable.get())));
             let mut board:Board=[((20,-10),0),((21,-10),0)].into_iter().collect();
             let oracle=Oracle::new(&ctl,&board);
-            for candidates in oracle.candidates.borrow_mut().iter_mut() {
-                for i in 0..512 {candidates.insert((0,(1000+i,1000),false));}
+            for id in 0..oracle.entries.len() {
+                for i in 0..512 {oracle.candidates.borrow_mut().insert(id,(0,(1000+i,1000),false));}
             }
             board.insert((22,-10),0);board.insert((23,-10),0);
             let stones:Vec<_>=board.iter().map(|(&p,&s)|(p,player(s))).collect();

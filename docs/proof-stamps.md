@@ -141,10 +141,16 @@ it. The board and its real remaining placement count carry that information.
 The worker retains at most 32 compiled templates under a 4 MiB accounting
 budget, including an allowance for compiled masks and containers. Matching
 instances and negative lookup memoization are bounded and expire after each
-query. Existing small shapes are indexed once at the query root. Only imported
-primitives are also matched around the last two added stones. Candidate
-geometries survive backtracking within a query, with at most 512 per template;
-every use checks the actual stones and masks again. Larger game-local stamps are
+query. Existing small shapes are indexed once at the query root. Imported
+shapes are also matched around newly added stones, comparing actual cell
+contents when solver contexts reorder the board. Candidate geometries survive
+backtracking within a query, with at most 512 per template. A failed candidate
+watches one missing supporting stone or occupied protected cell and sleeps
+until that cell changes. Removing stones during backtracking wakes the same
+watches. Candidates are grouped by template and colour so a lookup visits only
+the current turn phase. Every accepted use still checks the full mask and
+global counter-threat guards. There is at most one watched cell per candidate;
+the index expires with the query. Larger game-local stamps are
 discarded when the current branch permanently occupies a required empty cell
 or gives a required friendly cell to the opponent. Every hit is checked against
 the current board and tempo. No result survives merely because it matched an
@@ -178,6 +184,35 @@ The player saves the certificate with the exact outcome; its existing proof
 table propagates that result into the game graph.
 
 ## CPU measurements
+
+The October 5 lookup change watches failed candidate conditions instead of
+rescanning every geometry retained from earlier branches. The following paired
+measurements compare the preceding production build, `2c392c9`, with that
+change. Both builds enable stamps. CPU is a Ryzen 9 5900X, BelowNormal priority,
+two OpenMP threads, no GPU. Browser timings use the shipped WASM in Node.
+
+| Workload | Before | After | Speed-up |
+|---|---:|---:|---:|
+| Complete `tree` win after `[14,0]`, native | 25.68 s | 12.54 s | 2.05x |
+| Same complete proof, browser WASM | 36.46 s | 14.48 s | 2.52x |
+| Six recorded games, 546 native queries | 29.27 s | 23.00 s | 1.27x |
+| 28 original real positions, native | 1.49 s | 1.33 s | 1.13x |
+
+The complete solves allow 524,288 nodes and 59 seconds. All four finish at
+203,408 fresh nodes with identical certificates and a 14-attacker-turn bound;
+the independent Python checker accepts them. The six games use the same shard
+and query sequence documented below, at 8,192 nodes and 5 seconds per query.
+Every query's verdict, node count and stamp hits agree between builds: 210
+proven wins, 329,076 fresh nodes and 97 stamp hits. None hit a deadline.
+
+Disabling stamps still completes the six-game replay faster, in 15.20 seconds,
+with 341,767 nodes and the same 210 wins. This change reduces miss overhead;
+it does not make stamps beneficial on every workload. The eight changed real
+positions still prove in 24 ms total using eight fresh nodes after their
+source strategies have been learned, versus 485 ms, 9,471 nodes and seven
+wins without stamps. These recorded-position tests do not measure games/hour.
+
+Earlier measurements follow for the preceding reuse changes.
 
 The analysed turn-17 variation replacing Blue's `[-2,0]` with `[-1,0]`
 was checked with the saved 153-record study in a fresh WASM worker. Both
