@@ -94,14 +94,18 @@ struct EdgeMemory {
   bool do_is_equal(const std::pmr::memory_resource& other)const noexcept override {return this==&other;}
  } upstream;
  std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144},&upstream};
- ~EdgeMemory(){auto start=std::chrono::steady_clock::now();pool.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+ std::pmr::unsynchronized_pool_resource states{std::pmr::pool_options{1024,sizeof(EdgeState)},&upstream};
+ ~EdgeMemory(){auto start=std::chrono::steady_clock::now();states.release();pool.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
   std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"edge_memory\",\"peak_bytes\":%llu,\"allocations\":%llu,\"remaining_bytes\":%llu,\"release_ns\":%llu}\n",
    (unsigned long long)upstream.peak,(unsigned long long)upstream.allocations,(unsigned long long)upstream.bytes,(unsigned long long)ns);
  }
 #else
  std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144}};
+ std::pmr::unsynchronized_pool_resource states{std::pmr::pool_options{1024,sizeof(EdgeState)}};
 #endif
- EdgeState empty{&pool};
+ // Small states need many blocks per chunk; sharing the large-row pool's
+ // eight-block chunks turns tactical expansion into repeated heap allocations.
+ EdgeState empty{&states};
 };
 // An exact winner comes with a distance: the placements within which that winner completes six from this position
 // (an edge counts its own placement) against any defence, combined by min at the winner's choices and max at the
