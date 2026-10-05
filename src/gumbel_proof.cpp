@@ -91,7 +91,7 @@ struct Loop {
  void observe(Tree& t,const gumbel::Path& path){
   size_t i=0;while(i<pool.games.size() && pool.games[i]->game.get()!=t.state.get())++i;if(i==pool.games.size() || pool.games[i]->stopped)return;
   auto& f=frontiers[i];double relevance=1;for(auto& v:pool.games[i]->views)if(v.tree.get()==&t){relevance=v.relevance;break;}
-  double share=1;for(auto [parent,index]:path.edges){const auto& edge=parent->edges[index];share*=std::max(.001,edge.prior);}
+  double share=1;for(auto [parent,index]:path.edges){const auto& edge=parent->edges[index];share*=std::max(.001,parent->prior(edge));}
   double forcing=1+std::min(size_t(8),path.own.size()+path.threats.size());
   f.offer(path.leaf->shared_from_this(),path.history,std::max(.0001,relevance*share)*forcing,std::abs(path.leaf->q-path.leaf->value));
   for(auto [parent,index]:path.edges)if(parent->exact_winner>=0 && parent->stones<=int(path.history.size()))f.remember(std::vector<Cell>(path.history.begin(),path.history.begin()+parent->stones),*parent);

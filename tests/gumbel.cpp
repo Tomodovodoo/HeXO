@@ -7,18 +7,18 @@ int main(){
  // graph-shared values, pending visits and logits whose cached exponent underflows or becomes subnormal.
  for(bool graph:{false,true})for(double scale:{5.,700.,1000.})for(double low:{-2.,-710.,-744.,-1000.}){
   gumbel::Tree t(0);t.graph=graph;gumbel::Node n;n.value=.3;
-  for(int i=0;i<6;++i){gumbel::Edge e;e.logit=i==0?0:low+i*.01;e.prior=1./6;e.pending=i%2;
-   if(i==0){e.visits=1;e.sum=-1;}if(i==2){e.visits=2;e.sum=1;}if(i==3){e.exact_winner=0;e.eligible=false;}
-   if(i==4 && graph){e.child=std::make_shared<gumbel::Node>();e.child->n=1;e.child->q=.5;}
+  for(int i=0;i<6;++i){gumbel::Edge e;e.logit=i==0?0:low+i*.01;e.write().pending=i%2;
+   if(i==0){e.write().visits=1;e.write().sum=-1;}if(i==2){e.write().visits=2;e.write().sum=1;}if(i==3){e.write().exact_winner=0;e.write().eligible=false;}
+   if(i==4 && graph){e.write().child=std::make_shared<gumbel::Node>();e.read().child->n=1;e.read().child->q=.5;}
    n.edges.push_back(std::move(e));}
   auto q=t.transformed(n);for(auto& x:q)x*=scale;auto expected=q;double maximum=-1e300;
-  for(int i=0;i<6;++i){expected[i]=n.edges[i].eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
+  for(int i=0;i<6;++i){expected[i]=n.edges[i].read().eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
   for(auto& x:expected)x=std::exp(x-maximum);
   assert(t.interior(n,q)==6);
   for(int i=0;i<6;++i){assert(std::isfinite(q[i]));assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));}
   // The cached weights remain valid as the completed Q changes on another visit.
-  n.edges[1].pending=2;q=t.transformed(n);expected=q;maximum=-1e300;
-  for(int i=0;i<6;++i){expected[i]=n.edges[i].eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
+  n.edges[1].write().pending=2;q=t.transformed(n);expected=q;maximum=-1e300;
+  for(int i=0;i<6;++i){expected[i]=n.edges[i].read().eligible?expected[i]+n.edges[i].logit:-std::numeric_limits<double>::infinity();maximum=std::max(maximum,expected[i]);}
   for(auto& x:expected)x=std::exp(x-maximum);assert(t.interior(n,q)==7);
   for(int i=0;i<6;++i)assert(std::abs(q[i]-expected[i])<=1e-12*std::max(1.,expected[i]));
  }
@@ -26,9 +26,9 @@ int main(){
  for(int depth=1;depth<=4;++depth)for(int mask=0;mask<(1<<(depth+1));++mask)for(double value:{-1.,-.25,0.,.75,1.}){
   gumbel::Tree tree(0);std::vector<gumbel::Node> nodes(depth+1);gumbel::Path path;
   for(int i=0;i<=depth;++i)nodes[i].player=(mask>>i)&1;
-  path.leaf=&nodes.back();for(int i=0;i<depth;++i){nodes[i].edges.emplace_back();nodes[i].edges[0].pending=1;path.edges.emplace_back(&nodes[i],0);}
+  path.leaf=&nodes.back();for(int i=0;i<depth;++i){nodes[i].edges.emplace_back();nodes[i].edges[0].write().pending=1;path.edges.emplace_back(&nodes[i],0);}
   tree.backup(path,value);
-  for(int i=0;i<depth;++i){auto& e=nodes[i].edges[0];assert(e.visits==1 && e.pending==0);assert(e.sum==(nodes[i].player==nodes.back().player?value:-value));}
+  for(int i=0;i<depth;++i){auto& e=nodes[i].edges[0];assert(e.read().visits==1 && e.read().pending==0);assert(e.read().sum==(nodes[i].player==nodes.back().player?value:-value));}
  }
  // Independently enumerate partial binary proof trees. A numerical +-1 is deliberately used for every
  // UNKNOWN leaf; it must never supply a proof. Include consecutive placements by the same player and
@@ -39,7 +39,7 @@ int main(){
    gumbel::Tree t(0);std::vector<gumbel::Node*> level{t.root.get()};std::vector<std::vector<std::pair<gumbel::Node*,int>>> paths(1);
    for(int d=0;d<depth;++d){std::vector<gumbel::Node*> next;std::vector<std::vector<std::pair<gumbel::Node*,int>>> next_paths;
     for(int i=0;i<int(level.size());++i){auto* node=level[i];node->player=(players>>d)&1;node->expanded=true;
-     for(int j=0;j<2;++j){gumbel::Edge e;e.prior=.5;e.child=std::make_unique<gumbel::Node>();next.push_back(e.child.get());node->edges.push_back(std::move(e));auto p=paths[i];p.emplace_back(node,j);next_paths.push_back(std::move(p));}
+     for(int j=0;j<2;++j){gumbel::Edge e;e.write().child=std::make_unique<gumbel::Node>();next.push_back(e.read().child.get());node->edges.push_back(std::move(e));auto p=paths[i];p.emplace_back(node,j);next_paths.push_back(std::move(p));}
     }level=std::move(next);paths=std::move(next_paths);
    }
    std::vector<int> observed(leaves,-1);int encoded=assignment;
@@ -52,30 +52,30 @@ int main(){
     return {-1,-1};
    };
    for(int i=0;i<leaves;++i){int verdict=encoded%3-1;encoded/=3;observed[i]=verdict;level[i]->player=(players>>depth)&1;level[i]->exact_winner=verdict;level[i]->distance=verdict<0?-1:i%3;
-    gumbel::Path p;p.leaf=level[i];p.edges=paths[i];for(auto [node,index]:p.edges)++node->edges[index].pending;
+    gumbel::Path p;p.leaf=level[i];p.edges=paths[i];for(auto [node,index]:p.edges)++node->edges[index].write().pending;
     t.backup(p,i%2?1:-1);auto want=expected(0,0);assert(t.root->exact_winner==want.first);if(want.first>=0)assert(t.root->distance==want.second);
-    for(auto [node,index]:p.edges){auto& e=node->edges[index];assert(e.pending==0);assert(e.exact_winner==e.child->exact_winner);if(e.exact_winner>=0)assert(e.sum==(e.exact_winner==node->player?e.visits:-e.visits));}
+    for(auto [node,index]:p.edges){auto& e=node->edges[index];assert(e.read().pending==0);assert(e.read().exact_winner==e.read().child->exact_winner);if(e.read().exact_winner>=0)assert(e.read().sum==(e.read().exact_winner==node->player?e.read().visits:-e.read().visits));}
    }
   }
  }
  // Neither an empty nor an unexpanded action list can certify a loss.
- {gumbel::Tree t(0);gumbel::Node node;node.player=0;t.settle(node);assert(node.exact_winner==-1);node.edges.emplace_back();node.edges[0].exact_winner=1;t.settle(node);assert(node.exact_winner==-1);}
+ {gumbel::Tree t(0);gumbel::Node node;node.player=0;t.settle(node);assert(node.exact_winner==-1);node.edges.emplace_back();node.edges[0].write().exact_winner=1;t.settle(node);assert(node.exact_winner==-1);}
  // A lost node keeps every loss that may resist longest. With tactics a bounded loss outlasts every one-turn loss
  // (at least remaining + 5 placements); without tactics a bound may hide a faster loss, so it only drops losses
  // that are certainly shorter.
  for(bool tactics:{true,false}){gumbel::Tree t(0);t.tactics=tactics;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
   int d[]={3,2,20,7};bool b[]={false,false,true,true};
-  for(int i=0;i<4;++i){gumbel::Edge e;e.exact_winner=1;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  for(int i=0;i<4;++i){gumbel::Edge e;e.write().exact_winner=1;e.write().distance=d[i];e.write().bound=b[i];n.edges.push_back(std::move(e));}
   t.settle(n);assert(n.exact_winner==1 && n.distance==20 && n.bound);
-  assert(n.edges[0].eligible==!tactics && !n.edges[1].eligible && n.edges[2].eligible && n.edges[3].eligible);}
+  assert(n.edges[0].read().eligible==!tactics && !n.edges[1].read().eligible && n.edges[2].read().eligible && n.edges[3].read().eligible);}
  // A won node's distance is exact when an exact edge attains it and no bounded win could be faster.
  for(int slow:{20,4}){gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
   int d[]={2,slow};bool b[]={false,true};
-  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
-  t.settle(n);assert(n.exact_winner==0 && n.distance==2 && !n.bound && n.edges[0].eligible && !n.edges[1].eligible);}
+  for(int i=0;i<2;++i){gumbel::Edge e;e.write().exact_winner=0;e.write().distance=d[i];e.write().bound=b[i];n.edges.push_back(std::move(e));}
+  t.settle(n);assert(n.exact_winner==0 && n.distance==2 && !n.bound && n.edges[0].read().eligible && !n.edges[1].read().eligible);}
  {gumbel::Tree t(0);t.tactics=true;gumbel::Node n;n.player=0;n.remaining=1;n.expanded=true;
   int d[]={9,20};bool b[]={false,true};
-  for(int i=0;i<2;++i){gumbel::Edge e;e.exact_winner=0;e.distance=d[i];e.bound=b[i];n.edges.push_back(std::move(e));}
+  for(int i=0;i<2;++i){gumbel::Edge e;e.write().exact_winner=0;e.write().distance=d[i];e.write().bound=b[i];n.edges.push_back(std::move(e));}
   t.settle(n);assert(n.distance==9 && n.bound);}
  // Graph search: both orders of each turn meet in one node; another turn partition of the same stones is another
  // context but inherits the proven outcome of the position.
@@ -93,7 +93,7 @@ int main(){
  {gumbel::Tree t(0);t.graph=true;gumbel::Node n;n.player=0;n.expanded=true;
   for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};n.edges.push_back(std::move(e));}
   gumbel::Outcome won{0,0,5,3,true,{{{1,1},0,5,true}}};
-  assert(t.apply(won,n) && n.exact_winner==0 && n.distance==5 && !n.edges[0].eligible && n.edges[1].eligible);
+  assert(t.apply(won,n) && n.exact_winner==0 && n.distance==5 && !n.edges[0].read().eligible && n.edges[1].read().eligible);
   gumbel::Node u;u.player=1;u.exact_winner=0;u.distance=4;u.bound=true;
   assert(t.apply(gumbel::Outcome{1,0,4,3,false},u) && !u.bound && !t.apply(gumbel::Outcome{1,0,6,3,false},u));}
  // Advancing into another context of a position proven won with a witness keeps the verdict; the root still expands
@@ -107,14 +107,14 @@ int main(){
   auto& legal=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:legal){a.push_back(c.q);a.push_back(c.r);}
   std::vector<double> z(legal.size());u.fulfill(id,a.data(),z.data(),z.data(),int(legal.size()));
   assert(u.done() && u.root->exact_winner==0);
-  for(auto& e:u.root->edges)assert(e.eligible==(e.action==Cell{5,0}));}
+  for(auto& e:u.root->edges)assert(e.read().eligible==(e.action==Cell{5,0}));}
  // A second equally short win proven in one expanded context reaches an expanded peer, though the outcome is unchanged.
  {gumbel::Tree t(0);t.graph=true;
   auto make=[&](std::vector<Cell> moves){t.board=Board{};for(auto c:moves)t.board.make(c);auto n=t.child_here();n->expanded=true;
    for(int i=0;i<3;++i){gumbel::Edge e;e.action={9,i};n->edges.push_back(std::move(e));}return n;};
   auto one=make({{0,0},{1,0},{2,0},{0,1},{0,2},{3,0},{4,0}}),two=make({{0,0},{1,0},{3,0},{0,1},{0,2},{2,0},{4,0}});
-  for(int i:{0,1}){one->edges[i].exact_winner=0;one->edges[i].distance=2;t.settle(*one);t.learn(*one);}
-  assert(two->exact_winner==0 && two->edges[0].eligible && two->edges[1].eligible && !two->edges[2].eligible);}
+  for(int i:{0,1}){one->edges[i].write().exact_winner=0;one->edges[i].write().distance=2;t.settle(*one);t.learn(*one);}
+  assert(two->exact_winner==0 && two->edges[0].read().eligible && two->edges[1].read().eligible && !two->edges[2].read().eligible);}
  // A two-stone certificate whose witness context already has a node gives that node the second stone.
  {gumbel::Tree t(0);t.graph=true;t.root->position=gumbel::keys(t.board).first;
   for(auto c:std::vector<Cell>{{0,0},{1,0},{2,0}})t.advance(c);
@@ -122,18 +122,18 @@ int main(){
   t.begin(4,2);int id=t.request();auto h=t.requests.at(id).history;std::vector<int64_t> hist;for(auto c:h){hist.push_back(c.q);hist.push_back(c.r);}
   int64_t moves[]={3,3,3,4};t.prove(id,hist.data(),int(h.size()),0,2,moves,2,2);
   auto edge=std::find_if(t.root->edges.begin(),t.root->edges.end(),[](auto& e){return e.action==Cell{3,3};});
-  assert(edge->child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);
+  assert(edge->read().child==existing && existing->exact_winner==0 && existing->distance==5 && existing->bound);
   // Playing the first stone keeps the verdict, and the first request expands the root with the second stone.
   t.advance({3,3});assert(t.root==existing && t.root->exact_winner==0);
   t.begin(4,2);id=t.request();auto& l=t.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
   std::vector<double> z(l.size());t.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
-  for(auto& e:t.root->edges)assert(e.eligible==(e.action==Cell{3,4}));}
+  for(auto& e:t.root->edges)assert(e.read().eligible==(e.action==Cell{3,4}));}
  // Expanding another context of a proven loss takes a live peer's exact resistances, not only the shared bound.
  {gumbel::Tree t(0);t.graph=true;
   for(auto c:std::vector<Cell>{{0,0},{1,0},{2,0},{0,1},{0,2},{3,0}})t.advance(c);
   t.board.make({4,0});auto peer=t.child_here();auto legal=t.board.legal_moves();t.board.undo();
   peer->expanded=true;peer->remaining=2;
-  for(size_t i=0;i<legal.size();++i){gumbel::Edge e;e.action=legal[i];e.exact_winner=1;e.distance=i==0?9:3;peer->edges.push_back(std::move(e));}
+  for(size_t i=0;i<legal.size();++i){gumbel::Edge e;e.action=legal[i];e.write().exact_winner=1;e.write().distance=i==0?9:3;peer->edges.push_back(std::move(e));}
   t.settle(*peer);t.learn(*peer);assert(peer->exact_winner==1 && peer->distance==9 && !peer->bound);
   // With the peer alive, and after it is gone (the shared outcome keeps the per-move resistances).
   for(bool alive:{true,false}){
@@ -142,73 +142,73 @@ int main(){
    assert(u.root->exact_winner==1 && !u.root->expanded);
    u.begin(4,2);int id=u.request();auto& l=u.requests.at(id).legal;std::vector<int64_t> a;for(auto c:l){a.push_back(c.q);a.push_back(c.r);}
    std::vector<double> z(l.size());u.fulfill(id,a.data(),z.data(),z.data(),int(l.size()));
-   assert(u.root->distance==9 && !u.root->bound && u.root->edges[0].eligible && !u.root->edges[1].eligible);
+   assert(u.root->distance==9 && !u.root->bound && u.root->edges[0].read().eligible && !u.root->edges[1].read().eligible);
   }}
  // A longer proof from a shared child never loosens a tighter proof already on an incoming edge.
  {gumbel::Tree t(0);t.graph=true;auto p=std::make_shared<gumbel::Node>(),c=std::make_shared<gumbel::Node>();
   p->player=0;c->player=1;p->expanded=c->expanded=true;
-  gumbel::Edge e;e.child=c;e.exact_winner=0;e.distance=3;e.bound=true;p->edges.push_back(std::move(e));c->parents.push_back(p);
+  gumbel::Edge e;e.write().child=c;e.write().exact_winner=0;e.write().distance=3;e.write().bound=true;p->edges.push_back(std::move(e));c->parents.push_back(p);
   c->exact_winner=0;c->distance=9;t.propagate(*c,nullptr);
-  assert(p->edges[0].distance==3 && p->edges[0].bound);}
+  assert(p->edges[0].read().distance==3 && p->edges[0].read().bound);}
  // MCGS backup: a node's value is recomputed from its edges' visits and its children's current values; a playout
  // reusing a transposed child's value leaves that child unchanged.
  {gumbel::Tree t(0);t.graph=true;gumbel::Node r;r.player=0;r.expanded=true;r.value=.2;
   auto child=std::make_shared<gumbel::Node>();child->player=1;child->expanded=true;child->n=3;child->q=.5;
-  for(int i=0;i<2;++i){gumbel::Edge e;e.child=child;e.prior=.5;r.edges.push_back(std::move(e));}
-  gumbel::Path p;p.leaf=child.get();p.edges={{&r,0}};++r.edges[0].pending;t.backup(p,.5,false);
-  assert(r.edges[0].visits==1 && std::abs(r.q-(.2-.5)/2)<1e-12 && child->n==3 && r.n==1);
+  for(int i=0;i<2;++i){gumbel::Edge e;e.write().child=child;r.edges.push_back(std::move(e));}
+  gumbel::Path p;p.leaf=child.get();p.edges={{&r,0}};++r.edges[0].write().pending;t.backup(p,.5,false);
+  assert(r.edges[0].read().visits==1 && std::abs(r.q-(.2-.5)/2)<1e-12 && child->n==3 && r.n==1);
   assert(std::abs(t.value(r,r.edges[1])+.5)<1e-12);}
  // A backup through one parent of a shared child also brings the child's other parents up to date, verdicts included.
  {gumbel::Tree t(0);t.graph=true;
   auto r=std::make_shared<gumbel::Node>(),a=std::make_shared<gumbel::Node>(),b=std::make_shared<gumbel::Node>(),c=std::make_shared<gumbel::Node>();
   r->player=0;a->player=b->player=1;c->player=0;r->expanded=a->expanded=b->expanded=c->expanded=true;c->n=1;c->q=.2;
-  for(auto* x:{r.get()})for(auto child:{a,b}){gumbel::Edge e;e.child=child;e.prior=.5;x->edges.push_back(std::move(e));}
-  for(auto x:{a,b}){gumbel::Edge e;e.child=c;e.prior=1;e.visits=1;x->edges.push_back(std::move(e));c->parents.push_back(x);t.refresh(*x);}
+  for(auto* x:{r.get()})for(auto child:{a,b}){gumbel::Edge e;e.write().child=child;x->edges.push_back(std::move(e));}
+  for(auto x:{a,b}){gumbel::Edge e;e.write().child=c;e.write().visits=1;x->edges.push_back(std::move(e));c->parents.push_back(x);t.refresh(*x);}
   a->parents.push_back(r);b->parents.push_back(r);
   assert(std::abs(b->q+.1)<1e-12);
   c->exact_winner=0;c->distance=1;
-  gumbel::Path p;p.leaf=c.get();p.edges={{r.get(),0},{a.get(),0}};for(auto [n,i]:p.edges)++n->edges[i].pending;t.backup(p,1);
+  gumbel::Path p;p.leaf=c.get();p.edges={{r.get(),0},{a.get(),0}};for(auto [n,i]:p.edges)++n->edges[i].write().pending;t.backup(p,1);
   // b's only edge leads to the proven win for player 0, so b is proven lost like a.
-  assert(c->q==1 && a->q==-1 && b->q==-1 && b->exact_winner==0 && b->edges[0].exact_winner==0 && b->edges[0].distance==2);}
+  assert(c->q==1 && a->q==-1 && b->q==-1 && b->exact_winner==0 && b->edges[0].read().exact_winner==0 && b->edges[0].read().distance==2);}
  // A rarely selected legal edge keeps its weight after eviction, restarts when
  // its retained summary is absent, and receives proofs after reattachment.
  {gumbel::Tree t(3);t.graph=true;t.board.make({0,0});auto p=t.root;p->player=t.board.player;p->expanded=true;p->value=.25;
-  auto legal=t.board.legal_moves();for(auto action:legal){gumbel::Edge e;e.action=action;e.prior=1./legal.size();p->edges.push_back(std::move(e));}
+  auto legal=t.board.legal_moves();for(auto action:legal){gumbel::Edge e;e.action=action;p->edges.push_back(std::move(e));}
   auto child=std::make_shared<gumbel::Node>(p->memory);child->player=p->player;child->n=3;child->q=.5;
-  auto& edge=p->edges.back();t.attach(*p,edge,child);edge.visits=2;edge.sum=1;t.refresh(*p);
+  auto& edge=p->edges.back();t.attach(*p,edge,child);edge.write().visits=2;edge.write().sum=1;t.refresh(*p);
   assert(std::abs(p->q-1.25/3)<1e-12 && p->edges.size()==legal.size());
-  edge.child.reset();t.refresh(*p);assert(std::abs(p->q-1.25/3)<1e-12);
+  edge.write().child.reset();t.refresh(*p);assert(std::abs(p->q-1.25/3)<1e-12);
   child=std::make_shared<gumbel::Node>(p->memory);child->player=p->player;t.attach(*p,edge,child);t.refresh(*p);
-  assert(edge.visits==0 && edge.sum==0 && p->q==.25);
-  gumbel::Path path;path.leaf=child.get();path.edges={{p.get(),int(p->edges.size()-1)}};edge.pending=1;t.backup(path,.8);
-  assert(edge.visits==1 && edge.pending==0 && std::abs(p->q-.525)<1e-12);
+  assert(edge.read().visits==0 && edge.read().sum==0 && p->q==.25);
+  gumbel::Path path;path.leaf=child.get();path.edges={{p.get(),int(p->edges.size()-1)}};edge.write().pending=1;t.backup(path,.8);
+  assert(edge.read().visits==1 && edge.read().pending==0 && std::abs(p->q-.525)<1e-12);
   child->exact_winner=1-p->player;child->distance=3;t.propagate(*child,nullptr);
-  assert(edge.exact_winner==child->exact_winner && edge.distance==4 && !edge.eligible && p->exact_winner==-1);
+  assert(edge.read().exact_winner==child->exact_winner && edge.read().distance==4 && !edge.read().eligible && p->exact_winner==-1);
   // One touched losing edge cannot exhaust the untouched legal replies.
-  assert(std::count_if(p->edges.begin(),p->edges.end(),[](const auto& e){return e.eligible;})==int(legal.size())-1);
-  for(auto& e:p->edges)if(e.exact_winner<0){e.exact_winner=child->exact_winner;e.distance=2;}
+  assert(std::count_if(p->edges.begin(),p->edges.end(),[](const auto& e){return e.read().eligible;})==int(legal.size())-1);
+  for(auto& e:p->edges)if(e.read().exact_winner<0){e.write().exact_winner=child->exact_winner;e.write().distance=2;}
   t.settle(*p);assert(p->exact_winner==child->exact_winner && p->distance==4);
  }
  gumbel::Tree tree(1);tree.advance({0,0});tree.begin(16,4);
  assert(tree.sequence==std::vector<int>({0,0,0,0,1,1,1,1,2,2,3,3,4,4,5,5}));
  gumbel::Node n;n.value=.2;
- for(int i=0;i<3;++i){gumbel::Edge e;e.prior=1./3;e.visits=i==0?2:0;e.sum=i==0?1.:0;n.edges.push_back(std::move(e));}
+ for(int i=0;i<3;++i){gumbel::Edge e;e.write().visits=i==0?2:0;e.write().sum=i==0?1.:0;n.edges.push_back(std::move(e));}
  auto q=tree.transformed(n);assert(std::abs(q[0]-5.2)<1e-10 && q[1]==0 && q[2]==0);
  // A proven loss (ineligible, Q -1 with more visits) sets neither the range, the mixed value nor the visit scale.
  {gumbel::Node m;m.value=.2;m.player=0;
-  for(int i=0;i<3;++i){gumbel::Edge e;e.prior=1./3;e.visits=i<2?2:9;e.sum=i==0?1.:-1.;m.edges.push_back(std::move(e));}
-  m.edges[2].exact_winner=1;m.edges[2].eligible=false;
+  for(int i=0;i<3;++i){gumbel::Edge e;e.write().visits=i<2?2:9;e.write().sum=i==0?1.:-1.;m.edges.push_back(std::move(e));}
+  m.edges[2].write().exact_winner=1;m.edges[2].write().eligible=false;
   auto r=tree.transformed(m);assert(std::abs(r[0]-5.2)<1e-10 && std::abs(r[1])<1e-12);}
  // Final selection excludes eliminated actions despite a larger stale score.
  tree.root->expanded=true;tree.root->value=0;
- for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};e.prior=.5;e.logit=i?0:100;tree.root->edges.push_back(std::move(e));}
+ for(int i=0;i<2;++i){gumbel::Edge e;e.action={i,1};e.logit=i?0:100;tree.root->edges.push_back(std::move(e));}
  tree.prepare_root();tree.root_edges[0].epoch=1;tree.root_edges[1].epoch=4;
  int64_t actions[4];int visits[2];double values[2],scores[2];
  hxg_stats(&tree,actions,visits,values,scores);
  assert(!std::isfinite(scores[0]) && std::isfinite(scores[1]));
  // Reused estimates must not change the initial policy Gumbel sample.
- tree.root->edges[0].logit=1;tree.root_edges[0].gumbel=0;tree.root->edges[0].visits=10000;tree.root->edges[0].sum=-10000;
- tree.root->edges[1].logit=0;tree.root_edges[1].gumbel=0;tree.root->edges[1].visits=10000;tree.root->edges[1].sum=10000;
+ tree.root->edges[0].logit=1;tree.root_edges[0].gumbel=0;tree.root->edges[0].write().visits=10000;tree.root->edges[0].write().sum=-10000;
+ tree.root->edges[1].logit=0;tree.root_edges[1].gumbel=0;tree.root->edges[1].write().visits=10000;tree.root->edges[1].write().sum=10000;
  for(auto& e:tree.root_edges)e.epoch=0;
  int request=tree.request();assert(request>0 && tree.requests.at(request).edges.front().second==0);tree.cancel();
  // Returning after advance resumes the source comparison's priority, bonuses and hold as well as its credits.
