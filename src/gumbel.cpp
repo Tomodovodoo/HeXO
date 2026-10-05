@@ -196,7 +196,7 @@ struct Archive {
  std::unordered_map<Key,size_t,KeyHash> contexts;
  std::unordered_map<ColouredCell,std::bitset<slots>,ColouredHash> membership;
  std::bitset<slots> occupied,compatible;
- std::vector<ColouredCell> focus;
+ std::shared_ptr<const HistoryLink> focus;
  size_t limit,bytes=0;uint64_t retained=0,reused=0,discarded=0;
  explicit Archive(size_t budget):limit(budget){}
  static size_t payload(const Node& n){
@@ -207,16 +207,17 @@ struct Archive {
    +n.parents.capacity()*sizeof(std::weak_ptr<Node>)+size_t(n.stones)*(sizeof(HistoryLink)+2*sizeof(void*));
  }
  size_t index_bytes()const{
-  return sizeof(Archive)+focus.capacity()*sizeof(ColouredCell)
+  return sizeof(Archive)
    +(contexts.bucket_count()+membership.bucket_count())*sizeof(void*)
    +contexts.size()*(sizeof(decltype(contexts)::value_type)+2*sizeof(void*))
    +membership.size()*(sizeof(decltype(membership)::value_type)+2*sizeof(void*));
  }
  size_t total_bytes()const{return bytes+index_bytes();}
- void set_focus(const std::vector<Cell>& h){
-  focus.clear();for(size_t i=0;i<h.size();++i)focus.push_back({h[i],int((i+1)/2%2)});
+ int focus_stones()const{return focus?focus->stones:0;}
+ void set_focus(std::shared_ptr<const HistoryLink> h){
+  focus=std::move(h);
   compatible=occupied;
-  for(auto c:focus){auto found=membership.find(c);if(found==membership.end()){compatible.reset();break;}compatible&=found->second;}
+  for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end()){compatible.reset();break;}compatible&=found->second;}
  }
  void refresh(){bytes=0;for(auto& e:entries)if(e.node){e.bytes=payload(*e.node);bytes+=e.bytes;}}
  void insert(const std::shared_ptr<Node>& node){
@@ -224,12 +225,13 @@ struct Archive {
   if(slot==slots)throw std::runtime_error("Dormant archive has no free slot");
   auto& entry=entries[slot];entry={node,payload(*node)};bytes+=entry.bytes;contexts.emplace(node->context,slot);occupied.set(slot);compatible.set(slot);
   for(auto p=node->history;p;p=p->before)membership[{p->cell,(p->stones/2)%2}].set(slot);
-  for(auto c:focus){auto found=membership.find(c);if(found==membership.end() || !found->second[slot]){compatible.reset(slot);break;}}
+  for(auto p=focus;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});if(found==membership.end() || !found->second[slot]){compatible.reset(slot);break;}}
   node->dormant=true;++retained;
  }
  std::shared_ptr<Node> remove(size_t slot){
   auto node=std::move(entries[slot].node);bytes-=entries[slot].bytes;entries[slot].bytes=0;contexts.erase(node->context);occupied.reset(slot);compatible.reset(slot);
   for(auto p=node->history;p;p=p->before){auto found=membership.find({p->cell,(p->stones/2)%2});found->second.reset(slot);if(found->second.none())membership.erase(found);}
+  if(occupied.none()){contexts.rehash(0);membership.rehash(0);}
   return node;
  }
  template<class Allowed> size_t victim(Allowed allowed)const{
@@ -237,7 +239,7 @@ struct Archive {
   for(size_t i=0;i<slots;++i)if(occupied[i] && allowed(entries[i].node.get())){auto& e=entries[i];
    // Colour containment is necessary for forward reuse, not a reachability
    // proof. Keep incompatible entries less eagerly so undo remains useful.
-   double benefit=(compatible[i]?4.:1.)*std::log1p(e.node->n)/(1+std::abs(e.node->stones-int(focus.size())));
+   double benefit=(compatible[i]?4.:1.)*std::log1p(e.node->n)/(1+std::abs(e.node->stones-focus_stones()));
    double score=benefit/std::max(size_t(1),e.bytes);
    if(chosen==slots || score<best || (score==best && e.node->used<entries[chosen].node->used)){chosen=i;best=score;}
   }
@@ -370,7 +372,7 @@ struct Tree {
   if(found==archive.contexts.end())throw std::runtime_error("Unowned dormant node");
   archive.remove(found->second);node->dormant=false;store[node->context]=node;++archive.reused;node->used=clock;
  }
- void archive_focus(const std::vector<Cell>& history){if(state->archive)state->archive->set_focus(history);}
+ void archive_focus(){if(state->archive)state->archive->set_focus(root->history);}
  std::shared_ptr<Node> child_here(std::shared_ptr<const HistoryLink> before={},bool descended=false) {
   if(!graph){auto n=std::make_shared<Node>(state->memory);n->player=board.player;return n;}
   auto [position,context]=keys(board);auto& slot=nodes[context];
@@ -537,7 +539,7 @@ struct Tree {
     // Keep the incoming links while dormant: exact and numerical improvements
     // must still reach every surviving parent. Only actual discard cuts them.
     auto node=store.at(x->context);expanded-=x->expanded;++evicted;store.erase(x->context);
-    if(state->archive && node->expanded){
+    if(state->archive && node->expanded && Archive::payload(*node)+sizeof(Archive)<=state->archive->limit){
      trim_archive(true,false);
      if(!state->archive->occupied.all()){state->archive->insert(node);trim_archive(false,false);}
      else discard(node);
@@ -568,8 +570,9 @@ struct Tree {
   Board next;for(auto c:history){if(!next.legal(c))throw std::runtime_error("Illegal root history");next.make(c);}
   save_root();board=next;priority.clear();defence.clear();hold=false;budget=started=completed=0;lineage.clear();++version;
   if(!state->primary)state->primary=this;
-  if(state->primary==this)archive_focus(history);
-  root=child_here();root->player=board.player;root->used=++clock;restore_root();pin();adopt(root,history);
+  root=child_here();root->player=board.player;root->used=++clock;
+  if(state->primary==this)archive_focus();
+  restore_root();pin();adopt(root,history);
   evict();
  }
  // MCGS value of a graph node for its mover from its network value and its edges' visits and current values.
@@ -1020,7 +1023,7 @@ struct Tree {
   for(auto& e:root->edges)if(e.action==action){winner=e.read().exact_winner;distance=e.read().distance;bound=e.read().bound;next=shared?e.read().child:std::move(e.write().child);break;}
   save_root();auto before=root->history;board.make(action);root=next?std::move(next):child_here(std::move(before),true);reactivate(root);root->player=board.player;restore_root();
   // A shared graph keeps the siblings and every earlier position; a new root joins its stored parents.
-  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);if(state->primary==this)archive_focus(history);pin();adopt(root,history);root->used=++clock;++version;}
+  if(shared){std::vector<Cell> history;for(auto& u:board.history)history.push_back(u.c);if(state->primary==this)archive_focus();pin();adopt(root,history);root->used=++clock;++version;}
   if(winner>=0 && winner!=root->player){root->exact_winner=winner;root->distance=distance-1;root->bound=bound;}
   if(graph){
    std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
@@ -1098,12 +1101,12 @@ HX_API int hxg_archive(void* p,int64_t bytes){try{
  if(!t.shared || t.state->archive || !t.requests.empty() || std::any_of(t.store.begin(),t.store.end(),[](const auto& entry){return entry.second->expanded || entry.second->stones;}) || bytes<65536)
   throw std::runtime_error("Archive needs an unexpanded shared graph and at least 64 KiB");
  t.state->archive=std::make_unique<gumbel::Archive>(size_t(bytes));
- t.archive_focus({});return 1;
+ t.archive_focus();return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Managed dormant payload and estimated index allocations, not pool residency
 // or process RSS. History prefixes are conservatively charged per entry.
 HX_API int hxg_archive_stats(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);auto* a=t.state->archive.get();if(!a)return 0;
- a->refresh();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus.size())};
+ a->refresh();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus_stones())};
  std::copy(values.begin(),values.end(),out);return 1;}
 // Shared graph: moves the root to the position after `history` (n int64 q/r pairs), keeping every node's statistics
 // (Tree::root_at); 0 with the error set for an illegal history, an unshared tree or pending requests.

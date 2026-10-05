@@ -813,6 +813,13 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual(int(graph.credits().sum()), 8)
         self.assertEqual(int(result['visits'].sum()), 136)
         self.assertEqual(graph.counters()['pending'], 0)
+        different_context = original[:5]+original[9:11]+original[7:9]+original[5:7]
+        graph.at(different_context)
+        self.assertEqual(len(graph.result(0, 0, 0, 0)['actions']), 0)
+        different_colours = list(original)
+        different_colours[1], different_colours[3] = different_colours[3], different_colours[1]
+        graph.at(different_colours)
+        self.assertEqual(len(graph.result(0, 0, 0, 0)['actions']), 0)
 
     def test_auxiliary_archive_focus_and_rejected_configuration_leave_game_usable(self):
         graph = GameGraph(Uniform(), 'archive-focus', [(0,0)], limit=4, archive_bytes=65536)

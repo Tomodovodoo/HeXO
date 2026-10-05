@@ -3,6 +3,13 @@
 #include <iostream>
 #include <functional>
 int main(){
+ // A long active history must not consume an empty dormant archive's byte
+ // allowance. Consecutive cells alternate colours in pairs and cannot win.
+ {gumbel::Archive archive(65536);std::shared_ptr<const gumbel::HistoryLink> history;
+  for(int i=0;i<4096;++i)history=std::make_shared<gumbel::HistoryLink>(history,Cell{i,0});
+  archive.set_focus(history);assert(archive.focus_stones()==4096 && archive.total_bytes()<=archive.limit);
+  archive.focus.reset();while(history){auto before=history->before;history.reset();history=std::move(before);}
+ }
  // Dormant descendants survive a cut ancestor. Proofs propagate through
  // retained links, and beginning a descendant comparison promotes/pins its
  // lineage so another view cannot free a raw backup pointer.
