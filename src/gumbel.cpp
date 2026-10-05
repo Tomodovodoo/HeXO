@@ -60,6 +60,14 @@ std::pair<Key,Key> child_keys(Key parent,const std::vector<Cell>& history,Cell a
  for(size_t i=start>=2?start-2:0;i<start;++i){auto c=CellHash{}(i==n?action:history[i]);context.a+=mix(c+0x7f1);context.b+=mix(c+0x3c9);}
  return {position,context};
 }
+// Removing a possible last placement identifies its predecessor's rule position.
+// Neural context is checked separately when that predecessor expands.
+Key predecessor(Key child,size_t stones,Cell action) {
+ const int mover=int(stones/2%2),player=int((stones+1)/2%2),remaining=stones%2?2:1;
+ const int before=stones==1 || stones%2?1:2;auto h=CellHash{}(action);
+ return {child.a-mix(player*3+remaining+17)+mix(mover*3+before+17)-mix(h^mix(mover+1)),
+         child.b-mix(player*3+remaining+71)+mix(mover*3+before+71)-mix(h+mix(mover+911))};
+}
 // The same keys from a placement history, without replaying it: stone i belongs to player ((i + 1) / 2) % 2.
 std::pair<Key,Key> keys(const std::vector<Cell>& history) {
  const size_t n=history.size();const int player=int((n+1)/2%2),remaining=n==0 || n%2==0?1:2;
@@ -275,6 +283,8 @@ struct GameStore {
  std::shared_ptr<EdgeMemory> memory=std::make_shared<EdgeMemory>();
  std::unordered_map<Key,std::weak_ptr<Node>,KeyHash> nodes;
  std::unordered_map<Key,std::vector<std::weak_ptr<Node>>,KeyHash> positions;
+ struct Continuation {Cell action;std::weak_ptr<Node> child;};
+ std::unordered_map<Key,std::vector<Continuation>,KeyHash> continuations;
  std::unordered_map<Key,Outcome,KeyHash> outcomes;
  std::unordered_map<Key,std::shared_ptr<Node>,KeyHash> store;
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
@@ -401,6 +411,16 @@ struct Tree {
   if(found==archive.contexts.end())throw std::runtime_error("Unowned dormant node");
   archive.remove(found->second);node->dormant=false;store[node->context]=node;++archive.reused;node->used=clock;
  }
+ void index_child(const std::shared_ptr<Node>& node,const Board& position){
+  const auto n=position.history.size();if(!n)return;
+  auto add=[&](Cell action){state->continuations[predecessor(node->position,n,action)].push_back({action,node});};
+  add(position.history.back().c);
+  if(n>=3 && n%2)add(position.history[n-2].c);
+ }
+ void prune_continuations(){
+  for(auto& [key,list]:state->continuations)std::erase_if(list,[](const auto& e){return e.child.expired();});
+  std::erase_if(state->continuations,[](const auto& e){return e.second.empty();});
+ }
  void archive_focus(){if(state->archive)state->archive->set_focus(root->history);}
  std::shared_ptr<Node> child_here(std::shared_ptr<const HistoryLink> before={},bool descended=false) {
   if(!graph){auto n=std::make_shared<Node>(state->memory);n->player=board.player;return n;}
@@ -412,7 +432,7 @@ struct Tree {
    if(descended)n->history=std::make_shared<HistoryLink>(std::move(before),board.history.back().c);
    else for(auto& u:board.history)n->history=std::make_shared<HistoryLink>(n->history,u.c);
   }
-  slot=n;positions[position].push_back(n);
+  slot=n;positions[position].push_back(n);if(shared)index_child(n,board);
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
@@ -499,18 +519,16 @@ struct Tree {
   }
   else stale(parent);
  }
- // Shared graph: attaches to a newly expanded node every legal move whose turn context the store already holds.
- // A move's position key follows from the node's own, so the full key is computed only for positions present.
+ // Shared graph: find stored continuations by predecessor position, then check
+ // the exact neural context before attaching. Untouched legal actions need no lookup.
  void link(const Path& path,Node& node) {
-  const int p=path.player,r=path.remaining,after=r==2?p:1-p,left=r==2?1:2;
-  const uint64_t a=node.position.a-mix(p*3+r+17)+mix(after*3+left+17),b=node.position.b-mix(p*3+r+71)+mix(after*3+left+71);
-  std::vector<Cell> history=path.history;history.push_back({});
-  for(auto& e:node.edges){
-   if(e.read().child)continue;
-   auto h=CellHash{}(e.action);
-   if(!positions.contains(Key{a+mix(h^mix(p+1)),b+mix(h+mix(p+911))}))continue;
-   history.back()=e.action;
-   if(auto found=nodes.find(keys(history).second);found!=nodes.end())if(auto child=found->second.lock())attach(node,e,child);
+  auto found=state->continuations.find(node.position);if(found==state->continuations.end())return;
+  auto& candidates=found->second;std::erase_if(candidates,[](const auto& e){return e.child.expired();});
+  for(auto& candidate:candidates)if(auto child=candidate.child.lock()){
+   if(child_keys(node.position,path.history,candidate.action).second!=child->context)continue;
+   // Expanded legal lists are sorted. No policy move is removed by this index.
+   auto e=std::lower_bound(node.edges.begin(),node.edges.end(),candidate.action,[](const Edge& e,Cell action){return e.action<action;});
+   if(e!=node.edges.end() && e->action==candidate.action && !e->read().child)attach(node,*e,child);
   }
  }
  // Shared graph: attaches `node`, the position after `history`, under the expanded nodes that reach it by its last
@@ -593,7 +611,7 @@ struct Tree {
   }
   std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
-  std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
+  std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
   // Proven outcomes stay while a stored node or a kept summary holds their position; beyond sixteen times `limit` the
   // others go.
   if(outcomes.size()>16*limit){
@@ -1061,10 +1079,17 @@ struct Tree {
    for(auto& edge:node.edges)if(edge.action==witness)tighten(exact,distance,true,edge.write().exact_winner,edge.write().distance,edge.write().bound);
    settle(node);learn(node);revise(node);proof_closed(path);if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);return;
   }
-  auto& node=*path.leaf;double total=0;std::vector<double> weights(count);for(int i=0;i<count;++i)total+=weights[i]=std::exp(logits[i]-maximum);
-  // Only root edges read their Gumbel noise and begin() redraws it, so interior edges just advance the stream.
-  const bool at_root=&node==root.get();if(at_root){root_edges.assign(count,{});root_prepared=true;}
-  node.value=0;node.policy_mass=total;node.edges.reserve(count);for(int i=0;i<count;++i){Edge edge(&node.empty);edge.action=legal[i];edge.logit=logits[i]-maximum;edge.weight=weights[i];node.value+=node.prior(edge)*values[i];double u=std::generate_canonical<double,53>(rng);if(at_root)root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));node.edges.push_back(std::move(edge));}
+  auto& node=*path.leaf;const bool at_root=&node==root.get();
+  // Build each legal edge once. Normalize the weighted value after accumulating
+  // its mass, without a temporary weights array or a division for every action.
+  if(at_root){root_edges.assign(count,{});root_prepared=true;}
+  double total=0,weighted=0;node.edges.reserve(count);
+  for(int i=0;i<count;++i){Edge edge(&node.empty);edge.action=legal[i];edge.logit=logits[i]-maximum;edge.weight=std::exp(edge.logit);
+   total+=edge.weight;weighted+=edge.weight*values[i];double u=std::generate_canonical<double,53>(rng);
+   if(at_root)root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));
+   node.edges.push_back(std::move(edge));
+  }
+  node.policy_mass=total;node.value=weighted/total;
   node.expanded=true;node.remaining=path.remaining;
   if(graph && path.remaining==1 && !path.history.empty())node.first=path.history.back();
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
@@ -1120,7 +1145,7 @@ struct Tree {
    auto child=std::make_shared<Node>(state->memory);child->player=player;child->remaining=1;child->expanded=true;child->exact_winner=player;child->distance=distance-1;child->bound=true;
    if(state->archive)child->history=std::make_shared<HistoryLink>(node->history,witness);
    child->edges.reserve(next_legal.size());for(auto c:next_legal){Edge e(&child->empty);e.action=c;e.eligibility(c==Cell{moves[2],moves[3]});if(e.read().eligible){e.write().exact_winner=player;e.write().distance=distance-1;e.write().bound=true;}child->edges.push_back(std::move(e));}
-   if(graph){auto [p,c]=keys(position);child->position=p;child->context=c;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);if(shared)store[c]=child;learn(*child);}
+   if(graph){auto [p,c]=keys(position);child->position=p;child->context=c;child->stones=int(position.cells.size());child->n=1;child->q=1;child->parents.push_back(node->weak_from_this());nodes[c]=child;positions[p].push_back(child);if(shared){index_child(child,position);store[c]=child;}learn(*child);}
    for(auto& e:node->edges)if(e.action==witness){e.write().child=std::move(child);if(graph)node->track(e);break;}
   }
  }
@@ -1134,7 +1159,7 @@ struct Tree {
   if(graph){
    std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
    for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
-   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});
+   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
    // Stones are never removed, so positions with fewer stones than the board can not recur (a shared graph keeps
    // them for roots that return to them).
    if(!shared)std::erase_if(outcomes,[&](const auto& entry){return entry.second.stones<int(board.cells.size());});
@@ -1192,8 +1217,8 @@ HX_API int hxg_tactics(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(
 // Switches graph search on (enabled != 0) or off before the root is expanded: transposed turn contexts share one node
 // and proven outcomes are shared by position.
 HX_API int hxg_graph(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty() || t.state.use_count()>1)return 0;
- t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();t.positions.clear();
- if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->stones=int(t.board.cells.size());t.root->remaining=t.board.remaining;if(!t.board.history.empty())t.root->first=t.board.history.back().c;t.nodes[context]=t.root;t.positions[position].push_back(t.root);}
+ t.graph=enabled!=0;t.nodes.clear();t.outcomes.clear();t.positions.clear();t.state->continuations.clear();
+ if(t.graph){auto [position,context]=gumbel::keys(t.board);t.root->position=position;t.root->context=context;t.root->stones=int(t.board.cells.size());t.root->remaining=t.board.remaining;if(!t.board.history.empty())t.root->first=t.board.history.back().c;t.nodes[context]=t.root;t.positions[position].push_back(t.root);t.index_child(t.root,t.board);}
  return 1;}
 // Makes the tree a shared game graph (graph search whose store keeps every node until evicted) before the root is
 // expanded; `limit` bounds the expanded nodes kept between searches (0: no bound). 0 with the error set otherwise.

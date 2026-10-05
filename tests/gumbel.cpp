@@ -11,9 +11,38 @@ int main(){
    for(size_t i=0;i<std::min(size_t(17),legal.size());++i){auto action=legal[i*legal.size()/std::min(size_t(17),legal.size())];
     Board child=board;child.make(action);
     assert(gumbel::child_keys(parent,history,action)==gumbel::keys(child));
+    assert(gumbel::predecessor(gumbel::keys(child).first,history.size()+1,action)==parent);
    }
    auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);
   }
+ }
+ // Stored continuations reconnect through both legal orders of a turn, but
+ // rule-position identity alone cannot alias different neural turn inputs.
+ {gumbel::Tree t(19);assert(hxg_share(&t,256));
+  auto expand=[&](const std::vector<Cell>& h){t.root_at(h);t.begin(1,1);int id=t.request();assert(id>0);
+   auto legal=t.requests.at(id).legal;std::vector<int64_t> actions;std::vector<double> logits(legal.size()),values(legal.size());
+   for(size_t i=0;i<legal.size();++i){actions.push_back(legal[i].q);actions.push_back(legal[i].r);logits[i]=-double(i)/17;values[i]=i%2?.7:-.4;}
+   t.fulfill(id,actions.data(),logits.data(),values.data(),int(legal.size()));
+   double mass=0,value=0;for(size_t i=0;i<legal.size();++i){double w=std::exp(logits[i]);mass+=w;value+=w*values[i];}
+   assert(std::abs(t.root->value-value/mass)<1e-12);assert(t.root->edges.size()==legal.size());
+   for(size_t i=0;i<legal.size();++i)assert(t.root->edges[i].action==legal[i] && std::abs(t.root->prior(t.root->edges[i])-std::exp(logits[i])/mass)<1e-12);
+   return t.root;
+  };
+  auto edge=[](auto& n,Cell action)->gumbel::Edge&{auto e=std::find_if(n->edges.begin(),n->edges.end(),[&](auto& e){return e.action==action;});assert(e!=n->edges.end());return *e;};
+  auto completed=expand({{0,0},{1,0},{2,0}});
+  auto first=expand({{0,0},{1,0}});assert(edge(first,{2,0}).read().child==completed);
+  auto reversed=expand({{0,0},{2,0}});assert(edge(reversed,{1,0}).read().child==completed);
+  t.root_at({{0,0},{1,0},{2,0}});t.mark(t.root->edges.front().action,t.root->player,5);
+  assert(edge(first,{2,0}).read().exact_winner==completed->player && edge(reversed,{1,0}).read().exact_winner==completed->player);
+  std::vector<Cell> a{{0,0},{1,0},{2,0},{0,1},{0,2},{1,1},{2,1},{1,2},{2,2}};
+  std::vector<Cell> b{{0,0},{1,0},{2,0},{1,2},{2,2},{1,1},{2,1},{0,1},{0,2}};
+  auto middle=a;middle.push_back({3,0});auto child=expand(middle);
+  auto wrong=expand(b);assert(wrong->position==gumbel::keys(a).first && !edge(wrong,{3,0}).read().child);
+  auto right=expand(a);assert(edge(right,{3,0}).read().child==child);
+  middle.push_back({4,0});auto whole=expand(middle);
+  auto other=b;other.push_back({3,0});auto peer=expand(other);
+  assert(peer->position==child->position && peer->context!=child->context);
+  assert(edge(peer,{4,0}).read().child==whole && edge(child,{4,0}).read().child==whole);
  }
  // Round sampling remains explicit while useful work crosses visit layers.
  for(bool shared:{false,true}){gumbel::Tree t(23);if(shared)assert(hxg_share(&t,256));t.advance({0,0});t.begin(128,8);

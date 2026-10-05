@@ -659,6 +659,21 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_stored_turn_reconnects_proofs_in_either_stone_order(self):
+        from tests.test_neural_search import Uniform
+        histories = [[[0,0],[1,0],[2,0]], [[0,0],[1,0]], [[0,0],[2,0]]]
+        bad_indices = [Uniform().evaluate([history])[0]['actions'].tolist().index(forbidden)
+                       for history, forbidden in zip(histories[1:], ([2,0], [1,0]))]
+        witness = Uniform().evaluate([histories[0]])[0]['actions'][0].tolist()
+        steps = [dict(at=histories[0], simulations=1, marks=[[*witness,0,5]]),
+                 dict(at=histories[1], simulations=1), dict(at=histories[2], simulations=1)]
+        result = node(dict(kind='search', cases=[dict(history=histories[0], seed=19, tactics=False,
+                                                     limit=256, uniform=True, batches=[], steps=steps)]))[0]
+        self.assertEqual(result[0]['unmarked'], 0)
+        for turn, index in zip(result[1:], bad_indices):
+            self.assertEqual(turn['policy'][index], 0.)
+            self.assertAlmostEqual(sum(turn['policy']), 1.)
+
     def test_immediate_turn_keeps_a_complete_policy_without_neural_batches(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         cases = [dict(history=history, seed=7, tactics=True, limit=16 if shared else None,
