@@ -9752,6 +9752,24 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['settings']['simulations'], 16)
                 self.assertLessEqual(result['scheduler_completed'], 16)
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                # Exact backend verdicts are position-scoped; both stones here belong to P2.
+                for winner, status, value in ((1, 'PROVEN_WIN', 1.), (0, 'UNKNOWN', .5)):
+                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                        service = service_type.return_value
+                        service.stats.return_value = dict(launched_rows=2)
+                        service.event.side_effect = [
+                            dict(producer=0, game=0, model=0, token=1, history=[[0, 0]], context='first',
+                                 action=[1, 0], exact_winner=-1, root_completed=1, completed=1,
+                                 edges=np.array([[1, 0, 0, 0, 0, 1, -1, -1, 0]], float)),
+                            dict(producer=0, game=0, model=0, token=2, history=[[0, 0], [1, 0]], context='second',
+                                 action=[2, 0], exact_winner=winner, root_completed=1, completed=1,
+                                 edges=np.array([[2, 0, 0, 0, 0, 1, winner, 1, 0]], float))]
+                        result = player.turn(game, 1000)
+                    self.assertEqual(result['proof_status'], status)
+                    self.assertEqual(result['win_probability'], value)
+                    self.assertEqual(result['stones'][0]['exact_winner'], -1)
+                    self.assertEqual(result['stones'][1]['exact_winner'], winner)
+                    self.assertEqual(result['moves'], [[1, 0], [2, 0]])
             finally:
                 game.close()
                 player.close()

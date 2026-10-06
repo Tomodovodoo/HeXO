@@ -345,6 +345,10 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 result['proof_status'] = ('PROVEN_WIN' if winner == side else 'PROVEN_LOSS') if winner >= 0 else 'UNKNOWN'
                 result['suggestions'] = [dict(move=edges[i, :2].astype(np.int64).tolist(), probability=float(edges[i, 5]))
                                          for i in np.argsort(-edges[:, 5])[:5]]
+            elif winner == side:
+                # One winning same-player continuation proves the original root;
+                # a losing chosen continuation does not cover its alternatives.
+                result.update(win_probability=1., proof_status='PROVEN_WIN')
             action = found['action']
             result['stones'].append(dict(history=current, move=action, win_probability=probability,
                                          exact_winner=winner, completed=found['root_completed'],
