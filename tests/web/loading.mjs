@@ -21,7 +21,8 @@ globalThis.Worker = class {
   postMessage(message) {
     const post = data => setTimeout(() => { if (!this.terminated) this.onmessage?.({data}); }, 1);
     if (message.type === 'load') { this.options = message.options; starts.push({...message.options}); script.load(message.options, post); }
-    else if (message.type !== 'cancel') script.call(message, post, this.options);
+    else if (message.type === 'cancel') script.cancel?.(message, post, this.options);
+    else script.call(message, post, this.options);
   }
   terminate() { this.terminated = true; }
 };
@@ -216,6 +217,52 @@ session.paused = true;
 session.lighten('quick');
 out.lighten = {seats: session.seats.map(s => s.preset ?? null), preset: session.entries.get('quick').preset};
 session.cancelJobs();
+
+// An abandoned search must release the session even when its worker ignores Cancel.
+const stalled = new BrowserSession(session.native), engine = new EngineWorker('worker.mjs', 'Bubble');
+const history = [[0,0],[0,1],[1,0],[2,-1],[-1,-5]];
+for (let k=0;k<12;k++) {
+  history.push([-3-4*k,4+4*k],[-4-4*k,5+4*k]);
+  if(k<11)history.push([-2-4*k,3+4*k],[-4-4*k,4+4*k]);
+}
+let started, firstId, requests=0, finished;
+const began = new Promise(resolve=>{started=resolve;}), completed = new Promise(resolve=>{finished=resolve;});
+script = {
+  load(options,post) { post({type:'ready',device:{provider:'webgpu'}}); },
+  call(message,post) {
+    if (++requests===1) { firstId=message.id; started(); return; }
+    post({type:'result',id:message.id,result:{value:.75,moves:[],top:[],solved:true}});
+  },
+  cancel(message,post) { post({type:'progress',id:message.id,fraction:.2,stage:{name:'session',provider:'webgpu'}}); }
+};
+stalled.registerEngine(entry('cancel'), {ready:()=>engine.load(),turn:(history,budget,options)=>engine.call({type:'turn',history},options)});
+stalled.history=history; stalled.analysis=stalled.spec({engine:'cancel',preset:'standard',auto:false});
+stalled.onchange=state=>{if(state.evaluations[history.length]?.value===.75)finished();};
+stalled.enqueue('analyse',history.slice(0,26),stalled.analysis); stalled.pump(); await began;
+const abandoned = engine.worker;
+stalled.enqueue('analyse',history,stalled.analysis); stalled.pump();
+const blocked = {queued:stalled.state().jobs.map(j=>({ply:j.ply,status:j.status})),aborted:stalled.running.controller.signal.aborted};
+const recovered = await Promise.race([completed.then(()=>true),wait(4000).then(()=>false)]);
+if(recovered)await stalled.idle;
+abandoned.onmessage({data:{type:'result',id:firstId,result:{value:.1,moves:[],top:[],solved:true}}});
+out.cancel_stalled={blocked,recovered,requests,terminated:abandoned.terminated,sameDevice:engine.device?.provider==='webgpu',
+  value:stalled.lookup(history)?.value,oldSaved:!!stalled.lookup(history.slice(0,26)),running:!!stalled.running};
+stalled.cancelJobs();engine.close();
+
+// A prompt acknowledgement or a result racing cancellation keeps the healthy worker and its graph.
+out.cancel_ack=[];
+for(const type of ['cancelled','result']) {
+  let entered;
+  const ready = new Promise(resolve=>{entered=resolve;}), control = new AbortController();
+  script={load(options,post){post({type:'ready',device:{provider:'webgpu'}});},call(){entered();},
+    cancel(message,post){post({type,id:message.id,graph:'kept',result:{graph_id:'kept'}});}};
+  const engine=new EngineWorker('worker.mjs','Bubble'), result=engine.call({type:'turn'},{signal:control.signal})
+    .then(()=>({resolved:true}),error=>({name:error.name,graph:error.graph}));
+  await ready;const worker=engine.worker;control.abort();const found=await result;
+  await wait(2100);
+  out.cancel_ack.push({...found,kept:engine.worker===worker&&!worker.terminated,waits:engine.waits.size});
+  engine.close();
+}
 
 process.stdout.write(JSON.stringify(out));
 process.exit(0);

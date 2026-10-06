@@ -658,6 +658,19 @@ class Loading(unittest.TestCase):
         self.assertEqual((session['loads'][:2], session['history']), (['stuck', 'quick'], [[0, 0]]))
         self.assertEqual(self.out['lighten'], dict(seats=['lightning', 'lightning'], preset='lightning'))
 
+    def test_a_cancelled_worker_cannot_block_the_next_analysis_forever(self):
+        found = self.out['cancel_stalled']
+        self.assertEqual(found['blocked'], dict(queued=[dict(ply=51, status='queued')], aborted=True))
+        self.assertTrue(found['recovered'])
+        self.assertTrue(found['terminated'])
+        self.assertTrue(found['sameDevice'])
+        self.assertEqual((found['requests'], found['value']), (2, .75))
+        self.assertFalse(found['oldSaved'])
+        self.assertFalse(found['running'])
+
+    def test_cancellation_keeps_a_worker_that_acknowledges_or_returns_a_late_result(self):
+        self.assertEqual(self.out['cancel_ack'], [dict(name='AbortError', graph='kept', kept=True, waits=0)]*2)
+
 
 class Bundle(unittest.TestCase):
     def test_worker_cannot_return_more_endpoints_than_requested(self):

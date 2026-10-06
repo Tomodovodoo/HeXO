@@ -9,6 +9,7 @@ import {LIMITS, stageText} from './stages.mjs';
 
 /** Stages whose failure another device or thread count may avoid; a download fails the same way on any device. */
 const RETRIED = new Set(['probe', 'compile', 'session', 'timing', 'warmup']);
+const CANCEL_GRACE_MS = 2000;
 
 /** The engines' fallback notices for the page: 'notice' events whose `detail` is {engine (the EngineWorker), text (one
  * short line), cpu (true when the engine left WebGPU for WebAssembly)}. */
@@ -159,15 +160,16 @@ export class EngineWorker {
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); return; }
+        if (data.type === 'progress') { if (!wait.cancelled) { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); } return; }
         this.watch(data.id, null);
-        if (data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
+        if (!wait.cancelled && data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);
-        if (data.type === 'result') wait.resolve(data.result);
+        if (data.type === 'result' && !wait.cancelled) wait.resolve(data.result);
         else {
           // A worker that stopped a search names the search graph it changed (worker.mjs), for the session's count.
-          const error = data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : this.failure('failed', data.stage, data.message);
-          if (data.graph) error.graph = data.graph;
+          const error = wait.cancelled || data.type === 'cancelled' ? new DOMException('Cancelled', 'AbortError') : this.failure('failed', data.stage, data.message);
+          const graph = data.graph ?? (wait.cancelled ? data.result?.graph_id : null);
+          if (graph) error.graph = graph;
           wait.reject(error);
         }
       };
@@ -208,14 +210,26 @@ export class EngineWorker {
     const id = ++this.calls;
     return new Promise((resolve, reject) => {
       if (signal?.aborted || !this.worker) { reject(new DOMException(signal?.aborted ? 'Cancelled' : 'Closed', 'AbortError')); return; }
-      const wait = {resolve, reject, progress, message, cancelled: false};
-      this.waits.set(id, wait);
-      signal?.addEventListener('abort', () => {
+      let timer;
+      const clean = () => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); };
+      const wait = {resolve: value => { clean(); resolve(value); }, reject: error => { clean(); reject(error); }, progress, message, cancelled: false};
+      const cancel = () => {
         if (this.waits.get(id) !== wait) return;
         wait.cancelled = true;
-        if (!this.booting) this.worker?.postMessage({type: 'cancel', id});
-        else { this.waits.delete(id); reject(new DOMException('Cancelled', 'AbortError')); }
-      }, {once: true});
+        this.watch(id, null);
+        if (!this.booting) {
+          this.worker?.postMessage({type: 'cancel', id});
+          // A search stuck in WASM or inference cannot acknowledge cancellation. End its worker before
+          // releasing the session's job slot; the next job then loads a fresh engine on the same device.
+          timer = setTimeout(() => {
+            if (this.waits.get(id) !== wait) return;
+            this.fail(new DOMException('Cancelled', 'AbortError'));
+            this.notice(`${this.name}: cancelled search did not stop; restarting engine`, false);
+          }, CANCEL_GRACE_MS);
+        } else { this.waits.delete(id); wait.reject(new DOMException('Cancelled', 'AbortError')); }
+      };
+      this.waits.set(id, wait);
+      signal?.addEventListener('abort', cancel, {once: true});
       this.worker.postMessage({...message, id});
     });
   }
@@ -231,6 +245,9 @@ export class EngineWorker {
     this.watched.clear();
     this.worker?.terminate();
     this.worker = null;
+    for (const [id, wait] of this.waits) if (wait.cancelled) {
+      this.waits.delete(id); wait.reject(new DOMException('Cancelled', 'AbortError'));
+    }
   }
 
   /** Ends the worker and rejects the pending load and calls with `error`; the next call starts a new worker. */
