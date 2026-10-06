@@ -2401,6 +2401,17 @@ class NativeProofs(unittest.TestCase):
         stats=proofs.stats()
         self.assertEqual((stats['queued'],stats['active'],stats['ready']),(0,0,0))
 
+    def test_default_queue_holds_eight_jobs_per_worker(self):
+        graph = self.graph([[0,0]])
+        pool = self.pool([graph], quantum=4, views=1, work=4096)
+        proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=2, tasks=32)
+        for k in range(1, 21):
+            proofs.offer(0, [[0,0],[k%8+1,-1-k//8],[k%8+1,1+k//8]])
+        proofs.step()
+        # Answers stay held until the owner's next step, so one refill shows the bound.
+        self.assertEqual(proofs.stats()['submitted'], 16)
+        proofs.drain()
+
     def test_rejected_endpoint_limit_leaves_proof_owner_reusable(self):
         pool=self.pool([self.graph([[0,0]])],work=32)
         for endpoints in [-1,9,1.5]:
