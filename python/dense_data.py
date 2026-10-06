@@ -1479,7 +1479,12 @@ class Renderers:
         return self
 
     def __next__(self):
-        item = self.ready.get()
+        while True:
+            try:
+                item = self.ready.get(timeout=1)    # a timed wait keeps Ctrl+C deliverable on Windows
+                break
+            except queue.Empty:
+                pass
         if isinstance(item, BaseException):
             self.ready.put(item)
             raise item
