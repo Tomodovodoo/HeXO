@@ -2276,6 +2276,20 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(pool.games[0].stats()['pending'],0)
         self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()),pool.games[0].stats()['root_completed'])
 
+    def test_every_queued_job_reaches_a_worker_without_another_owner_step(self):
+        pool=self.pool([self.graph(self.opening) for _ in range(16)],quantum=16,views=1,work=4096)
+        proofs=pool.enable_proofs(slice_ms=2,table_mb=1,workers=4,queue=16)
+        pool.step();self.answer(pool);proofs.step()
+        submitted=proofs.stats()['submitted']
+        self.assertGreater(submitted,4)
+        # Only workers run from here on; a lost wakeup would leave jobs queued.
+        self.wait(lambda:proofs.stats()['finished']==submitted)
+        stats=proofs.stats()
+        self.assertEqual((stats['queued'],stats['active'],stats['submitted']),(0,0,submitted))
+        pool.cancel();proofs.drain();pool.abandon_fenced()
+        stats=proofs.stats()
+        self.assertEqual((stats['queued'],stats['active'],stats['ready']),(0,0,0))
+
     def test_rejected_endpoint_limit_leaves_proof_owner_reusable(self):
         pool=self.pool([self.graph([[0,0]])],work=32)
         for endpoints in [-1,9,1.5]:
