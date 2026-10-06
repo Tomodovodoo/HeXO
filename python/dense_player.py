@@ -10,7 +10,10 @@ class DensePlayer:
     """Play exported dense checkpoints; analysis searches a copy of the browser game."""
     mode = 'dense'
 
-    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused'):
+    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused', native_scheduler=False):
+        if type(native_scheduler) is not bool:
+            raise ValueError('native_scheduler must be on or off')
+        self.native_scheduler = native_scheduler
         self.run, self.device = run, device
         self.model_path = Path(model).resolve() if model else None
         self.tactical_package = tactical_package
@@ -66,7 +69,11 @@ class DensePlayer:
         from legacy.train import digest
         path = self.model_path or self.run/'checkpoints'/checkpoint/'ema.pt'
         model = hexnet.load_model(path, net_kernels=self.net_kernels)
-        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=16)
+        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path),
+            max_batch=128 if self.native_scheduler else 16,
+            cuda_graphs=self.native_scheduler and self.net_kernels == 'fused')
+        if self.native_scheduler:
+            self.evaluator.free = []  # Packed forwards own staging until their completion fence.
         self.checkpoint, self.model_sha256 = checkpoint, digest(path)
         self.set_history()
 
@@ -83,15 +90,20 @@ class DensePlayer:
 
     def set_history(self, history=()):
         from neural_search import EvaluationCache
+        if getattr(self, '_timed_native', None):
+            graph, pool, _ = self._timed_native
+            pool.close()
+            graph.close()
+            self._timed_native = None
         if getattr(self, '_timed_tree', None):
             self._timed_tree.close()
             self._timed_tree = None
         self.cache = EvaluationCache(4096)
 
     def close(self):
-        if getattr(self, '_timed_tree', None):
-            self._timed_tree.close()
-            self._timed_tree = None
+        self.set_history()
+        if self.evaluator is not None and self.evaluator.graph is not None:
+            self.evaluator.graph.close()
         self.evaluator = None
 
     def solve(self, history, attacker='mover'):

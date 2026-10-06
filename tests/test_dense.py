@@ -9681,17 +9681,23 @@ class DenseTimedWorker(unittest.TestCase):
             model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
-            with TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
-                                  solver=dict(enabled=False))) as engine:
-                game = Game([[0, 0]])
-                try:
-                    result = engine.turn(game, 1000)
-                    self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
-                    self.assertGreater(result.get('evaluated', 0), 0)
-                    self.assertEqual(result['backend'], 'dense')
-                    self.assertEqual(result['model_sha256'], engine.model_sha256)
-                finally:
-                    game.close()
+            for native in (False, True):
+                with self.subTest(native_scheduler=native), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                        search=dict(native_scheduler=native), solver=dict(enabled=False))) as engine:
+                    game = Game([[0, 0]])
+                    try:
+                        result = engine.turn(game, 1000)
+                        self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                        self.assertGreater(result.get('evaluated', 0), 0)
+                        self.assertEqual(result['backend'], 'dense')
+                        self.assertEqual(result['model_sha256'], engine.model_sha256)
+                        self.assertEqual([list(cell[:2]) for cell in game.cells], [[0, 0]])
+                        if native:
+                            self.assertTrue(result['settings']['native_scheduler'])
+                            self.assertTrue(result['stones'])
+                            self.assertEqual(result['stones'][0]['history'], [[0, 0]])
+                    finally:
+                        game.close()
 
 
 class DenseBrowser(unittest.TestCase):
