@@ -34,6 +34,7 @@ for name, result, args in (
     ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
+    ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
     ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
@@ -416,7 +417,7 @@ class InferenceService:
     available with ms=0; interactive comparisons use a common clock.
     """
     def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
-                 merge_cells=32768, latency_ms=.2):
+                 merge_cells=32768, latency_ms=.2, flights=2):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
@@ -425,10 +426,12 @@ class InferenceService:
         if len(versions)!=len(set(versions)) or any(p.model_version not in versions for p in pools):
             raise ValueError('One frozen evaluator is required for every pool model version')
         self.batch_size, self.pending, self.leases, self._stats = batch_size, [], {}, None
+        self.flight_limit = flights
         self._ptr = native.hxb_new(quantum, pending, merge_cells, latency_ms)
         if not self._ptr:
             checked(False)
         try:
+            checked(native.hxb_flights(self._ptr, flights))
             for pool in pools:
                 self.attach(pool,self.models[versions.index(pool.model_version)])
         except BaseException:
@@ -622,6 +625,12 @@ class InferenceService:
         result = dict(zip(('unique_rows', 'coalesced_rows', 'launched_rows', 'subscriber_deliveries',
                          'withdrawn_ready_rows', 'batches', 'row_high_water', 'pending_rows',
                          'inflight_batches', 'active_producers'), map(int, out)))
+        # Leased model batches include queued forwards, not simultaneous GPU kernels.
+        # Producer snapshots have a separate limit and may span several batches.
+        flights = np.empty(3, np.uint64)
+        native.hxb_flight_stats(self.ptr, flights.ctypes.data)
+        result.update(zip(('batch_flight_limit', 'batch_flight_high_water',
+                           'snapshot_limit_per_producer'), map(int, flights)))
         # Native feed messages installed, including retired/empty messages.
         # This is not a neural-row or search-visit count.
         result['installed_message_rows'] = int(native.hxb_installed(self.ptr))
@@ -659,14 +668,14 @@ class InferenceService:
                 raise
             self.pending.append((token, handle))
             return True
-        while len(self.pending)<2:
+        while len(self.pending)<self.flight_limit:
             if not launch(0 if self.pending else 2.):
                 break
         if self.pending:
             # A partial batch may become ready while the oldest forward runs.
             # Keep feeding its spare slot instead of blocking in collect().
             event = self.pending[0][1].event
-            while len(self.pending)<2 and event is not None and not event.query():
+            while len(self.pending)<self.flight_limit and event is not None and not event.query():
                 if not launch(0):
                     # A timed take flushes a partial batch at its timeout.
                     # Preserve the configured batching latency while waiting.
@@ -676,7 +685,7 @@ class InferenceService:
             self.pending.pop(0)
             # Actor event processing can take longer than a forward. Leave
             # ready work running before handing control back to that caller.
-            while len(self.pending)<2 and launch(0):
+            while len(self.pending)<self.flight_limit and launch(0):
                 pass
 
     def run(self, ms=0):

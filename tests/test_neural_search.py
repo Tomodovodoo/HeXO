@@ -1372,6 +1372,7 @@ class NativeScheduler(unittest.TestCase):
         from native_scheduler import InferenceService
         service = InferenceService.__new__(InferenceService)
         service.pending = []
+        service.flight_limit = 2
         service.models = [None]
         launched, collected, delivered = [], [], []
         batches = iter([(1,0,'first'), None, (2,0,'second'), (3,0,'third')])
@@ -1394,6 +1395,31 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual(delivered,[(1,'first')])
         self.assertEqual([token for token,_ in service.pending],[2,3])
 
+    def test_launcher_refills_the_configured_batch_capacity(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from native_scheduler import InferenceService
+        for limit in (1,2,4):
+            with self.subTest(limit=limit):
+                service = InferenceService.__new__(InferenceService)
+                service.pending, service.models, service.flight_limit = [], [None], limit
+                launched, collected = [], []
+                batches = iter((i,0,i) for i in range(1,limit+2))
+                service.take = lambda wait:next(batches,None)
+                service.complete = lambda token,rows:collected.append(token)
+                def submit(model,rows):
+                    launched.append(rows)
+                    def collect():
+                        self.assertEqual(len(service.pending),limit)
+                        return rows
+                    return SimpleNamespace(event=SimpleNamespace(query=lambda:True),collect=collect)
+                with patch.dict(sys.modules,native_dense=SimpleNamespace(submit=submit)):
+                    service.pump()
+                self.assertEqual(launched,list(range(1,limit+2)))
+                self.assertEqual(collected,[1])
+                self.assertEqual([token for token,_ in service.pending],list(range(2,limit+2)))
+
     def test_launcher_keeps_failed_gpu_fence_owned_and_quarantined_submit_live(self):
         import sys
         from types import SimpleNamespace
@@ -1401,6 +1427,7 @@ class NativeScheduler(unittest.TestCase):
         from native_scheduler import InferenceService
         service = InferenceService.__new__(InferenceService)
         service.pending = []
+        service.flight_limit = 2
         service.models = [None]
         rows = object()
         service.take = lambda wait:(1,0,rows)
