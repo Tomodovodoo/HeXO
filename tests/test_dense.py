@@ -1075,19 +1075,48 @@ class FusedCudaTests(unittest.TestCase):
         runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
         for rows, shape in ((7, (24, 72)), (3, (72, 24)), (65, (24, 32)), (100, (32, 24)),
-                            (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
+                            (2, (25, 41)), (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
                            (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
             height, width = (shape, shape) if isinstance(shape, int) else shape
             x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
                 expected = model(x, x[:, 3:4], aux=False)
-            out = runner(x)
+            # Uint8 staging is converted by the graph input copy. The public
+            # BF16 route remains valid, and the packed output describes the same
+            # policy/value row that its views expose.
+            out = runner(x.to(torch.uint8))
             for name in expected:
                 self.assert_bf16_close(expected[name], out[name])
+            torch.testing.assert_close(out['packed'], torch.cat((out['policy'],
+                out['far'][:, None], out['value_logit'][:, None]), 1))
+            destination = torch.empty(out['packed'].shape, dtype=torch.float32, pin_memory=True)
+            runner.copy_predictions(x.to(torch.uint8), destination)
+            torch.cuda.current_stream().synchronize()
+            self.assert_bf16_close(out['packed'].cpu(), destination)
             inputs.append(x)
             outputs.append(out)
             saved.append({name: value.clone() for name, value in out.items()})
+        # An exception after a partial D2H must still hand the private stream
+        # back to the caller before the caller records its cleanup fence.
+        partial = torch.cat((inputs[5], inputs[5]), dim=0).to(torch.uint8)
+        expected_partial = outputs[5]['packed'][:16].cpu().clone()
+        destination = torch.full((len(partial), 24*24+2), float('nan'), pin_memory=True)
+        failure = RuntimeError('after first graph output copy')
+        def fail_after_first(*args):
+            yield 16, 16
+            torch.cuda._sleep(20000000)
+            raise failure
+        with unittest.mock.patch.object(runner, '_segments', fail_after_first):
+            with self.assertRaises(RuntimeError) as raised:
+                runner.copy_predictions(partial, destination)
+        self.assertIs(raised.exception, failure)
+        fence = torch.cuda.Event()
+        fence.record()
+        fence.synchronize()
+        self.assertTrue(runner.stream.query())
+        self.assert_bf16_close(expected_partial, destination[:16])
+        self.assertTrue(torch.isnan(destination[16:]).all())
         self.assertIn((24, 128), runner.graphs)
         self.assertIn((32, 64), runner.graphs)
         self.assertIn((40, 64), runner.graphs)
