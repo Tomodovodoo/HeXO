@@ -273,9 +273,22 @@ class TimedClocks(unittest.TestCase):
         from dense_openings import canonical
         with TemporaryDirectory() as directory:
             path = Path(directory)/'settings.json'
-            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None),
+            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None, native_scheduler=True),
                                             solver=dict(enabled=False))), encoding='utf-8')
             self.assertIsNone(side_settings(path)['search']['max_simulations'])
+            self.assertTrue(side_settings(path)['search']['native_scheduler'])
+            path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=dict(nodes=512))), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'time slices'):
+                side_settings(path)
+            from timed_engine import TimedEngine
+            with self.assertRaisesRegex(ValueError, 'time slices'):
+                TimedEngine(dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(nodes=512)))
+            with self.assertRaisesRegex(ValueError, 'proof frontier'):
+                TimedEngine(dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(leaf=True)))
+            path.write_text(json.dumps(dict(search=dict(native_scheduler=False), solver=dict(nodes=512))), encoding='utf-8')
+            self.assertEqual(side_settings(path)['solver']['nodes'], 512)
+            path.write_text(json.dumps(dict(search=dict(native_scheduler=True, enabled=False), solver=dict(nodes=512))), encoding='utf-8')
+            self.assertEqual(side_settings(path)['solver']['nodes'], 512)
             path.write_text(json.dumps(dict(search=dict(native_feed=True))), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'Unsupported search'):
                 side_settings(path)
