@@ -95,7 +95,7 @@ struct Job {
  uint64_t id=0,token=0;size_t game=0;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
   std::vector<Cell> history;std::vector<Dependency> scope;std::string context,request,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
  Clock::time_point queued,started,deadline{};double elapsed=0,wait=0;bool cancelled=false,pruned=false;
- std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;
+ std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;std::vector<int64_t> neural;
 };
 struct Worker {void* native=nullptr;
 #ifndef __EMSCRIPTEN__
@@ -103,6 +103,8 @@ struct Worker {void* native=nullptr;
 #endif
  std::shared_ptr<Job> active;uint64_t token=0;double service=0,idle=0;Clock::time_point idle_since=Clock::now();};
 struct Loop {
+ API::Moves endpoint=nullptr;int endpoint_limit=0;uint64_t endpoint_paths=0,endpoint_candidates=0,endpoint_rejected=0,endpoint_bytes=0,endpoint_ns=0;
+ std::deque<std::string> endpoint_records;
  owner::Pool& pool;API api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>> workers;
  std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<Job>> queued,done;
   std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false;
@@ -188,7 +190,7 @@ struct Loop {
   }
  }
   std::string request(const Job& job,int ms,uint64_t token=0)const{
-   return job.context.substr(0,job.context.size()-1)+",\"ms\":"+std::to_string(ms)+",\"nodes\":10000000,\"idtt_nodes\":0,\"depth\":8,\"attacker\":\""+(job.side?"defender":"mover")+"\",\"table_mb\":"+std::to_string(table)+",\"bounds\":true,\"resume\":true,\"stamps\":"+(stamps?"true":"false")+(token?",\"request_id\":"+std::to_string(token):"")+'}';
+   return job.context.substr(0,job.context.size()-1)+",\"ms\":"+std::to_string(ms)+",\"nodes\":10000000,\"idtt_nodes\":0,\"depth\":8,\"attacker\":\""+(job.side?"defender":"mover")+"\",\"table_mb\":"+std::to_string(table)+",\"bounds\":true,\"resume\":true,\"stamps\":"+(stamps?"true":"false")+(endpoint_limit && !job.side?",\"neural_frontier\":"+std::to_string(endpoint_limit):"")+(token?",\"request_id\":"+std::to_string(token):"")+'}';
   }
   uint64_t external_take(int index){
    if(!external || index<0 || index>=int(workers.size()))throw std::runtime_error("Invalid external proof worker");
@@ -232,7 +234,8 @@ struct Loop {
       job->info[4]=0;lock.unlock();answer=api.query(worker.native,payload.c_str());
       if(!answer || !api.info(answer,job->info.data()))job->error="missing typed native answer";
       else{job->move_count=api.moves(answer,job->moves.data(),2);if(job->move_count<0)throw std::runtime_error("Invalid typed proof witness");
-       if(job->info[0]){raw=api.json(answer);if(raw){job->result=static_cast<char*>(raw);api.buffer_free(raw);raw=nullptr;}}
+       if(endpoint && !job->side){int count=endpoint(answer,nullptr,0);if(count<0 || count>endpoint_limit*130)throw std::runtime_error("Invalid neural frontier size");job->neural.resize(count);if(count && endpoint(answer,job->neural.data(),count)!=count)throw std::runtime_error("Invalid neural frontier payload");}
+       if(job->info[0] || !job->neural.empty()){raw=api.json(answer);if(raw){job->result=static_cast<char*>(raw);api.buffer_free(raw);raw=nullptr;}}
       }
       if(answer){api.answer_free(answer);answer=nullptr;}
       // A deadline may return before cooperative background cancellation finishes.
@@ -251,6 +254,29 @@ struct Loop {
   if(auto old=view.outcomes.find(key);old!=view.outcomes.end() && old->second.winner!=outcome.winner)throw std::runtime_error("Conflicting verified graph proof");
   view.record(key,outcome);
   if(auto peers=view.positions.find(key);peers!=view.positions.end())for(auto& weak:std::vector(peers->second))if(auto node=weak.lock())if(view.apply(view.outcomes.at(key),*node))view.revise(*node);
+ }
+ size_t neural(Job& job){
+  if(job.neural.empty())return 0;
+  auto start=Clock::now();auto& o=*pool.games[job.game];
+  if(!endpoint_limit || job.side || !job.info[12] || job.neural.size()>size_t(endpoint_limit*130))throw std::runtime_error("Unexpected neural frontier");
+  Board base;for(Cell c:job.history){if(!base.legal(c))throw std::runtime_error("Invalid frontier root");base.make(c);}
+  size_t cursor=0,paths=0,added=0;
+  while(cursor<job.neural.size()){
+   if(job.neural.size()-cursor<2 || ++paths>size_t(endpoint_limit))throw std::runtime_error("Malformed neural frontier");
+   int64_t count=job.neural[cursor++],reason=job.neural[cursor++];
+   if(count<1 || count>64 || reason<0 || reason>1 || job.neural.size()-cursor<size_t(2*count))throw std::runtime_error("Malformed neural path");
+   Board board=base;auto history=job.history;bool valid=board.winner<0;
+   for(int i=0;i<count;++i){Cell c{job.neural[cursor],job.neural[cursor+1]};cursor+=2;
+    if(!valid || c.q<-1000000 || c.q>1000000 || c.r<-1000000 || c.r>1000000 || !board.legal(c)){valid=false;continue;}
+    board.make(c);history.push_back(c);if(board.winner>=0)valid=false;
+   }
+   for(auto [cell,player]:o.views[0].tree->board.cells){auto found=board.cells.find(cell);if(found==board.cells.end() || found->second!=player){valid=false;break;}}
+   ++endpoint_paths;
+   if(valid){added+=o.solver_path(history,o.focus.size(),job.task->impact);}
+   else ++endpoint_rejected;
+  }
+  endpoint_candidates+=added;endpoint_bytes+=job.neural.size()*sizeof(int64_t);
+  endpoint_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();return added;
  }
  void install(Job& job){
   auto start=Clock::now();auto& o=*pool.games[job.game];auto& f=frontiers[job.game];auto& task=*job.task;
@@ -277,6 +303,10 @@ struct Loop {
    view.trim_archive();f.remember(job.history,*view.root);f.tasks.erase(task.key);++installed;
    if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
   }else{
+   size_t added=neural(job);
+   if(!job.neural.empty()){
+    endpoint_records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"frontier_candidates\":"+std::to_string(added)+",\"request\":"+job.context+",\"result\":"+(job.result.empty()?"null":job.result)+'}');if(endpoint_records.size()>512)endpoint_records.pop_front();
+   }
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
    f.scope(task,stamps);bool same_scope=job.scope==task.scope && (!stamps || job.facts==f.revision);
    if(same_scope && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
@@ -316,6 +346,19 @@ struct Loop {
 }
 extern "C" HX_API void* hxp_new(void* pool,const uint64_t* functions,int workers,int capacity,int slice,int table,int tasks,int stamps){try{if(!pool || !functions)throw std::runtime_error("Missing proof pool");return new proving::Loop(*static_cast<owner::Pool*>(pool),functions,workers,capacity,slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 extern "C" HX_API void* hxpe_new(void* pool,int workers,int capacity,int slice,int table,int tasks,int stamps,int maximum){try{if(!pool || maximum<1 || maximum>1000)throw std::runtime_error("Invalid external proof limits");auto* loop=new proving::Loop(*static_cast<owner::Pool*>(pool),nullptr,workers,capacity,slice,table,tasks,stamps!=0);loop->external_limit=maximum;return loop;}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API int hxp_neural(void* p,uint64_t callback,int limit){try{
+ auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);
+ if(limit<0 || limit>8 || !loop.live.empty() || (!loop.external && limit && !callback))throw std::runtime_error("Invalid neural frontier configuration");
+ loop.endpoint=reinterpret_cast<proving::API::Moves>(callback);loop.endpoint_limit=limit;return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxpe_neural(void* p,int worker,uint64_t id,const int64_t* values,int count){try{
+ auto& loop=*static_cast<proving::Loop*>(p);
+ if(!loop.external || worker<0 || worker>=int(loop.workers.size()) || count<0 || count>loop.endpoint_limit*130 || (count && !values))throw std::runtime_error("Invalid external neural frontier");
+ auto job=loop.workers[worker]->active;if(!job || job->id!=id)throw std::runtime_error("Unknown external neural frontier");
+ if(count)job->neural.assign(values,values+count);return 1;
+}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API void hxp_neural_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);std::array<uint64_t,6> values{loop.endpoint_paths,loop.endpoint_candidates,loop.endpoint_rejected,loop.endpoint_bytes,loop.endpoint_ns,uint64_t(loop.endpoint_records.size())};std::copy(values.begin(),values.end(),out);}
+extern "C" HX_API const char* hxp_neural_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->endpoint_records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 extern "C" HX_API int hxpe_cancelled(void* p,int worker){auto& loop=*static_cast<proving::Loop*>(p);if(worker<0 || worker>=int(loop.workers.size()))return 0;auto& active=loop.workers[worker]->active;return active && active->cancelled;}
 extern "C" HX_API uint64_t hxpe_take(void* p,int worker){try{return static_cast<proving::Loop*>(p)->external_take(worker);}catch(const std::exception& e){gumbel::error=e.what();return UINT64_MAX;}}
 extern "C" HX_API const char* hxpe_request(void* p,int worker){auto& loop=*static_cast<proving::Loop*>(p);if(!loop.external || worker<0 || worker>=int(loop.workers.size()) || !loop.workers[worker]->active)return nullptr;return loop.workers[worker]->active->request.c_str();}

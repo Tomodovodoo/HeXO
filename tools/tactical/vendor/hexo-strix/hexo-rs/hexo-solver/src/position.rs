@@ -440,6 +440,7 @@ fn prover_config(
         _ => prover::DriverKind::Idtt,
     };
     prover::ProverConfig {
+        neural_frontier: 0,
         driver,
         wide,
         depth_cap,

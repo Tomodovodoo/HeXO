@@ -112,6 +112,10 @@ pub(crate) struct KernelCtx {
     wide: bool,
     comps: FxHashMap<u64, Rc<NodeComps>>,
     gencache: FxHashMap<(u64, u8), Rc<Vec<CellSet2>>>,
+    neural_limit: usize,
+    neural_path: Vec<(CellSet2, Player)>,
+    neural_keys: Vec<(u64, Node)>,
+    pub(crate) neural_frontier: Vec<super::NeuralEndpoint>,
 }
 
 impl KernelCtx {
@@ -176,12 +180,30 @@ impl KernelCtx {
             wide,
             comps: FxHashMap::default(),
             gencache: FxHashMap::default(),
+            neural_limit: 0,
+            neural_path: Vec::new(),
+            neural_keys: Vec::new(),
+            neural_frontier: Vec::new(),
         })
     }
 
     #[inline]
     pub(crate) fn hash(&self) -> u64 {
         self.board.hash
+    }
+
+    pub(crate) fn neural_limit(&mut self, limit: usize) { self.neural_limit = limit.min(8); }
+
+    pub(crate) fn offer_neural(&mut self, node: Node, reason: u8) {
+        if self.neural_limit == 0 || self.neural_frontier.len() >= self.neural_limit
+            || self.neural_path.is_empty() { return; }
+        let key = (self.hash(), node);
+        if self.neural_keys.contains(&key)
+            || self.neural_path.iter().map(|(m, _)| m.len()).sum::<usize>() > 64 { return; }
+        self.neural_keys.push(key);
+        self.neural_frontier.push(super::NeuralEndpoint {
+            turns: self.neural_path.iter().map(|(m, p)| (m.cells().to_vec(), *p)).collect(), reason,
+        });
     }
 
     /// Hash a generated legal turn without updating the board's window index.
@@ -282,6 +304,7 @@ impl KernelCtx {
             m
         };
         if moves.is_empty() {
+            self.offer_neural(Node::Or { placements }, 0);
             OrEval::Loss
         } else {
             OrEval::Moves(moves)
@@ -297,7 +320,9 @@ impl KernelCtx {
             return None;
         }
         if let Some(v) = self.gencache.get(&(self.board.hash, placements)) {
-            return Some(v.len() as u32);
+            let count = v.len() as u32;
+            if count == 0 { self.offer_neural(Node::Or { placements }, 0); }
+            return Some(count);
         }
         Some(threat_window_count(&self.board, self.atk, self.wl, self.radius).max(1) as u32)
     }
@@ -311,6 +336,7 @@ impl KernelCtx {
         }
         let (bnum, covers) = min_covers2(&comps.0);
         if bnum < 2 {
+            self.offer_neural(Node::And, 0);
             AndEval::Loss
         } else if bnum >= 3 {
             AndEval::AttackerWin
@@ -352,6 +378,7 @@ impl KernelCtx {
 
     #[inline]
     pub(crate) fn place(&mut self, cells: &CellSet2, player: Player) {
+        if self.neural_limit > 0 { self.neural_path.push((*cells, player)); }
         for &c in cells.cells() {
             self.board.place(c, player);
         }
@@ -359,6 +386,7 @@ impl KernelCtx {
 
     #[inline]
     pub(crate) fn unplace(&mut self, cells: &CellSet2) {
+        if self.neural_limit > 0 { self.neural_path.pop(); }
         for &c in cells.cells() {
             self.board.remove(c);
         }

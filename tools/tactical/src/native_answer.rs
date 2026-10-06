@@ -2,7 +2,7 @@
 //! constructs these handles, from the same checked query path as the JSON ABI.
 use super::*;
 
-struct Answer {value:Value,info:[u64;13],moves:Vec<(i32,i32)>}
+struct Answer {value:Value,info:[u64;13],moves:Vec<(i32,i32)>,frontier:Vec<i64>}
 
 // A native scheduler already owns a background dispatcher. After the slice ends
 // it must collect the cancelled worker's meter, rather than abandon its reply.
@@ -76,7 +76,15 @@ pub unsafe extern "C" fn hexo_tactical_worker_answer(worker:*mut std::ffi::c_voi
         if numbers["scope"].as_str()==Some("wide-forcing") && numbers["game_exact"].as_bool()==Some(false) {
             if let (Some(pn),Some(dn))=(numbers["pn"].as_u64(),numbers["dn"].as_u64()) {info[6]=pn;info[7]=dn;info[8]=1;}
         }
-        Box::into_raw(Box::new(Answer{value,info,moves})).cast()
+        let mut frontier=vec![];
+        if let Some(paths)=value["neural_frontier"].as_array() {
+            for endpoint in paths {
+                let path:Vec<(i32,i32)>=serde_json::from_value(endpoint["path"].clone()).unwrap();
+                frontier.extend([path.len() as i64,endpoint["reason"].as_u64().unwrap() as i64]);
+                for (q,r) in path {frontier.extend([q as i64,r as i64]);}
+            }
+        }
+        Box::into_raw(Box::new(Answer{value,info,moves,frontier})).cast()
     })).unwrap_or(std::ptr::null_mut())
 }
 
@@ -96,6 +104,15 @@ pub unsafe extern "C" fn hexo_tactical_answer_moves(answer:*const std::ffi::c_vo
     if capacity<moves.len() {return -1;}
     for (i,&(q,r)) in moves.iter().enumerate() {unsafe{*out.add(2*i)=q as i64;*out.add(2*i+1)=r as i64;}}
     moves.len() as i32
+}
+/// Packed legal paths: stone count, reason, then q/r pairs. At most 8 paths of 64 stones.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_answer_frontier(answer:*const std::ffi::c_void,out:*mut i64,capacity:usize)->i32 {
+    if answer.is_null() {return -1;}
+    let values=&unsafe{&*answer.cast::<Answer>()}.frontier;
+    if out.is_null() {return values.len() as i32;}
+    if capacity<values.len() {return -1;}
+    unsafe{std::ptr::copy_nonoverlapping(values.as_ptr(),out,values.len())};values.len() as i32
 }
 /// Optional evidence serialization; release the returned buffer with
 /// hexo_tactical_free. It is not needed to install a graph completion.

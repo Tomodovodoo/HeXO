@@ -461,6 +461,9 @@ impl PnSearch {
                 break;
             }
         }
+        if self.arena[0].pn != 0 && !applied.is_empty() {
+            k.offer_neural(self.arena[applied.last().unwrap().child].node, 1);
+        }
         for edge in applied.iter().rev() {
             k.unplace(&edge.mv);
         }
