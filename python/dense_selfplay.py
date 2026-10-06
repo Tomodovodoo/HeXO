@@ -188,7 +188,7 @@ class Evaluator(hexnet.DenseEvaluator):
             for start in range(0, len(indices), step):
                 chunk = indices[start:start+step]
                 x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
-                if self.graph is None:
+                if not (self.cuda and callable(getattr(self.graph, 'copy_predictions', None))):
                     x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
                 target = result[start:start+len(chunk)]
                 self.copy_predictions(x, target)

@@ -3998,27 +3998,38 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_graph_fallback_keeps_large_canvas_transfers_bounded(self):
         from hexnet_graphs import ActorGraph
         import native_dense
-        evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
-        shapes = []
-        def predict(planes):
-            shapes.append(tuple(planes.shape))
-            b, _, h, w = planes.shape
-            return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
-        evaluator.graph = unittest.mock.Mock(max_batch=128, supports=ActorGraph.supports,
-                                            _limit=ActorGraph._limit, side_effect=predict)
-        sample = SimpleNamespace(size=256, shape=(256, 256), planes=np.zeros((8, 256, 256), np.uint8))
-        histories = [np.empty((0, 2), np.int64)]*3
-        with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
-            evaluator.submit(histories)
-        self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
-        shapes.clear()
-        rows = unittest.mock.Mock(count=3, mixed=False, groups=[(256, 3)])
-        rows.pack.side_effect = lambda index, buffer: buffer.fill(0)
-        handle = native_dense.submit(evaluator, rows)
-        try:
-            self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
-        finally:
-            handle.close()
+        allocate = hexnet.staging_buffer
+        for cuda in (False, True):
+            with self.subTest(cuda=cuda):
+                evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
+                evaluator.cuda, evaluator.packing_adaptive = cuda, False
+                shapes = []
+                def predict(planes):
+                    self.assertEqual(planes.dtype, torch.bfloat16 if cuda else torch.float32)
+                    shapes.append(tuple(planes.shape))
+                    b, _, h, w = planes.shape
+                    return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
+                evaluator.graph = unittest.mock.Mock(max_batch=128, supports=ActorGraph.supports,
+                    _limit=ActorGraph._limit, copy_predictions=None, side_effect=predict)
+                sample = SimpleNamespace(size=256, shape=(256, 256), planes=np.zeros((8, 256, 256), np.uint8))
+                histories = [np.empty((0, 2), np.int64)]*3
+                # The CUDA case exercises dispatch/dtype without requiring a GPU in CI.
+                with unittest.mock.patch.object(torch.cuda, 'Event', return_value=unittest.mock.Mock()), \
+                     unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
+                    with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
+                        evaluator.submit(histories)
+                    self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+                    shapes.clear()
+                    rows = unittest.mock.Mock(count=3, mixed=False, groups=[(256, 3)])
+                    rows.pack.side_effect = lambda index, buffer: buffer.fill(0)
+                    handle = native_dense.submit(evaluator, rows)
+                    try:
+                        self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+                    finally:
+                        handle.close()
+                    shapes.clear()
+                    evaluator.evaluate([[(0, 0)]])
+                    self.assertEqual(shapes, [(1, 8, 24, 24)])
 
     def test_native_search_returns_legal_actions_in_native_order(self):
         for history in (POSITIONS[12], [(0, 0)], line_history(31)):

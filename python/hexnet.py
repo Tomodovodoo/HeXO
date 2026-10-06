@@ -566,7 +566,7 @@ class DenseEvaluator:
 
     def copy_predictions(self, planes, destination):
         """Write one packed batch; CUDA callers own and fence the host destination."""
-        if self.graph is not None and self.cuda:
+        if self.cuda and callable(getattr(self.graph, 'copy_predictions', None)):
             self.graph.copy_predictions(planes, destination)
         else:
             out = self.predict(planes)
@@ -588,7 +588,7 @@ class DenseEvaluator:
                 host = staging_buffer(self.staging, shape, len(chunk), (len(hexcrop.PLANES), *shape), torch.uint8, self.cuda)
                 np.stack([samples[i].planes for i in chunk], out=host.numpy())
                 x = host.to(self.device, non_blocking=True)
-                if self.graph is None:
+                if not (self.cuda and callable(getattr(self.graph, 'copy_predictions', None))):
                     x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
                 out = self.predict(x)
                 packed = (out['packed'] if 'packed' in out else torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)).cpu().numpy()

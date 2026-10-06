@@ -223,7 +223,8 @@ def submit(evaluator, rows, max_cells=48*48*48):
             for start in range(0, count, step):
                 size = min(step, count-start)
                 x = host[start:start+size].to(evaluator.device, non_blocking=True)
-                if evaluator.graph is None or copy_predictions is None:
+                if not (evaluator.cuda and copy_predictions is not None
+                        and callable(getattr(graph, 'copy_predictions', None))):
                     x = x.to(memory_format=evaluator.memory_format, dtype=torch.bfloat16 if evaluator.cuda else torch.float32)
                 target = result[start:start+size]
                 if copy_predictions is not None:
