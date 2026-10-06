@@ -675,6 +675,27 @@ if (job.kind === 'encode') {
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;
+} else if (job.kind === 'cached-cancel') {
+  const cache = new EvaluationCache(), options = {history:[[0,0]],seed:1740}, budget = {simulations:128,rootSamples:16};
+  const evaluate = async leaves => leaves.map(({actions})=>({logits:actions.map(()=>0),q:actions.map(()=>0)}));
+  const first = new NeuralSearch(native,options);
+  const expected = await first.search({...budget,cache,evaluate}); first.close();
+  const tree = new NeuralSearch(native,options), clock = globalThis.performance, get = cache.get.bind(cache);
+  const channel = new MessageChannel();
+  let ticks=0,received=false,forwards=0;
+  channel.port1.onmessage=()=>{received=true;};
+  cache.get=key=>{const value=get(key);if(++ticks===1)channel.port2.postMessage('cancel');return value;};
+  // Advance a clock at each cache read so message delivery is independent of the test machine's speed.
+  globalThis.performance={now:()=>ticks*1000};
+  try {
+    const stopped=await tree.search({...budget,cache,evaluate:async leaves=>{forwards++;return evaluate(leaves);},stop:()=>received});
+    answer={received,stopped:stopped.stopped,completed:stopped.completed,forwards,hits:stopped.cache_hits};
+  } finally {
+    globalThis.performance=clock;cache.get=get;channel.port1.close();channel.port2.close();tree.close();
+  }
+  const retry = new NeuralSearch(native,options);
+  const found = await retry.search({...budget,cache,evaluate}); retry.close();
+  answer.retry={completed:found.completed,unchanged:JSON.stringify([found.action,found.policy])===JSON.stringify([expected.action,expected.policy])};
 } else if (job.kind === 'analysis-failure') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
   let calls = 0;

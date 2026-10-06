@@ -1086,6 +1086,15 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(fractions, sorted(fractions))
                 self.assertEqual(turn['evaluations'].count(root), 1)
 
+    def test_cached_search_receives_cancellation_messages(self):
+        result = node(dict(kind='cached-cancel'))
+        self.assertTrue(result['received'])
+        self.assertTrue(result['stopped'])
+        self.assertLess(result['completed'], 128)
+        self.assertGreater(result['hits'], 0)
+        self.assertEqual(result['forwards'], 0)
+        self.assertEqual(result['retry'], dict(completed=128, unchanged=True))
+
     def test_analysis_failure_stays_visible_and_can_be_retried(self):
         result = node(dict(kind='analysis-failure'))
         message = 'Analysis failed: Temporary inference failure'
