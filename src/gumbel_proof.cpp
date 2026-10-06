@@ -178,7 +178,8 @@ struct Loop {
    }return heap.empty()?SIZE_MAX:heap.front();
   }
  };
- std::vector<Ready> prepare(size_t available){
+ std::vector<Ready> prepare(size_t available,Clock::time_point& retry){
+  retry={};
   std::vector<Ready> ready(frontiers.size());auto now=Clock::now();bool explore=submitted%5==4;
   for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped)continue;
    auto& candidates=ready[i];candidates.single=available==1;if(!candidates.single)candidates.choices.reserve(f.tasks.size());
@@ -186,7 +187,8 @@ struct Loop {
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
     if(task->flight || !node || node->dormant)continue;
     f.scope(*task,stamps);
-    if(task->closed==3 || task->ready>now)continue;
+    if(task->closed==3)continue;
+    if(task->ready>now){if(retry==Clock::time_point{} || task->ready<retry)retry=task->ready;continue;}
     bool pending=node->pending;if(auto peers=o.game->positions.find(task->key);peers!=o.game->positions.end())for(auto& weak:peers->second)if(auto peer=weak.lock())pending|=peer->pending;
     if(pending)continue;double age=double(f.next-task->born+1);
     double score=task->impact*(1+task->change)/std::max(.05,task->cost)+.0001*age;
@@ -209,12 +211,19 @@ struct Loop {
   // The graph owner cannot change candidates while this refill is dispatching.
   // Rank eligibility once, then consume priority/age heaps instead of rescanning
   // every position for each job. Worker completions install on the next step.
-  std::vector<Ready> ready;
+  std::vector<Ready> ready;Clock::time_point retry{};
   for(;;){
    size_t available;
    {std::lock_guard lock(mutex);if(stopping || !enabled || live.size()>=capacity)return;available=capacity-live.size();}
-   if(ready.empty())ready=prepare(available);
-   size_t i=0;auto task=take(ready,i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
+   if(ready.empty())ready=prepare(available,retry);
+   size_t i=0;auto task=take(ready,i);
+   if(!task){
+    // Ranking/dispatch can outlast a retry delay. Refresh only when an excluded
+    // cooldown has elapsed, without waiting or rescanning for every job.
+    if(retry==Clock::time_point{} || retry>Clock::now())return;
+    ready.clear();continue;
+   }
+   auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
     // Without a shared cancel flag, bound the synchronous WASM call by a short

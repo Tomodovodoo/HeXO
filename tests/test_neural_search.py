@@ -2352,6 +2352,42 @@ class NativeProofs(unittest.TestCase):
         finally:
             native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
+    def test_unknown_task_observes_cooldown_then_rejoins_underfilled_queue(self):
+        import ctypes as C
+        import json
+        import time
+        from neural_search import bind, checked, ptr
+        bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
+        bind('hxpe_take', C.c_uint64, ptr, C.c_int)
+        bind('hxpe_request', C.c_char_p, ptr, C.c_int)
+        bind('hxpe_complete', C.c_int, ptr, C.c_int, C.c_uint64, ptr, ptr, C.c_int, C.c_char_p, C.c_char_p)
+        history=[[0,0],[4,0],[5,0]]
+        graph=self.graph(history)
+        graph.search(1,root_samples=1,batch_size=1)
+        pool=self.pool([graph],quantum=4,views=1,work=4096)
+        loop=native.hxpe_new(pool.ptr,1,4,100,1,64,0,64)
+        self.assertTrue(loop)
+        try:
+            cells=np.asarray(history,np.int64)
+            checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),1.))
+            checked(native.hxp_step(loop))
+            first=native.hxpe_take(loop,0)
+            self.assertNotIn(first,(0,2**64-1))
+            info=np.zeros(13,np.uint64);info[4]=1;info[10]=2;info[12]=1
+            checked(native.hxpe_complete(loop,0,first,info.ctypes.data,None,0,None,None))
+            checked(native.hxp_step(loop))
+            self.assertEqual(native.hxpe_take(loop,0),0)
+            time.sleep(.21)
+            checked(native.hxp_step(loop))
+            retry=native.hxpe_take(loop,0)
+            self.assertNotIn(retry,(0,first,2**64-1))
+            self.assertEqual(json.loads(native.hxpe_request(loop,0))['history'],history)
+            info[11]=1
+            checked(native.hxpe_complete(loop,0,retry,info.ctypes.data,None,0,None,None))
+            self.assertEqual(native.hxg_exact(graph.ptr),-1)
+        finally:
+            native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
+
     def test_root_proof_overrides_late_neural_rows_and_releases_reservations(self):
         graph = self.graph(self.opening)
         pool = self.pool([graph], quantum=32, views=1, work=4096)
