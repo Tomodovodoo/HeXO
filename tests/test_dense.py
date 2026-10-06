@@ -96,6 +96,60 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 
 class HexcropTests(unittest.TestCase):
+    def test_combined_rows_keep_encoding_after_original_and_intermediate_close(self):
+        import ctypes as C
+        from native_dense import PackedRows
+        from neural_search import GameGraph, native, checked, bind, ptr
+        bind('hxgp_combine', ptr, ptr, ptr, C.c_int, C.c_int)
+        histories=[line_history(n,4) for n in (1,3,7)]+[line_history(31)]
+        samples=[hexcrop.encode(h) for h in histories]
+        self.assertGreater(samples[-1].far,0)
+        trees=[GameGraph(None,'retained-crops',h,tactics=False) for h in histories]
+        self.addCleanup(lambda:[t.close() for t in trees])
+        requests=[]
+        for tree in trees:
+            checked(native.hxg_begin(tree.ptr,1,1));requests.append(native.hxg_next(tree.ptr))
+        banks=[PackedRows(np.asarray([t.ptr for t in trees[:3]],np.uintp),np.asarray(requests[:3],np.int32),0),
+               PackedRows(np.asarray([trees[3].ptr],np.uintp),np.asarray(requests[3:],np.int32),0)]
+        for bank in banks:self.addCleanup(bank.close)
+        sources=np.asarray([banks[0].ptr,banks[1].ptr,banks[0].ptr],np.uintp)
+        ids=np.asarray([0,0,2],np.int32)
+        pointer=native.hxgp_combine(sources.ctypes.data,ids.ctypes.data,len(ids),32768)
+        checked(pointer);middle=PackedRows.from_native(pointer,len(ids));self.addCleanup(middle.close)
+        sources=np.asarray([middle.ptr,banks[0].ptr,middle.ptr,banks[1].ptr],np.uintp)
+        ids=np.asarray([1,1,0,0],np.int32)
+        pointer=native.hxgp_combine(sources.ctypes.data,ids.ctypes.data,len(ids),32768)
+        checked(pointer);rows=PackedRows.from_native(pointer,len(ids));self.addCleanup(rows.close)
+        for tree in trees:tree.close()
+        for bank in banks:bank.close()
+        middle.close()
+        selected=[3,1,0,3]
+        groups={}
+        for row,i in enumerate(selected):groups.setdefault(samples[i].size,[]).append(row)
+        for small,large in zip(sorted(groups),sorted(groups)[1:]):
+            if len(groups[small])*(large*large-small*small)<32768:
+                groups[large]=groups.pop(small)+groups[large]
+        canvases={row:side for side,indices in groups.items() for row in indices}
+        for index,(side,count) in enumerate(rows.groups):
+            planes=np.empty((count,8,side,side),np.uint8);rows.pack(index,planes)
+            for j,row in enumerate(groups[side]):
+                sample=samples[selected[row]];expected=np.zeros((8,side,side),np.uint8)
+                expected[:,:sample.size,:sample.size]=sample.planes
+                np.testing.assert_array_equal(planes[j],expected)
+            output=np.zeros((count,side*side+2),np.float32)
+            output[:,:-2]=np.arange(side*side);output[:,-2]=123;output[:,-1]=.4
+            rows.decode(index,0,output)
+        pointers=rows.outputs()
+        offsets=np.ctypeslib.as_array(C.cast(pointers[0],C.POINTER(C.c_int64)),shape=(len(selected)+1,))
+        logits=np.ctypeslib.as_array(C.cast(pointers[2],C.POINTER(C.c_double)),shape=(int(offsets[-1]),))
+        values=np.ctypeslib.as_array(C.cast(pointers[3],C.POINTER(C.c_double)),shape=(int(offsets[-1]),))
+        for row,i in enumerate(selected):
+            sample=samples[i];cells=sample.cells
+            expected=np.where(cells<0,123-np.log(max(1,sample.far)),
+                              cells//sample.size*canvases[row]+cells%sample.size)
+            np.testing.assert_array_equal(logits[offsets[row]:offsets[row+1]],expected)
+            np.testing.assert_allclose(values[offsets[row]:offsets[row+1]],np.tanh(.2),atol=1e-8)
+
     def test_native_cost_planner_retains_rows_and_minimizes_capture_cost(self):
         import ctypes as C
         from native_dense import PackedRows, PackingCosts
