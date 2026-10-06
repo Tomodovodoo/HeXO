@@ -116,14 +116,27 @@ class ActorGraph:
                       128 if height*width <= 32*32 else 64 if height*width <= 40*40 else 32))
         return max(cap for cap in cls.BATCHES if cap <= ceiling and cap*height*width <= cls.MAX_CELLS)
 
-    @torch.inference_mode()
     def __call__(self, planes):
-        """Return caller-owned aux=False outputs for resident BF16 [B,8,S,S]."""
+        """Return caller-owned views and packed outputs for BF16 or binary uint8 planes."""
+        packed = self._forward(planes)
+        return {'policy': packed[:, :-2], 'far': packed[:, -2],
+                'value_logit': packed[:, -1], 'packed': packed}
+
+    def copy_predictions(self, planes, destination):
+        """Queue predictions into pinned host storage; its owner must fence before reading."""
+        if (destination.device.type != 'cpu' or not destination.is_pinned()
+                or destination.dtype != torch.float32 or not destination.is_contiguous()
+                or destination.shape != (len(planes), planes.shape[-2]*planes.shape[-1]+2)):
+            raise ValueError('expected a contiguous pinned float32 prediction buffer')
+        self._forward(planes, destination)
+
+    @torch.inference_mode()
+    def _forward(self, planes, destination=None):
         b, channels, height, width = planes.shape
         side = height if height == width else (height, width)
         if (channels != 8 or min(height, width) < 1 or b < 1 or planes.device != self.device
-                or planes.dtype != torch.bfloat16):
-            raise ValueError('expected nonempty [B,8,H,W] BF16 planes on the model CUDA device')
+                or planes.dtype not in (torch.bfloat16, torch.uint8)):
+            raise ValueError('expected nonempty [B,8,H,W] BF16 or uint8 planes on the model CUDA device')
         caller_stream = torch.cuda.current_stream(self.device)
         same_stream = caller_stream.cuda_stream == self.stream.cuda_stream
         with self.lock, torch.cuda.stream(self.stream), \
@@ -131,50 +144,73 @@ class ActorGraph:
             if not same_stream:
                 self.stream.wait_stream(caller_stream)
                 planes.record_stream(self.stream)
-            if not self.supports(side):
-                packed = self._fallback(planes)
-            else:
-                limit = self._limit(side, self.max_batch)
-                pieces = []
-                start = 0
-                for rows, capacity in self._segments(b, limit, side):
-                    part = planes[start:start+rows]
-                    record = self.graphs.get((side, capacity))
-                    if record is None and not self.budget_exhausted:
-                        try:
-                            record = self._capture(side, capacity)
-                        except (torch.OutOfMemoryError, MemoryError) as exc:
-                            self.budget_exhausted = True
-                            self.capture_memory_error = str(exc)
-                            warnings.warn('CUDA graph memory limit reached; new shapes use eager inference',
-                                          RuntimeWarning, stacklevel=2)
-                    if record is None:
-                        pieces.append(self._fallback(part))
+            try:
+                if not self.supports(side):
+                    packed = self._fallback(planes)
+                    if destination is not None:
+                        destination.copy_(packed, non_blocking=True)
+                else:
+                    limit = self._limit(side, self.max_batch)
+                    pieces = []
+                    start = 0
+                    for rows, capacity in self._segments(b, limit, side):
+                        part = planes[start:start+rows]
+                        record = self.graphs.get((side, capacity))
+                        if record is None and not self.budget_exhausted:
+                            try:
+                                record = self._capture(side, capacity)
+                            except (torch.OutOfMemoryError, MemoryError) as exc:
+                                self.budget_exhausted = True
+                                self.capture_memory_error = str(exc)
+                                warnings.warn('CUDA graph memory limit reached; new shapes use eager inference',
+                                              RuntimeWarning, stacklevel=2)
+                        if record is None:
+                            out = self._fallback(part)
+                            if destination is None:
+                                pieces.append(out)
+                            else:
+                                destination[start:start+rows].copy_(out, non_blocking=True)
+                            start += rows
+                            continue
+                        graph, template, static_input, static_packed = record
+                        if rows == capacity:
+                            static_input.copy_(part)
+                        else:
+                            static_input.copy_(template)
+                            static_input[:rows].copy_(part)
+                        graph.replay()
+                        # Copy before another replay can overwrite static storage.
+                        # Native batches already own pinned output memory until their
+                        # completion fence, so they need no intermediate GPU clone.
+                        if destination is None:
+                            pieces.append(static_packed[:rows].clone())
+                        else:
+                            destination[start:start+rows].copy_(static_packed[:rows], non_blocking=True)
                         start += rows
-                        continue
-                    graph, template, static_input, static_packed = record
-                    if rows == capacity:
-                        static_input.copy_(part)
-                    else:
-                        static_input.copy_(template)
-                        static_input[:rows].copy_(part)
-                    graph.replay()
-                    # The clone is queued on the same stream before any graph
-                    # can replay. Callers never observe reusable graph storage.
-                    pieces.append(static_packed[:rows].clone())
-                    start += rows
-                packed = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
-            if not same_stream:
-                caller_stream.wait_stream(self.stream)
-                packed.record_stream(caller_stream)
-        return {'policy': packed[:, :-2], 'far': packed[:, -2],
-                'value_logit': packed[:, -1]}
+                    packed = (pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)) if destination is None else None
+                if not same_stream:
+                    caller_stream.wait_stream(self.stream)
+                    if destination is None:
+                        packed.record_stream(caller_stream)
+            except BaseException as error:
+                if not same_stream:
+                    try:
+                        caller_stream.wait_stream(self.stream)
+                    except BaseException as fence_error:
+                        # The submitting adapter must retain staging if even its
+                        # failure fence cannot include writes on this stream.
+                        error.gpu_unfenced = True
+                        if hasattr(error, 'add_note'):
+                            error.add_note(f'graph stream handoff failed: {fence_error}')
+                raise
+        return packed
 
     def _fallback(self, planes):
         height, width = planes.shape[-2:]
         chunk = max(1, self.MAX_CELLS//(height*width))
         pieces = []
         for part in planes.split(chunk):
+            part = part.to(dtype=torch.bfloat16, memory_format=torch.channels_last)
             out = self.model(part, part[:, 3:4], aux=False)
             pieces.append(torch.cat((out['policy'], out['far'][:, None],
                                      out['value_logit'][:, None]), dim=1))

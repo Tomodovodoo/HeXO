@@ -1075,19 +1075,67 @@ class FusedCudaTests(unittest.TestCase):
         runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
         for rows, shape in ((7, (24, 72)), (3, (72, 24)), (65, (24, 32)), (100, (32, 24)),
-                            (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
+                            (2, (25, 41)), (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
                            (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
             height, width = (shape, shape) if isinstance(shape, int) else shape
             x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
                 expected = model(x, x[:, 3:4], aux=False)
-            out = runner(x)
+            # Uint8 staging is converted by the graph input copy. The public
+            # BF16 route remains valid, and the packed output describes the same
+            # policy/value row that its views expose.
+            out = runner(x.to(torch.uint8))
             for name in expected:
                 self.assert_bf16_close(expected[name], out[name])
+            torch.testing.assert_close(out['packed'], torch.cat((out['policy'],
+                out['far'][:, None], out['value_logit'][:, None]), 1))
+            destination = torch.empty(out['packed'].shape, dtype=torch.float32, pin_memory=True)
+            runner.copy_predictions(x.to(torch.uint8), destination)
+            torch.cuda.current_stream().synchronize()
+            self.assert_bf16_close(out['packed'].cpu(), destination)
             inputs.append(x)
             outputs.append(out)
             saved.append({name: value.clone() for name, value in out.items()})
+        # An exception after a partial D2H must still hand the private stream
+        # back to the caller before the caller records its cleanup fence.
+        partial = torch.cat((inputs[5], inputs[5]), dim=0).to(torch.uint8)
+        expected_partial = outputs[5]['packed'][:16].cpu().clone()
+        destination = torch.full((len(partial), 24*24+2), float('nan'), pin_memory=True)
+        failure = RuntimeError('after first graph output copy')
+        def fail_after_first(*args):
+            yield 16, 16
+            torch.cuda._sleep(20000000)
+            raise failure
+        with unittest.mock.patch.object(runner, '_segments', fail_after_first):
+            with self.assertRaises(RuntimeError) as raised:
+                runner.copy_predictions(partial, destination)
+        self.assertIs(raised.exception, failure)
+        fence = torch.cuda.Event()
+        fence.record()
+        fence.synchronize()
+        self.assertTrue(runner.stream.query())
+        self.assert_bf16_close(expected_partial, destination[:16])
+        self.assertTrue(torch.isnan(destination[16:]).all())
+        class LegacyError(RuntimeError):
+            def __getattribute__(self, name):
+                if name == 'add_note':
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+        failure = LegacyError('legacy exception after partial copy')
+        caller = torch.cuda.current_stream()
+        wait_stream = torch.cuda.Stream.wait_stream
+        def fail_handoff(stream, other):
+            if stream.cuda_stream == caller.cuda_stream and other.cuda_stream == runner.stream.cuda_stream:
+                raise RuntimeError('cannot establish graph handoff')
+            return wait_stream(stream, other)
+        with unittest.mock.patch.object(runner, '_segments', fail_after_first), \
+             unittest.mock.patch.object(torch.cuda.Stream, 'wait_stream', fail_handoff):
+            with self.assertRaises(LegacyError) as raised:
+                runner.copy_predictions(partial, destination)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(failure.gpu_unfenced)
+        runner.stream.synchronize()  # This test retains the destination until its writes finish.
         self.assertIn((24, 128), runner.graphs)
         self.assertIn((32, 64), runner.graphs)
         self.assertIn((40, 64), runner.graphs)
@@ -3950,27 +3998,38 @@ class EvaluatorSearchTests(unittest.TestCase):
     def test_graph_fallback_keeps_large_canvas_transfers_bounded(self):
         from hexnet_graphs import ActorGraph
         import native_dense
-        evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
-        shapes = []
-        def predict(planes):
-            shapes.append(tuple(planes.shape))
-            b, _, h, w = planes.shape
-            return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
-        evaluator.graph = unittest.mock.Mock(max_batch=128, supports=ActorGraph.supports,
-                                            _limit=ActorGraph._limit, side_effect=predict)
-        sample = SimpleNamespace(size=256, shape=(256, 256), planes=np.zeros((8, 256, 256), np.uint8))
-        histories = [np.empty((0, 2), np.int64)]*3
-        with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
-            evaluator.submit(histories)
-        self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
-        shapes.clear()
-        rows = unittest.mock.Mock(count=3, mixed=False, groups=[(256, 3)])
-        rows.pack.side_effect = lambda index, buffer: buffer.fill(0)
-        handle = native_dense.submit(evaluator, rows)
-        try:
-            self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
-        finally:
-            handle.close()
+        allocate = hexnet.staging_buffer
+        for cuda in (False, True):
+            with self.subTest(cuda=cuda):
+                evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
+                evaluator.cuda, evaluator.packing_adaptive = cuda, False
+                shapes = []
+                def predict(planes):
+                    self.assertEqual(planes.dtype, torch.bfloat16 if cuda else torch.float32)
+                    shapes.append(tuple(planes.shape))
+                    b, _, h, w = planes.shape
+                    return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
+                evaluator.graph = unittest.mock.Mock(max_batch=128, supports=ActorGraph.supports,
+                    _limit=ActorGraph._limit, copy_predictions=None, side_effect=predict)
+                sample = SimpleNamespace(size=256, shape=(256, 256), planes=np.zeros((8, 256, 256), np.uint8))
+                histories = [np.empty((0, 2), np.int64)]*3
+                # The CUDA case exercises dispatch/dtype without requiring a GPU in CI.
+                with unittest.mock.patch.object(torch.cuda, 'Event', return_value=unittest.mock.Mock()), \
+                     unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
+                    with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
+                        evaluator.submit(histories)
+                    self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+                    shapes.clear()
+                    rows = unittest.mock.Mock(count=3, mixed=False, groups=[(256, 3)])
+                    rows.pack.side_effect = lambda index, buffer: buffer.fill(0)
+                    handle = native_dense.submit(evaluator, rows)
+                    try:
+                        self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+                    finally:
+                        handle.close()
+                    shapes.clear()
+                    evaluator.evaluate([[(0, 0)]])
+                    self.assertEqual(shapes, [(1, 8, 24, 24)])
 
     def test_native_search_returns_legal_actions_in_native_order(self):
         for history in (POSITIONS[12], [(0, 0)], line_history(31)):
@@ -5082,15 +5141,22 @@ class EngineTests(unittest.TestCase):
         import native_dense
         from native_feed import NativeFeed
         from neural_search import native, checked
+        class LegacyError(RuntimeError):
+            def __getattribute__(self, name):
+                if name == 'add_note':
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
         def predict(x):
+            self.assertEqual(x.dtype, torch.bfloat16)  # Custom predict-only graphs retain floating inputs.
             count, _, side, _ = x.shape
             return dict(policy=torch.zeros(count, side*side), far=torch.zeros(count), value_logit=torch.zeros(count))
         allocate = hexnet.staging_buffer
-        for failure in ('create', 'record'):
+        for failure in ('create', 'record', 'create-legacy', 'record-legacy', 'unfenced-legacy'):
             with self.subTest(failure=failure):
                 tree = NeuralSearch(None, 'test', [(0,0)])
                 feed = NativeFeed(8)
-                evaluator = SimpleNamespace(cuda=True, free=[], graph=None, max_batch=8,
+                evaluator = SimpleNamespace(cuda=True, free=[], graph=SimpleNamespace(supports=lambda canvas: False),
+                                            packing_adaptive=False, max_batch=8,
                                             device=torch.device('cpu'), memory_format=torch.contiguous_format,
                                             predict=unittest.mock.Mock(side_effect=predict))
                 try:
@@ -5099,13 +5165,20 @@ class EngineTests(unittest.TestCase):
                     feed.gather(tree)
                     _, rows = feed.take_packed(8)
                     event = unittest.mock.Mock()
-                    event.record.side_effect = RuntimeError('fence failed')
-                    make_event = unittest.mock.Mock(side_effect=RuntimeError('fence failed')) if failure == 'create' else unittest.mock.Mock(return_value=event)
+                    error = (LegacyError if failure.endswith('legacy') else RuntimeError)('fence failed')
+                    event.record.side_effect = error
+                    make_event = unittest.mock.Mock(side_effect=error) if failure.startswith('create') else unittest.mock.Mock(return_value=event)
+                    if failure == 'unfenced-legacy':
+                        error.gpu_unfenced = True
+                        evaluator.predict.side_effect = error
                     with unittest.mock.patch.object(native_dense, '_quarantined', []), \
                          unittest.mock.patch.object(native_dense.torch.cuda, 'Event', make_event), \
                          unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
-                        with self.assertRaisesRegex(RuntimeError, 'fence failed'):
+                        with self.assertRaisesRegex(RuntimeError, 'fence failed') as raised:
                             native_dense.submit(evaluator, rows)
+                        self.assertIs(raised.exception, error)
+                        if failure == 'unfenced-legacy':
+                            make_event.assert_not_called()
                         self.assertGreater(evaluator.predict.call_count, 0)
                         handle = native_dense._quarantined[0]
                         self.assertIsNotNone(handle.staging)

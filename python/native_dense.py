@@ -183,6 +183,7 @@ class Forward:
 @torch.inference_mode()
 def submit(evaluator, rows, max_cells=48*48*48):
     handle = Forward(evaluator, rows)
+    copy_predictions = getattr(evaluator, 'copy_predictions', None)
     try:
         graph = evaluator.graph
         if evaluator.cuda and graph is not None and getattr(evaluator, 'packing_adaptive', True):
@@ -222,10 +223,17 @@ def submit(evaluator, rows, max_cells=48*48*48):
             for start in range(0, count, step):
                 size = min(step, count-start)
                 x = host[start:start+size].to(evaluator.device, non_blocking=True)
-                x = x.to(memory_format=evaluator.memory_format, dtype=torch.bfloat16 if evaluator.cuda else torch.float32)
-                out = evaluator.predict(x)
-                packed = torch.cat((out['policy'], out['far'][:, None], out['value_logit'][:, None]), 1)
-                target = result[start:start+size].copy_(packed, non_blocking=True)
+                if not (evaluator.cuda and copy_predictions is not None
+                        and callable(getattr(graph, 'copy_predictions', None))):
+                    x = x.to(memory_format=evaluator.memory_format, dtype=torch.bfloat16 if evaluator.cuda else torch.float32)
+                target = result[start:start+size]
+                if copy_predictions is not None:
+                    copy_predictions(x, target)
+                else:
+                    out = evaluator.predict(x)
+                    packed = out['packed'] if 'packed' in out else torch.cat((out['policy'],
+                        out['far'][:, None], out['value_logit'][:, None]), 1)
+                    target.copy_(packed, non_blocking=True)
                 handle.chunks.append((index, start, target))
             if index in handle.observations:
                 handle.observations[index][3].record()
@@ -234,16 +242,19 @@ def submit(evaluator, rows, max_cells=48*48*48):
             event.record()
             handle.event = event
         return handle
-    except BaseException:
+    except BaseException as error:
         # A failure may follow an asynchronous copy. Do not recycle its host buffer early.
         if handle not in _quarantined:
             _quarantined.append(handle)
         try:
-            if evaluator.cuda:
+            if evaluator.cuda and not getattr(error, 'gpu_unfenced', False):
                 event = torch.cuda.Event(blocking=True)
                 event.record()
                 handle.event = event
             handle.close()
+        except BaseException as cleanup_error:
+            if hasattr(error, 'add_note'):
+                error.add_note(f'packed submission cleanup failed: {cleanup_error}')
         finally:
             handle.rows.close()
         raise
