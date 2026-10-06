@@ -1811,6 +1811,30 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(row['root_estimate'], 0.)
             self.assertEqual(row['raw_value'], 0.)
 
+    def test_new_continuations_skip_positions_proven_after_discovery(self):
+        from neural_search import checked
+        graph = self.graph()
+        actions = Uniform().evaluate([[(0,0)]])[0]['actions'].tolist()
+        children = [graph.view([(0,0), tuple(action)]) for action in actions]
+        for child in children:
+            self.addCleanup(child.close)
+        pool = self.pool([graph], quantum=16, views=4, depth=3, work=256)
+        pool.step()
+        self.answer(pool)
+        pool.step()  # The expanded focus has now offered its continuations.
+        before = pool.games[0].stats()['created']
+        # Caller-verified synthetic losses exercise delivery and admission, not
+        # the game solver. Keep two unresolved first stones for a complete turn.
+        for child in children[:-2]:
+            checked(native.hxg_prove_loss(child.ptr, 0, 4))
+        self.finish(pool)
+        new = [r for r in pool.games[0].records() if r['view'] > before and r['depth']]
+        self.assertTrue(new)
+        self.assertTrue(all(r['history'][1] in actions[-2:] for r in new))
+        stats = pool.games[0].stats()
+        self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+        self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0,0))
+
     def test_global_queue_coalesces_games_without_sharing_their_sampling_credits(self):
         pool = self.pool([self.graph(), self.graph()], quantum=16, views=1, work=16)
         pool.step()
