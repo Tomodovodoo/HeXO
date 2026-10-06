@@ -2087,6 +2087,33 @@ class DenseDataTests(unittest.TestCase):
         self.assertAlmostEqual(loss_on-loss_off, .5*off[-1].item(), places=5)
         self.assertFalse(all(torch.allclose(a, b) for a, b in zip(grad_off, grad_on)))
 
+    def test_padding_rows_carry_no_loss_and_shift_gradients_through_norm_statistics_only(self):
+        """Padding rows have zero loss weight; their one crop cell enters the norm statistics, so gradients move by
+        a small amount that grows with the number of padding rows."""
+        torch.manual_seed(0)
+        model = hexnet.HexNet(TINY, 'masked')
+        moves = winning_game()
+        roots = [float(v) for v in np.random.default_rng(3).uniform(-1, 1, len(moves))]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_games(Path(tmp)/'shards'/'000001', [(moves, 0, roots)]*3)
+            window = dense_data.ReplayWindow(tmp, capacity_rows=1000)
+            refs = [window.ref(*window.index[k]) for k in range(len(window.index))][:-3]
+            batch = dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0), future_target='masked'))
+        self.assertEqual([len(b['counts']) % 4 for b in batch.values()], [1])
+        losses, gradients = [], []
+        for quantum in (1, dense_learn.QUANTUM, 16):
+            m = copy.deepcopy(model)
+            with unittest.mock.patch.object(dense_learn, 'QUANTUM', quantum):
+                losses.append(dense_learn.batch_losses(m, batch, torch.ones(len(dense_learn.HEADS)), torch.device('cpu'),
+                                                       torch.contiguous_format, True))
+            gradients.append(torch.cat([p.grad.flatten() for p in m.parameters() if p.grad is not None]))
+        self.assertTrue(torch.isfinite(losses[0]).all())
+        for logged in losses[1:]:
+            torch.testing.assert_close(logged, losses[0], rtol=1e-3, atol=1e-5)
+        shift = [float((g-gradients[0]).norm()/gradients[0].norm()) for g in gradients[1:]]
+        self.assertLess(shift[0], .03)
+        self.assertLess(shift[0], shift[1])
+
     def test_shard_round_trip_and_tamper(self):
         rng = np.random.default_rng(2)
         moves, _ = random_game(rng, 10)
