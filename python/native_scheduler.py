@@ -596,7 +596,9 @@ class InferenceService:
     def wait(self, ms):
         """Block up to `ms` for a root event; True when one is ready."""
         self._raise()
-        return bool(native.hxb_wait_event(self.ptr, ms))
+        ready = bool(native.hxb_wait_event(self.ptr, ms))
+        self._raise()  # A launcher failure cancels the service and ends the wait.
+        return ready
 
     def event(self):
         """Copy one immutable root/lifecycle completion; None while roots run.
