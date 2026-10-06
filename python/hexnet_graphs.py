@@ -112,7 +112,8 @@ class ActorGraph:
     @classmethod
     def _limit(cls, side, max_batch=32):
         height, width = cls.shape(side)
-        ceiling = min(max_batch, cls.LARGE_BATCHES.get(side, 32))
+        ceiling = min(max_batch, cls.LARGE_BATCHES.get(side,
+                      128 if height*width <= 32*32 else 64 if height*width <= 40*40 else 32))
         return max(cap for cap in cls.BATCHES if cap <= ceiling and cap*height*width <= cls.MAX_CELLS)
 
     @torch.inference_mode()

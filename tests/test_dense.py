@@ -1072,7 +1072,8 @@ class FusedCudaTests(unittest.TestCase):
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
-        for rows, shape in ((7, (24, 72)), (3, (72, 24)), (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
+        for rows, shape in ((7, (24, 72)), (3, (72, 24)), (65, (24, 32)), (100, (32, 24)),
+                            (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
                            (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
             height, width = (shape, shape) if isinstance(shape, int) else shape
             x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
