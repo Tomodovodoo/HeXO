@@ -9686,16 +9686,23 @@ class DenseTimedWorker(unittest.TestCase):
                         search=dict(native_scheduler=native), solver=dict(enabled=False))) as engine:
                     game = Game([[0, 0]])
                     try:
-                        result = engine.turn(game, 1000)
-                        self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
-                        self.assertGreater(result.get('evaluated', 0), 0)
-                        self.assertEqual(result['backend'], 'dense')
-                        self.assertEqual(result['model_sha256'], engine.model_sha256)
-                        self.assertEqual([list(cell[:2]) for cell in game.cells], [[0, 0]])
-                        if native:
-                            self.assertTrue(result['settings']['native_scheduler'])
-                            self.assertTrue(result['stones'])
-                            self.assertEqual(result['stones'][0]['history'], [[0, 0]])
+                        for turn in range(2):
+                            history = [list(cell[:2]) for cell in game.cells]
+                            result = engine.turn(game, 1000)
+                            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+                            self.assertGreater(result.get('evaluated', 0), 0)
+                            self.assertEqual(result['backend'], 'dense')
+                            self.assertEqual(result['model_sha256'], engine.model_sha256)
+                            self.assertEqual([list(cell[:2]) for cell in game.cells], history)
+                            if native:
+                                self.assertTrue(result['settings']['native_scheduler'])
+                                self.assertTrue(result['stones'])
+                                self.assertEqual(result['stones'][0]['history'], history)
+                                self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
+                                self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
+                            engine.wait_idle()
+                            for action in result['moves']:
+                                game.play(*action)
                     finally:
                         game.close()
 

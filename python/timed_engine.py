@@ -257,7 +257,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
                   settings=dict(player.options) | dict(native_scheduler=True,
                       simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8),
-                  completed=0, evaluated=0, solver_nodes=0, stones=[])
+                  completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[])
     service = None
     def stopped():
         return cancel.is_set() or time.monotonic() >= hard
@@ -293,6 +293,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 raise
             kept = player._timed_native = graph, pool, signature
         _, pool, _ = kept
+        # The preceding service stopped the pool. Re-arm its retained graph only
+        # while detached, before a new service takes exclusive ownership.
+        pool.retarget(0, history, work=1)
         before = pool.proofs.stats() if pool.proofs is not None else None
         service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=64,
                                    pending=2, flights=2, interleave_feedback=True)
@@ -303,7 +306,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             end = min(normal, started + limits['normal_ms']*.6/1000) if first else normal
             ms = max(0., (min(hard, end)-time.monotonic())*1000)
             cap = limits.get('simulations')
-            work = 0 if cap is None else max(0, cap-result['completed'])
+            work = 0 if cap is None else max(0, cap-result['scheduler_completed'])
             if first and work:
                 work = max(1, int(work*.6))
             if ms <= 0 or cap is not None and not work:
@@ -330,7 +333,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             winner = found['exact_winner']
             value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
             probability = (value+1)/2
-            result['completed'] += found['completed']
+            result['completed'] += found['root_completed']
+            result['scheduler_completed'] += found['completed']
             if not selected:
                 result['win_probability'] = probability
                 result['proof_status'] = ('PROVEN_WIN' if winner == side else 'PROVEN_LOSS') if winner >= 0 else 'UNKNOWN'
@@ -338,7 +342,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                                          for i in np.argsort(-edges[:, 5])[:5]]
             action = found['action']
             result['stones'].append(dict(history=current, move=action, win_probability=probability,
-                                         exact_winner=winner, completed=found['completed'],
+                                         exact_winner=winner, completed=found['root_completed'],
+                                         scheduler_completed=found['completed'],
                                          root_completed=found['root_completed'], context=found['context']))
             game.play(*action)
             selected.append(action)
