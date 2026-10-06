@@ -3947,18 +3947,28 @@ class EvaluatorSearchTests(unittest.TestCase):
 
     def test_graph_fallback_keeps_large_canvas_transfers_bounded(self):
         from hexnet_graphs import ActorGraph
+        import native_dense
         evaluator = dense_selfplay.Evaluator(self.model, 'cpu', 'tiny', 256)
         shapes = []
         def predict(planes):
             shapes.append(tuple(planes.shape))
             b, _, h, w = planes.shape
             return dict(policy=torch.zeros(b, h*w), far=torch.zeros(b), value_logit=torch.zeros(b))
-        evaluator.graph = unittest.mock.Mock(CANVASES=ActorGraph.CANVASES, side_effect=predict)
-        sample = SimpleNamespace(size=256, planes=np.zeros((8, 256, 256), np.uint8))
+        evaluator.graph = unittest.mock.Mock(max_batch=128, supports=ActorGraph.supports,
+                                            _limit=ActorGraph._limit, side_effect=predict)
+        sample = SimpleNamespace(size=256, shape=(256, 256), planes=np.zeros((8, 256, 256), np.uint8))
         histories = [np.empty((0, 2), np.int64)]*3
         with unittest.mock.patch.object(hexcrop, 'encode_game', return_value=sample):
             evaluator.submit(histories)
         self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+        shapes.clear()
+        rows = unittest.mock.Mock(count=3, mixed=False, groups=[(256, 3)])
+        rows.pack.side_effect = lambda index, buffer: buffer.fill(0)
+        handle = native_dense.submit(evaluator, rows)
+        try:
+            self.assertEqual(shapes, [(1, 8, 256, 256)]*3)
+        finally:
+            handle.close()
 
     def test_native_search_returns_legal_actions_in_native_order(self):
         for history in (POSITIONS[12], [(0, 0)], line_history(31)):

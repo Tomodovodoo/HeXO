@@ -203,7 +203,9 @@ def submit(evaluator, rows, max_cells=48*48*48):
             rows.pack(index, host.numpy())
             pack_ms = (time.perf_counter()-began)*1000 if observe else 0.
             graphed = evaluator.graph is not None and evaluator.graph.supports(side)
-            step = evaluator.max_batch if graphed else max(1, min(evaluator.max_batch, max_cells//(height*width)))
+            step = max(1, min(evaluator.max_batch, max_cells//(height*width)))
+            if graphed:
+                step = min(step, graph._limit(side, graph.max_batch))
             if observe and graphed:
                 pieces = [cap for start in range(0, count, step)
                           for _, cap in graph._segments(min(step, count-start), graph._limit(side, graph.max_batch), side)]
