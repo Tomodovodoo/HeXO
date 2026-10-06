@@ -721,7 +721,9 @@ class InferenceService:
         finally:
             self.close()
 
-    def close(self):
+    def close(self, *, completions=False):
+        """Fence and join; optionally retain final writer-owned root events."""
+        final = []
         if self._ptr:
             self.cancel()
             failure = None
@@ -740,8 +742,14 @@ class InferenceService:
                 raise ValueError('Complete or abandon_fenced every manually taken service batch before close')
             checked(native.hxb_join(self._ptr))
             self._stats = self.stats()
-            checked(native.hxb_free(self._ptr))
-            self._ptr = None
-            for pool in self.pools:
-                if pool is not None:
-                    pool._service = None
+            try:
+                if completions:
+                    while (event := self.event()) is not None:
+                        final.append(event)
+            finally:
+                checked(native.hxb_free(self._ptr))
+                self._ptr = None
+                for pool in self.pools:
+                    if pool is not None:
+                        pool._service = None
+        return final if completions else None

@@ -9749,8 +9749,11 @@ class DenseTimedWorker(unittest.TestCase):
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
                             if native:
                                 self.assertTrue(result['settings']['native_scheduler'])
-                                self.assertTrue(result['stones'])
+                                self.assertEqual(len(result['stones']), 2)
+                                self.assertEqual([s['move'] for s in result['stones']], result['moves'])
                                 self.assertEqual(result['stones'][0]['history'], history)
+                                self.assertEqual(result['stones'][1]['history'], history+[result['moves'][0]])
+                                self.assertTrue(all(s['root_completed'] > 0 for s in result['stones']))
                                 self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
                                 self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
                                 if solver:
@@ -9819,6 +9822,34 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
                     self.assertEqual(result['stones'][1]['exact_winner'], winner)
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # The searched second root can arrive only at shutdown. Its
+                # matching final frame replaces the provisional legal filler.
+                clock = [0.]
+                frames = [dict(producer=0, game=0, model=0, token=1, history=[[0,0]],
+                               context='first', action=[1,0], exact_winner=-1, root_completed=2, completed=2,
+                               edges=np.array([[1,0,0,0,.2,1,2,2,1]], float)),
+                          dict(producer=0, game=0, model=0, token=2, history=[[0,0],[1,0]],
+                               context='second', action=[2,0], exact_winner=-1, root_completed=3, completed=3,
+                               edges=np.array([[2,0,0,0,.6,1,3,3,1]], float))]
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=2)
+                    def completion():
+                        if service.event.call_count == 1:
+                            return frames[0]
+                        clock[0] = 1.
+                        return None
+                    service.event.side_effect = completion
+                    service.close.side_effect = lambda **kw: [frames[1]] if kw.get('completions') else None
+                    result = player.turn(game, 1000)
+                    service.cancel.assert_called_once()
+                    service.pump.assert_not_called()
+                    self.assertIn(unittest.mock.call(completions=True), service.close.call_args_list)
+                self.assertEqual(result['moves'], [[1,0],[2,0]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
+                self.assertEqual(result['completed'], 5)
+                self.assertEqual(result['proof_status'], 'UNKNOWN')
                 # A real immediate pair is committed before the first winning
                 # publication can cancel the worker. No second inference is needed.
                 from timed_engine import dense_turn

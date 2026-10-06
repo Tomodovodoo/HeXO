@@ -1605,7 +1605,13 @@ class NativeScheduler(unittest.TestCase):
             if token.value:
                 checked(native.hxb_abort(service.ptr,token))
                 native.hxgp_free(snapshot)
-            service.close()
+            final = service.close(completions=True)
+        self.assertEqual(len(final), 1)
+        self.assertEqual((final[0]['game'],final[0]['token'],final[0]['history'],final[0]['error']),
+                         (1,1,[[0,0]],'cancelled'))
+        self.assertNotIn('edges',final[0])
+        self.assertEqual(pool.games[1].stats()['deadline'],0)
+        self.assertEqual(service.close(completions=True),[])
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
 
     def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
@@ -2329,11 +2335,19 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(len(released), len(graphs))
             for graph in graphs:
                 graph.close()
+            histories = [[[0,0],[game+1,0]] for game in range(len(graphs))]
             for game in range(len(graphs)):
-                service.replace(0, game, self.graph(), expected=1, views=1)
+                service.replace(0, game, self.graph(histories[game]), expected=1, work=8, views=1)
             service.cancel()
         finally:
-            service.close()
+            final = service.close(completions=True)
+        self.assertEqual(len(final),len(graphs))
+        self.assertEqual(len({(e['game'],e['token']) for e in final}),len(graphs))
+        for event in final:
+            self.assertEqual((event['token'],event['history'],event['error']),
+                             (2,histories[event['game']],'cancelled'))
+            self.assertNotIn('edges',event)
+        self.assertTrue(all(view.stats()['deadline']==0 for view in pool.games))
         stats = service.stats()
         self.assertEqual((stats['reclaim_queued'], stats['reclaim_active'], stats['reclaim_reserved'],
                           stats['pending_rows'], stats['inflight_batches'], stats['active_producers']),

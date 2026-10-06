@@ -348,7 +348,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token, current):
                 raise ValueError('Native turn completion does not match the current position')
             if 'error' in found:
-                if found['error'] == 'deadline':
+                if found['error'] in ('deadline', 'cancelled'):
                     break
                 raise ValueError(f"Native turn search failed: {found['error']}")
             edges = np.asarray(found['edges'], np.float64)
