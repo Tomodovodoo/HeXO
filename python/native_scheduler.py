@@ -637,7 +637,7 @@ class InferenceService:
                            'snapshot_limit_per_producer'), map(int, flights)))
         # Opt-in observations and owner wall spans. Repeated queue samples are
         # not unique work; sums over concurrent producers are not CPU occupancy.
-        timing = np.empty(37, np.uint64)
+        timing = np.empty(39, np.uint64)
         native.hxb_schedule_stats(self.ptr, timing.ctypes.data)
         # Admission/gate counters are repeated observations, not unique rows or wait time.
         # Urgent-at-entry marks certificates, checked solver endpoints or errors
@@ -652,7 +652,8 @@ class InferenceService:
                  'packet_install_max_ns', 'urgent_at_entry_packets', 'urgent_at_entry_packet_ns',
                  'completion_bursts', 'burst_packets_max', 'burst_install_ns', 'burst_install_max_ns',
                  'urgent_at_entry_bursts', 'urgent_at_entry_burst_ns', 'snapshot_gate_samples',
-                 'snapshot_gate_ready_samples', 'snapshot_gate_ready_row_samples', 'snapshot_gate_ready_rows_max', 'urgent_collections', 'urgent_collection_ns', 'urgent_collection_max_ns')
+                 'snapshot_gate_ready_samples', 'snapshot_gate_ready_row_samples', 'snapshot_gate_ready_rows_max', 'urgent_collections', 'urgent_collection_ns', 'urgent_collection_max_ns',
+                 'urgent_certificate_collections', 'urgent_certificates')
         result.update(('schedule_'+key, int(value)) for key, value in zip(names, timing))
         result['interleave_feedback'] = self.interleave_feedback
         # Native feed messages installed, including retired/empty messages.

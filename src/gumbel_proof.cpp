@@ -130,7 +130,7 @@ struct Loop {
   }catch(...){shutdown();throw;}
   for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
-  pool.proof_collect=[](void* p){static_cast<Loop*>(p)->feedback();};
+  pool.proof_collect=[](void* p){return static_cast<Loop*>(p)->feedback();};
   pool.proof_bind=[](void* p,int i){static_cast<Loop*>(p)->bind(i);};
   pool.proof_ready=[](void* p){return static_cast<Loop*>(p)->completion_ready.load(std::memory_order_acquire);};
   pool.proof_listen=[](void* p,std::shared_ptr<owner::Signal> signal){auto& loop=*static_cast<Loop*>(p);std::lock_guard lock(loop.mutex);loop.listener=std::move(signal);};
@@ -384,7 +384,7 @@ struct Loop {
  void prune(){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}}
  }
-  void feedback(){prune();collect();prune();}
+ uint64_t feedback(){auto before=installed;prune();collect();prune();return installed-before;}
   void step(){
    ++ticks;feedback();
   for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;

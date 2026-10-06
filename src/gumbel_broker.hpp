@@ -80,7 +80,7 @@ struct Broker {
  int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
  uint64_t flight_high_water=0;
  // Optional repeated admission observations and owner wall spans, not occupancy.
- bool profile_enabled=false,interleave_feedback=false;std::array<uint64_t,36> schedule{};
+ bool profile_enabled=false,interleave_feedback=false;std::array<uint64_t,38> schedule{};
  std::vector<std::pair<int,int>> model_rows;
  std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
@@ -110,10 +110,11 @@ struct Broker {
   std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure interleaved solver feedback before starting");
   interleave_feedback=enabled;
  }
- void collected(Clock::time_point start){
+ void collected(Clock::time_point start,uint64_t proofs){
   if(!profile_enabled)return;
   auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());
   std::lock_guard lock(mutex);++schedule[33];schedule[34]+=ns;schedule[35]=std::max(schedule[35],ns);
+  schedule[36]+=proofs!=0;schedule[37]+=proofs;
  }
  void sample_admission(int limit,Clock::time_point now){
   if(!profile_enabled)return;
@@ -503,7 +504,7 @@ inline void Producer::run()noexcept{
     // waiting for a running solver. Late predictions retain their leases.
     if(broker.interleave_feedback && pool.proof_collect && pool.proof_ready && pool.proof_ready(pool.proof_owner)){
      auto start=broker.profile_enabled?Clock::now():Clock::time_point{};
-     pool.proof_collect(pool.proof_owner);broker.collected(start);
+     auto proofs=pool.proof_collect(pool.proof_owner);broker.collected(start,proofs);
     }
     auto install_start=broker.profile_enabled?Clock::now():Clock::time_point{};
     bool install_proof=broker.profile_enabled && pool.proof_ready && pool.proof_ready(pool.proof_owner);
