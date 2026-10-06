@@ -16,6 +16,7 @@ const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit', 'no fallback strategy', 'zone proof budget', 'zone certificate byte limit', 'proof zone size limit']);
 let native, ort, network, cache, games, device, solver = null, solverCalls = 0;
+let frontierWorkers = null;
 /** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
  * another turn advances, searches or evicts a game tree. */
 let gameTurn = Promise.resolve();
@@ -27,6 +28,68 @@ class Cancelled extends Error {}
 
 const GRACE_MS = 500;
 const unknown = reason => ({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason});
+
+/** One outstanding slice per worker. Ordinary cancellation drains its short
+ * query and retains the resident table; only a broken worker is replaced. */
+class SolverWorkers {
+  constructor(count) { this.count = count; this.entries = Array(count).fill(null); this.next = 0; }
+  retire(index, error) {
+    const entry = this.entries[index]; if (!entry) return;
+    entry.worker.terminate(); this.entries[index] = null;
+    if (entry.wait) { clearTimeout(entry.wait.timer); entry.wait.reject(error); entry.wait = null; }
+  }
+  ask(index, data, ms) {
+    const entry = this.entries[index];
+    if (!entry || entry.wait) return Promise.reject(new Error('Solver worker is unavailable or busy'));
+    return new Promise((resolve, reject) => {
+      const id = ++this.next, timer = setTimeout(() => this.retire(index, new Error('solver slice hard deadline')), ms + GRACE_MS);
+      entry.wait = {id, timer, resolve, reject}; entry.worker.postMessage({id, ...data});
+    });
+  }
+  prepare(index) {
+    let entry = this.entries[index];
+    if (!entry) {
+      const worker = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
+      entry = this.entries[index] = {worker, wait: null, ready: null,
+        control: typeof SharedArrayBuffer === 'function' ? new Int32Array(new SharedArrayBuffer(4)) : null};
+      worker.onmessage = ({data}) => {
+        const wait = entry.wait;
+        if (!wait || wait.id !== data.id) return;
+        clearTimeout(wait.timer); entry.wait = null; wait.resolve(data);
+      };
+      worker.onerror = event => this.retire(index, new Error(`${FAILED}: ${event.message || 'error'}`));
+      entry.ready = this.ask(index, {prepare: true}, 10000).then(data => {
+        if (!data.ready) { const error = new Error(`${FAILED}: ${data.result?.reason || 'preparing'}`); this.retire(index, error); throw error; }
+      });
+    }
+    return entry.ready;
+  }
+  async query(index, request, cancelled = () => false) {
+    await this.prepare(index);
+    if (cancelled()) {
+      const info = Array(13).fill(0), size = request.history.length;
+      info[4] = 1; info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+      info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+      return {info, moves: []};
+    }
+    const control = this.entries[index].control;
+    if (control) Atomics.store(control, 0, 0);
+    const data = await this.ask(index, {request, cancel: control}, request.ms);
+    if (!data.answer) throw new Error('Missing typed solver completion');
+    return data.answer;
+  }
+  cancel(index) { const flag = this.entries[index]?.control; if (flag) Atomics.store(flag, 0, 1); }
+  get cooperative() { return this.entries.every(entry => entry?.control); }
+  close() { for (let i = 0; i < this.count; i++) this.retire(i, new Error('Solver worker closed')); }
+}
+
+async function proofWorkers(count) {
+  if (!Number.isInteger(count) || count < 1 || count > 16) throw new Error('Invalid solver worker count');
+  if (frontierWorkers && frontierWorkers.count !== count) { frontierWorkers.close(); frontierWorkers = null; }
+  frontierWorkers ??= new SolverWorkers(count);
+  await Promise.all(Array.from({length: count}, (_, i) => frontierWorkers.prepare(i)));
+  return frontierWorkers;
+}
 
 /**
  * The solver's answer to one query of turn `owner`; queries run one at a time in the solver worker. A query still
@@ -101,12 +164,10 @@ function rootRows(tree, choice) {
 async function turn(request) {
   const previous = gameTurn;
   let release = null;
-  if (request.line != null) gameTurn = new Promise(resolve => { release = resolve; });
+  gameTurn = new Promise(resolve => { release = resolve; });
   try {
-    if (request.line != null) {
-      await previous;
-      if (cancelled.has(request.id)) throw new Cancelled();
-    }
+    await previous;
+    if (cancelled.has(request.id)) throw new Cancelled();
     return await playTurn(request);
   } finally {
     release?.();
@@ -118,11 +179,14 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, nativeOwner = false, nativeCapture = false}) {
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, nativeOwner = false, nativeCapture = false, nativeProof = false, solverWorkers = 1, solverSlice = 8, solverTable = 4}) {
   if (nativeCapture && !nativeOwner) throw new Error('Native captures require the native graph owner');
-  if (nativeOwner && leafBudget) throw new Error('Native browser owner has no leaf-proof dispatcher yet');
+  if (nativeProof && !nativeOwner) throw new Error('Native proof frontier requires the native graph owner');
+  if (nativeOwner && leafBudget) throw new Error('Native owner uses frontier proofs instead of per-leaf queries');
   await use(model, new Stages(postMessage, id));
+  const proofPool = nativeProof ? await proofWorkers(solverWorkers) : null;
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
+  check();
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
   const table = new Proofs(known || []), given = answered(native, history, table), leafProofs = new Map();
@@ -180,7 +244,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     return found;
   } : null;
   try {
-    if (solverNodes) {
+    if (solverNodes && !nativeProof) {
       postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
       if (!timed) {
         const actions = native.legal(history), prediction = await predict(history, actions);
@@ -266,13 +330,31 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         if (nativeOwner) {
           const owner = new NativeOwner(tree, {work: timed ? 0 : simulations, ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
           try {
-            searchedResult = await owner.search({network, batchSize, choice, capture: nativeCapture, stop: () => cancelled.has(id), onBatch: stats => {
+            searchedResult = await owner.search({network, batchSize, choice, capture: nativeCapture,
+              proofs: nativeProof ? {workers: solverWorkers, slice: solverSlice, table: solverTable, stamps: proofStamps,
+                cancel: proofPool.cooperative ? worker => proofPool.cancel(worker) : null,
+                query: (worker, request, cancelled) => proofPool.query(worker, request, cancelled)} : null,
+              stop: () => cancelled.has(id), onBatch: stats => {
               if (line != null) touched = tree.id;
               postMessage({type: 'progress', id, fraction: timed ? Math.min(1, (performance.now() - start) / ms)
                 : Math.min(1, (stone + stats.completed / simulations) / state.remaining),
                 ...(stone ? {} : {live: rootRows(owner.root, choice)})});
             }});
-            scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference, ...(nativeCapture ? {capture_pool: searchedResult.capture_pool} : {})});
+            scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference,
+              ...(nativeCapture ? {capture_pool: searchedResult.capture_pool} : {}),
+              ...(nativeProof ? {proof: searchedResult.proof_scheduler} : {})});
+            if (nativeProof) {
+              solverUsed += searchedResult.proof_scheduler.fresh_nodes;
+              failure ||= searchedResult.solver_error;
+              for (const {request, result: found} of searchedResult.proof_records) {
+                const winner = found.winner,
+                  plies = found.status === 'PROVEN_WIN' ? found.moves.length + 4 * (found.proof_turns - 1) : 4 * found.proof_turns + 2;
+                const pv = principalVariation(native, request.history, found.certificate, {attacker: winner, known: request.known}).pv,
+                  fact = {history: request.history, winner, plies, pv}, key = proofKey(request.history);
+                leafProofs.set(key, fact);
+                table.add(request.history, {proof: {winner, plies, turns: found.proof_turns, ...proofEvidence(found)}, pv});
+              }
+            }
           } finally { owner.close(); }
         } else searchedResult = await tree.search({simulations, rootSamples: 16, batchSize, cache, version: network.version, choice,
           ...(line == null ? {} : {pvCheck: PV_CHECK}),
@@ -322,6 +404,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     const knownTurn = answered(native, history, table);
     if (knownTurn && (!proof || knownTurn.proof.plies <= proof.plies)) ({moves, value, top, proof, pv} = knownTurn);
     else if (proof) pv = table.line(history, {winner: proof.winner, plies: proof.plies, pv});
+    if (nativeProof) solved = proof !== null;
     return proven(table, history, {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
       ...(nativeOwner ? {native_scheduler: scheduler} : {}),
@@ -413,7 +496,7 @@ onmessage = async ({data}) => {
   try {
     if (data.type === 'load') postMessage({type: 'ready', device: await load(data.options)});
     else if (data.type === 'turn') postMessage({type: 'result', id: data.id, result: await turn(data)});
-    else if (data.type === 'use') { await use(data.model, new Stages(postMessage, data.id)); postMessage({type: 'result', id: data.id, result: null}); }
+    else if (data.type === 'use') { await gameTurn; await use(data.model, new Stages(postMessage, data.id)); postMessage({type: 'result', id: data.id, result: null}); }
     else if (data.type === 'bench') postMessage({type: 'result', id: data.id, result: await bench(data)});
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));

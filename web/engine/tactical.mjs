@@ -7,6 +7,35 @@
 const MAX_NODES = 10000000, MAX_TABLE_MB = 256, REQUEST_LIMIT = 64 * 1024 * 1024;
 const ENOSYS = 52, EINVAL = 28;
 
+/** The checked JSON ABI mapped to native_answer.rs's completion contract.
+ * Bounds remain scheduling evidence. Only verified mover/defender certificates
+ * may create exact game outcomes. */
+export function proofAnswer(result, request) {
+  const info = Array(13).fill(0), size = request.history.length, player = Math.floor((size + 1) / 2) % 2,
+    remaining = !size || size % 2 === 0 ? 1 : 2, side = request.attacker === 'defender' ? 1 : 0;
+  const count = n => Number.isSafeInteger(n) && n >= 0;
+  if (result.attacker && result.attacker !== request.attacker) throw new Error('Solver completion scope differs from its request');
+  info[9] = player; info[10] = remaining; info[11] = side; info[12] = 1;
+  if (count(result.nodes_fresh)) { info[3] = result.nodes_fresh; info[4] = 1; }
+  if (count(result.nodes_used)) info[5] = result.nodes_used;
+  const bounds = result.proof_numbers;
+  if (bounds?.scope === 'wide-forcing' && bounds.game_exact === false && count(bounds.pn) && count(bounds.dn)) {
+    info[6] = bounds.pn; info[7] = bounds.dn; info[8] = 1;
+  }
+  const verdict = side === 0 && result.status === 'PROVEN_WIN' ? 1 : side === 1 && result.status === 'PROVEN_LOSS' ? 3 : 0;
+  let moves = [];
+  if (verdict && result.native_verified === true && result.winner === (side ? 1 - player : player)
+      && count(result.proof_turns) && result.proof_turns > 0 && result.proof_turns <= 10000) {
+    moves = result.moves || [];
+    if (moves.length <= 2 && (side || moves.length > 0 && moves.length <= remaining)
+        && moves.every(p => p.length === 2 && p.every(n => Number.isInteger(n) && n >= -2147483648 && n <= 2147483647))) {
+      info[0] = verdict; info[1] = result.winner + 1; info[2] = result.proof_turns;
+    }
+  }
+  return {info, moves: info[0] ? moves : [], raw: info[0] ? JSON.stringify(result) : '',
+    reason: result.reason, resident_reused: result.resident_reused, frontier_reused_nodes: result.frontier_reused_nodes};
+}
+
 /** Thrown by the shim's proc_exit. */
 export class Exit extends Error {}
 
@@ -16,6 +45,10 @@ export function wasi(state) {
   const zeroSizes = (count, size) => { view().setUint32(count, 0, true); view().setUint32(size, 0, true); return 0; };
   return {
     clock_time_get(id, precision, out) {
+      const control = state.control;
+      if (control && !control.signalled && Atomics.load(control.flag, 0)) {
+        control.exports.hexo_tactical_cancel(control.token); control.signalled = true;
+      }
       const ns = id === 0 ? BigInt(Date.now()) * 1000000n : id === 1 ? BigInt(Math.round(performance.now() * 1e6)) : null;
       if (ns === null) return EINVAL;
       view().setBigUint64(out, ns, true);
@@ -80,7 +113,15 @@ export async function loadTactical(source) {
   const bind = instance => { state.exports = instance.exports; state.memory = instance.exports.memory; };
   bind(await WebAssembly.instantiate(module, imports));
 
-  function query(request) {
+  function query(request, flag = null) {
+    const owned = state.exports;
+    let token = 0n;
+    if (flag) {
+      token = owned.hexo_tactical_prepare();
+      if (!token) throw new Error('Solver cancellation token limit');
+      state.control = {flag, token, exports: owned, signalled: false};
+      request = {...request, request_id: Number(token)};
+    }
     const payload = new TextEncoder().encode(JSON.stringify(request));
     const { hexo_tactical_alloc: alloc, hexo_tactical_query: run, hexo_tactical_free: free } = state.exports;
     try {
@@ -96,12 +137,15 @@ export async function loadTactical(source) {
       if (!(error instanceof WebAssembly.RuntimeError || error instanceof Exit)) throw error;
       bind(new WebAssembly.Instance(module, imports));
       return { status: 'UNKNOWN', native_verified: false, reason: 'native panic', moves: [] };
+    } finally {
+      state.control = null;
+      if (token) owned.hexo_tactical_release(token);
     }
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
                                certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, known = [],
-                               stamps = false, library = null, replay = [] } = {}) {
+                                stamps = false, library = null, replay = [], cancel = null } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     if (resume && !table_mb) throw new RangeError('Solver resume requires a positive table_mb');
     const start = performance.now();
@@ -123,7 +167,7 @@ export async function loadTactical(source) {
     if (bounds) request.bounds = true;
     if (resume) request.resume = true;
     if (JSON.stringify(request).length > REQUEST_LIMIT) return unknown('request size limit');
-    const result = { ...unknown('native error'), nodes_fresh: null, ...query(request) };
+    const result = { ...unknown('native error'), nodes_fresh: null, ...query(request, cancel) };
     if (performance.now() - start >= ms) Object.assign(result, {
       status: 'UNKNOWN', native_verified: false, moves: [], certificate: null, proof_turns: null, shortest: false, reason: 'deadline',
     });

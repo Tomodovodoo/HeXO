@@ -11,15 +11,17 @@ struct API {
  using New=void*(*)();using Free=void(*)(void*);using Query=void*(*)(void*,const char*);
  using Info=bool(*)(void*,uint64_t*);using Moves=int(*)(void*,int64_t*,size_t);using JSON=void*(*)(void*);
  using Prepare=uint64_t(*)();using Cancel=bool(*)(uint64_t);using Release=void(*)(uint64_t);using Busy=bool(*)(void*);
- New make;Free worker_free,answer_free,buffer_free;Query query;Info info;Moves moves;JSON json;Prepare prepare;Cancel cancel;Release release;Busy busy;
- explicit API(const uint64_t* f):make(reinterpret_cast<New>(f[0])),worker_free(reinterpret_cast<Free>(f[1])),query(reinterpret_cast<Query>(f[2])),info(reinterpret_cast<Info>(f[3])),moves(reinterpret_cast<Moves>(f[4])),json(reinterpret_cast<JSON>(f[5])),answer_free(reinterpret_cast<Free>(f[6])),buffer_free(reinterpret_cast<Free>(f[7])),prepare(reinterpret_cast<Prepare>(f[8])),cancel(reinterpret_cast<Cancel>(f[9])),release(reinterpret_cast<Release>(f[10])),busy(reinterpret_cast<Busy>(f[11])) {
+  New make=nullptr;Free worker_free=nullptr,answer_free=nullptr,buffer_free=nullptr;Query query=nullptr;Info info=nullptr;Moves moves=nullptr;JSON json=nullptr;Prepare prepare=nullptr;Cancel cancel=nullptr;Release release=nullptr;Busy busy=nullptr;
+  explicit API(const uint64_t* f) {
+   if(!f)return;
+   make=reinterpret_cast<New>(f[0]);worker_free=reinterpret_cast<Free>(f[1]);query=reinterpret_cast<Query>(f[2]);info=reinterpret_cast<Info>(f[3]);moves=reinterpret_cast<Moves>(f[4]);json=reinterpret_cast<JSON>(f[5]);answer_free=reinterpret_cast<Free>(f[6]);buffer_free=reinterpret_cast<Free>(f[7]);prepare=reinterpret_cast<Prepare>(f[8]);cancel=reinterpret_cast<Cancel>(f[9]);release=reinterpret_cast<Release>(f[10]);busy=reinterpret_cast<Busy>(f[11]);
   for(int i=0;i<12;++i)if(!f[i])throw std::runtime_error("Missing native proof callback");
  }
 };
 struct Dependency {Key key;int distance;bool operator==(const Dependency&)const=default;};
 using Premises=std::bitset<256>;
 struct Task {
- Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0;
+  Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0,observed_change=0,attempted_change=0;
  int side=0,closed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false,scoped=false;Clock::time_point ready{};
  std::vector<Dependency> scope;
 };
@@ -74,8 +76,9 @@ struct Frontier {
   ++offers;remember(history,*node);if(node->exact_winner>=0)return;
   auto key=gumbel::keys(history).first;auto found=tasks.find(key);
   if(found!=tasks.end()){
-   auto& t=*found->second;t.impact=std::max(t.impact,impact);t.change=std::max(t.change,change);
-   if(!t.flight){t.node=node;t.history=history;if(change>.1)t.ready=Clock::time_point{};}return;
+    auto& t=*found->second;t.impact=std::max(t.impact,impact);t.observed_change=change;
+    const double moved=std::abs(change-t.attempted_change);t.change=std::max(t.change,moved);
+    if(!t.flight){t.node=node;t.history=history;if(moved>.1)t.ready=Clock::time_point{};}return;
   }
   if(tasks.size()>=capacity){
    auto victim=tasks.end();double weakest=std::numeric_limits<double>::infinity();
@@ -85,30 +88,38 @@ struct Frontier {
    if(victim==tasks.end() || (weakest>=impact/.2 && offers%5!=0))return;tasks.erase(victim);
   }
   auto task=std::make_shared<Task>();task->key=key;task->node=node;task->history=history;task->generation=generation;
-  task->impact=impact;task->change=change;task->born=++next;task->facts=revision;tasks.emplace(key,std::move(task));
+   task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;tasks.emplace(key,std::move(task));
  }
 };
 struct Job {
  uint64_t id=0,token=0;size_t game=0;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
- std::vector<Cell> history;std::vector<Dependency> scope;std::string context,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
+  std::vector<Cell> history;std::vector<Dependency> scope;std::string context,request,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
  Clock::time_point queued,started,deadline{};double elapsed=0,wait=0;bool cancelled=false,pruned=false;
  std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;
 };
-struct Worker {void* native=nullptr;std::thread thread;std::shared_ptr<Job> active;uint64_t token=0;double service=0,idle=0;};
+struct Worker {void* native=nullptr;
+#ifndef __EMSCRIPTEN__
+ std::thread thread;
+#endif
+ std::shared_ptr<Job> active;uint64_t token=0;double service=0,idle=0;Clock::time_point idle_since=Clock::now();};
 struct Loop {
  owner::Pool& pool;API api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>> workers;
  std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<Job>> queued,done;
- std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table;bool stopping=false,enabled=true,stamps=false;
+  std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false;
  uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
  uint64_t available_facts=0,sent_facts=0,empty_scope_jobs=0,quantum_ms=0;
  std::deque<std::string> records;
  std::string released_effort;
- Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps){
+  Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps),external(!functions){
   if(pool.proof_owner || count<1 || count>16 || queue<count || queue>128 || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
   frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks);
   try {
-   for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");workers.push_back(std::move(worker));}
-   for(size_t i=0;i<workers.size();++i)workers[i]->thread=std::thread([this,i]{run(i);});
+    for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();if(!external){worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");}workers.push_back(std::move(worker));}
+#ifndef __EMSCRIPTEN__
+    if(!external)for(size_t i=0;i<workers.size();++i)workers[i]->thread=std::thread([this,i]{run(i);});
+#else
+    if(!external)throw std::runtime_error("Browser proofs require external solver workers");
+#endif
   }catch(...){shutdown();throw;}
   for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
@@ -122,7 +133,11 @@ struct Loop {
  }
  void shutdown(){
   {std::lock_guard lock(mutex);stopping=true;for(auto& [id,job]:live)mark(*job);}wake.notify_all();
-  for(auto& worker:workers){if(worker->thread.joinable())worker->thread.join();if(worker->native){api.worker_free(worker->native);worker->native=nullptr;}}
+   for(auto& worker:workers){
+#ifndef __EMSCRIPTEN__
+    if(worker->thread.joinable())worker->thread.join();
+#endif
+    if(worker->native){api.worker_free(worker->native);worker->native=nullptr;}}
  }
  void observe(Tree& t,const gumbel::Path& path){
   size_t i=0;while(i<pool.games.size() && pool.games[i]->game.get()!=t.state.get())++i;if(i==pool.games.size() || pool.games[i]->stopped)return;
@@ -161,15 +176,45 @@ struct Loop {
    size_t i=0;auto task=take(i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
+    // Without a shared cancel flag, bound the synchronous WASM call by a short
+    // slice. Cooperative adapters may continue longer on the same resident table.
+   if(external)job->quantum=std::min(external_limit,job->quantum);
    job->generation=task->generation;job->facts=frontiers[i].revision;job->scope=task->scope;job->queued=Clock::now();job->context=context(i,*task);
    available_facts+=frontiers[i].facts.size();sent_facts+=task->scope.size();empty_scope_jobs+=task->scope.empty();quantum_ms+=job->quantum;
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
-   task->flight=true;o.game->pins[task.get()]={node.get()};
+   task->flight=true;task->attempted_change=task->observed_change;o.game->pins[task.get()]={node.get()};
    {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
    cursor=(i+1)%frontiers.size();wake.notify_all();
   }
  }
- void run(size_t i) noexcept {
+  std::string request(const Job& job,int ms,uint64_t token=0)const{
+   return job.context.substr(0,job.context.size()-1)+",\"ms\":"+std::to_string(ms)+",\"nodes\":10000000,\"idtt_nodes\":0,\"depth\":8,\"attacker\":\""+(job.side?"defender":"mover")+"\",\"table_mb\":"+std::to_string(table)+",\"bounds\":true,\"resume\":true,\"stamps\":"+(stamps?"true":"false")+(token?",\"request_id\":"+std::to_string(token):"")+'}';
+  }
+  uint64_t external_take(int index){
+   if(!external || index<0 || index>=int(workers.size()))throw std::runtime_error("Invalid external proof worker");
+   auto& worker=*workers[index];if(worker.active)throw std::runtime_error("External proof worker is busy");
+   while(enabled && !stopping && !queued.empty()){
+    auto it=std::find_if(queued.begin(),queued.end(),[&](const auto& j){return j->preferred<0 || j->preferred==index;});
+    if(it==queued.end())it=queued.begin();auto job=*it;queued.erase(it);
+    int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
+    if(ms<1)mark(*job);
+    if(job->cancelled){job->info[4]=1;done.push_back(job);++finished;continue;}
+    job->worker=index;job->started=Clock::now();job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
+    worker.idle+=std::chrono::duration<double,std::milli>(job->started-worker.idle_since).count();
+    job->request=request(*job,ms);worker.active=job;++started;return job->id;
+   }return 0;
+  }
+  void external_complete(int index,uint64_t id,const uint64_t* info,const int64_t* moves,int count,const char* result,const char* error){
+   if(!external || index<0 || index>=int(workers.size()))throw std::runtime_error("Invalid external proof completion");
+   auto& worker=*workers[index];auto job=worker.active;
+   if(!job || job->id!=id || !info || count<0 || count>2 || (count && !moves))throw std::runtime_error("Unknown external proof completion");
+   std::copy_n(info,13,job->info.begin());job->move_count=count;if(count)std::copy_n(moves,2*count,job->moves.begin());
+   if(result)job->result=result;if(error)job->error=error;
+   job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();worker.service+=job->elapsed;
+   worker.idle_since=Clock::now();worker.active.reset();done.push_back(job);++finished;
+  }
+#ifndef __EMSCRIPTEN__
+  void run(size_t i) noexcept {
   auto& worker=*workers[i];auto idle_start=Clock::now();
   for(;;){std::unique_lock lock(mutex);wake.wait(lock,[&]{return stopping || !queued.empty();});if(stopping && queued.empty())return;
    // Prefer a continuation's resident table, but steal work rather than idle.
@@ -183,7 +228,7 @@ struct Loop {
     if(ms<1)mark(*job);
     if(!job->cancelled){worker.token=api.prepare();if(!worker.token)job->error="cancellation token limit";
      else{job->token=worker.token;
-      std::string payload=job->context.substr(0,job->context.size()-1)+",\"ms\":"+std::to_string(ms)+",\"nodes\":10000000,\"idtt_nodes\":0,\"depth\":8,\"attacker\":\""+(job->side?"defender":"mover")+"\",\"table_mb\":"+std::to_string(table)+",\"bounds\":true,\"resume\":true,\"stamps\":"+(stamps?"true":"false")+",\"request_id\":"+std::to_string(worker.token)+'}';
+       std::string payload=request(*job,ms,worker.token);
       job->info[4]=0;lock.unlock();answer=api.query(worker.native,payload.c_str());
       if(!answer || !api.info(answer,job->info.data()))job->error="missing typed native answer";
       else{job->move_count=api.moves(answer,job->moves.data(),2);if(job->move_count<0)throw std::runtime_error("Invalid typed proof witness");
@@ -200,6 +245,7 @@ struct Loop {
    worker.service+=job->elapsed;++finished;done.push_back(job);worker.active.reset();idle_start=Clock::now();wake.notify_all();
   }
  }
+#endif
  void publish(Tree& view,const Board& board,const gumbel::Outcome& outcome){
   auto key=gumbel::keys(board).first;
   if(auto old=view.outcomes.find(key);old!=view.outcomes.end() && old->second.winner!=outcome.winner)throw std::runtime_error("Conflicting verified graph proof");
@@ -216,6 +262,7 @@ struct Loop {
   int player=int((job.history.size()+1)/2%2),remaining=job.history.empty() || job.history.size()%2==0?1:2;
   if(job.info[12] && (job.info[9]!=uint64_t(player) || job.info[10]!=uint64_t(remaining) || job.info[11]!=uint64_t(job.side)))throw std::runtime_error("Native proof scope mismatch");
   int verdict=int(job.info[0]);
+  if(external && (!job.info[12] || (verdict!=0 && verdict!=1 && verdict!=3) || (verdict && (job.info[2]<1 || job.info[1]!=uint64_t((verdict==1?player:1-player)+1)))))throw std::runtime_error("Invalid external proof outcome");
   if(verdict){
    if((verdict==1 && job.side!=0) || (verdict==3 && job.side!=1) || job.info[2]>10000)throw std::runtime_error("Invalid typed exact proof");
    Tree view(0,o.game);view.shared=view.graph=view.scheduler_owned=true;view.root_at(job.history);
@@ -258,12 +305,21 @@ struct Loop {
   auto& store=*pool.games[game]->game;store.evidence=nullptr;store.evidence_owner=nullptr;
   return released_effort.c_str();
  }
- void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);wake.notify_all();}
+  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);if(external){for(auto& job:queued){job->info[4]=1;done.push_back(job);++finished;}queued.clear();}wake.notify_all();}
  void resume(){std::lock_guard lock(mutex);enabled=true;}
- void drain(){cancel_all();for(;;){collect();std::unique_lock lock(mutex);if(live.empty())break;wake.wait(lock,[&]{return !done.empty();});}}
+  void drain(){cancel_all();if(external){collect();if(!live.empty())throw std::runtime_error("Complete external proof slices before freeing their graph");return;}
+#ifndef __EMSCRIPTEN__
+   for(;;){collect();std::unique_lock lock(mutex);if(live.empty())break;wake.wait(lock,[&]{return !done.empty();});}
+#endif
+  }
 };
 }
 extern "C" HX_API void* hxp_new(void* pool,const uint64_t* functions,int workers,int capacity,int slice,int table,int tasks,int stamps){try{if(!pool || !functions)throw std::runtime_error("Missing proof pool");return new proving::Loop(*static_cast<owner::Pool*>(pool),functions,workers,capacity,slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API void* hxpe_new(void* pool,int workers,int capacity,int slice,int table,int tasks,int stamps,int maximum){try{if(!pool || maximum<1 || maximum>1000)throw std::runtime_error("Invalid external proof limits");auto* loop=new proving::Loop(*static_cast<owner::Pool*>(pool),nullptr,workers,capacity,slice,table,tasks,stamps!=0);loop->external_limit=maximum;return loop;}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API int hxpe_cancelled(void* p,int worker){auto& loop=*static_cast<proving::Loop*>(p);if(worker<0 || worker>=int(loop.workers.size()))return 0;auto& active=loop.workers[worker]->active;return active && active->cancelled;}
+extern "C" HX_API uint64_t hxpe_take(void* p,int worker){try{return static_cast<proving::Loop*>(p)->external_take(worker);}catch(const std::exception& e){gumbel::error=e.what();return UINT64_MAX;}}
+extern "C" HX_API const char* hxpe_request(void* p,int worker){auto& loop=*static_cast<proving::Loop*>(p);if(!loop.external || worker<0 || worker>=int(loop.workers.size()) || !loop.workers[worker]->active)return nullptr;return loop.workers[worker]->active->request.c_str();}
+extern "C" HX_API int hxpe_complete(void* p,int worker,uint64_t id,const uint64_t* info,const int64_t* moves,int count,const char* result,const char* error){try{static_cast<proving::Loop*>(p)->external_complete(worker,id,info,moves,count,result,error);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxp_step(void* p){try{static_cast<proving::Loop*>(p)->step();return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxp_cancel(void* p){static_cast<proving::Loop*>(p)->cancel_all();}
 extern "C" HX_API void hxp_resume(void* p){static_cast<proving::Loop*>(p)->resume();}

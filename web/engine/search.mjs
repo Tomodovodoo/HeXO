@@ -483,7 +483,7 @@ export class NativeBatch {
     try {
       this.n.checked(this.m._hxgp_outputs(this.ptr, pointers));
       const [offsets, actions, logits, values] = this.n.view(Uint32Array, pointers, 4);
-      this.n.checked(this.m._hxgo_install(this.owner.ptr, this.ids, this.count, offsets, actions, logits, values));
+      this.n.checked(this.m._hxgm_install(this.owner.pool, this.ids, this.count, offsets, actions, logits, values));
     } finally { this.m._free(pointers); }
     this.installed = true; this.close();
   }
@@ -497,29 +497,45 @@ export class NativeBatch {
 }
 
 /** The desktop C++ scheduler in one browser graph-owner worker. JavaScript
- * crosses the boundary per batch, never per selected node. Proof-frontier
- * dispatch is not part of this adapter yet. */
+ * crosses the boundary per neural batch or immutable proof slice. */
 export class NativeOwner {
   constructor(graph, {capacity = 4096, quantum = 32, views = 8, depth = 8, work = 0, ms = 1000, seed = 1740} = {}) {
     if (!(graph instanceof GameGraph) || !graph.ptr || graph.nativeOwner) throw new Error('A free game graph is required');
-    this.graph = graph; this.n = graph.n; this.m = graph.m; this.batches = new Set(); this.busy = false;
-    this.ptr = this.m._hxgo_new(graph.ptr, capacity, quantum, views, depth, BigInt(work), ms, BigInt(seed));
-    this.n.checked(this.ptr); this.feed = this.m._hxgo_feed(this.ptr);
+    if (!work && !(ms > 0)) throw new Error('A work allowance or positive clock is required');
+    this.graph = graph; this.n = graph.n; this.m = graph.m; this.batches = new Set(); this.busy = false; this.proofs = null;
+    const source = this.n.alloc(4), version = new TextEncoder().encode(String(graph.model || 'web') + '\0'), name = this.n.alloc(version.length);
+    try {
+      this.n.view(Uint32Array, source, 1)[0] = graph.ptr; this.n.view(Uint8Array, name, version.length).set(version);
+      this.pool = this.m._hxgm_new(source, 1, capacity, quantum, views, depth, BigInt(work || quantum), name, BigInt(seed));
+      this.n.checked(this.pool);
+      if (ms && work) {
+        const history = this.n.cells(graph.history);
+        try { this.n.checked(this.m._hxgm_retarget(this.pool, 0, history, graph.history.length, BigInt(work), ms)); }
+        finally { this.m._free(history); }
+      } else if (ms) this.n.checked(this.m._hxgm_clock(this.pool, ms));
+      this.ptr = this.m._hxgm_owner(this.pool, 0); this.feed = this.m._hxgm_feed(this.pool);
+    } catch (error) {
+      if (this.pool) this.m._hxgm_free(this.pool); this.pool = 0; throw error;
+    } finally { this.m._free(source); this.m._free(name); }
     this.root = Object.assign(Object.create(NeuralSearch.prototype), {n: this.n, m: this.m, ptr: this.m._hxgo_root(this.ptr), history: graph.history, nativeOwner: this});
     graph.nativeOwner = this;
   }
   step(readyLimit = 64) {
     if (!this.ptr) throw new Error('Native owner is closed');
-    const progress = this.m._hxgo_step_ready(this.ptr, readyLimit);
+    this.n.checked(this.m._hxgm_ready_limit(this.pool, readyLimit));
+    const progress = this.m._hxgm_step(this.pool);
     if (progress < 0) this.n.checked(0);
     return progress;
   }
-  done() { return !this.ptr || Boolean(this.m._hxgo_done(this.ptr)); }
-  cancel() { if (this.ptr) this.m._hxgo_cancel(this.ptr); }
+  done() { return !this.ptr || Boolean(this.m._hxgm_done(this.pool)); }
+  cancel() { if (this.ptr) { try { this.n.checked(this.m._hxgm_cancel(this.pool)); } finally { this.proofs?.cancelActive(); } } }
   admit() {
     if (!this.ptr) return false;
     if (this.m._hxg_exact(this.root.ptr) >= 0) this.cancel();
-    return Boolean(this.m._hxgo_admit(this.ptr));
+    const admitted = this.m._hxgm_admit(this.pool);
+    if (admitted < 0) this.n.checked(0);
+    if (this.m._hxg_exact(this.root.ptr) >= 0) { this.cancel(); return false; }
+    return Boolean(admitted);
   }
   take(limit = 64) {
     if (!this.ptr) throw new Error('Native owner is closed');
@@ -559,24 +575,25 @@ export class NativeOwner {
   }
   close() {
     if (!this.ptr) return;
-    if (this.busy || this.batches.size) throw new Error('Wait for native inference before closing its owner');
+    if (this.busy || this.batches.size || this.proofs) throw new Error('Wait for native producers before closing their owner');
     this.cancel();
     this.n.checked(this.m._hxgf_abandon_all(this.feed));
-    this.n.checked(this.m._hxgo_free(this.ptr));
-    this.ptr = 0; this.root.ptr = 0; this.graph.nativeOwner = null;
+    this.n.checked(this.m._hxgm_free(this.pool));
+    this.ptr = this.pool = 0; this.root.ptr = 0; this.graph.nativeOwner = null;
     // The scheduler root owned archive focus. Reclaim it before this graph
     // advances, so permanent colour conflicts follow the played position.
     this.graph.at(this.graph.history);
   }
-  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel', capture = false}) {
+  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel', capture = false, proofs = null}) {
     if (this.busy || !this.ptr) throw new Error('Native owner is closed or already running');
     if (!(batchSize > 0)) throw new Error('Positive native batch size required');
+    const frontier = proofs ? new NativeProofs(this, {...proofs, stop}) : null;
     this.busy = true; const started = performance.now(); let batches = 0, largest = 0, networkMs = 0, batch = null, flight = null;
     const inference = {rows: 0, physical: 0, forwards: 0};
     try {
       while (!this.done()) {
         if (stop()) { this.cancel(); break; }
-        this.step(batchSize);
+        this.step(batchSize); frontier?.pump(); frontier?.check();
         if (this.done()) break;
         batch = this.take(batchSize);
         if (batch) {
@@ -591,7 +608,7 @@ export class NativeOwner {
           const observed = flight.then(() => { settled = true; }, () => { settled = true; });
           while (!settled && !this.done() && this.m._hxgf_queued(this.feed) < BigInt(batchSize)) {
             if (stop()) { this.cancel(); break; }
-            const progress = this.step(batchSize);
+            const progress = this.step(batchSize); frontier?.pump(); frontier?.check();
             await nextTask();
             if (!progress) break;
           }
@@ -612,7 +629,9 @@ export class NativeOwner {
         await nextTask();
       }
       if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
+      if (frontier) await frontier.close();
       return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
+        ...(frontier ? {proof_scheduler: frontier.finalStats, proof_records: frontier.records, solver_error: frontier.workerError} : {}),
         batches, largest, network_ms: networkMs, inference, ...(capture ? {capture_pool: network.captureStats()} : {})};
     } catch (error) {
       this.cancel(); throw error;
@@ -620,9 +639,105 @@ export class NativeOwner {
       // evaluateNative resolves/rejects only after its current forward settles.
       // A host callback/phase can also throw while that forward is still live.
       if (flight) await flight.catch(() => {});
-      batch?.close(); this.busy = false;
-      if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
+      try { batch?.close(); } finally {
+        try { if (frontier) await frontier.close(); } finally {
+          this.busy = false;
+          if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
+        }
+      }
     }
+  }
+}
+
+/** Transport for the compiled proof frontier. query(worker, request) must keep
+ * each worker's resident solver table and resolve only after its slice stops. */
+export class NativeProofs {
+  constructor(owner, {query, cancel = null, maxSlice = cancel ? 1000 : 64, workers = 1, slice = 8, table = 4, tasks = 256, stamps = false, stop = () => false} = {}) {
+    if (!owner.pool || owner.proofs || typeof query !== 'function') throw new Error('A free native owner and proof transport are required');
+    if (maxSlice > 64 && typeof cancel !== 'function') throw new Error('Long solver slices require cooperative cancellation');
+    this.owner = owner; this.n = owner.n; this.m = owner.m; this.query = query; this.workers = workers; this.stop = stop; this.signal = cancel;
+    this.pending = new Map(); this.failure = null; this.workerError = null; this.closing = null; this.records = [];
+    this.ptr = this.m._hxpe_new(owner.pool, workers, workers, slice, table, tasks, Number(stamps), maxSlice);
+    this.n.checked(this.ptr); owner.proofs = this;
+  }
+  check() { if (this.failure) throw this.failure; }
+  cancelActive() { for (const worker of this.pending.keys()) this.signal?.(worker); }
+  offer(history, relevance = 1) {
+    const cells = this.n.cells(history);
+    try { this.n.checked(this.m._hxp_offer(this.ptr, 0, cells, history.length, relevance)); }
+    finally { this.m._free(cells); }
+  }
+  complete(worker, id, found) {
+    const data = found.info || Array(13).fill(0), cells = found.moves || [], text = new TextEncoder().encode((found.raw || '') + '\0');
+    const info = this.n.alloc(104), moves = this.n.cells(cells), result = this.n.alloc(text.length);
+    try {
+      this.n.view(BigUint64Array, info, 13).set(data.map(BigInt)); this.n.view(Uint8Array, result, text.length).set(text);
+      this.n.checked(this.m._hxpe_complete(this.ptr, worker, id, info, moves, cells.length, result, 0));
+    } finally { this.m._free(info); this.m._free(moves); this.m._free(result); }
+  }
+  pump() {
+    if (!this.ptr || this.closing) return;
+    if (this.stop()) this.owner.cancel();
+    const admitted = this.owner.admit();
+    for (const worker of this.pending.keys()) if (this.m._hxpe_cancelled(this.ptr, worker)) this.signal?.(worker);
+    if (!admitted) return;
+    for (let worker = 0; worker < this.workers; worker++) {
+      if (this.pending.has(worker)) continue;
+      const id = this.m._hxpe_take(this.ptr, worker);
+      if (id === 0xffffffffffffffffn) this.n.checked(0);
+      if (!id) continue;
+      const request = JSON.parse(this.m.UTF8ToString(this.m._hxpe_request(this.ptr, worker)));
+      const cancelled = () => Boolean(this.closing || !this.ptr || this.m._hxpe_cancelled(this.ptr, worker));
+      // Promise callbacks only deliver immutable completions. Installation and
+      // renewed admission run through the single native pool between phases.
+      const done = Promise.resolve().then(() => {
+        if (!cancelled()) return this.query(worker, request, cancelled);
+        const info = Array(13).fill(0), size = request.history.length;
+        info[4] = 1; info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+        info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+        return {info, moves: []};
+      }).catch(error => {
+        this.workerError = String(error.message || error);
+        const info = Array(13).fill(0), size = request.history.length;
+        info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+        info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+        return {info, moves: [], raw: ''};
+      }).then(found => {
+        try { this.complete(worker, id, found); } catch (error) {
+          this.failure ||= error;
+          const info = Array(13).fill(0), size = request.history.length;
+          info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+          info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+          this.complete(worker, id, {info, moves: []});
+        }
+        this.pending.delete(worker);
+        if (!this.closing && !this.failure) this.pump();
+      }).catch(error => { this.failure ||= error; this.pending.delete(worker); });
+      this.pending.set(worker, done);
+    }
+  }
+  stats() {
+    const out = this.n.alloc(128), times = this.n.alloc(32);
+    try {
+      this.m._hxp_stats(this.ptr, out, times);
+      const values = Array.from(this.n.view(BigUint64Array, out, 16), Number), elapsed = Array.from(this.n.view(Float64Array, times, 4));
+      return {...Object.fromEntries(['ticks','submitted','started','finished','installed','cancelled','pruned','unknown','fresh_nodes','missing_fresh','queued','active','ready','tasks','facts','records'].map((name, i) => [name, values[i]])),
+        ...Object.fromEntries(['worker_service_ms','worker_idle_ms','snapshot_ms','install_ms'].map((name, i) => [name, elapsed[i]]))};
+    } finally { this.m._free(out); this.m._free(times); }
+  }
+  close() {
+    if (!this.ptr) return this.closing || Promise.resolve();
+    if (this.closing) return this.closing;
+    this.m._hxp_cancel(this.ptr);
+    this.cancelActive();
+    this.closing = (async () => {
+      await Promise.all([...this.pending.values()]);
+      this.n.checked(this.m._hxp_drain(this.ptr)); this.finalStats = this.stats();
+      for (let i = 0; i < this.finalStats.records; i++) this.records.push(JSON.parse(this.m.UTF8ToString(this.m._hxp_record(this.ptr, i))));
+      this.n.checked(this.m._hxp_free(this.ptr)); this.ptr = 0; this.owner.proofs = null;
+      this.check();
+    })();
+    return this.closing;
   }
 }
 

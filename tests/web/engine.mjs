@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, NativeOwner, PV_CHECK} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, NativeOwner, NativeProofs, PV_CHECK} from '../../web/engine/search.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -36,7 +36,7 @@ import {BrowserSession, review} from '../../web/engine/play-session.mjs';
 import {PlayStorage} from '../../web/engine/storage.mjs';
 import {OpeningBook} from '../../web/engine/openings.mjs';
 import {exportGame, readGame} from '../../web/engine/notation.mjs';
-import {loadTactical} from '../../web/engine/tactical.mjs';
+import {loadTactical, proofAnswer} from '../../web/engine/tactical.mjs';
 
 const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
@@ -121,7 +121,7 @@ if (job.kind === 'encode') {
   }
 } else if (job.kind === 'native-owner') {
   const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
-    work: job.ms ? 0 : job.work ?? 256, ms: job.ms ?? 0, views: job.views ?? 8, quantum: 32});
+    work: job.work ?? (job.ms ? 0 : 256), ...(job.defaultClock ? {} : {ms: job.ms ?? 0}), views: job.views ?? 8, quantum: 32});
   const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
   network.maxBatch = job.maxBatch ?? network.maxBatch;
   let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
@@ -167,6 +167,95 @@ if (job.kind === 'encode') {
     answer.graph = graph.counters();
     answer.remainingViews = graph.counters().views;
   } finally { owner.close(); graph.close(); }
+} else if (job.kind === 'native-proofs') {
+  const {Worker: Thread} = await import('node:worker_threads'), workers = [], controls = [], waits = new Map(), events = [];
+  let next = 0, inForward = false, cancelled = false, forwards = 0, error = null;
+  const script = `import {parentPort} from 'node:worker_threads';
+    import {loadTactical,proofAnswer} from ${JSON.stringify(new URL('../../web/engine/tactical.mjs',import.meta.url).href)};
+    const solver=await loadTactical(${JSON.stringify(new URL('../../web/engine/tactical.wasm',import.meta.url).href)});
+    parentPort.postMessage({ready:true});
+    parentPort.on('message',({id,request,cancel})=>{const {history,...options}=request;
+      const start=performance.now(), result=solver.history(history,{...options,cancel});
+      parentPort.postMessage({id,answer:proofAnswer(result,request),ms:performance.now()-start});});`;
+  try {
+    await Promise.all(Array.from({length:job.workers??1},(_,index)=>new Promise((resolve,reject)=>{
+      const worker=new Thread(new URL('data:text/javascript,'+encodeURIComponent(script)),{type:'module'});workers.push(worker);controls.push(new Int32Array(new SharedArrayBuffer(4)));
+      worker.on('error',reject);
+      worker.on('message',data=>{
+        if(data.ready){resolve();return;}
+        const wait=waits.get(data.id);waits.delete(data.id);
+        events.push({worker:index,request:wait.request,ms:data.ms,info:data.answer.info,resident:data.answer.resident_reused,reused:data.answer.frontier_reused_nodes,duringForward:inForward});
+        wait.resolve(data.answer);
+      });
+    })));
+    const graph = new GameGraph(native,{history:job.history,roundBarrier:true});
+    let middle = null, peer = null;
+    if (job.offer || job.cancelBeforeDispatch || job.cooldown) {
+      const evaluate = async leaves => leaves.map(({history,actions}) => ({logits:actions.map(()=>0),q:actions.map(()=>job.cooldown && history.length>job.history.length ? .8 : 0)}));
+      await graph.search({simulations:4,rootSamples:4,evaluate});
+      if(job.offer){middle=graph.view(job.offer.history.slice(0,-1));await middle.search({simulations:4,rootSamples:4,evaluate});
+        peer=graph.view(job.offer.peer || job.offer.history);}
+    }
+    const owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4});
+    const network = new Network(null,null,'fp32',{model_version:'test'},1);
+    network.forward = async (input,count,size)=>{
+      forwards++;inForward=true;await new Promise(resolve=>setTimeout(resolve,job.delay??20));inForward=false;
+      return {policy:new Float32Array(count*size*size),far:new Float32Array(count),value:new Float32Array(count)};
+    };
+    const query = (index,request)=>new Promise(resolve=>{
+      // This fixture tests delivery from the offered interior position. A root
+      // proof can otherwise finish first and correctly cancel that query.
+      if(job.offer && JSON.stringify(request.history)!==JSON.stringify(job.offer.history)){
+        const info=proofAnswer({status:'UNKNOWN',nodes_fresh:0},request);
+        events.push({request,info:info.info});resolve(info);return;
+      }
+      if(job.cooldown){
+        const info=proofAnswer({status:'UNKNOWN',nodes_fresh:0,proof_numbers:request.attacker==='mover'?{scope:'wide-forcing',game_exact:false,pn:1073741824,dn:0}:null},request);
+        events.push({request,info:info.info});resolve(info);return;
+      }
+      const id=++next;waits.set(id,{resolve,request});Atomics.store(controls[index],0,0);workers[index].postMessage({id,request,cancel:controls[index]});
+      if(job.cancelOnDispatch)cancelled=true;
+      if(job.cancelAfterMs) setTimeout(()=>{cancelled=true;owner.cancel();},job.cancelAfterMs);
+    });
+    try {
+      if(job.cancelBeforeDispatch || job.cooldown){
+        const frontier=new NativeProofs(owner,{query,cancel:i=>Atomics.store(controls[i],0,1),workers:1,slice:1000,stamps:false});
+        try{
+          frontier.pump();
+          if(job.cancelBeforeDispatch)owner.cancel();
+          else {for(let i=0;i<30;i++){await Promise.resolve();frontier.pump();}}
+          answer={queries:events.length,discrepancy:Math.abs(native.m._hxg_value(graph.ptr))};
+        }finally{await frontier.close();if(answer)answer.proof=frontier.finalStats;owner.cancel();}
+      }else if(job.offer){
+        const frontier = new NativeProofs(owner,{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false});
+        try {
+          try {
+            frontier.offer(job.offer.history,10);
+            const until=performance.now()+2000;
+            while(native.m._hxg_exact(peer.ptr)<0 && performance.now()<until){frontier.pump();await new Promise(resolve=>setTimeout(resolve,2));}
+            answer={peerExact:native.m._hxg_exact(peer.ptr),rootExact:native.m._hxg_exact(graph.ptr),middleExact:native.m._hxg_exact(middle.ptr)};
+          } finally {peer.close();}
+        } finally {await frontier.close();if(answer){answer.proof=frontier.finalStats;answer.records=frontier.records;}owner.cancel();}
+      } else {
+        try {
+          const result=await owner.search({network,batchSize:16,proofs:{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false},stop:()=>cancelled});
+          answer={result,proof:result.proof_scheduler,records:result.proof_records};
+        } catch(e){error=String(e);answer={error};}
+      }
+      answer.stats=owner.stats();answer.events=events;answer.forwards=forwards;answer.waits=waits.size;answer.cancelled=cancelled;
+      owner.close();graph.at(job.history);answer.graph=graph.counters();
+    } finally {owner.close();peer?.close();middle?.close();graph.close();}
+  } finally {await Promise.all(workers.map(w=>w.terminate()));}
+} else if (job.kind === 'solver-preparation-cancel') {
+  const messages=[],workerUrl=new URL('../../web/engine/worker.mjs',import.meta.url);let ready;
+  const context={URL,performance,setTimeout,clearTimeout,SharedArrayBuffer,Int32Array,Atomics,onmessage:null,
+    Worker:class{postMessage(data){messages.push(data);if(data.prepare)ready=()=>this.onmessage({data:{id:data.id,ready:true}});}terminate(){}}};
+  const source=readFileSync(workerUrl,'utf8').replace(/^import .*;\r?$/gm,'').replaceAll('import.meta.url',JSON.stringify(workerUrl.href));
+  runInNewContext(source+'\nglobalThis.SolverWorkers=SolverWorkers;',context);
+  const pool=new context.SolverWorkers(1);let cancelled=false;
+  const pending=pool.query(0,{history:[[0,0]],attacker:'mover',ms:1000},()=>cancelled);
+  cancelled=true;pool.cancel(0);ready();const found=await pending;
+  answer={messages:messages.length,query_messages:messages.filter(m=>m.request).length,flag:Atomics.load(pool.entries[0].control,0),info:found.info};pool.close();
 } else if (job.kind === 'owner-adapter') {
   const fetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({networks: []}));
@@ -510,7 +599,13 @@ if (job.kind === 'encode') {
         return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
       })})},
     Worker: class {
-      postMessage({id, history, options}) {
+      postMessage({id, history, options, prepare, request, cancel}) {
+        if (prepare) { queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
+        if (request) {
+          const {history,...options} = request;
+          const found = solver.history(history,{...options,cancel});
+          queueMicrotask(() => this.onmessage({data:{id,answer:proofAnswer(found,request)}})); return;
+        }
         queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
         const result = job.replayMiss && options.replay?.length
           ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'replay work limit'}
@@ -557,6 +652,7 @@ if (job.kind === 'encode') {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
       nativeOwner: job.nativeOwner ?? false,
+      nativeProof: job.nativeProof ?? false, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,
       known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
