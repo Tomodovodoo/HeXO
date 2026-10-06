@@ -4943,6 +4943,44 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(service.stats()['batch_flight_limit'],2)
         service.run()
 
+    def test_inference_service_profile_counts_delivery_and_remains_opt_in(self):
+        from native_scheduler import InferenceService
+        from neural_search import native, checked
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        for enabled, feedback in ((False,False),(True,False),(True,True)):
+            with self.subTest(profile=enabled, feedback=feedback):
+                pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,[(0,0),(i,0),(i,1)])
+                                                 for i in range(1,5)],views=1,work=16,quantum=16)
+                service = InferenceService([pool],[evaluator],batch_size=2,profile=enabled,interleave_feedback=feedback)
+                self.addCleanup(service.close)
+                service.start()
+                with self.assertRaisesRegex(ValueError,'before starting'):
+                    checked(native.hxb_profile(service.ptr,not enabled))
+                with self.assertRaisesRegex(ValueError,'before starting'):
+                    checked(native.hxb_feedback(service.ptr,not feedback))
+                while not service.done():service.pump()
+                service.close()
+                stats = service.stats()
+                self.assertEqual(stats['schedule_profile_enabled'],int(enabled))
+                self.assertEqual(stats['interleave_feedback'],feedback)
+                self.assertEqual(stats['schedule_urgent_collections'],0)
+                if enabled:
+                    self.assertGreater(stats['schedule_admission_samples'],0)
+                    self.assertEqual(stats['schedule_lease_reservations'],stats['batches'])
+                    self.assertEqual(stats['schedule_partial_leases']+stats['schedule_full_leases'],stats['batches'])
+                    self.assertEqual(stats['schedule_completion_rows'],stats['installed_message_rows'])
+                    self.assertGreater(stats['schedule_completion_packets'],0)
+                    self.assertGreater(stats['schedule_packet_install_ns'],0)
+                    self.assertGreater(stats['schedule_burst_install_ns'],0)
+                    self.assertLessEqual(stats['schedule_completion_queue_age_max_ns'],stats['schedule_completion_queue_age_ns'])
+                    self.assertEqual(stats['schedule_urgent_at_entry_packets'],0)
+                else:
+                    self.assertTrue(all(value==0 for key,value in stats.items() if key.startswith('schedule_')))
+                self.assertEqual((stats['pending_rows'],stats['inflight_batches'],stats['active_producers']),(0,0,0))
+                self.assertTrue(all(game.stats()['completed']==16 and game.stats()['pending']==0 for game in pool.games))
+                self.assertTrue(all(int(game.evidence()['lifetime_credits'].sum())==16 for game in pool.games))
+
     def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
         import ctypes
         from native_scheduler import InferenceService
