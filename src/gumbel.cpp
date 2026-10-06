@@ -1099,8 +1099,8 @@ struct Tree {
   if(at_root){root_edges.assign(count,{});root_prepared=true;}
   double total=0,weighted=0;node.edges.reserve(count);
   for(int i=0;i<count;++i){Edge edge(&node.empty);edge.action=legal[i];edge.logit=logits[i]-maximum;edge.weight=std::exp(edge.logit);
-   total+=edge.weight;weighted+=edge.weight*values[i];double u=std::generate_canonical<double,53>(rng);
-   if(at_root)root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));
+   total+=edge.weight;weighted+=edge.weight*values[i];
+   if(at_root){double u=std::generate_canonical<double,53>(rng);root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
    node.edges.push_back(std::move(edge));
   }
   node.policy_mass=total;node.value=weighted/total;

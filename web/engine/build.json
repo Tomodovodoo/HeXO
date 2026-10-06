@@ -1,6 +1,6 @@
 {
  "sources": {
-  "src/gumbel.cpp": "2987d705ebe2987b29a46b079e86393829b23429b89574416d30c7ccd3c5209e",
+  "src/gumbel.cpp": "e1ad86d69b4843a166e71cb3f5a59b4fc3ac8a951661624d8374e049130d2682",
   "src/gumbel_owner.cpp": "c1ca1d1aeaceaec17cd4baa5236f3e9e4ab83bafb284cc280eeb9323c1636dfe",
   "src/gumbel_proof.cpp": "a49bcb7a545090b22e25b466bd1e5ce6c3efda66eab76c9e725dd909967d1922",
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
@@ -91,7 +91,7 @@
  },
  "artefacts": {
   "gumbel.mjs": "375a3d325ee875a7413031585ab9373c506b2ac5b6de4edb5be20222dc8173d7",
-  "gumbel.wasm": "aa42c87475e584362dced3bd1973b730bf553a4fae03bcb5244acccd73d5f78d",
+  "gumbel.wasm": "ae8fd82ba34498ff18c066815c7f24d650562aba86dbc5f3df229865a4c06dcd",
   "tactical.wasm": "8701ab6f52ce7b9ca8c07e29ea030facbf532849b163a0e747a09aa4aff336b2",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "d0218ad42e1223353e629ccf536f55048f637ef93a2140a4c1fa9ebc35587dbb",
