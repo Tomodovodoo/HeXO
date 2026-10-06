@@ -4,6 +4,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <bitset>
+#include <atomic>
 namespace proving {
 using Clock=std::chrono::steady_clock;
 using gumbel::Node;using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
@@ -107,6 +108,7 @@ struct Loop {
  std::deque<std::string> endpoint_records;
  owner::Pool& pool;API api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>> workers;
  std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<Job>> queued,done;
+ std::shared_ptr<owner::Signal> listener;std::atomic<bool> completion_ready=false;
   std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false;
  uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
  uint64_t available_facts=0,sent_facts=0,empty_scope_jobs=0,quantum_ms=0;
@@ -126,8 +128,10 @@ struct Loop {
   for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
   pool.proof_bind=[](void* p,int i){static_cast<Loop*>(p)->bind(i);};
+  pool.proof_ready=[](void* p){return static_cast<Loop*>(p)->completion_ready.load(std::memory_order_acquire);};
+  pool.proof_listen=[](void* p,std::shared_ptr<owner::Signal> signal){auto& loop=*static_cast<Loop*>(p);std::lock_guard lock(loop.mutex);loop.listener=std::move(signal);};
  }
- ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;}
+ ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;pool.proof_ready=nullptr;pool.proof_listen=nullptr;}
  void bind(int game){auto& store=*pool.games[game]->game;store.evidence_owner=this;store.evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
  void mark(Job& job,bool obsolete=false){
   if(!job.cancelled){job.cancelled=true;++cancelled;}if(obsolete && !job.pruned){job.pruned=true;++pruned;}
@@ -248,7 +252,7 @@ struct Loop {
     if(it==queued.end())it=queued.begin();auto job=*it;queued.erase(it);
     int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
     if(ms<1)mark(*job);
-    if(job->cancelled){job->info[4]=1;done.push_back(job);++finished;continue;}
+    if(job->cancelled){job->info[4]=1;done.push_back(job);completion_ready.store(true,std::memory_order_release);++finished;continue;}
     job->worker=index;job->started=Clock::now();job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
     worker.idle+=std::chrono::duration<double,std::milli>(job->started-worker.idle_since).count();
     job->request=request(*job,ms);worker.active=job;++started;return job->id;
@@ -261,7 +265,7 @@ struct Loop {
    std::copy_n(info,13,job->info.begin());job->move_count=count;if(count)std::copy_n(moves,2*count,job->moves.begin());
    if(result)job->result=result;if(error)job->error=error;
    job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();worker.service+=job->elapsed;
-   worker.idle_since=Clock::now();worker.active.reset();done.push_back(job);++finished;
+   worker.idle_since=Clock::now();worker.active.reset();done.push_back(job);completion_ready.store(true,std::memory_order_release);++finished;
   }
 #ifndef __EMSCRIPTEN__
   void run(size_t i) noexcept {
@@ -293,7 +297,10 @@ struct Loop {
     }
    }catch(...){if(answer)api.answer_free(answer);if(raw)api.buffer_free(raw);if(!lock.owns_lock())lock.lock();job->error="native proof worker failure";}
    if(worker.token){api.release(worker.token);worker.token=0;}job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();
-   worker.service+=job->elapsed;++finished;done.push_back(job);worker.active.reset();idle_start=Clock::now();wake.notify_all();
+   worker.service+=job->elapsed;++finished;done.push_back(job);completion_ready.store(true,std::memory_order_release);worker.active.reset();idle_start=Clock::now();wake.notify_all();
+   // Do not acquire the broker's mutex while holding the proof mutex. Retain
+   // only its independent signal so detach/free cannot invalidate this wake.
+   auto signal=listener;lock.unlock();if(signal)signal->notify();
   }
  }
 #endif
@@ -363,7 +370,7 @@ struct Loop {
   }
   install_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
  }
- void collect(){for(;;){std::shared_ptr<Job> job;{std::lock_guard lock(mutex);if(done.empty())return;job=done.front();done.pop_front();live.erase(job->id);}install(*job);}}
+ void collect(){for(;;){std::shared_ptr<Job> job;{std::lock_guard lock(mutex);if(done.empty())return;job=done.front();done.pop_front();completion_ready.store(!done.empty(),std::memory_order_release);live.erase(job->id);}install(*job);}}
  void prune(){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}}
  }
@@ -383,7 +390,7 @@ struct Loop {
   auto& store=*pool.games[game]->game;store.evidence=nullptr;store.evidence_owner=nullptr;
   return released_effort.c_str();
  }
-  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);if(external){for(auto& job:queued){job->info[4]=1;done.push_back(job);++finished;}queued.clear();}wake.notify_all();}
+  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);if(external){for(auto& job:queued){job->info[4]=1;done.push_back(job);++finished;}queued.clear();completion_ready.store(!done.empty(),std::memory_order_release);}wake.notify_all();}
  void resume(){std::lock_guard lock(mutex);enabled=true;}
   void drain(){cancel_all();if(external){collect();if(!live.empty())throw std::runtime_error("Complete external proof slices before freeing their graph");return;}
 #ifndef __EMSCRIPTEN__
@@ -415,7 +422,7 @@ extern "C" HX_API int hxp_step(void* p){try{static_cast<proving::Loop*>(p)->step
 extern "C" HX_API void hxp_cancel(void* p){static_cast<proving::Loop*>(p)->cancel_all();}
 extern "C" HX_API void hxp_resume(void* p){static_cast<proving::Loop*>(p)->resume();}
 extern "C" HX_API int hxp_drain(void* p){try{static_cast<proving::Loop*>(p)->drain();return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API int hxp_free(void* p){auto& loop=*static_cast<proving::Loop*>(p);{std::lock_guard lock(loop.mutex);if(!loop.live.empty()){gumbel::error="Drain proof jobs before freeing loop";return 0;}}delete &loop;return 1;}
+extern "C" HX_API int hxp_free(void* p){auto& loop=*static_cast<proving::Loop*>(p);if(loop.pool.inference_owner){gumbel::error="Detach the native inference service before freeing proof loop";return 0;}{std::lock_guard lock(loop.mutex);if(!loop.live.empty()){gumbel::error="Drain proof jobs before freeing loop";return 0;}}delete &loop;return 1;}
 extern "C" HX_API int hxp_offer(void* p,int game,const int64_t* cells,int count,double relevance){try{
  auto& loop=*static_cast<proving::Loop*>(p);if(game<0 || game>=int(loop.pool.games.size()) || count<0 || (count && !cells) || !std::isfinite(relevance) || relevance<0)throw std::runtime_error("Invalid proof frontier position");
  std::vector<Cell> history;for(int i=0;i<count;++i)history.push_back({cells[2*i],cells[2*i+1]});auto& owner=*loop.pool.games[game];

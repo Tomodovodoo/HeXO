@@ -68,7 +68,8 @@ struct Producer:std::enable_shared_from_this<Producer> {
 // The service owns only immutable snapshots and prediction messages. Producers
 // exclusively mutate their pools. No GPU callback dereferences a graph node.
 struct Broker {
- std::mutex mutex;std::condition_variable wake;
+ std::shared_ptr<owner::Signal> signal=std::make_shared<owner::Signal>();
+ std::mutex& mutex=signal->mutex;std::condition_variable& wake=signal->wake;
  // Stable registry slots; old immutable jobs can retain a joined producer.
  // Model IDs never change identity, even after its last producer retires.
  std::vector<std::shared_ptr<Producer>> producers{16};std::map<int,std::string> models;
@@ -100,8 +101,9 @@ struct Broker {
   auto producer=std::make_shared<Producer>(*this,pool,model,index);
   if(started){pool.ready_limit=2*quantum;pool.stop();if(pool.proof_owner)hxp_resume(pool.proof_owner);}
   models[model]=pool.model;*vacant=producer;pool.inference_owner=this;
+  if(pool.proof_listen)pool.proof_listen(pool.proof_owner,signal);
   try{if(started)producer->thread=std::thread([producer]{producer->run();});}
-  catch(...){vacant->reset();pool.inference_owner=nullptr;throw;}
+  catch(...){if(pool.proof_listen)pool.proof_listen(pool.proof_owner,{});vacant->reset();pool.inference_owner=nullptr;throw;}
   wake.notify_all();return index;
  }
  void detach(int index){
@@ -121,7 +123,7 @@ struct Broker {
    producer->retiring=true;wake.notify_all();
   }
   producer->thread.join();
-  std::lock_guard lock(mutex);producers[index].reset();producer->pool.inference_owner=nullptr;
+  std::lock_guard lock(mutex);if(producer->pool.proof_listen)producer->pool.proof_listen(producer->pool.proof_owner,{});producers[index].reset();producer->pool.inference_owner=nullptr;
  }
  bool model_pending(int model){
   std::lock_guard lock(mutex);
@@ -309,7 +311,7 @@ struct Broker {
   if(!out.empty())producer.pause_ack=0;return out;
  }
  void wait(Producer& producer){
-  std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(1),[&]{return cancelled || producer.worker_request || !producer.completed.empty() || !producer.commands.empty();});
+  std::unique_lock lock(mutex);wake.wait_for(lock,std::chrono::milliseconds(1),[&]{return cancelled || producer.worker_request || !producer.completed.empty() || !producer.commands.empty() || (producer.pool.proof_ready && producer.pool.proof_ready(producer.pool.proof_owner));});
  }
  bool done_locked()const{return started && std::all_of(producers.begin(),producers.end(),[](const auto& p){return !p || p->done;}) && flights.empty();}
  int take(int limit,double wait_ms,uint64_t* token,int* model,void** snapshot){
@@ -523,7 +525,7 @@ HX_API int hxb_complete(void* p,uint64_t token,const int64_t* offsets,const int6
 HX_API int hxb_abort(void* p,uint64_t token){try{static_cast<inference::Broker*>(p)->abort(token);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_done(void* p){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);if(!b.error.empty()){gumbel::error=b.error;return -1;}return b.done_locked();}
 HX_API int hxb_join(void* p){try{static_cast<inference::Broker*>(p)->join();return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxb_free(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started && !b.joined){gumbel::error="Join the native inference service before freeing it";return 0;}for(auto& producer:b.producers)if(producer)producer->pool.inference_owner=nullptr;delete &b;return 1;}
+HX_API int hxb_free(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started && !b.joined){gumbel::error="Join the native inference service before freeing it";return 0;}for(auto& producer:b.producers)if(producer){auto& pool=producer->pool;if(pool.proof_listen)pool.proof_listen(pool.proof_owner,{});pool.inference_owner=nullptr;}delete &b;return 1;}
 HX_API void hxb_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);
  std::array<uint64_t,10> v{b.created,b.coalesced,b.launched,b.delivered,b.withdrawn,b.batches,b.high_water,uint64_t(b.tasks.size()),uint64_t(b.flights.size()),uint64_t(std::count_if(b.producers.begin(),b.producers.end(),[](const auto& p){return p && !p->done;}))};std::copy(v.begin(),v.end(),out);
 }
