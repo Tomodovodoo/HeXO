@@ -2535,7 +2535,7 @@ class NativeProofs(unittest.TestCase):
         empty.step();time.sleep(.05)
         stats = empty.stats()
         self.assertGreaterEqual(stats['idle_empty_ms'], 2*45)
-        self.assertEqual([stats[k] for k in ('idle_capacity_ms','idle_pending_ms','idle_closed_ms','idle_dormant_ms')], [0]*4)
+        self.assertEqual([stats[k] for k in ('idle_capacity_ms','idle_held_ms','idle_pending_ms','idle_closed_ms','idle_dormant_ms')], [0]*5)
         empty.close()
         pool, proofs = self.quiet_closed_frontier()
         stats = proofs.stats()
@@ -2549,6 +2549,55 @@ class NativeProofs(unittest.TestCase):
         self.assertGreaterEqual(stats['idle_closed_ms']-before, 2*90)
         self.assertEqual(stats['submitted'], 16)
         proofs.drain()
+
+    def test_retries_take_only_idle_workers_and_never_queue_ahead_of_fresh_work(self):
+        import ctypes as C
+        import json
+        from neural_search import bind, checked, ptr
+        bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
+        bind('hxpe_take', C.c_uint64, ptr, C.c_int)
+        bind('hxpe_request', C.c_char_p, ptr, C.c_int)
+        bind('hxpe_complete', C.c_int, ptr, C.c_int, C.c_uint64, ptr, ptr, C.c_int, C.c_char_p, C.c_char_p)
+        first,second,fresh=[[0,0],[4,0],[5,0]],[[0,0],[4,0],[5,1]],[[0,0],[4,0],[5,0],[6,1]]
+        graph=self.graph(first)
+        graph.search(1,root_samples=1,batch_size=1)
+        pool=self.pool([graph],quantum=4,views=1,work=4096)
+        loop=native.hxpe_new(pool.ptr,1,4,10,1,64,0,1000)
+        self.assertTrue(loop)
+        def offer(moves):
+            cells=np.asarray(moves,np.int64)
+            checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),1.))
+        def take():
+            job=native.hxpe_take(loop,0)
+            self.assertNotIn(job,(0,2**64-1))
+            return job,json.loads(native.hxpe_request(loop,0))['history']
+        def unknown(job,history):
+            info=np.zeros(13,np.uint64);info[4]=1;info[5]=7;info[10]=2 if len(history)%2 else 1;info[12]=1
+            checked(native.hxpe_complete(loop,0,job,info.ctypes.data,None,0,None,None))
+        try:
+            offer(first);offer(second)
+            checked(native.hxp_step(loop))
+            job,history=take()
+            unknown(job,history)
+            # The other fresh task is still queued, so the free worker has work and
+            # the cooling retry stays out of the queue.
+            checked(native.hxp_step(loop))
+            job,other=take()
+            self.assertNotEqual(other,history)
+            offer(fresh)
+            unknown(job,other)
+            checked(native.hxp_step(loop))
+            job,history=take()
+            self.assertEqual(history,fresh)
+            unknown(job,history)
+            self.assertEqual(native.hxpe_take(loop,0),0)
+            # Three retries are due later; the one idle worker continues one of them.
+            checked(native.hxp_step(loop))
+            job,history=take()
+            unknown(job,history)
+            self.assertEqual(native.hxpe_take(loop,0),0)
+        finally:
+            native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
     def test_unknown_task_waits_behind_fresh_work_then_continues_with_a_larger_slice(self):
         import ctypes as C

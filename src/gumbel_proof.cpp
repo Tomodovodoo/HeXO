@@ -120,16 +120,17 @@ struct Loop {
  std::deque<std::string> records;
  std::string released_effort;
  // Supply census. Idle native-worker time is charged to the reason the last
- // refill stopped: every slot held, or no dispatchable task, split over the
- // exclusions (pending neural work, closed scope, dormant) or none at all.
- enum Idle {Full,Pending,Closed,Dormant,Empty,Reasons};
- std::array<double,Reasons> idle_ms{};size_t idle_workers=0;Clock::time_point idle_mark=Clock::now();bool refill_full=false;
+ // refill stopped: every slot held, retries held back for fresh work, or no
+ // dispatchable task, split over the exclusions (pending neural work, closed
+ // scope, dormant) or none at all.
+ enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Reasons};
+ std::array<double,Reasons> idle_ms{};size_t idle_workers=0;Clock::time_point idle_mark=Clock::now();Idle stop=Empty;
  std::array<uint64_t,3> scan{},excluded{},excluded_total{};
- uint64_t scans=0,seen=0,eligible=0,deferred=0,deferred_dispatched=0,full_exits=0,empty_exits=0,first_queries=0;
+ uint64_t scans=0,seen=0,eligible=0,deferred=0,deferred_dispatched=0,full_exits=0,held_exits=0,empty_exits=0,first_queries=0;
  void account(Clock::time_point now){
   if(idle_workers && now>idle_mark){
    double ms=std::chrono::duration<double,std::milli>(now-idle_mark).count()*double(idle_workers),total=double(excluded[0]+excluded[1]+excluded[2]);
-   if(refill_full)idle_ms[Full]+=ms;else if(!total)idle_ms[Empty]+=ms;
+   if(stop!=Empty)idle_ms[stop]+=ms;else if(!total)idle_ms[Empty]+=ms;
    else for(size_t k=0;k<excluded.size();++k)idle_ms[Pending+k]+=ms*double(excluded[k])/total;
   }
   idle_mark=now;
@@ -209,8 +210,9 @@ struct Loop {
    }return heap.empty()?SIZE_MAX:heap.front();
   }
  };
- // A task inside its retry delay stays dispatchable behind every task outside
- // one: idle workers continue it with the larger slice instead of waiting.
+ // A task inside its retry delay ranks behind every task outside one. Only a
+ // worker idle at this refill continues it with the larger slice, so retries
+ // never queue ahead of fresh positions the owner offers next.
  static double later(double x){return -1/(1+x);}
  std::vector<Ready> prepare(size_t available){
   scan={};++scans;
@@ -248,13 +250,16 @@ struct Loop {
   // every position for each job. Worker completions install on the next step.
   std::vector<Ready> ready;
   for(;;){
-   size_t available;
+   size_t available,spare;
    {std::lock_guard lock(mutex);if(stopping || !enabled)return;
-    if(live.size()>=capacity){account(Clock::now());refill_full=true;++full_exits;return;}available=capacity-live.size();}
+    if(live.size()>=capacity){account(Clock::now());stop=Full;++full_exits;return;}available=capacity-live.size();
+    size_t idle=std::count_if(workers.begin(),workers.end(),[](const auto& w){return !w->active;});spare=idle>queued.size()?idle-queued.size():0;}
    if(ready.empty())ready=prepare(available);
    size_t i=0;auto task=take(ready,i);
-   if(!task){std::lock_guard lock(mutex);account(Clock::now());refill_full=false;excluded=scan;++empty_exits;return;}
-   first_queries+=!task->queried;task->queried=true;deferred_dispatched+=task->ready>Clock::now();
+   if(!task){std::lock_guard lock(mutex);account(Clock::now());stop=Empty;excluded=scan;++empty_exits;return;}
+   bool cooling=task->ready>Clock::now();
+   if(cooling && !spare){std::lock_guard lock(mutex);account(Clock::now());stop=Held;++held_exits;return;}
+   first_queries+=!task->queried;task->queried=true;deferred_dispatched+=cooling;
    auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
@@ -465,11 +470,11 @@ extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop
  std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;}
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 // counts: refill scans, candidates seen, eligible, eligible inside a retry delay, excluded by pending neural work,
-// closed scope and dormancy, refills stopped with every slot held, refills stopped without a dispatchable task,
-// first queries of frontier entries, dispatches inside a retry delay.
-// idle: native-worker idle ms charged to held slots, pending, closed, dormant, and no candidate at all.
+// closed scope and dormancy, refills stopped with every slot held, with retries held back, without a dispatchable
+// task, first queries of frontier entries, dispatches inside a retry delay.
+// idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, and no candidate at all.
 extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.account(proving::Clock::now());
- std::array<uint64_t,11> values{loop.scans,loop.seen,loop.eligible,loop.deferred,loop.excluded_total[0],loop.excluded_total[1],loop.excluded_total[2],loop.full_exits,loop.empty_exits,loop.first_queries,loop.deferred_dispatched};
+ std::array<uint64_t,12> values{loop.scans,loop.seen,loop.eligible,loop.deferred,loop.excluded_total[0],loop.excluded_total[1],loop.excluded_total[2],loop.full_exits,loop.held_exits,loop.empty_exits,loop.first_queries,loop.deferred_dispatched};
  std::copy(values.begin(),values.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
 extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;
  for(auto& f:loop.frontiers){checks+=f.scope_checks;changed+=f.scope_changed;unchanged+=f.scope_unchanged;ns+=f.scope_ns;cells+=f.members.size();for(auto& [key,task]:f.tasks)closed+=bool(task->closed&1)+bool(task->closed&2);}
