@@ -21,7 +21,7 @@ struct API {
 struct Dependency {Key key;int distance;bool operator==(const Dependency&)const=default;};
 using Premises=std::bitset<256>;
 struct Task {
- Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0;
+  Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0,observed_change=0,attempted_change=0;
  int side=0,closed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false,scoped=false;Clock::time_point ready{};
  std::vector<Dependency> scope;
 };
@@ -76,8 +76,9 @@ struct Frontier {
   ++offers;remember(history,*node);if(node->exact_winner>=0)return;
   auto key=gumbel::keys(history).first;auto found=tasks.find(key);
   if(found!=tasks.end()){
-   auto& t=*found->second;t.impact=std::max(t.impact,impact);t.change=std::max(t.change,change);
-   if(!t.flight){t.node=node;t.history=history;if(change>.1)t.ready=Clock::time_point{};}return;
+    auto& t=*found->second;t.impact=std::max(t.impact,impact);t.observed_change=change;
+    const double moved=std::abs(change-t.attempted_change);t.change=std::max(t.change,moved);
+    if(!t.flight){t.node=node;t.history=history;if(moved>.1)t.ready=Clock::time_point{};}return;
   }
   if(tasks.size()>=capacity){
    auto victim=tasks.end();double weakest=std::numeric_limits<double>::infinity();
@@ -87,7 +88,7 @@ struct Frontier {
    if(victim==tasks.end() || (weakest>=impact/.2 && offers%5!=0))return;tasks.erase(victim);
   }
   auto task=std::make_shared<Task>();task->key=key;task->node=node;task->history=history;task->generation=generation;
-  task->impact=impact;task->change=change;task->born=++next;task->facts=revision;tasks.emplace(key,std::move(task));
+   task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;tasks.emplace(key,std::move(task));
  }
 };
 struct Job {
@@ -175,13 +176,13 @@ struct Loop {
    size_t i=0;auto task=take(i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
-   // A worker's synchronous WASM call cannot receive cancel messages. Short
-   // resumable slices bound cooperative stop latency without losing its table.
+    // Without a shared cancel flag, bound the synchronous WASM call by a short
+    // slice. Cooperative adapters may continue longer on the same resident table.
    if(external)job->quantum=std::min(external_limit,job->quantum);
    job->generation=task->generation;job->facts=frontiers[i].revision;job->scope=task->scope;job->queued=Clock::now();job->context=context(i,*task);
    available_facts+=frontiers[i].facts.size();sent_facts+=task->scope.size();empty_scope_jobs+=task->scope.empty();quantum_ms+=job->quantum;
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
-   task->flight=true;o.game->pins[task.get()]={node.get()};
+   task->flight=true;task->attempted_change=task->observed_change;o.game->pins[task.get()]={node.get()};
    {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
    cursor=(i+1)%frontiers.size();wake.notify_all();
   }

@@ -683,9 +683,16 @@ export class NativeProofs {
       if (id === 0xffffffffffffffffn) this.n.checked(0);
       if (!id) continue;
       const request = JSON.parse(this.m.UTF8ToString(this.m._hxpe_request(this.ptr, worker)));
+      const cancelled = () => Boolean(this.closing || !this.ptr || this.m._hxpe_cancelled(this.ptr, worker));
       // Promise callbacks only deliver immutable completions. Installation and
       // renewed admission run through the single native pool between phases.
-      const done = Promise.resolve().then(() => this.query(worker, request)).catch(error => {
+      const done = Promise.resolve().then(() => {
+        if (!cancelled()) return this.query(worker, request, cancelled);
+        const info = Array(13).fill(0), size = request.history.length;
+        info[4] = 1; info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+        info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+        return {info, moves: []};
+      }).catch(error => {
         this.workerError = String(error.message || error);
         const info = Array(13).fill(0), size = request.history.length;
         info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;

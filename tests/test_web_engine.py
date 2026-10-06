@@ -660,6 +660,32 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_solver_cancellation_before_dispatch_does_not_start_a_slice(self):
+        answer = node(dict(kind='native-proofs',history=[[0,0],[1,2],[3,-1]],cancelBeforeDispatch=True))
+        self.assertEqual(answer['queries'],0)
+        self.assertEqual((answer['proof']['active'],answer['proof']['queued'],answer['stats']['pending']),(0,0,0))
+
+    def test_solver_cancellation_during_preparation_keeps_the_cancel_flag(self):
+        answer = node(dict(kind='solver-preparation-cancel'))
+        self.assertEqual((answer['messages'],answer['query_messages'],answer['flag']),(1,0,1))
+        self.assertEqual((answer['info'][0],answer['info'][3],answer['info'][4]),(0,0,1))
+
+    def test_unchanged_search_disagreement_does_not_bypass_solver_cooldown(self):
+        answer = node(dict(kind='native-proofs',history=[[0,0]],cooldown=True))
+        self.assertGreater(answer['discrepancy'],.1)
+        self.assertLessEqual(answer['queries'],2)
+        self.assertEqual((answer['proof']['active'],answer['proof']['queued'],answer['stats']['pending']),(0,0,0))
+
+    def test_native_arbitrary_proof_reaches_reordered_context_and_both_ancestors(self):
+        opening = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
+        history = opening + [[-1,0],[2,1]]
+        answer = node(dict(kind='native-proofs',history=opening,slice=64,offer=dict(history=history,peer=opening+[[2,1],[-1,0]])))
+        self.assertEqual((answer['peerExact'],answer['middleExact'],answer['rootExact']),(0,0,0))
+        proof = next(r for r in answer['records'] if r['request']['history'] == history)
+        self.assertEqual(proof['result']['status'],'PROVEN_LOSS')
+        self.assertEqual(tactical_proof.independent_verify(proof['result']['certificate'],history,attacker='defender',known=proof['request']['known']),'PROVEN_LOSS')
+        self.assertEqual((answer['proof']['active'],answer['proof']['queued'],answer['stats']['pending'],answer['waits']),(0,0,0,0))
+
     def test_native_proof_shared_cancel_interrupts_a_long_slice(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
         answer = node(dict(kind='native-proofs',history=history,ms=2000,slice=1000,delay=30,cancelAfterMs=8))

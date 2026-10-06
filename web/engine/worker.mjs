@@ -64,8 +64,14 @@ class SolverWorkers {
     }
     return entry.ready;
   }
-  async query(index, request) {
+  async query(index, request, cancelled = () => false) {
     await this.prepare(index);
+    if (cancelled()) {
+      const info = Array(13).fill(0), size = request.history.length;
+      info[4] = 1; info[9] = Math.floor((size + 1) / 2) % 2; info[10] = !size || size % 2 === 0 ? 1 : 2;
+      info[11] = request.attacker === 'defender' ? 1 : 0; info[12] = 1;
+      return {info, moves: []};
+    }
     const control = this.entries[index].control;
     if (control) Atomics.store(control, 0, 0);
     const data = await this.ask(index, {request, cancel: control}, request.ms);
@@ -327,7 +333,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
             searchedResult = await owner.search({network, batchSize, choice, capture: nativeCapture,
               proofs: nativeProof ? {workers: solverWorkers, slice: solverSlice, table: solverTable, stamps: proofStamps,
                 cancel: proofPool.cooperative ? worker => proofPool.cancel(worker) : null,
-                query: (worker, request) => proofPool.query(worker, request)} : null,
+                query: (worker, request, cancelled) => proofPool.query(worker, request, cancelled)} : null,
               stop: () => cancelled.has(id), onBatch: stats => {
               if (line != null) touched = tree.id;
               postMessage({type: 'progress', id, fraction: timed ? Math.min(1, (performance.now() - start) / ms)

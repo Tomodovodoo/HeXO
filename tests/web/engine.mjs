@@ -188,29 +188,48 @@ if (job.kind === 'encode') {
         wait.resolve(data.answer);
       });
     })));
-    const graph = new GameGraph(native,{history:job.history,roundBarrier:true}), owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4});
+    const graph = new GameGraph(native,{history:job.history,roundBarrier:true});
+    let middle = null, peer = null;
+    if (job.offer || job.cancelBeforeDispatch || job.cooldown) {
+      const evaluate = async leaves => leaves.map(({history,actions}) => ({logits:actions.map(()=>0),q:actions.map(()=>job.cooldown && history.length>job.history.length ? .8 : 0)}));
+      await graph.search({simulations:4,rootSamples:4,evaluate});
+      if(job.offer){middle=graph.view(job.offer.history.slice(0,-1));await middle.search({simulations:4,rootSamples:4,evaluate});
+        peer=graph.view(job.offer.peer || job.offer.history);}
+    }
+    const owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4});
     const network = new Network(null,null,'fp32',{model_version:'test'},1);
     network.forward = async (input,count,size)=>{
       forwards++;inForward=true;await new Promise(resolve=>setTimeout(resolve,job.delay??20));inForward=false;
       return {policy:new Float32Array(count*size*size),far:new Float32Array(count),value:new Float32Array(count)};
     };
     const query = (index,request)=>new Promise(resolve=>{
+      if(job.cooldown){
+        const info=proofAnswer({status:'UNKNOWN',nodes_fresh:0,proof_numbers:request.attacker==='mover'?{scope:'wide-forcing',game_exact:false,pn:1073741824,dn:0}:null},request);
+        events.push({request,info:info.info});resolve(info);return;
+      }
       const id=++next;waits.set(id,{resolve,request});Atomics.store(controls[index],0,0);workers[index].postMessage({id,request,cancel:controls[index]});
       if(job.cancelOnDispatch)cancelled=true;
       if(job.cancelAfterMs) setTimeout(()=>{cancelled=true;owner.cancel();},job.cancelAfterMs);
     });
     try {
-      if(job.offer){
+      if(job.cancelBeforeDispatch || job.cooldown){
+        const frontier=new NativeProofs(owner,{query,cancel:i=>Atomics.store(controls[i],0,1),workers:1,slice:1000,stamps:false});
+        try{
+          frontier.pump();
+          if(job.cancelBeforeDispatch)owner.cancel();
+          else {for(let i=0;i<30;i++){await Promise.resolve();frontier.pump();}}
+          answer={queries:events.length,discrepancy:Math.abs(native.m._hxg_value(graph.ptr))};
+        }finally{await frontier.close();if(answer)answer.proof=frontier.finalStats;owner.cancel();}
+      }else if(job.offer){
         const frontier = new NativeProofs(owner,{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false});
         try {
-          const peer=graph.view(job.offer.history);
           try {
             frontier.offer(job.offer.history,10);
             const until=performance.now()+2000;
             while(native.m._hxg_exact(peer.ptr)<0 && performance.now()<until){frontier.pump();await new Promise(resolve=>setTimeout(resolve,2));}
-            answer={peerExact:native.m._hxg_exact(peer.ptr),rootExact:native.m._hxg_exact(graph.ptr)};
+            answer={peerExact:native.m._hxg_exact(peer.ptr),rootExact:native.m._hxg_exact(graph.ptr),middleExact:native.m._hxg_exact(middle.ptr)};
           } finally {peer.close();}
-        } finally {await frontier.close();answer.proof=frontier.finalStats;answer.records=frontier.records;owner.cancel();}
+        } finally {await frontier.close();if(answer){answer.proof=frontier.finalStats;answer.records=frontier.records;}owner.cancel();}
       } else {
         try {
           const result=await owner.search({network,batchSize:16,proofs:{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false},stop:()=>cancelled});
@@ -219,8 +238,18 @@ if (job.kind === 'encode') {
       }
       answer.stats=owner.stats();answer.events=events;answer.forwards=forwards;answer.waits=waits.size;answer.cancelled=cancelled;
       owner.close();graph.at(job.history);answer.graph=graph.counters();
-    } finally {owner.close();graph.close();}
+    } finally {owner.close();peer?.close();middle?.close();graph.close();}
   } finally {await Promise.all(workers.map(w=>w.terminate()));}
+} else if (job.kind === 'solver-preparation-cancel') {
+  const messages=[],workerUrl=new URL('../../web/engine/worker.mjs',import.meta.url);let ready;
+  const context={URL,performance,setTimeout,clearTimeout,SharedArrayBuffer,Int32Array,Atomics,onmessage:null,
+    Worker:class{postMessage(data){messages.push(data);if(data.prepare)ready=()=>this.onmessage({data:{id:data.id,ready:true}});}terminate(){}}};
+  const source=readFileSync(workerUrl,'utf8').replace(/^import .*;\r?$/gm,'').replaceAll('import.meta.url',JSON.stringify(workerUrl.href));
+  runInNewContext(source+'\nglobalThis.SolverWorkers=SolverWorkers;',context);
+  const pool=new context.SolverWorkers(1);let cancelled=false;
+  const pending=pool.query(0,{history:[[0,0]],attacker:'mover',ms:1000},()=>cancelled);
+  cancelled=true;pool.cancel(0);ready();const found=await pending;
+  answer={messages:messages.length,query_messages:messages.filter(m=>m.request).length,flag:Atomics.load(pool.entries[0].control,0),info:found.info};pool.close();
 } else if (job.kind === 'owner-adapter') {
   const fetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({networks: []}));
