@@ -159,7 +159,7 @@ struct ColdBlock {double mass=0;int best=-1;bool dirty=true;};
 struct HistoryLink {std::shared_ptr<const HistoryLink> before;Cell cell;int stones;
  HistoryLink(std::shared_ptr<const HistoryLink> p,Cell c):before(std::move(p)),cell(c),stones(before?before->stones+1:1){}
 };
-struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false;bool* archive_dirty=nullptr;double value=0,q=0,carried_sum=0,policy_mass=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
+struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false,raw_known=false;bool* archive_dirty=nullptr;double value=0,q=0,carried_sum=0,policy_mass=0,raw=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
  std::pmr::vector<int> active;std::pmr::vector<ColdBlock> cold;bool selective=false,cold_dirty=true;int cold_best=-1;double cold_mass=0;
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->pool),tracked(&memory->pool),active(&memory->pool),cold(&memory->pool){empty.owner=this;}
@@ -1378,7 +1378,12 @@ HX_API int hxg_next(void* p){try{auto& t=*static_cast<gumbel::Tree*>(p);int resu
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}
 // Legal moves of a pending request in sorted (q, r) order, the actions hxg_fulfill must be given.
 HX_API int hxg_legal(void* p,int id,int64_t* out){auto& l=static_cast<gumbel::Tree*>(p)->requests.at(id).legal;if(out)for(int i=0;i<int(l.size());++i){out[2*i]=l[i].q;out[2*i+1]=l[i].r;}return int(l.size());}
-HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{auto& t=*static_cast<gumbel::Tree*>(p);t.fulfill(id,a,logits,q,n);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Network predictions arrive here. The expanded leaf keeps its raw value for
+// later root records; proofs and immediate wins expand without one.
+HX_API int hxg_fulfill(void* p,int id,const int64_t* a,const double* logits,const double* q,int n){try{auto& t=*static_cast<gumbel::Tree*>(p);
+ auto found=t.requests.find(id);gumbel::Node* leaf=found==t.requests.end()?nullptr:found->second.leaf;bool expanded=leaf && leaf->expanded;
+ t.fulfill(id,a,logits,q,n);if(leaf && !expanded && leaf->expanded && n>0){leaf->raw=q[0];leaf->raw_known=true;}
+ t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // Caller must independently verify the strategy certificate before this entry.
 // Exact history and placement phase prevent applying it to a different request.
 HX_API int hxg_prove(void* p,int id,const int64_t* h,int n,int player,int remaining,const int64_t* moves,int count,int turns){try{auto& t=*static_cast<gumbel::Tree*>(p);t.prove(id,h,n,player,remaining,moves,count,turns);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
