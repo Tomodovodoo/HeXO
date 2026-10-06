@@ -107,7 +107,10 @@ struct Loop {
  API::Moves endpoint=nullptr;int endpoint_limit=0;uint64_t endpoint_paths=0,endpoint_candidates=0,endpoint_rejected=0,endpoint_bytes=0,endpoint_ns=0;
  std::deque<std::string> endpoint_records;
  owner::Pool& pool;API api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>> workers;
- std::mutex mutex;std::condition_variable wake;std::deque<std::shared_ptr<Job>> queued,done;
+ std::mutex mutex;
+ // Idle workers sleep on wake and each queued job wakes one of them, so the
+ // graph owner's admission never queues behind every idle worker. Drain waits on answered.
+ std::condition_variable wake,answered;std::deque<std::shared_ptr<Job>> queued,done;
  std::shared_ptr<owner::Signal> listener;std::atomic<bool> completion_ready=false;size_t urgent=0;
   std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false;
  uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
@@ -244,7 +247,7 @@ struct Loop {
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
    task->flight=true;task->attempted_change=task->observed_change;o.game->pins[task.get()]={node.get()};
    {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
-   cursor=(i+1)%frontiers.size();wake.notify_all();
+   cursor=(i+1)%frontiers.size();wake.notify_one();
   }
  }
   std::string request(const Job& job,int ms,uint64_t token=0)const{
@@ -303,7 +306,7 @@ struct Loop {
     }
    }catch(...){if(answer)api.answer_free(answer);if(raw)api.buffer_free(raw);if(!lock.owns_lock())lock.lock();job->error="native proof worker failure";}
    if(worker.token){api.release(worker.token);worker.token=0;}job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();
-   worker.service+=job->elapsed;++finished;completed(job);worker.active.reset();idle_start=Clock::now();wake.notify_all();
+   worker.service+=job->elapsed;++finished;completed(job);worker.active.reset();idle_start=Clock::now();answered.notify_all();
    // Do not acquire the broker's mutex while holding the proof mutex. Retain
    // only its independent signal so detach/free cannot invalidate this wake.
    auto signal=job->wake_owner?listener:nullptr;lock.unlock();if(signal)signal->notify();
@@ -400,7 +403,7 @@ struct Loop {
  void resume(){std::lock_guard lock(mutex);enabled=true;}
   void drain(){cancel_all();if(external){collect();if(!live.empty())throw std::runtime_error("Complete external proof slices before freeing their graph");return;}
 #ifndef __EMSCRIPTEN__
-   for(;;){collect();std::unique_lock lock(mutex);if(live.empty())break;wake.wait(lock,[&]{return !done.empty();});}
+   for(;;){collect();std::unique_lock lock(mutex);if(live.empty())break;answered.wait(lock,[&]{return !done.empty();});}
 #endif
   }
 };
