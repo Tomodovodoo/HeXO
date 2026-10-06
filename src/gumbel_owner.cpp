@@ -356,16 +356,16 @@ struct Pool {
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;
   failed[index]=false;stopped=false;++retargets;o.start(root);
  }
- void replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,uint64_t seed){
+ std::unique_ptr<Owner> replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,uint64_t seed){
   auto& old=*games[index];int quantum=old.quantum,depth=old.max_depth;
   // Retirement already drained this slot's proof jobs and detached neural
   // subscribers. Device snapshots own copied encodings, not the old store.
   source.root_noise=noise;
   auto replacement=std::make_unique<Owner>(source,0,quantum,views,depth,(work || ms)?work:uint64_t(quantum),ms,seed,feed,samples);
-  games[index]=std::move(replacement);
+  auto retired=std::move(games[index]);games[index]=std::move(replacement);
   if(!work && !ms)games[index]->stop();
   if(proof_bind)proof_bind(proof_owner,index);
-  failed[index]=false;stopped=false;++retargets;
+  failed[index]=false;stopped=false;++retargets;return retired;
  }
  int install(const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){
   size_t capacity=0;for(auto& o:games)capacity+=o->views.size();std::vector<void*> failures(capacity);

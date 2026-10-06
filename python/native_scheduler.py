@@ -35,7 +35,7 @@ for name, result, args in (
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
-    ('reclaim_stats', None, [ptr, ptr]),
+    ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
     ('complete', C.c_int, [ptr, C.c_uint64, ptr, ptr, ptr, ptr]),
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
@@ -628,6 +628,10 @@ class InferenceService:
         retired = np.empty(4,np.uint64)
         native.hxb_reclaim_stats(self.ptr,retired.ctypes.data)
         result.update(zip(('reclaim_queued','reclaim_active','reclaimed_pools','reclaim_ns'),map(int,retired)))
+        games = np.empty(6,np.uint64)
+        native.hxb_owner_reclaim_stats(self.ptr,games.ctypes.data)
+        result.update(zip(('owner_reclaim_queued','owner_reclaim_active','reclaimed_games',
+                           'owner_reclaim_ns','reclaim_reserved','replacement_deferrals'),map(int,games)))
         return result
 
     def cancel(self):
