@@ -18,7 +18,7 @@ extern "C" int hxgf_root_value(void*,void*,double*);
 extern "C" int hxgf_install(void*,const uint64_t*,int,const int64_t*,const int64_t*,const double*,const double*,void**,int);
 namespace owner {
 using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
-struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false,active=false;};
+struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false,active=false,settled=false;};
 struct View {std::unique_ptr<Tree> tree;Key key;std::vector<Cell> history;double relevance=1;uint64_t id=0,generation=0,completed=0,issued=0,cancelled=0;int depth=0,passes=0;bool active=false,discovered=false;};
 struct Record {uint64_t id,generation,completed,shared,context_a,context_b;int depth,exact;bool raw_known,estimate_known;double value,net,ms;std::vector<Cell> history;};
 struct FeedDeleter {void operator()(void* p)const{if(p)hxgf_free(p);}};
@@ -127,13 +127,25 @@ struct Owner {
   return added;
  }
  Candidate* choose(Key& selected){
-  Candidate* best=nullptr;double score=-1;bool explore=allocations%5==4;
-  for(auto& [key,c]:candidates){if(c.depth==0 || (c.depth>max_depth && !c.solver) || c.active)continue;
-   if(auto n=game->nodes.find(key);n!=game->nodes.end())if(auto node=n->second.lock())if(node->exact_winner>=0)continue;
-   double age=double(allocations-c.last+1);double x=explore?age/std::sqrt(1.+c.completed):c.relevance*(1.+std::min(16.,age/16.))/std::sqrt(c.cost*(1.+double(c.completed)/quantum));
-   // Stable key breaks ties; pointer/map iteration is not the schedule's ordering.
-   if(x>score || (x==score && (key.a<selected.a || (key.a==selected.a && key.b<selected.b)))){score=x;best=&c;selected=key;}
-  }return best;
+  const bool explore=allocations%5==4;
+  bool refresh=false;
+  for(;;){
+   Candidate* best=nullptr;double score=-1;
+   for(auto& [key,c]:candidates){if(c.depth==0 || (c.depth>max_depth && !c.solver) || c.active || c.settled)continue;
+    // A newly exact leader triggers one complete refresh, not one rescan for
+    // each proven candidate. Ordinary allocations need no per-candidate lookup.
+    if(refresh)if(auto n=game->nodes.find(key);n!=game->nodes.end())if(auto node=n->second.lock())if(node->exact_winner>=0){c.settled=true;continue;}
+    double age=double(allocations-c.last+1);double x=explore?age/std::sqrt(1.+c.completed):c.relevance*(1.+std::min(16.,age/16.))/std::sqrt(c.cost*(1.+double(c.completed)/quantum));
+    // Stable key breaks ties; pointer/map iteration is not the schedule's ordering.
+    if(x>score || (x==score && (key.a<selected.a || (key.a==selected.a && key.b<selected.b)))){score=x;best=&c;selected=key;}
+   }
+   if(!best || refresh)return best;
+   // Only admission needs graph evidence. An exact verdict cannot become
+   // unknown in this owner's fixed game; estimates and failed proofs do not
+   // settle a candidate. Keep every unresolved candidate available.
+   if(auto n=game->nodes.find(selected);n!=game->nodes.end())if(auto node=n->second.lock())if(node->exact_winner>=0){best->settled=true;refresh=true;continue;}
+   return best;
+  }
  }
  int allocate(){
   if(stopped || expired())return -1;size_t slot=1;
