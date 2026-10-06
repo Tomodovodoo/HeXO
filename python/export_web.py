@@ -129,19 +129,19 @@ def export_onnx(model, path, half):
     if half:
         net, example = net.half(), example.half()
     torch.onnx.export(net, (example,), str(path), input_names=['features'], output_names=['policy', 'far', 'value'],
-                      dynamic_axes=dict(features={0: 'batch', 2: 'size', 3: 'size'}, policy={0: 'batch', 1: 'cells'},
+                      dynamic_axes=dict(features={0: 'batch', 2: 'height', 3: 'width'}, policy={0: 'batch', 1: 'cells'},
                                         far={0: 'batch'}, value={0: 'batch'}),
                       opset_version=OPSET, dynamo=False, do_constant_folding=True)
 
 
-def parity(model, path, positions, half=False):
+def parity(model, path, positions, half=False, rectangular=False):
     """Max abs differences {policy, far, value} of the ONNX graph at `path` under ONNX Runtime's CPU provider
     against PyTorch's reference path over `positions`; policy over in-crop legal cells."""
     import onnxruntime
     session = onnxruntime.InferenceSession(str(path), providers=['CPUExecutionProvider'])
-    samples = [hexcrop.encode(h) for h in positions]
+    samples = [hexcrop.encode(h, rectangular=rectangular) for h in positions]
     worst = dict(policy=0., far=0., value=0.)
-    for size, indices in hexcrop.group_by_size(samples).items():
+    for shape, indices in hexcrop.group_by_shape(samples).items():
         with torch.inference_mode():
             planes = torch.from_numpy(np.stack([samples[i].planes for i in indices])).float()
             out = model(planes, planes[:, 3:4], aux=False)
@@ -165,7 +165,7 @@ def export(checkpoint, out):
         files[name] = dict(sha256=hashlib.sha256((out/name).read_bytes()).hexdigest(), bytes=(out/name).stat().st_size)
     positions = histories()
     manifest = dict(schema='bubble-web-v1', source_sha256=hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
-                    model_version=hexnet.model_digest(model), opset=OPSET, channels=CHANNELS, files=files,
+                    model_version=hexnet.model_digest(model), opset=OPSET, channels=CHANNELS, spatial_axes=['height', 'width'], files=files,
                     parity=dict(positions=len(positions), fp32=parity(model, out/'bubble-fp32.onnx', positions),
                                 fp16=parity(model, out/'bubble-fp16.onnx', positions, half=True)))
     (out/'manifest.json').write_text(json.dumps(manifest, indent=1)+'\n', encoding='utf-8')

@@ -71,7 +71,8 @@ class LineFeatures(nn.Module):
                 and not any(v.requires_grad for v in (own, opp, mask))):
             from hexnet_kernels import line_features
             return line_features(own, opp, mask)
-        size, pad = own.shape[-1], WINDOW-1
+        height, width = own.shape[-2:]
+        pad = WINDOW-1
         counts = F.conv2d(torch.cat((own, opp, mask), 1), self.kernel.to(own.dtype), padding=pad, groups=3)
         o, p, m = counts.split(len(AXES), 1)
         full = m > WINDOW-0.5
@@ -81,7 +82,7 @@ class LineFeatures(nn.Module):
         for a, (dx, dy) in enumerate(AXES):
             # Windows containing the cell start at cell - i*(dx, dy), i = 0..5.
             channels = slice(a, a+4, 3) if self.net_kernels == 'fused' else (a, a+3)
-            best.append(torch.stack([open_counts[:, channels, pad-i*dy:pad-i*dy+size, pad-i*dx:pad-i*dx+size]
+            best.append(torch.stack([open_counts[:, channels, pad-i*dy:pad-i*dy+height, pad-i*dx:pad-i*dx+width]
                                      for i in range(WINDOW)]).amax(0))
         best = torch.cat(best, 1)
         best = torch.cat((best[:, ::2], best[:, 1::2]), 1) if self.net_kernels == 'fused' else best[:, (0, 2, 4, 1, 3, 5)]
@@ -134,16 +135,21 @@ class LineConv(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(channels, len(AXES), length))
 
-    def matrices(self, size, dtype):
+    def matrices(self, size, dtype, width=None):
         """Horizontal, vertical and skewed-diagonal [C, size, size] matrices. With grad enabled they are built
         from _toeplitz (index backward); otherwise by one gather from the zero-padded taps."""
         weight = self.weight.to(dtype)
+        width = size if width is None else width
         if torch.is_grad_enabled():
             # In skewed columns the (1, -1) step is one row up, so the diagonal taps reverse.
-            return (_toeplitz(weight[:, 0], size), _toeplitz(weight[:, 1], size).transpose(1, 2),
+            return (_toeplitz(weight[:, 0], width), _toeplitz(weight[:, 1], size).transpose(1, 2),
                     _toeplitz(weight[:, 2].flip(1), size).transpose(1, 2))
         taps = F.pad(weight.transpose(0, 1), (0, 1))     # [3, C, L+1], index L is zero
         index = _band_index(size, weight.shape[-1], weight.device)
+        if width != size:
+            horizontal = _band_index(width, weight.shape[-1], weight.device)[0]
+            return (taps[0].gather(1, horizontal.expand(taps.shape[1], -1)).unflatten(1, (width, width)),
+                    *tuple(taps[1:].gather(2, index[1:].expand(-1, taps.shape[1], -1)).unflatten(2, (size, size))))
         return tuple(taps.gather(2, index.expand(-1, taps.shape[1], -1)).unflatten(2, (size, size)))
 
     def lines(self, x, matrices):
@@ -164,7 +170,7 @@ class LineConv(nn.Module):
         return out.view(c, h, b, w).add_(_skewed(diagonal)).permute(2, 0, 1, 3)
 
     def forward(self, x):
-        return self.lines(x, self.matrices(x.shape[-2], x.dtype))
+        return self.lines(x, self.matrices(x.shape[-2], x.dtype, x.shape[-1]))
 
     def add_to(self, x):
         """x += self(x) in place without autograd, in batch chunks of at most LINE_CHUNK_CELLS crop cells."""
@@ -174,7 +180,7 @@ class LineConv(nn.Module):
                 and (not torch.is_autocast_enabled('cuda') or x.dtype == torch.get_autocast_dtype('cuda'))):
             from hexnet_kernels import line_add
             return x.copy_(line_add(x, self.weight))
-        matrices = self.matrices(x.shape[-2], x.dtype)
+        matrices = self.matrices(x.shape[-2], x.dtype, x.shape[-1])
         for part in x.split(max(1, LINE_CHUNK_CELLS//(x.shape[-2]*x.shape[-1]))):
             part += self.lines(part, matrices)
         return x
@@ -561,16 +567,16 @@ class DenseEvaluator:
     @torch.inference_mode()
     def evaluate_leaves(self, leaves):
         from neural_search import native
-        return self.evaluate(hexcrop.encode_leaves(native, leaves))
+        return self.evaluate(hexcrop.encode_leaves(native, leaves, rectangular=True))
 
     @torch.inference_mode()
     def evaluate(self, histories):
-        samples = [h if isinstance(h, hexcrop.Sample) else hexcrop.encode(h) for h in histories]
+        samples = [h if isinstance(h, hexcrop.Sample) else hexcrop.encode(h, rectangular=True) for h in histories]
         result = [None]*len(samples)
-        for size, indices in hexcrop.group_by_size(samples).items():
+        for shape, indices in hexcrop.group_by_shape(samples).items():
             for start in range(0, len(indices), self.max_batch):
                 chunk = indices[start:start+self.max_batch]
-                host = staging_buffer(self.staging, size, len(chunk), (len(hexcrop.PLANES), size, size), torch.uint8, self.cuda)
+                host = staging_buffer(self.staging, shape, len(chunk), (len(hexcrop.PLANES), *shape), torch.uint8, self.cuda)
                 np.stack([samples[i].planes for i in chunk], out=host.numpy())
                 x = host.to(self.device, non_blocking=True)
                 x = x.to(memory_format=self.memory_format, dtype=torch.bfloat16 if self.cuda else torch.float32)
