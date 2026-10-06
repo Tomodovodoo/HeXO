@@ -95,6 +95,8 @@ def complete_candidate(history, prefix):
 
 def dense_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
     """One allowance for proofs and both stones; publish only complete legal turns."""
+    if getattr(player, 'native_scheduler', False) and player.options['search']:
+        return native_turn(player, history, limits, cancel, publish, analyze)
     import numpy as np
     from neural_search import NeuralSearch
     from dense_selfplay import root_value
@@ -240,6 +242,156 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
         game.close()
 
 
+def native_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
+    """Clocked native graph owner, batched inference and concurrent proof slices."""
+    started = time.monotonic()
+    if player.options['solver'] and player.solver_nodes_explicit:
+        raise ValueError('Native timed solving uses time slices; omit solver_nodes or disable native_scheduler')
+    if limits.get('leaf_solver'):
+        raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+    import numpy as np
+    from neural_search import GameGraph
+    from native_scheduler import SearchPool, InferenceService
+    hard = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
+    normal = min(hard, started + limits['normal_ms']/1000)
+    game = Game(history)
+    side, remaining = game.player, game.remaining
+    result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
+                  model_sha256=player.model_sha256, player=side, win_probability=None,
+                  suggestions=[], winning_line=[], threat=None,
+                  proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
+                  settings=dict(player.options) | dict(native_scheduler=True,
+                      simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8),
+                  completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[])
+    service = None
+    def stopped():
+        return cancel.is_set() or time.monotonic() >= hard
+    def emit(moves):
+        if service is not None:
+            result['evaluated'] = service.stats()['launched_rows']
+        result.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
+        publish(dict(result, stones=list(result['stones'])))
+    try:
+        emit(result['moves'])
+        if stopped():
+            result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline'
+            return result
+        signature = (player.model_sha256, player.options['solver'],
+                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.))
+        kept = getattr(player, '_timed_native', None)
+        if kept is not None and kept[2] != signature:
+            player.set_history(history)
+            kept = None
+        if kept is None:
+            graph = GameGraph(player.evaluator, player.model_sha256, history, seed=1740,
+                              cache=player.cache, tactics=True, q_range_floor=signature[3], round_barrier=True)
+            pool = None
+            try:
+                pool = SearchPool([graph], quantum=64, views=8, depth=8, work=1, seed=1740)
+                if player.options['solver']:
+                    pool.enable_proofs(player.tactical_package, workers=2, queue=16,
+                                       slice_ms=8, stamps=signature[2])
+            except BaseException:
+                if pool is not None:
+                    pool.close()
+                graph.close()
+                raise
+            kept = player._timed_native = graph, pool, signature
+        _, pool, _ = kept
+        # The preceding service stopped the pool. Re-arm its retained graph only
+        # while detached, before a new service takes exclusive ownership.
+        pool.retarget(0, history, work=1)
+        before = pool.proofs.stats() if pool.proofs is not None else None
+        service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=64,
+                                   pending=2, flights=2, interleave_feedback=True)
+        service.start(continuous=True)
+        selected, token = [], 0
+        while game.player == side and game.winner < 0 and not stopped():
+            first = remaining == 2 and not selected
+            end = min(normal, started + limits['normal_ms']*.6/1000) if first else normal
+            ms = max(0., (min(hard, end)-time.monotonic())*1000)
+            cap = limits.get('simulations')
+            work = 0 if cap is None else max(0, cap-result['scheduler_completed'])
+            if first and work:
+                work = max(1, int(work*.6))
+            if ms <= 0 or cap is not None and not work:
+                break
+            current = [list(cell[:2]) for cell in game.cells]
+            service.retarget(0, 0, current, expected=token, work=work, ms=ms,
+                             samples=limits.get('root_samples', 16), views=8)
+            found = None
+            while not stopped():
+                found = service.event()
+                if found is not None:
+                    break
+                service.pump()
+            if found is None:
+                break
+            token += 1
+            if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token, current):
+                raise ValueError('Native turn completion does not match the current position')
+            if 'error' in found:
+                if found['error'] == 'deadline':
+                    break
+                raise ValueError(f"Native turn search failed: {found['error']}")
+            edges = np.asarray(found['edges'], np.float64)
+            winner = found['exact_winner']
+            value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
+            probability = (value+1)/2
+            result['completed'] += found['root_completed']
+            result['scheduler_completed'] += found['completed']
+            if not selected:
+                result['win_probability'] = probability
+                result['proof_status'] = ('PROVEN_WIN' if winner == side else 'PROVEN_LOSS') if winner >= 0 else 'UNKNOWN'
+                result['suggestions'] = [dict(move=edges[i, :2].astype(np.int64).tolist(), probability=float(edges[i, 5]))
+                                         for i in np.argsort(-edges[:, 5])[:5]]
+            elif winner == side:
+                # One winning same-player continuation proves the original root;
+                # a losing chosen continuation does not cover its alternatives.
+                result.update(win_probability=1., proof_status='PROVEN_WIN')
+            action = found['action']
+            witness = found.get('winning_turn', [])
+            if witness:
+                if winner != side or witness[0] != action:
+                    raise ValueError('Winning turn does not match the exact root action')
+                legal_turn(current, witness)
+            elif winner == side and game.remaining == 2:
+                raise ValueError('Winning root has no complete turn witness')
+            result['stones'].append(dict(history=current, move=action, win_probability=probability,
+                                         exact_winner=winner, completed=found['root_completed'],
+                                         scheduler_completed=found['completed'],
+                                         root_completed=found['root_completed'], context=found['context']))
+            game.play(*action)
+            selected.append(action)
+            if witness:
+                for second in witness[1:]:
+                    result['stones'].append(dict(history=[list(cell[:2]) for cell in game.cells],
+                        move=second, win_probability=1., exact_winner=side, completed=0,
+                        scheduler_completed=0, root_completed=0, context=None, source='proof_witness'))
+                    game.play(*second)
+                    selected.append(second)
+                result['winning_turn'] = list(selected)
+                emit(selected)
+                break
+            emit(complete_candidate(history, selected))
+        result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget'
+    finally:
+        try:
+            if service is not None:
+                service.close()
+                result['inference'] = service.stats()
+                result['evaluated'] = result['inference']['launched_rows']
+                if pool.proofs is not None:
+                    after = pool.proofs.stats()
+                    result['proof_work'] = {key: after[key]-before[key] for key in
+                        ('submitted', 'finished', 'installed', 'unknown', 'fresh_nodes', 'missing_fresh', 'worker_service_ms')}
+                    result['solver_nodes'] = result['proof_work']['fresh_nodes']
+        finally:
+            game.close()
+    result['elapsed_ms'] = (time.monotonic()-started)*1000
+    return result
+
+
 def _worker(connection, cancellation, config):
     """Own the model and its mutable tree in one spawned process."""
     player = None
@@ -260,16 +412,19 @@ def _worker(connection, cancellation, config):
                     checkpoint = max((p.parent for p in (run/'checkpoints').glob('*/*/ema.pt')),
                                      key=lambda p: int(p.name)).relative_to(run/'checkpoints').as_posix()
                 model = run/'checkpoints'/checkpoint/'ema.pt'
+            search, solver = config.get('search', {}), config.get('solver', {})
             player = DensePlayer(run, config.get('device', 'cpu'), model=model,
                                  tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
-                                 net_kernels=config.get('net_kernels', 'fused'))
-            search, solver = config.get('search', {}), config.get('solver', {})
+                                 net_kernels=config.get('net_kernels', 'fused'),
+                                 native_scheduler=search.get('native_scheduler', False))
             if player.prover is not None:
                 player.prover.stamps = bool(solver.get('stamps', False))
-            player.configure(dict(search=search.get('enabled', True),
-                                  simulations=search.get('simulations', 128),
-                                  solver=solver.get('enabled', player.prover is not None),
-                                  solver_nodes=solver.get('nodes', 32768)))
+            options = dict(search=search.get('enabled', True), solver=solver.get('enabled', player.prover is not None))
+            if 'simulations' in search:
+                options['simulations'] = search['simulations']
+            if 'nodes' in solver:
+                options['solver_nodes'] = solver['nodes']
+            player.configure(options)
             t0 = time.monotonic()
             player.evaluator.evaluate([[(0, 0)]])
             player.batch_seconds = time.monotonic()-t0
@@ -364,7 +519,12 @@ def _worker(connection, cancellation, config):
 class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
-        search = config.get('search', {})
+        search, solver = config.get('search', {}), config.get('solver', {})
+        if config.get('kind') == 'bubble' and search.get('native_scheduler') and search.get('enabled', True) and solver.get('enabled', True):
+            if 'nodes' in solver:
+                raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
+            if solver.get('leaf'):
+                raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
         cap = search.get('max_simulations', search.get('simulations'))
         if cap is not None and (type(cap) is not int or cap <= 0):
             raise ValueError('simulation cap must be a positive integer')
