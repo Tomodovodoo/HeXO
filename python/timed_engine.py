@@ -252,8 +252,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     import numpy as np
     from neural_search import GameGraph
     from native_scheduler import SearchPool, InferenceService
-    hard = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
-    normal = min(hard, started + limits['normal_ms']/1000)
+    hard = limits.get('response_deadline', started + max(0, limits['hard_ms'])/1000)
+    normal = min(hard-limits['reserve_ms']/1000,
+                 limits.get('search_deadline', started + limits['normal_ms']/1000))
     game = Game(history)
     side, remaining = game.player, game.remaining
     result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
@@ -265,7 +266,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                   completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[])
     service = None
     def stopped():
-        return cancel.is_set() or time.monotonic() >= hard
+        return cancel.is_set() or time.monotonic() >= normal
     def emit(moves):
         if service is not None:
             result['evaluated'] = service.stats()['launched_rows']
@@ -320,9 +321,25 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             service.retarget(0, 0, current, expected=token, work=work, ms=ms,
                              samples=limits.get('root_samples', 16), views=8)
             found = None
-            while not stopped():
+            while True:
                 found = service.event()
                 if found is not None:
+                    break
+                if stopped():
+                    # Stop admission, then receive the writer's final choice.
+                    # Response time is separate from search time; no graph is
+                    # inspected here and no new forward is launched.
+                    service.cancel()
+                    while time.monotonic() < hard:
+                        found = service.event()
+                        if found is not None:
+                            break
+                        time.sleep(.0001)
+                    if found is None:
+                        finals = service.close(completions=True)
+                        if len(finals) > 1:
+                            raise ValueError('Multiple final completions for one native turn root')
+                        found = finals[0] if finals else None
                     break
                 service.pump()
             if found is None:
@@ -601,7 +618,13 @@ class TimedEngine:
             remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
             limits['hard_ms'] = remaining if milliseconds is None else min(remaining, milliseconds)
             limits['clock'] = dict(clock)
-        deadline = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
+        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
+                          self.config.get('search', {}).get('native_scheduler') and
+                          self.config.get('search', {}).get('enabled', True))
+        # Native search stops before the reserve; its final result is delivered
+        # during it. Keep listening through the inclusive response deadline.
+        response_ms = limits['hard_ms'] if native_clocked else limits['hard_ms']-limits['reserve_ms']
+        deadline = started + max(0, response_ms)/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
                     allowance=limits)
@@ -639,6 +662,11 @@ class TimedEngine:
             elapsed = (time.monotonic()-started)*1000
             worker_limits = limits | dict(hard_ms=max(0, limits['hard_ms']-elapsed),
                                          normal_ms=max(0, limits['normal_ms']-elapsed))
+            if native_clocked:
+                # Monotonic time is shared by local processes. Queue/IPC delay
+                # consumes the turn instead of restarting its clock on receipt.
+                worker_limits.update(response_deadline=deadline,
+                                     search_deadline=started+limits['normal_ms']/1000)
             self.connection.send((generation, history, worker_limits))
             self.busy = True
             complete = False
