@@ -624,7 +624,20 @@ struct Tree {
   // others go.
   if(outcomes.size()>16*limit){
    std::unordered_set<Key,KeyHash> summarised;for(auto& [key,stats]:evicted_stats)summarised.insert(stats.position);
-   std::erase_if(outcomes,[&](const auto& entry){return !positions.contains(entry.first) && !summarised.contains(entry.first);});
+   // A surviving winning first stone still needs its second-stone witness,
+   // even when the child graph and its numerical summary were discarded.
+   // Keep only that half-turn dependency, not an orphan proof's descendants.
+   std::unordered_set<Key,KeyHash> needed;
+   for(auto& [key,outcome]:outcomes)if((positions.contains(key) || summarised.contains(key)) && outcome.winner==outcome.player && outcome.stones>0 && outcome.stones%2){
+    const int p=outcome.player;
+    for(auto& edge:outcome.edges)if(edge.winner==p && edge.distance==outcome.distance){
+     const auto h=CellHash{}(edge.action);
+     Key half{key.a-mix(p*3+2+17)+mix(p*3+1+17)+mix(h^mix(p+1)),
+              key.b-mix(p*3+2+71)+mix(p*3+1+71)+mix(h+mix(p+911))};
+     if(auto child=outcomes.find(half);child!=outcomes.end() && child->second.player==p && child->second.winner==p && child->second.witnessed())needed.insert(half);
+    }
+   }
+   std::erase_if(outcomes,[&](const auto& entry){return !positions.contains(entry.first) && !summarised.contains(entry.first) && !needed.contains(entry.first);});
   }
  }
  // Shared graph: moves the root to the position after `history`, a node of the store or a new one attached under
