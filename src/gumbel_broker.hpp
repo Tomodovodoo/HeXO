@@ -7,7 +7,7 @@
 #include <iomanip>
 
 extern "C" {
-void* hxgp_new(void* const*,const int*,int,int);
+void* hxgp_new_rect(void* const*,const int*,int,int);
 void* hxgp_combine(void* const*,const int*,int,int);
 void hxgp_free(void*);
 int hxgp_outputs(void*,void**);
@@ -446,7 +446,7 @@ inline void Producer::run()noexcept{
      auto job=std::make_shared<Job>();job->owner=shared_from_this();job->ids.resize(count);job->results.resize(count);job->installed.resize(count);job->remaining=count;
      std::vector<void*> trees(count);std::vector<int> requests(count);
      if(!hxgf_take(pool.feed,count,job->ids.data(),trees.data(),requests.data(),nullptr,nullptr,0))throw std::runtime_error(gumbel::error);
-     job->snapshot.reset(hxgp_new(trees.data(),requests.data(),count,0));if(!job->snapshot)throw std::runtime_error(gumbel::error);
+     job->snapshot.reset(hxgp_new_rect(trees.data(),requests.data(),count,0));if(!job->snapshot)throw std::runtime_error(gumbel::error);
      for(auto id:job->ids){int64_t size=0;auto key=hxgf_key(pool.feed,id,&size);if(!key)throw std::runtime_error(gumbel::error);
       job->keys.emplace_back(1,int64_t(model));job->keys.back().insert(job->keys.back().end(),key,key+size);
      }

@@ -44,17 +44,28 @@ class ActorGraph:
         self.budget_exhausted = False
         self.capture_memory_error = None
 
+    @staticmethod
+    def shape(canvas):
+        return (canvas, canvas) if isinstance(canvas, int) else canvas
+
+    @classmethod
+    def supports(cls, canvas):
+        height, width = cls.shape(canvas)
+        return canvas in cls.CANVASES or (min(height, width) >= 24
+                and max(height, width) <= 256 and height % 8 == width % 8 == 0)
+
     def _capture(self, side, capacity):
         if self.incremental_reserved_bytes >= self.max_incremental_bytes:
             raise MemoryError('actor graph memory budget exhausted')
+        height, width = self.shape(side)
         key = side, capacity
         # Outside capture: these addresses stay fixed, but can never alias the
         # shared graph pool. Dummy rows have one valid cell to avoid 0/0 pooling.
-        template = torch.empty((capacity, 8, side, side), device=self.device,
+        template = torch.empty((capacity, 8, height, width), device=self.device,
                                dtype=torch.bfloat16, memory_format=torch.channels_last).zero_()
         template[:, 3, 0, 0] = 1
         static_input = template.clone(memory_format=torch.channels_last)
-        static_packed = torch.empty((capacity, side*side+2), device=self.device, dtype=torch.float32)
+        static_packed = torch.empty((capacity, height*width+2), device=self.device, dtype=torch.float32)
 
         with torch.cuda.stream(self.stream), torch.inference_mode(), \
                 torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
@@ -100,16 +111,19 @@ class ActorGraph:
 
     @classmethod
     def _limit(cls, side, max_batch=32):
-        ceiling = min(max_batch, cls.LARGE_BATCHES.get(side, 32))
-        return max(cap for cap in cls.BATCHES if cap <= ceiling and cap*side*side <= cls.MAX_CELLS)
+        height, width = cls.shape(side)
+        ceiling = min(max_batch, cls.LARGE_BATCHES.get(side,
+                      128 if height*width <= 32*32 else 64 if height*width <= 40*40 else 32))
+        return max(cap for cap in cls.BATCHES if cap <= ceiling and cap*height*width <= cls.MAX_CELLS)
 
     @torch.inference_mode()
     def __call__(self, planes):
         """Return caller-owned aux=False outputs for resident BF16 [B,8,S,S]."""
-        b, channels, side, width = planes.shape
-        if (channels != 8 or side != width or b < 1 or planes.device != self.device
+        b, channels, height, width = planes.shape
+        side = height if height == width else (height, width)
+        if (channels != 8 or min(height, width) < 1 or b < 1 or planes.device != self.device
                 or planes.dtype != torch.bfloat16):
-            raise ValueError('expected nonempty [B,8,S,S] BF16 planes on the model CUDA device')
+            raise ValueError('expected nonempty [B,8,H,W] BF16 planes on the model CUDA device')
         caller_stream = torch.cuda.current_stream(self.device)
         same_stream = caller_stream.cuda_stream == self.stream.cuda_stream
         with self.lock, torch.cuda.stream(self.stream), \
@@ -117,7 +131,7 @@ class ActorGraph:
             if not same_stream:
                 self.stream.wait_stream(caller_stream)
                 planes.record_stream(self.stream)
-            if side not in self.CANVASES:
+            if not self.supports(side):
                 packed = self._fallback(planes)
             else:
                 limit = self._limit(side, self.max_batch)
@@ -157,8 +171,8 @@ class ActorGraph:
                 'value_logit': packed[:, -1]}
 
     def _fallback(self, planes):
-        side = planes.shape[-1]
-        chunk = max(1, self.MAX_CELLS//(side*side))
+        height, width = planes.shape[-2:]
+        chunk = max(1, self.MAX_CELLS//(height*width))
         pieces = []
         for part in planes.split(chunk):
             out = self.model(part, part[:, 3:4], aux=False)

@@ -39,9 +39,9 @@ class SpanError(ValueError):
 
 @dataclass
 class Sample:
-    """One encoded position. cells[i] is the flat index y*size+x of actions[i], or -1 when far."""
-    planes: np.ndarray      # uint8 [len(PLANES), size, size]
-    size: int
+    """One encoded position. cells[i] is y*shape[1]+x of actions[i], or -1 when far."""
+    planes: np.ndarray      # uint8 [len(PLANES), height, width]
+    size: int              # legacy square bucket; use shape for inference dimensions
     cells: np.ndarray       # int64 [N]
     actions: np.ndarray     # int64 [N, 2], untransformed, native legal order
     far: int
@@ -50,10 +50,14 @@ class Sample:
     symmetry: int
     offset: tuple           # (qmin, rmin, ox, oy)
 
+    @property
+    def shape(self):
+        return self.planes.shape[-2:]
+
     def point(self, index):
         """Original (q, r) of flat crop index `index`."""
         qmin, rmin, ox, oy = self.offset
-        y, x = divmod(int(index), self.size)
+        y, x = divmod(int(index), self.shape[1])
         q, r = np.array([x-ox+qmin, y-oy+rmin]) @ INVERSES[self.symmetry]
         return int(q), int(r)
 
@@ -148,61 +152,68 @@ def _choose(sides, symmetry, rng):
     return int(rng.choice(np.flatnonzero(sides <= bucket)))
 
 
-def encode(history, *, symmetry=None, rng=None):
+def encode(history, *, symmetry=None, rng=None, rectangular=False):
     """Replay `history` and encode it; see encode_game."""
     game = Game(history)
     try:
-        return encode_game(game, history, symmetry=symmetry, rng=rng)
+        return encode_game(game, history, symmetry=symmetry, rng=rng, rectangular=rectangular)
     finally:
         game.close()
 
 
-def encode_leaf(native, tree, request, history):
+def encode_leaf(native, tree, request, history, *, rectangular=False):
     """Encode an existing native search leaf; old libraries retain the non-replay Python path."""
-    if not hasattr(native, 'hxg_encode'):
-        return encode_game(Position(np.asarray(history, np.int64)), history)
-    info = np.empty(9, np.int64)
-    size = native.hxg_encode(tree, request, None, 0, None, info.ctypes.data)
+    name = 'hxg_encode_rect' if rectangular else 'hxg_encode'
+    if not hasattr(native, name):
+        return encode_game(Position(np.asarray(history, np.int64)), history, rectangular=rectangular)
+    encode = getattr(native, name)
+    encode.argtypes = [C.c_void_p, C.c_int, C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
+    encode.restype = C.c_int
+    info = np.empty(10 if rectangular else 9, np.int64)
+    size = encode(tree, request, None, 0, None, info.ctypes.data)
     if size == -2:
         raise SpanError('Stones plus halo exceed the largest bucket')
     if size == 0:
         raise ValueError(native.hxg_error().decode())
     actions = np.empty((int(info[0]), 2), np.int64)
     native.hxg_legal(tree, request, actions.ctypes.data)
-    planes = np.empty((len(PLANES), size, size), np.uint8)
+    width = int(info[9]) if rectangular else size
+    planes = np.empty((len(PLANES), size, width), np.uint8)
     cells = np.empty(len(actions), np.int64)
-    if native.hxg_encode(tree, request, planes.ctypes.data, planes.size, cells.ctypes.data, info.ctypes.data) != size:
+    if encode(tree, request, planes.ctypes.data, planes.size, cells.ctypes.data, info.ctypes.data) != size:
         raise ValueError(native.hxg_error().decode())
-    return Sample(planes, size, cells, actions, int(info[8]), int(info[1]), int(info[2]), int(info[3]),
+    return Sample(planes, _bucket(max(size, width)), cells, actions, int(info[8]), int(info[1]), int(info[2]), int(info[3]),
                   tuple(map(int, info[4:8])))
 
 
-def encode_leaves(native, leaves, *, allow_span=False):
+def encode_leaves(native, leaves, *, allow_span=False, rectangular=False):
     """Encode a pending batch in two native calls; returned action arrays own their cache storage."""
-    if len(leaves) < 8 or not hasattr(native, 'hxg_encode_many'):
+    name = 'hxg_encode_many_rect' if rectangular else 'hxg_encode_many'
+    if len(leaves) < 8 or not hasattr(native, name):
         samples = []
         for tree, request, history in leaves:
             try:
-                samples.append(encode_leaf(native, tree, request, history))
+                samples.append(encode_leaf(native, tree, request, history, rectangular=rectangular))
             except SpanError:
                 if not allow_span:
                     raise
                 samples.append(None)
         return samples
-    encode = native.hxg_encode_many
+    encode = getattr(native, name)
     encode.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_void_p, C.c_void_p, C.c_int64,
                        C.c_void_p, C.c_void_p, C.c_int64]
     encode.restype = C.c_int
     trees = np.asarray([tree for tree, _, _ in leaves], np.uintp)
     requests = np.asarray([request for _, request, _ in leaves], np.int32)
-    info = np.zeros((len(leaves), 12), np.int64)
+    info = np.zeros((len(leaves), 13 if rectangular else 12), np.int64)
     if not encode(trees.ctypes.data, requests.ctypes.data, len(leaves), info.ctypes.data,
                   None, 0, None, None, 0):
         raise ValueError(native.hxg_error().decode())
     if not allow_span and np.any(info[:, 0] == -2):
         raise SpanError('Stones plus halo exceed the largest bucket')
     sides = np.maximum(info[:, 0], 0)
-    planes = np.empty(int((len(PLANES)*sides*sides).sum()), np.uint8)
+    widths = np.maximum(info[:, 12], 0) if rectangular else sides
+    planes = np.empty(int((len(PLANES)*sides*widths).sum()), np.uint8)
     count = int(info[sides > 0, 1].sum())
     cells, actions = np.empty(count, np.int64), np.empty((count, 2), np.int64)
     if not encode(trees.ctypes.data, requests.ctypes.data, len(leaves), info.ctypes.data,
@@ -210,15 +221,16 @@ def encode_leaves(native, leaves, *, allow_span=False):
         raise ValueError(native.hxg_error().decode())
     samples = []
     for row in info:
-        size, n, player, remaining, symmetry, qmin, rmin, ox, oy, far, po, lo = map(int, row)
+        size, n, player, remaining, symmetry, qmin, rmin, ox, oy, far, po, lo = map(int, row[:12])
+        width = int(row[12]) if rectangular else size
         samples.append(None if size == -2 else Sample(
-            planes[po:po+len(PLANES)*size*size].reshape(len(PLANES), size, size), size,
+            planes[po:po+len(PLANES)*size*width].reshape(len(PLANES), size, width), _bucket(max(size, width)),
             cells[lo:lo+n], actions[lo:lo+n].copy(), far, player, remaining, symmetry,
             (qmin, rmin, ox, oy)))
     return samples
 
 
-def encode_game(game, history, *, symmetry=None, rng=None, actions=None):
+def encode_game(game, history, *, symmetry=None, rng=None, actions=None, rectangular=False):
     """Encode the position of `game`, whose placements are `history`; `actions` [N, 2], when given, must be its
     legal moves in native order (legal_array is skipped).
 
@@ -250,16 +262,19 @@ def encode_game(game, history, *, symmetry=None, rng=None, actions=None):
     axis, positive = _AXIS_OF[k], _POSITIVE[k]
     low = np.where(positive, bounds[0][axis], -bounds[1][axis])-halo
     extent = np.where(positive, bounds[1][axis], -bounds[0][axis])+halo-low+1
-    ox, oy = (size-extent)//2
+    # Keep the same symmetry and true crop. Only the surrounding zero padding changes.
+    width, height = (np.maximum(24, (extent+7)//8*8) if rectangular else (size, size))
+    width, height = int(width), int(height)
+    ox, oy = (np.array([width, height])-extent)//2
     shift = np.array([ox, oy])-low
     xy = moves @ SYMMETRIES[k]+shift
     a = actions @ SYMMETRIES[k]+shift
-    cells = a[:, 1]*size+a[:, 0]
+    cells = a[:, 1]*width+a[:, 0]
     if halo:
         inside = ((a >= (ox, oy)) & (a < (ox+extent[0], oy+extent[1]))).all(1)
         cells[~inside] = -1
     owner = ((np.arange(n)+1)//2) % 2
-    planes = np.zeros((len(PLANES), size, size), np.uint8)
+    planes = np.zeros((len(PLANES), height, width), np.uint8)
     own = owner == player
     planes[0, xy[own, 1], xy[own, 0]] = 1
     planes[1, xy[~own, 1], xy[~own, 0]] = 1
@@ -282,6 +297,60 @@ def group_by_size(samples):
     for i, sample in enumerate(samples):
         groups.setdefault(sample.size, []).append(i)
     return groups
+
+
+def group_by_shape(samples):
+    groups = {}
+    for i, sample in enumerate(samples):
+        groups.setdefault(sample.shape, []).append(i)
+    return groups
+
+
+def move_geometry(history, action, sample=None):
+    """Measure a played stone before placement. Never changes the crop or legal list.
+
+    Without a Sample, reconstruct the deterministic square inference frame from
+    the full radius-8 legal bounds. Tensor-edge distance is then reconstructed,
+    rather than a receipt of the canvas actually submitted by a particular search.
+    """
+    moves = np.asarray(history, np.int64).reshape(-1, 2)
+    action = np.asarray(action, np.int64)
+    if not len(moves):
+        nearest, extension = None, 0
+        bounds = (np.zeros(3, np.int64), np.zeros(3, np.int64))
+    else:
+        delta = np.abs(moves-action)
+        nearest = int(np.maximum(delta.max(1), np.abs((moves-action).sum(1))).min())
+        low, high = _bounds(moves)
+        point = np.array([*action, action.sum()])
+        extension = int(np.maximum(low-point, point-high).max(initial=0))
+        bounds = (low-RADIUS, high+RADIUS)
+    if sample is None:
+        sides = _sides(None, bounds=bounds)
+        k = int(np.argmin(sides))
+        side = _bucket(sides[k])
+        if side is None:
+            return dict(nearest=nearest, extension=extension, tensor_edge=None, crop_edge=None,
+                        tensor_shape=None, frame='full-legal-span')
+        axis, positive = _AXIS_OF[k], _POSITIVE[k]
+        low = np.where(positive, bounds[0][axis], -bounds[1][axis])
+        extent = (bounds[1]-bounds[0])[axis]+1
+        offset = (side-extent)//2
+        xy = action @ SYMMETRIES[k]+offset-low
+        height = width = side
+        frame = 'reconstructed-square'
+    else:
+        k = sample.symmetry
+        qmin, rmin, ox, oy = sample.offset
+        height, width = sample.shape
+        xy = action @ SYMMETRIES[k]+np.array([ox-qmin, oy-rmin])
+        y, x = np.nonzero(sample.planes[3])
+        offset, extent = np.array([x.min(), y.min()]), np.array([x.max()-x.min()+1, y.max()-y.min()+1])
+        frame = 'sample'
+    edge = int(min(xy[0], width-1-xy[0], xy[1], height-1-xy[1]))
+    crop_edge = int(np.minimum(xy-offset, offset+extent-1-xy).min())
+    return dict(nearest=nearest, extension=extension, tensor_edge=edge, crop_edge=crop_edge,
+                tensor_shape=[height, width], frame=frame)
 
 
 def batch(samples):

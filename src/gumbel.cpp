@@ -1179,7 +1179,7 @@ struct Tree {
 thread_local std::string error;
 // Encode a pending, non-terminal leaf directly from the history and complete legal list captured by search.
 // This is the deterministic hexcrop layout; no rules-board replay or dense legal-mask regeneration is needed.
-int encode(const Path& path,uint8_t* planes,int capacity,int64_t* cells,int64_t* info){
+int encode(const Path& path,uint8_t* planes,int capacity,int64_t* cells,int64_t* info,bool rectangular=false){
  auto transform=[](Cell c,int k){if(k>=6)std::swap(c.q,c.r);for(int i=0;i<k%6;++i)c={-c.r,c.q+c.r};return c;};
  std::array<int64_t,3> low{},high{};bool empty=true;
  auto include=[&](Cell c){std::array<int64_t,3> v{c.q,c.r,c.q+c.r};if(empty){low=high=v;empty=false;}else for(int i=0;i<3;++i){low[i]=std::min(low[i],v[i]);high[i]=std::max(high[i],v[i]);}};
@@ -1189,21 +1189,25 @@ int encode(const Path& path,uint8_t* planes,int capacity,int64_t* cells,int64_t*
  auto choose=[&]{side=std::numeric_limits<int64_t>::max();for(int k=0;k<12;++k){auto f=frame(k,halo);auto need=std::max(f[2],f[3]);if(need<side){side=need;symmetry=k;}}};
  choose();if(side>256){halo=4;bounds(true);choose();if(side>256)return -2;}
  int size=0;for(int b:{24,32,40,48,64,96,128,192,256})if(b>=side){size=b;break;}
- auto f=frame(symmetry,halo);int64_t ox=(size-f[2])/2,oy=(size-f[3])/2;
+ auto f=frame(symmetry,halo);
+ int width=rectangular?int(std::max<int64_t>(24,(f[2]+7)/8*8)):size;
+ int height=rectangular?int(std::max<int64_t>(24,(f[3]+7)/8*8)):size;
+ int64_t ox=(width-f[2])/2,oy=(height-f[3])/2;
  auto xy=[&](Cell c){auto p=transform(c,symmetry);return Cell{p.q+ox-f[0],p.r+oy-f[1]};};
- const int area=size*size,n=int(path.history.size());int far=0;
+ const int area=height*width,n=int(path.history.size());int far=0;
  if(planes){if(capacity<8*area)throw std::runtime_error("Leaf plane buffer too small");std::fill(planes,planes+8*area,0);}
- for(size_t i=0;i<path.legal.size();++i){auto p=xy(path.legal[i]);bool inside=!halo || (p.q>=ox && p.r>=oy && p.q<ox+f[2] && p.r<oy+f[3]);int64_t index=inside?p.r*size+p.q:-1;if(cells)cells[i]=index;if(planes && inside)planes[2*area+index]=1;far+=!inside;}
+ for(size_t i=0;i<path.legal.size();++i){auto p=xy(path.legal[i]);bool inside=!halo || (p.q>=ox && p.r>=oy && p.q<ox+f[2] && p.r<oy+f[3]);int64_t index=inside?p.r*width+p.q:-1;if(cells)cells[i]=index;if(planes && inside)planes[2*area+index]=1;far+=!inside;}
  if(planes){
-  for(int i=0;i<n;++i){auto p=xy(path.history[i]);int owner=((i+1)/2)%2;planes[(owner==path.player?0:area)+p.r*size+p.q]=1;}
-  for(int64_t y=oy;y<oy+f[3];++y)std::fill(planes+3*area+y*size+ox,planes+3*area+y*size+ox+f[2],1);
+  for(int i=0;i<n;++i){auto p=xy(path.history[i]);int owner=((i+1)/2)%2;planes[(owner==path.player?0:area)+p.r*width+p.q]=1;}
+  for(int64_t y=oy;y<oy+f[3];++y)std::fill(planes+3*area+y*width+ox,planes+3*area+y*width+ox+f[2],1);
   std::fill(planes+(path.remaining==1?4:5)*area,planes+(path.remaining==1?5:6)*area,1);
   int start=path.remaining==2 || !n?n:n-1;
-  if(start<n){auto p=xy(path.history.back());planes[6*area+p.r*size+p.q]=1;}
-  for(int i=std::max(0,start-2);i<start;++i){auto p=xy(path.history[i]);planes[7*area+p.r*size+p.q]=1;}
+  if(start<n){auto p=xy(path.history.back());planes[6*area+p.r*width+p.q]=1;}
+  for(int i=std::max(0,start-2);i<start;++i){auto p=xy(path.history[i]);planes[7*area+p.r*width+p.q]=1;}
  }
  if(info){std::array<int64_t,9> metadata{int64_t(path.legal.size()),path.player,path.remaining,symmetry,f[0],f[1],ox,oy,far};std::copy(metadata.begin(),metadata.end(),info);}
- return size;
+ if(rectangular && info)info[9]=width;
+ return height;
 }
 }
 extern "C" {
@@ -1211,6 +1215,8 @@ HX_API const char* hxg_error(){return gumbel::error.c_str();}
 // Returns crop side, -2 for an unencodable span, or 0 on invalid request/buffer. info has nine int64 entries;
 // cells has hxg_legal entries, planes has capacity bytes. Null outputs query the required layout.
 HX_API int hxg_encode(void* p,int id,uint8_t* planes,int capacity,int64_t* cells,int64_t* info){try{auto& requests=static_cast<gumbel::Tree*>(p)->requests;auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown encode request");return gumbel::encode(found->second,planes,capacity,cells,info);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+// Rectangular layout: the same nine metadata entries, followed by width. Return value is height.
+HX_API int hxg_encode_rect(void* p,int id,uint8_t* planes,int capacity,int64_t* cells,int64_t* info){try{auto& requests=static_cast<gumbel::Tree*>(p)->requests;auto found=requests.find(id);if(found==requests.end())throw std::runtime_error("Unknown encode request");return gumbel::encode(found->second,planes,capacity,cells,info,true);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void* hxg_new(uint64_t seed){try{return new gumbel::Tree(seed);}catch(...){return nullptr;}}
 HX_API void hxg_free(void* p){delete static_cast<gumbel::Tree*>(p);}
 HX_API int hxg_tactics(void* p,int enabled){auto& t=*static_cast<gumbel::Tree*>(p);if(t.root->expanded || !t.requests.empty())return 0;t.tactics=enabled!=0;return 1;}

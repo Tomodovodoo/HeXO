@@ -156,7 +156,8 @@ out.probe = {
 Object.defineProperty(globalThis, 'navigator', {value: {hardwareConcurrency: 8, deviceMemory: 8}, configurable: true});
 
 // Network.create with a fake ONNX Runtime and a fake origin that serves the model's manifest and graphs.
-const graphs = {'bubble-fp32.onnx': 'fp32 graph', 'bubble-fp16.onnx': 'fp16 graph', 'shrimp.onnx': 'shrimp graph'};
+const bubbleGraph = Buffer.from('CAo6hwEKHAoIZmVhdHVyZXMSBnBvbGljeSIISWRlbnRpdHkSB2ZpeHR1cmVaLwoIZmVhdHVyZXMSIwohCAESHQoHEgViYXRjaAoCCBQKBhIEc2l6ZQoGEgRzaXplYi0KBnBvbGljeRIjCiEIARIdCgcSBWJhdGNoCgIIFAoGEgRzaXplCgYSBHNpemVCBAoAEBE=', 'base64');
+const graphs = {'bubble-fp32.onnx': bubbleGraph, 'bubble-fp16.onnx': bubbleGraph, 'shrimp.onnx': 'shrimp graph'};
 const hash = text => createHash('sha256').update(text).digest('hex');
 const pinned = names => Object.fromEntries(names.map(name => [name, {sha256: hash(graphs[name]), bytes: graphs[name].length}]));
 const manifests = {'model/manifest.json': {model_version: 'm', files: pinned(['bubble-fp32.onnx', 'bubble-fp16.onnx'])},

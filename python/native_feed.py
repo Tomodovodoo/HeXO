@@ -100,7 +100,7 @@ class NativeFeed:
         trees, requests = np.empty(count, np.uintp), np.empty(count, np.int32)
         checked(native.hxgf_take(self.ptr, count, ids.ctypes.data, trees.ctypes.data, requests.ctypes.data,
                                 None, None, 0))
-        return ids, PackedRows(trees, requests)
+        return ids, PackedRows(trees, requests, rectangular=True)
 
     def install_packed(self, ids, rows):
         if rows.count != len(ids):
