@@ -10,7 +10,11 @@ class DensePlayer:
     """Play exported dense checkpoints; analysis searches a copy of the browser game."""
     mode = 'dense'
 
-    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused'):
+    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused', native_scheduler=False):
+        if type(native_scheduler) is not bool:
+            raise ValueError('native_scheduler must be on or off')
+        self.native_scheduler = native_scheduler
+        self.solver_nodes_explicit = self.simulations_explicit = False
         self.run, self.device = run, device
         self.model_path = Path(model).resolve() if model else None
         self.tactical_package = tactical_package
@@ -65,8 +69,17 @@ class DensePlayer:
         import hexnet
         from legacy.train import digest
         path = self.model_path or self.run/'checkpoints'/checkpoint/'ema.pt'
+        if self.evaluator is not None:
+            self.close()
+            self.checkpoint = None
         model = hexnet.load_model(path, net_kernels=self.net_kernels)
-        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=16)
+        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path),
+            max_batch=128 if self.native_scheduler else 16,
+            cuda_graphs=self.native_scheduler and self.net_kernels == 'fused')
+        if self.native_scheduler:
+            self.evaluator.free = []  # Packed forwards own staging until their completion fence.
+            if self.evaluator.graph is not None:
+                self.evaluator.graph.max_batch = 128
         self.checkpoint, self.model_sha256 = checkpoint, digest(path)
         self.set_history()
 
@@ -80,18 +93,25 @@ class DensePlayer:
             if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
                 raise ValueError(f'{key} must be 1..{maximum}')
         self.options = updated
+        self.solver_nodes_explicit |= 'solver_nodes' in options
+        self.simulations_explicit |= 'simulations' in options
 
     def set_history(self, history=()):
         from neural_search import EvaluationCache
+        if getattr(self, '_timed_native', None):
+            graph, pool, _ = self._timed_native
+            pool.close()
+            graph.close()
+            self._timed_native = None
         if getattr(self, '_timed_tree', None):
             self._timed_tree.close()
             self._timed_tree = None
         self.cache = EvaluationCache(4096)
 
     def close(self):
-        if getattr(self, '_timed_tree', None):
-            self._timed_tree.close()
-            self._timed_tree = None
+        self.set_history()
+        if self.evaluator is not None and self.evaluator.graph is not None:
+            self.evaluator.graph.close()
         self.evaluator = None
 
     def solve(self, history, attacker='mover'):
@@ -121,13 +141,15 @@ class DensePlayer:
             local.close()
 
     def turn(self, game, milliseconds=None, analyze=False):
-        """Keep the first stone's search continuation, with a fresh budget for each placement."""
+        """Choose a complete legal turn with an optional whole-turn clock."""
         if milliseconds is not None:
             from threading import Event
             from timed_engine import dense_turn
             from time_control import allowance
-            return dense_turn(self, [cell[:2] for cell in game.cells], allowance(movetime=milliseconds),
-                              Event(), analyze=analyze)
+            limits = allowance(movetime=milliseconds)
+            if self.native_scheduler and self.simulations_explicit:
+                limits['simulations'] = self.options['simulations']
+            return dense_turn(self, [cell[:2] for cell in game.cells], limits, Event(), analyze=analyze)
         import numpy as np
         from neural_search import NeuralSearch
         from dense_selfplay import root_value

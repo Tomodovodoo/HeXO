@@ -29,7 +29,7 @@ jobs:
       - run: python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install --no-deps -e .
       - run: CARGO_BUILD_JOBS=2 python tools/build_tactical.py
-      - run: python -m unittest tests.test_neural_search tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api tests.test_seal_current tests.test_forcing_material tests.test_isolated_tactics tests.test_dense_solver -v
+      - run: python -m unittest tests.test_neural_search tests.test_dense.DenseTimedWorker tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api tests.test_seal_current tests.test_forcing_material tests.test_isolated_tactics tests.test_dense_solver -v
       - run: c++ -std=c++20 -O2 tests/tt_injection.cpp -o build/tt_injection
       - run: ./build/tt_injection
       - run: c++ -std=c++20 -O2 tests/gumbel.cpp -o build/gumbel_test

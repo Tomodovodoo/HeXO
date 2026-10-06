@@ -9730,17 +9730,117 @@ class DenseTimedWorker(unittest.TestCase):
             model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
-            with TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
-                                  solver=dict(enabled=False))) as engine:
-                game = Game([[0, 0]])
-                try:
-                    result = engine.turn(game, 1000)
-                    self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
-                    self.assertGreater(result.get('evaluated', 0), 0)
-                    self.assertEqual(result['backend'], 'dense')
-                    self.assertEqual(result['model_sha256'], engine.model_sha256)
-                finally:
-                    game.close()
+            for native, solver in ((False, False), (True, False), (True, True)):
+                search = dict(native_scheduler=native)
+                if solver:
+                    search['max_simulations'] = 64  # Complete early enough to inspect joined accounting.
+                with self.subTest(native_scheduler=native, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                        search=search, solver=dict(enabled=solver))) as engine:
+                    game = Game([[0, 0]])
+                    try:
+                        for turn in range(2):
+                            history = [list(cell[:2]) for cell in game.cells]
+                            result = engine.turn(game, 1000)
+                            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+                            if turn == 0 or not solver:
+                                self.assertGreater(result.get('evaluated', 0), 0)
+                            self.assertEqual(result['backend'], 'dense')
+                            self.assertEqual(result['model_sha256'], engine.model_sha256)
+                            self.assertEqual([list(cell[:2]) for cell in game.cells], history)
+                            if native:
+                                self.assertTrue(result['settings']['native_scheduler'])
+                                self.assertTrue(result['stones'])
+                                self.assertEqual(result['stones'][0]['history'], history)
+                                self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
+                                self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
+                                if solver:
+                                    self.assertLessEqual(result['scheduler_completed'], 64)
+                                    if turn == 0:
+                                        self.assertGreater(result['proof_work']['finished'], 0)
+                                    self.assertEqual(result['solver_nodes'], result['proof_work']['fresh_nodes'])
+                                    self.assertEqual([result['inference'][key] for key in
+                                        ('pending_rows', 'inflight_batches', 'active_producers')], [0, 0, 0])
+                            engine.wait_idle()
+                            for action in result['moves']:
+                                game.play(*action)
+                        history = [list(cell[:2]) for cell in game.cells]
+                        engine.reset(history)
+                        cancelled = multiprocessing.Event()
+                        cancelled.set()
+                        result = engine.turn(game, 1000, cancel=cancelled)
+                        self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+                        engine.wait_idle()
+                    finally:
+                        game.close()
+                    if native and solver:
+                        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
+                                   (3, 0), (-1, 1), (6, 6), (7, 7)]
+                        engine.reset(history)
+                        game = Game(history)
+                        try:
+                            result = engine.turn(game, 1000)
+                            for action in result['moves']:
+                                game.play(*action)
+                            self.assertEqual(game.winner, 0)
+                            self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+                            engine.wait_idle()
+                        finally:
+                            game.close()
+
+
+            from dense_player import DensePlayer
+            player = DensePlayer(Path(folder), 'cpu', model=path, native_scheduler=True, net_kernels='reference')
+            game = Game([[0, 0]])
+            try:
+                player.configure(dict(solver=True, solver_nodes=512))
+                with self.assertRaisesRegex(ValueError, 'time slices'):
+                    player.turn(game, 1000)
+                player.configure(dict(solver=False, simulations=16))
+                result = player.turn(game, 1000)
+                self.assertEqual(result['model_sha256'], player.model_sha256)
+                self.assertEqual(result['settings']['simulations'], 16)
+                self.assertLessEqual(result['scheduler_completed'], 16)
+                self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+                # Exact backend verdicts are position-scoped; both stones here belong to P2.
+                for winner, status, value in ((1, 'PROVEN_WIN', 1.), (0, 'UNKNOWN', .5)):
+                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                        service = service_type.return_value
+                        service.stats.return_value = dict(launched_rows=2)
+                        service.event.side_effect = [
+                            dict(producer=0, game=0, model=0, token=1, history=[[0, 0]], context='first',
+                                 action=[1, 0], exact_winner=-1, root_completed=1, completed=1,
+                                 edges=np.array([[1, 0, 0, 0, 0, 1, -1, -1, 0]], float)),
+                            dict(producer=0, game=0, model=0, token=2, history=[[0, 0], [1, 0]], context='second',
+                                 action=[2, 0], exact_winner=winner, root_completed=1, completed=1,
+                                 edges=np.array([[2, 0, 0, 0, 0, 1, winner, 1, 0]], float))]
+                        result = player.turn(game, 1000)
+                    self.assertEqual(result['proof_status'], status)
+                    self.assertEqual(result['win_probability'], value)
+                    self.assertEqual(result['stones'][0]['exact_winner'], -1)
+                    self.assertEqual(result['stones'][1]['exact_winner'], winner)
+                    self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # Release retained search and captures before replacement allocations.
+                old_pool = player._timed_native[1]
+                old_graph = unittest.mock.Mock()
+                player.evaluator.graph = old_graph
+                player.model_path = None
+                replacement = Path(folder)/'checkpoints/main/000002/ema.pt'
+                replacement.parent.mkdir(parents=True)
+                hexnet.save_model(replacement, model)
+                lifecycle = unittest.mock.Mock()
+                lifecycle.attach_mock(old_graph, 'graph')
+                with unittest.mock.patch('hexnet.DenseEvaluator', wraps=hexnet.DenseEvaluator) as construct:
+                    lifecycle.attach_mock(construct, 'construct')
+                    player.select('main/000002')
+                old_graph.close.assert_called_once()
+                self.assertIsNone(old_pool._ptr)
+                events = [call[0] for call in lifecycle.mock_calls]
+                self.assertLess(events.index('graph.close'), events.index('construct'))
+                self.assertEqual(player.checkpoint, 'main/000002')
+                self.assertIsNotNone(player.evaluator)
+            finally:
+                game.close()
+                player.close()
 
 
 class DenseBrowser(unittest.TestCase):
