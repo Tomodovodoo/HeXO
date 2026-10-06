@@ -108,6 +108,7 @@ struct Batch {
   if(count<1 || merge_cells<0)throw std::runtime_error("Invalid packed batch size");
   auto encode=rectangular?hxg_encode_rect:hxg_encode;
   for(int i=0;i<count;++i){auto* row=info.data()+13*int64_t(i);std::array<int64_t,10> metadata{};
+   if(!trees[i])throw std::runtime_error("Missing leaf batch tree");
    row[0]=encode(trees[i],requests[i],nullptr,0,nullptr,metadata.data());
    if(!row[0])throw std::runtime_error(gumbel::error);
    std::copy(metadata.begin(),metadata.begin()+9,row+1);row[12]=rectangular?metadata[9]:row[0];
@@ -175,7 +176,8 @@ struct Batch {
    caps[{int(s),int(w)}]=int(cap);}
   std::map<std::pair<int,int>,std::vector<int>> by_size;
   for(int i=0;i<int(decoded.size());++i){int side=int(info[13*int64_t(i)]);if(side<1)continue;
-   if(decoded[i])throw std::runtime_error("Packed prediction already completed");by_size[{side,int(info[13*int64_t(i)+12])}].push_back(i);}
+   if(decoded[i])throw std::runtime_error("Packed prediction already completed");
+   by_size[{side,int(info[13*int64_t(i)+12])}].push_back(i);}
   groups.clear();for(auto& [shape,rows]:by_size)groups.push_back({shape.first,shape.second,std::move(rows)});
   if(!cost.fitted)return;
   auto units=[&](int rows,int side,int width,int limit){double cells=0;int launches=0;
@@ -188,6 +190,25 @@ struct Batch {
    }
    return std::pair{cells,launches};
   };
+  if(rectangular && std::any_of(groups.begin(),groups.end(),[](const auto& g){return g.side!=g.width;})){
+   auto score=[&](int rows,int height,int width){auto cap=caps.find({height,width});
+    if(cap==caps.end())return std::numeric_limits<double>::infinity();
+    auto [cells,launches]=units(rows,height,width,cap->second);return cost.cell*cells+cost.launch*launches;};
+   // Shapes need not form a containment chain. Merge any two groups whose
+   // bounding canvas has lower measured execution cost than separate forwards.
+   for(;;){double saving=0;int first=-1,second=-1;
+    for(int i=0;i<int(groups.size());++i)for(int j=i+1;j<int(groups.size());++j){
+     auto& a=groups[i];auto& b=groups[j];
+     double gain=score(int(a.rows.size()),a.side,a.width)+score(int(b.rows.size()),b.side,b.width)
+       -score(int(a.rows.size()+b.rows.size()),std::max(a.side,b.side),std::max(a.width,b.width));
+     if(gain>saving){saving=gain;first=i;second=j;}
+    }
+    if(first<0)break;
+    auto& a=groups[first];auto& b=groups[second];a.side=std::max(a.side,b.side);a.width=std::max(a.width,b.width);
+    a.rows.insert(a.rows.end(),b.rows.begin(),b.rows.end());groups.erase(groups.begin()+second);
+   }
+   return;
+  }
   // A partition may merge adjacent sizes into its largest canvas. Score the
   // actual capture segments, including padding; retain every original row.
   std::vector<double> best(groups.size()+1,std::numeric_limits<double>::infinity());std::vector<int> before(best.size());best[0]=0;

@@ -184,8 +184,12 @@ def submit(evaluator, rows, max_cells=48*48*48):
             if costs is None:
                 costs = graph.packing_costs = PackingCosts()
             if rows.mixed:
-                limits = [] if graph.budget_exhausted else [(side, graph._limit(side, graph.max_batch))
-                         for side, _ in rows.groups if graph.supports(side)]
+                shapes = [(side, side) if isinstance(side, int) else side for side, _ in rows.groups]
+                # A compatible union can amortize launches without dropping any row or legal cell.
+                canvases = {(max(a[0], b[0]), max(a[1], b[1])) for a in shapes for b in shapes}
+                limits = [] if graph.budget_exhausted else [(h if h == w else (h, w),
+                          graph._limit(h if h == w else (h, w), graph.max_batch))
+                          for h, w in sorted(canvases) if graph.supports((h, w))]
                 rows.plan(costs, limits, evaluator.max_batch)
             handle.costs = costs
         observe = handle.costs is not None and handle.costs.sample()

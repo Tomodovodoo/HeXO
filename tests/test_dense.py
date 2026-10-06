@@ -98,14 +98,20 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 class HexcropTests(unittest.TestCase):
     def test_rectangles_keep_full_legal_geometry_and_decode_after_tree_close(self):
         import ctypes as C
-        from native_dense import PackedRows
-        from neural_search import GameGraph, native, checked
-        histories = [line_history(n, 4) for n in (1, 3, 7, 15, 25)]
+        from native_dense import PackedRows, PackingCosts
+        from neural_search import GameGraph, native, checked, bind, ptr
+        for rectangular in (False, True):
+            with self.assertRaisesRegex(ValueError, 'Missing leaf batch tree'):
+                PackedRows([0], [1], rectangular=rectangular)
+        histories = [line_history(n, 4) for n in (1, 3, 7, 15, 25)] + [[[0, 0], [0, 4], [0, 8]]]
         trees = [GameGraph(None, 'rectangles', h, tactics=False) for h in histories]
         self.addCleanup(lambda: [t.close() for t in trees])
         requests = []
         samples = [hexcrop.encode(h, rectangular=True) for h in histories]
         self.assertTrue(any(h != w for h, w in (s.shape for s in samples)))
+        legacy = SimpleNamespace(hxg_encode=native.hxg_encode)
+        actual = hexcrop.encode_leaf(legacy, None, 0, histories[-1], rectangular=True)
+        np.testing.assert_array_equal(actual.planes, samples[-1].planes)
         for tree, history, expected in zip(trees, histories, samples):
             checked(native.hxg_begin(tree.ptr, 1, 1))
             request = native.hxg_next(tree.ptr)
@@ -119,6 +125,12 @@ class HexcropTests(unittest.TestCase):
             self.assertEqual(actual.far, 0)
             for i, action in zip(actual.cells, actual.actions):
                 self.assertEqual(actual.point(i), tuple(action))
+        singles = SimpleNamespace(hxg_encode_many=native.hxg_encode_many,
+                                  hxg_encode_rect=native.hxg_encode_rect, hxg_legal=native.hxg_legal,
+                                  hxg_error=native.hxg_error)
+        leaves = [(t.ptr, r, h) for t, r, h in zip(trees, requests, histories)] * 2
+        for actual, expected in zip(hexcrop.encode_leaves(singles, leaves, rectangular=True), samples * 2):
+            np.testing.assert_array_equal(actual.planes, expected.planes)
         rows = PackedRows([t.ptr for t in trees], requests, 0, rectangular=True)
         self.addCleanup(rows.close)
         for tree in trees:
@@ -138,6 +150,29 @@ class HexcropTests(unittest.TestCase):
         logits = np.ctypeslib.as_array(C.cast(outputs[2], C.POINTER(C.c_double)), shape=(int(offsets[-1]),))
         for i, sample in enumerate(samples):
             np.testing.assert_array_equal(logits[offsets[i]:offsets[i+1]], sample.cells)
+        bind('hxgp_combine', ptr, ptr, ptr, C.c_int, C.c_int)
+        ids = np.array([1]*8+[5]*8, np.int32)
+        sources = np.full(len(ids), rows.ptr, np.uintp)
+        combined = PackedRows.from_native(native.hxgp_combine(sources.ctypes.data, ids.ctypes.data, len(ids), 0), len(ids))
+        self.addCleanup(combined.close)
+        costs = PackingCosts(); self.addCleanup(costs._free)
+        observed = np.array([[576, 1], [768, 1], [1024, 1], [2048, 2]], np.float64)
+        costs.learn(np.c_[observed, observed[:, 0]*.000001+observed[:, 1]])
+        combined.plan(costs, [((24, 32), 32), ((32, 24), 32), (32, 128)], 128)
+        self.assertEqual(combined.groups, [(32, 16)])
+        planes = np.empty((16, 8, 32, 32), np.uint8)
+        combined.pack(0, planes)
+        prediction = np.zeros((16, 1026), np.float32)
+        prediction[:, :-2] = np.fromfunction(lambda y, x: y*100+x, (32, 32)).reshape(-1)
+        combined.decode(0, 0, prediction)
+        output = combined.outputs()
+        offsets = np.ctypeslib.as_array(C.cast(output[0], C.POINTER(C.c_int64)), shape=(17,))
+        logits = np.ctypeslib.as_array(C.cast(output[2], C.POINTER(C.c_double)), shape=(int(offsets[-1]),))
+        for row, source in enumerate(ids):
+            sample = samples[source]
+            height, width = sample.shape
+            np.testing.assert_array_equal(planes[row, :, :height, :width], sample.planes)
+            np.testing.assert_array_equal(logits[offsets[row]:offsets[row+1]], sample.cells//width*100+sample.cells%width)
 
     def test_move_geometry_preserves_distant_legal_replies_as_measurements(self):
         sample = hexcrop.encode([[0, 0]], rectangular=True)

@@ -163,9 +163,10 @@ def encode(history, *, symmetry=None, rng=None, rectangular=False):
 
 def encode_leaf(native, tree, request, history, *, rectangular=False):
     """Encode an existing native search leaf; old libraries retain the non-replay Python path."""
-    if not hasattr(native, 'hxg_encode'):
-        return encode_game(Position(np.asarray(history, np.int64)), history)
-    encode = native.hxg_encode_rect if rectangular else native.hxg_encode
+    name = 'hxg_encode_rect' if rectangular else 'hxg_encode'
+    if not hasattr(native, name):
+        return encode_game(Position(np.asarray(history, np.int64)), history, rectangular=rectangular)
+    encode = getattr(native, name)
     encode.argtypes = [C.c_void_p, C.c_int, C.c_void_p, C.c_int, C.c_void_p, C.c_void_p]
     encode.restype = C.c_int
     info = np.empty(10 if rectangular else 9, np.int64)
@@ -187,7 +188,8 @@ def encode_leaf(native, tree, request, history, *, rectangular=False):
 
 def encode_leaves(native, leaves, *, allow_span=False, rectangular=False):
     """Encode a pending batch in two native calls; returned action arrays own their cache storage."""
-    if len(leaves) < 8 or not hasattr(native, 'hxg_encode_many'):
+    name = 'hxg_encode_many_rect' if rectangular else 'hxg_encode_many'
+    if len(leaves) < 8 or not hasattr(native, name):
         samples = []
         for tree, request, history in leaves:
             try:
@@ -197,7 +199,7 @@ def encode_leaves(native, leaves, *, allow_span=False, rectangular=False):
                     raise
                 samples.append(None)
         return samples
-    encode = native.hxg_encode_many_rect if rectangular else native.hxg_encode_many
+    encode = getattr(native, name)
     encode.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_void_p, C.c_void_p, C.c_int64,
                        C.c_void_p, C.c_void_p, C.c_int64]
     encode.restype = C.c_int

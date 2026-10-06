@@ -97,7 +97,7 @@ def digest(path):
 
 def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
-    paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'gumbel_owner.cpp', *GUMBEL_SOURCES, 'gumbel_parallel.hpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
+    paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'gumbel_owner.cpp', *GUMBEL_SOURCES, 'gumbel_parallel.hpp', 'gumbel_broker.hpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
     paths.append(TACTICAL/'stamps.json')
     paths += sorted(p for p in SHRIMP.rglob('*') if (p.suffix in ('.rs', '.lock') or p.name == 'Cargo.toml')
