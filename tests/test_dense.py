@@ -9681,16 +9681,20 @@ class DenseTimedWorker(unittest.TestCase):
             model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
-            for native in (False, True):
-                with self.subTest(native_scheduler=native), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
-                        search=dict(native_scheduler=native), solver=dict(enabled=False))) as engine:
+            for native, solver in ((False, False), (True, False), (True, True)):
+                search = dict(native_scheduler=native)
+                if solver:
+                    search['max_simulations'] = 64  # Complete early enough to inspect joined accounting.
+                with self.subTest(native_scheduler=native, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                        search=search, solver=dict(enabled=solver))) as engine:
                     game = Game([[0, 0]])
                     try:
                         for turn in range(2):
                             history = [list(cell[:2]) for cell in game.cells]
                             result = engine.turn(game, 1000)
                             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
-                            self.assertGreater(result.get('evaluated', 0), 0)
+                            if turn == 0 or not solver:
+                                self.assertGreater(result.get('evaluated', 0), 0)
                             self.assertEqual(result['backend'], 'dense')
                             self.assertEqual(result['model_sha256'], engine.model_sha256)
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
@@ -9700,11 +9704,38 @@ class DenseTimedWorker(unittest.TestCase):
                                 self.assertEqual(result['stones'][0]['history'], history)
                                 self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
                                 self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
+                                if solver:
+                                    if turn == 0:
+                                        self.assertGreater(result['proof_work']['finished'], 0)
+                                    self.assertEqual(result['solver_nodes'], result['proof_work']['fresh_nodes'])
+                                    self.assertEqual([result['inference'][key] for key in
+                                        ('pending_rows', 'inflight_batches', 'active_producers')], [0, 0, 0])
                             engine.wait_idle()
                             for action in result['moves']:
                                 game.play(*action)
+                        history = [list(cell[:2]) for cell in game.cells]
+                        engine.reset(history)
+                        cancelled = multiprocessing.Event()
+                        cancelled.set()
+                        result = engine.turn(game, 1000, cancel=cancelled)
+                        self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+                        engine.wait_idle()
                     finally:
                         game.close()
+                    if native and solver:
+                        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
+                                   (3, 0), (-1, 1), (6, 6), (7, 7)]
+                        engine.reset(history)
+                        game = Game(history)
+                        try:
+                            result = engine.turn(game, 1000)
+                            for action in result['moves']:
+                                game.play(*action)
+                            self.assertEqual(game.winner, 0)
+                            self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+                            engine.wait_idle()
+                        finally:
+                            game.close()
 
 
 class DenseBrowser(unittest.TestCase):
