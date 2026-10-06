@@ -33,6 +33,7 @@ export function proofAnswer(result, request) {
     }
   }
   const neural = [];
+  if ((result.neural_frontier?.length || 0) > (request.neural_frontier || 0)) throw new Error('Invalid solver neural frontier count');
   for (const endpoint of result.neural_frontier || []) {
     const path = endpoint.path;
     if (!request.neural_frontier || neural.length + 2 + 2 * path.length > request.neural_frontier * 130
