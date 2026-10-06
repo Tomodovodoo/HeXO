@@ -2165,11 +2165,23 @@ class Session:
 
     def job_list(self):
         """Queued and running jobs, then jobs that failed in the last ten seconds with their `error`; a job's live
-        search is shown only while its position is still on the board."""
+        search is shown only while its position is still on the board. Analysis failures belong to their settings
+        and position, so a late failure cannot stop analysis of a newly selected configuration."""
         now, current = time.time(), tuple(self.history)
-        return [job.summary() | ({} if job.history == current[:len(job.history)] else dict(live=None))
-                for job in self.jobs.values()
-                if job.status in ('queued', 'running') or job.status == 'failed' and now - job.ended < 10]
+        shown = []
+        for job in self.jobs.values():
+            same_position = job.history == current[:len(job.history)]
+            if job.status == 'failed':
+                if now - job.ended >= 10:
+                    continue
+                if job.kind == 'analyse' and (not same_position or any(
+                        job.seat.get(key) != (self.analysis or {}).get(key)
+                        for key in ('engine', 'checkpoint', 'preset', 'budget', 'device'))):
+                    continue
+            elif job.status not in ('queued', 'running'):
+                continue
+            shown.append(job.summary() | ({} if same_position else dict(live=None)))
+        return shown
 
     def poll(self, since):
         with self.lock:

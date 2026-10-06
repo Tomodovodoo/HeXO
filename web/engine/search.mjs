@@ -209,7 +209,7 @@ export class NeuralSearch {
     const start = performance.now(), stats = {evaluated: 0, hits: 0, batches: 0, largest: 0, network_ms: 0};
     const sample = rootSamples ?? Math.max(2, Math.floor(Math.sqrt(simulations)));
     this.n.checked(this.m._hxg_begin(this.ptr, simulations, sample));
-    let active = this.n.game(this.history).winner < 0, stopped = false;
+    let active = this.n.game(this.history).winner < 0, stopped = false, yielded = start;
     const finished = () => {
       const expired = stop();
       if (this.m._hxg_done(this.ptr) || expired) {
@@ -223,6 +223,12 @@ export class NeuralSearch {
       while (active) {
         let pending = [], idle = 0;
         while (active && pending.length < batchSize) {
+          // Cached and exact leaves need no inference await, but must still receive cancellation messages.
+          if (performance.now() - yielded >= 8) {
+            onBatch({...stats, completed: this.m._hxg_completed(this.ptr)});
+            await nextTask();
+            yielded = performance.now();
+          }
           if (finished()) idle = 0;
           else {
             const [id, leaf] = this.request();
@@ -265,6 +271,7 @@ export class NeuralSearch {
           });
           onBatch({...stats, completed: this.m._hxg_completed(this.ptr)});
           await nextTask();
+          yielded = performance.now();
         } else if (active) {
           finished();
           if (active && idle >= 1) throw new Error('Native scheduler stalled without pending evaluations');

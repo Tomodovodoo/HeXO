@@ -675,6 +675,70 @@ if (job.kind === 'encode') {
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;
+} else if (job.kind === 'cached-cancel') {
+  const cache = new EvaluationCache(), options = {history:[[0,0]],seed:1740}, budget = {simulations:128,rootSamples:16};
+  const evaluate = async leaves => leaves.map(({actions})=>({logits:actions.map(()=>0),q:actions.map(()=>0)}));
+  const first = new NeuralSearch(native,options);
+  const expected = await first.search({...budget,cache,evaluate}); first.close();
+  const tree = new NeuralSearch(native,options), clock = globalThis.performance, get = cache.get.bind(cache);
+  const channel = new MessageChannel();
+  let ticks=0,received=false,forwards=0;
+  channel.port1.onmessage=()=>{received=true;};
+  cache.get=key=>{const value=get(key);if(++ticks===1)channel.port2.postMessage('cancel');return value;};
+  // Advance a clock at each cache read so message delivery is independent of the test machine's speed.
+  globalThis.performance={now:()=>ticks*1000};
+  try {
+    const stopped=await tree.search({...budget,cache,evaluate:async leaves=>{forwards++;return evaluate(leaves);},stop:()=>received});
+    answer={received,stopped:stopped.stopped,completed:stopped.completed,forwards,hits:stopped.cache_hits};
+  } finally {
+    globalThis.performance=clock;cache.get=get;channel.port1.close();channel.port2.close();tree.close();
+  }
+  const retry = new NeuralSearch(native,options);
+  const found = await retry.search({...budget,cache,evaluate}); retry.close();
+  answer.retry={completed:found.completed,unchanged:JSON.stringify([found.action,found.policy])===JSON.stringify([expected.action,expected.policy])};
+} else if (job.kind === 'analysis-failure') {
+  const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
+  let calls = 0;
+  const entry = {id:'test',kind:'bubble',presets:{standard:{simulations:4,solver_nodes:0}}};
+  session.registerEngine(entry,{turn:async()=>{
+    if (++calls === 1) throw Error('Temporary inference failure');
+    return {value:.5,moves:[[0,1],[1,0]],top:[[0,1,1,.5]],solved:true};
+  }});
+  session.history = [[0,0]]; session.analysis = session.spec({engine:'test',preset:'standard',auto:true});
+  session.enqueue('analyse',session.history,session.analysis); await session.pump();
+  const elements = new Map(), requests = [], notices = [];
+  const element = () => ({classList:{toggle(){}},style:{setProperty(){}},firstChild:{style:{}},children:[],
+    replaceChildren(){},append(){},setAttribute(k,v){this[k]=v;}});
+  const page = {S:null,view:0,COLORS:['yellow','blue'],STOPS:['standard'],STOP_ICON:[''],asked:new Map(),
+    performance,placing:[],placed:new Set(),landed:new Map(),seenLabels:new Map(),fitted:false,
+    $:id=>{if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+    setIcon:(e,icon)=>{e.icon=icon;},toast:text=>notices.push(text),
+    fit(){},draw(){},tickClocks(){},renderPanels(){},renderAnalysis(){},
+    post:async(path,body)=>{requests.push([path,body]);},key:(q,r)=>`${q},${r}`};
+  runInNewContext(source.match(/^const playerAt=.*$/m)[0]+'\n'
+    + source.slice(source.indexOf('const failures='),source.indexOf('/* board geometry:'))
+    + source.slice(source.indexOf('function finished('),source.indexOf('function renderAnalysis('))
+    + source.slice(source.indexOf('function autoAnalyse('),source.indexOf('function renderGraph('))
+    + source.slice(source.indexOf('function renderJobs('),source.indexOf('/* game actions */')),page);
+  page.accept(session.state());
+  // Polling the same revision must keep the error visible without resubmitting it.
+  page.accept(session.state());
+  page.accept({instance:session.instance,revision:session.revision,jobs:[]});
+  const failure = {stage:elements.get('analysis-stage').textContent,title:elements.get('analysis-stage').title,
+    retry:elements.get('again')['aria-label'],requests:requests.length,notices:[...notices],calls};
+  await elements.get('again').onclick();
+  const retry = requests.at(-1);
+  const response = await session.request(...retry,'POST'); page.accept(response[1]); await session.idle;
+  page.accept(session.state());
+  const recovered = {calls,value:session.lookup(session.history)?.value,stage:elements.get('analysis-stage').textContent,
+    label:elements.get('again')['aria-label']};
+  page.accept({...session.state(),revision:session.revision+1,jobs:[
+    {id:1,kind:'analyse',status:'failed',ply:1,error:'Temporary inference failure'},
+    {id:99,kind:'analyse',status:'queued',ply:1,done:0,total:1}]});
+  const queued = {stage:elements.get('analysis-stage').textContent,
+    progress:elements.get('analysis-progress').style.visibility,label:elements.get('again')['aria-label']};
+  page.accept({...session.state(),revision:session.revision+1,jobs:[{id:1,kind:'analyse',status:'failed',ply:1,error:'Temporary inference failure'}]});
+  answer = {failure,retry,recovered,queued,afterRetry:elements.get('analysis-stage').textContent};
 } else if (job.kind === 'analysis-bar') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
   answer = job.cases.map(({history, value, live, top = [], node_value}) => {
