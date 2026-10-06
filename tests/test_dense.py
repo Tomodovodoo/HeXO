@@ -6984,7 +6984,7 @@ class ActorModelTests(unittest.TestCase):
             self.pick('latest')
 
     def test_worker_switches_between_games(self):
-        """The pointer moves as the first shard is written: the game started before it keeps the first model, the
+        """The pointer moves as the first shard is published: the game started before it keeps the first model, the
         next game plays the second, and the switch is an 'actor_model' event."""
         self.export('main/000010', 1.)
         self.export('main/000020', 2.)
@@ -6996,12 +6996,12 @@ class ActorModelTests(unittest.TestCase):
         dense_config.save(self.run, config)
         pointer = lambda cid: (self.run/'actor.json').write_text(json.dumps(dict(checkpoint=cid, reason='newest', vetoed=[])))
         pointer('main/000010')
-        write_shard = dense_data.write_shard
+        name = dense_selfplay.shard_name
 
-        def publish(path, identity, *args):
+        def publish():
             pointer('main/000020')
-            return write_shard(path, identity, *args)
-        with unittest.mock.patch.object(dense_data, 'write_shard', publish):
+            return name()
+        with unittest.mock.patch.object(dense_selfplay, 'shard_name', publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
         self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])

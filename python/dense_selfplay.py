@@ -167,7 +167,11 @@ class Evaluator(hexnet.DenseEvaluator):
         for small, large in zip(sizes, sizes[1:]):
             if all(a <= b for a, b in zip(small, large)) and len(groups[small])*(large[0]*large[1]-small[0]*small[1]) < MERGE_CELLS:
                 groups[large] = groups.pop(small)+groups[large]
-        chunks, staging = [], self.free.pop() if self.free else {}
+        try:  # one pop: a launcher thread may take a staging set concurrently
+            staging = self.free.pop()
+        except IndexError:
+            staging = {}
+        chunks = []
         for shape, indices in groups.items():
             height, width = shape
             size = height if height == width else shape
@@ -1338,7 +1342,6 @@ def worker(args):
                         process=args.worker,
                         pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
-        state['shards_written'] += 1
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
         elapsed = now-since['time']
         fields = dict(shard=name, games=games, rows=len(rows), terminal_fraction=terminal/games,
@@ -1347,18 +1350,23 @@ def worker(args):
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
         fields.update(book_games=sum(e.get('origin') == 'book' for e in episodes),
                       restart_games=sum(e.get('origin') == 'restart' for e in episodes))
-        # The writer thread owns these lists; the main loop keeps the GPU launcher supplied meanwhile.
+        # The writer thread owns these lists; the launcher keeps the GPU busy meanwhile. At most two
+        # shards wait to be written, so a stalled disk holds back the main loop instead of memory.
+        while len(writes) >= 2:
+            written(wait=1)
         writes.append((writer.submit(dense_data.write_shard, run/'shards'/name, identity, list(episodes), list(rows), 'actor'),
                        f'shard {name}: {games} games, {len(rows)} rows', fields))
         since.update(time=now, positions=state['positions'], evals=engine.evals)
         episodes.clear(); rows.clear()
         refresh_sources()
 
-    def written(wait=False):
-        """Log shards whose write finished, in order; a failed write raises here."""
-        while writes and (wait or writes[0][0].done()):
+    def written(wait=0):
+        """Count and log finished shard writes in order, first waiting for `wait` of them; a failed write raises."""
+        while writes and (wait > 0 or writes[0][0].done()):
             future, message, fields = writes.popleft()
             future.result()
+            wait -= 1
+            state['shards_written'] += 1
             log_event(run, 'actor', 'shard', message, **fields)
             print(json.dumps(fields), flush=True)
 
@@ -1450,7 +1458,7 @@ def worker(args):
                 status('playing'); last = time.perf_counter()
         if episodes:
             publish()
-        written(wait=True)
+        written(wait=len(writes))
         engine.drain()
         status('finished')
     except BaseException as error:

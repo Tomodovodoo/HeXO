@@ -127,11 +127,19 @@ class PackedRows:
             self.ptr = None
 
 
+def take_staging(evaluator):
+    """Check out a free host staging set. A launcher thread and its caller may both submit."""
+    try:
+        return evaluator.free.pop()
+    except IndexError:
+        return {}
+
+
 class Forward:
     """A submitted batch owns its staging until the GPU's completion event finishes."""
     def __init__(self, evaluator, rows):
         self.evaluator, self.rows = evaluator, rows
-        self.staging = evaluator.free.pop() if evaluator.free else {}
+        self.staging = take_staging(evaluator)
         self.chunks, self.event = [], None
         self.costs, self.observations = None, {}
 
