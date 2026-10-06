@@ -147,11 +147,12 @@ struct Loop {
   }catch(...){shutdown();throw;}
   for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
+  pool.proof_collect=[](void* p){return static_cast<Loop*>(p)->feedback();};
   pool.proof_bind=[](void* p,int i){static_cast<Loop*>(p)->bind(i);};
   pool.proof_ready=[](void* p){return static_cast<Loop*>(p)->completion_ready.load(std::memory_order_acquire);};
   pool.proof_listen=[](void* p,std::shared_ptr<owner::Signal> signal){auto& loop=*static_cast<Loop*>(p);std::lock_guard lock(loop.mutex);loop.listener=std::move(signal);};
  }
- ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;pool.proof_ready=nullptr;pool.proof_listen=nullptr;}
+ ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_collect=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;pool.proof_ready=nullptr;pool.proof_listen=nullptr;}
  void bind(int game){auto& store=*pool.games[game]->game;store.evidence_owner=this;store.evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
  void completed(const std::shared_ptr<Job>& job){
   // Quiet UNKNOWN results still drain on the bounded owner tick. Waking for
@@ -405,8 +406,9 @@ struct Loop {
  void prune(){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}}
  }
- void step(){
-  ++ticks;prune();collect();prune();
+ uint64_t feedback(){auto before=installed;prune();collect();prune();return installed-before;}
+  void step(){
+   ++ticks;feedback();
   for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;
    for(auto& v:o.views)if(v.active && v.tree->root->expanded)frontiers[i].offer(v.tree->root,v.history,v.relevance,std::abs(v.tree->root->q-v.tree->root->value));
   }

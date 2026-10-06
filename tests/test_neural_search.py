@@ -1610,6 +1610,7 @@ class NativeScheduler(unittest.TestCase):
 
     def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
         import ctypes as C
+        import time
         from neural_search import bind, ptr
         bind('hxgp_groups', C.c_int, ptr)
         bind('hxgp_group', C.c_int, ptr, C.c_int, ptr)
@@ -1628,8 +1629,18 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(native.hxgm_step(pools[0].ptr), -1)
             self.assertEqual(native.hxgm_free(pools[0].ptr), 0)
             self.assertTrue(native.hxb_start(service, 0.))
+            # Requests share a task only while one is queued. Both identical producers ask for their root before any
+            # answer, so hold the batches until their requests have met, however the threads are scheduled.
+            counters = np.zeros(10, np.uint64)
+            deadline = time.monotonic()+30
+            while not counters[1] and time.monotonic() < deadline:
+                time.sleep(.001)
+                native.hxb_stats(service, counters.ctypes.data)
+            self.assertGreater(counters[1], 0, 'identical requests from two producers did not share a task')
             for _ in range(1000):
-                if native.hxb_done(service):
+                done = native.hxb_done(service)
+                self.assertGreaterEqual(done, 0, native.hxg_error().decode())
+                if done:
                     break
                 token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
                 count = native.hxb_take(service, 128, 50., C.byref(token), C.byref(model), C.byref(snapshot))
@@ -1654,9 +1665,7 @@ class NativeScheduler(unittest.TestCase):
             else:
                 self.fail('Native producer service did not complete bounded work')
             self.assertEqual(models, {0,1})
-            counters = np.empty(10, np.uint64)
             native.hxb_stats(service, counters.ctypes.data)
-            self.assertGreater(counters[1], 0)
             self.assertEqual(tuple(counters[7:]), (0,0,0))
         finally:
             native.hxb_cancel(service)
@@ -2779,66 +2788,69 @@ class NativeProofs(unittest.TestCase):
             proofs.stats()
 
     def test_native_service_retires_a_neural_lease_when_real_solver_finishes(self):
-        import ctypes as C
-        import json
-        import threading
-        from neural_search import checked,ptr,bind
-        from tactical_proof import NativeTactics,independent_verify
-        bind('hxgp_free',None,ptr)
-        graph=self.graph(self.opening)
-        graph.search(1,root_samples=1,batch_size=1)
-        pool=self.pool([graph],quantum=16,views=4,work=4096)
-        entered,release=threading.Event(),threading.Event()
-        loop=service=None
-        token,model,snapshot=C.c_uint64(),C.c_int(),ptr()
-        with NativeTactics(independent=True) as library:
-            actual=library.lib.hexo_tactical_worker_answer
-            actual.argtypes,actual.restype=[ptr,C.c_char_p],ptr
-            # Hold the actual verified answer until a neural lease is in flight.
-            # This controls result ordering without inventing a game verdict.
-            @C.CFUNCTYPE(ptr,ptr,C.c_char_p)
-            def query(worker,request):
-                answer=actual(worker,request)
-                entered.set();release.wait(5)
-                return answer
-            names=('worker_new','worker_free','worker_answer','answer_info','answer_moves',
-                   'answer_json','answer_free','free','prepare','cancel','release','worker_busy')
-            functions=np.asarray([C.cast(query if name=='worker_answer' else
-                                 getattr(library.lib,'hexo_tactical_'+name),ptr).value
-                                  for name in names],np.uint64)
-            try:
-                loop=native.hxp_new(pool.ptr,functions.ctypes.data,1,4,1000,1,64,0)
-                self.assertTrue(loop)
-                service=native.hxb_new(16,2,0,0.)
-                self.assertTrue(service)
-                checked(native.hxb_attach(service,pool.ptr,0))
-                checked(native.hxb_start(service,0.))
-                self.assertTrue(entered.wait(2))
-                self.assertGreater(native.hxb_take(service,128,1000.,C.byref(token),
-                                                   C.byref(model),C.byref(snapshot)),0)
-                release.set()
-                counters=np.empty(10,np.uint64)
-                def retired():
-                    native.hxb_stats(service,counters.ctypes.data)
-                    return counters[9]==0
-                self.wait(retired)
-                # No neural answer was installed: CPU evidence retired its lease.
-                self.assertEqual(native.hxb_installed(service),0)
-                checked(native.hxb_abort(service,token));native.hxgp_free(snapshot);token.value=0
-                checked(native.hxb_join(service));checked(native.hxb_free(service));service=None
-                self.assertEqual(native.hxg_exact(graph.ptr),0)
-                row=json.loads(native.hxp_record(loop,0))
-                self.assertEqual(independent_verify(row['result']['certificate'],self.opening,
-                                                   known=row['request']['known']),'PROVEN_WIN')
-            finally:
-                release.set()
-                if service:
-                    native.hxb_cancel(service)
-                    if token.value:
-                        native.hxb_abort(service,token);native.hxgp_free(snapshot)
-                    checked(native.hxb_join(service));checked(native.hxb_free(service))
-                if loop:
-                    checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
+        for feedback in (False,True):
+            with self.subTest(feedback=feedback):
+                import ctypes as C
+                import json
+                import threading
+                from neural_search import checked,ptr,bind
+                from tactical_proof import NativeTactics,independent_verify
+                bind('hxgp_free',None,ptr)
+                graph=self.graph(self.opening)
+                graph.search(1,root_samples=1,batch_size=1)
+                pool=self.pool([graph],quantum=16,views=4,work=4096)
+                entered,release=threading.Event(),threading.Event()
+                loop=service=None
+                token,model,snapshot=C.c_uint64(),C.c_int(),ptr()
+                with NativeTactics(independent=True) as library:
+                    actual=library.lib.hexo_tactical_worker_answer
+                    actual.argtypes,actual.restype=[ptr,C.c_char_p],ptr
+                    # Hold the actual verified answer until a neural lease is in flight.
+                    # This controls result ordering without inventing a game verdict.
+                    @C.CFUNCTYPE(ptr,ptr,C.c_char_p)
+                    def query(worker,request):
+                        answer=actual(worker,request)
+                        entered.set();release.wait(5)
+                        return answer
+                    names=('worker_new','worker_free','worker_answer','answer_info','answer_moves',
+                           'answer_json','answer_free','free','prepare','cancel','release','worker_busy')
+                    functions=np.asarray([C.cast(query if name=='worker_answer' else
+                                         getattr(library.lib,'hexo_tactical_'+name),ptr).value
+                                          for name in names],np.uint64)
+                    try:
+                        loop=native.hxp_new(pool.ptr,functions.ctypes.data,1,4,1000,1,64,0)
+                        self.assertTrue(loop)
+                        service=native.hxb_new(16,2,0,0.)
+                        self.assertTrue(service)
+                        checked(native.hxb_feedback(service,feedback))
+                        checked(native.hxb_attach(service,pool.ptr,0))
+                        checked(native.hxb_start(service,0.))
+                        self.assertTrue(entered.wait(2))
+                        self.assertGreater(native.hxb_take(service,128,1000.,C.byref(token),
+                                                           C.byref(model),C.byref(snapshot)),0)
+                        release.set()
+                        counters=np.empty(10,np.uint64)
+                        def retired():
+                            native.hxb_stats(service,counters.ctypes.data)
+                            return counters[9]==0
+                        self.wait(retired)
+                        # No neural answer was installed: CPU evidence retired its lease.
+                        self.assertEqual(native.hxb_installed(service),0)
+                        checked(native.hxb_abort(service,token));native.hxgp_free(snapshot);token.value=0
+                        checked(native.hxb_join(service));checked(native.hxb_free(service));service=None
+                        self.assertEqual(native.hxg_exact(graph.ptr),0)
+                        row=json.loads(native.hxp_record(loop,0))
+                        self.assertEqual(independent_verify(row['result']['certificate'],self.opening,
+                                                           known=row['request']['known']),'PROVEN_WIN')
+                    finally:
+                        release.set()
+                        if service:
+                            native.hxb_cancel(service)
+                            if token.value:
+                                native.hxb_abort(service,token);native.hxgp_free(snapshot)
+                            checked(native.hxb_join(service));checked(native.hxb_free(service))
+                        if loop:
+                            checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
     def test_cancel_rejects_a_ready_completion_before_installation(self):
         graph = self.graph(self.opening)
