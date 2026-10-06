@@ -64,6 +64,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -608,6 +609,7 @@ class ReplayWindow:
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
+        self.admitted = self.indexed = None
         self.unlabelled = set(); self.deblunders = {}
         self.regret_mtime = None; self.regret_entries = {}; self.exact_regret = {}
         self.refresh()
@@ -687,11 +689,13 @@ class ReplayWindow:
         return shard
 
     def refresh(self):
-        """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
+        """Rescan manifests, recompute the window and load newly admitted shards; returns window rows. The indices
+        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed."""
         for path in shard_dirs(self.run_dir):
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
         names = self.names = sorted(self.manifests)
+        self.pacing_rows = None
         for name in [n for n, (_, labelled) in self.counts.items() if not labelled]:
             if (self.run_dir/'shards'/name/SIDECAR).exists():
                 del self.counts[name]
@@ -710,6 +714,7 @@ class ReplayWindow:
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         self.prune({n for n, _ in admitted})
+        changed = admitted[::-1] != self.admitted or self.regret_entries is not self.indexed
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
@@ -719,7 +724,11 @@ class ReplayWindow:
                     label(self.shards[name], labels); self.unlabelled.discard(name)
                     episodes, rows = read_shard(self.run_dir/'shards'/name, policies=False)
                     self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
-        self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
+                    changed = True
+        if not changed:
+            return self.rows
+        self.admitted, self.indexed = admitted[::-1], self.regret_entries
+        self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}; candidates = 0; train_offset = 0
         listed = {}
@@ -758,13 +767,18 @@ class ReplayWindow:
 
     @property
     def total_rows(self):
-        """Retained trained rows of the shards seen by the last refresh, held-out rows included: the pacing count."""
-        if self.cheap_row_fraction >= 1:
-            return sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0) for n in self.names)
-        for name in self.names:
-            if name not in self.counts:
-                self.counts[name] = self.count(name)
-        return sum(self.counts[n][0] for n in self.names)
+        """Retained trained rows of the shards seen by the last refresh, held-out rows included: the pacing count,
+        summed once per refresh."""
+        if self.pacing_rows is None:
+            if self.cheap_row_fraction >= 1:
+                self.pacing_rows = sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0)
+                                       for n in self.names)
+            else:
+                for name in self.names:
+                    if name not in self.counts:
+                        self.counts[name] = self.count(name)
+                self.pacing_rows = sum(self.counts[n][0] for n in self.names)
+        return self.pacing_rows
 
     def count(self, name):
         """(retained trained rows, whether its proof sidecar was read) of shard `name`, read from its files; rows the
@@ -1425,7 +1439,8 @@ class Renderers:
     trainer's GIL; at most depth * workers rendered batches wait in the queue. Worker i draws from its own generator
     seeded [*seed, i]; `run_seed` keys cheap-row retention (ReplayWindow seed). Settings (a LearnerSettings) are
     fixed per pool: close() it and start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
-    torch tensors}; a worker's exception or death is raised in the consumer."""
+    torch tensors}; a worker's exception or death is raised in the consumer. A receiving thread reads the next batch
+    from the worker queue while the consumer trains on the current one."""
 
     def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, regret_entries=None,
                  run_seed=0):
@@ -1439,6 +1454,32 @@ class Renderers:
                                                 self.regret_updates[i], regret_entries, run_seed))
                           for i in range(workers)]
         start_hidden(self.processes)
+        self.ready, self.stopped = queue.Queue(1), threading.Event()
+        self.receiver = threading.Thread(target=self.receive, daemon=True)
+        self.receiver.start()
+
+    def receive(self):
+        """Move rendered batches into `ready` as torch tensors, one ahead of the consumer, until close(); a worker's
+        exception, or RuntimeError for a worker that exited, is passed on in place of a batch."""
+        while not self.stopped.is_set():
+            try:
+                item = self.queue.get(timeout=1)
+                if not isinstance(item, BaseException):
+                    item = tensors(item)
+            except queue.Empty:
+                if all(p.is_alive() for p in self.processes):
+                    continue
+                item = RuntimeError('A render worker exited')
+            except BaseException as error:
+                item = error
+            while not self.stopped.is_set():
+                try:
+                    self.ready.put(item, timeout=1)
+                    break
+                except queue.Full:
+                    pass
+            if isinstance(item, BaseException):
+                return
 
     def set_calibration(self, calibration):
         self.calibration[:] = pack_calibration(calibration)
@@ -1453,20 +1494,22 @@ class Renderers:
     def __next__(self):
         while True:
             try:
-                item = self.queue.get(timeout=5)
+                item = self.ready.get(timeout=1)    # a timed wait keeps Ctrl+C deliverable on Windows
+                break
             except queue.Empty:
-                if not all(p.is_alive() for p in self.processes):
-                    raise RuntimeError('A render worker exited')
-                continue
-            if isinstance(item, BaseException):
-                raise item
-            return tensors(item)
+                pass
+        if isinstance(item, BaseException):
+            self.ready.put(item)
+            raise item
+        return item
 
     def close(self):
+        self.stopped.set()
         for process in self.processes:
             process.terminate()
         for process in self.processes:
             process.join()
+        self.receiver.join(5)    # a worker terminated mid-batch can leave it blocked on a partial read
         self.queue.cancel_join_thread()
         for updates in self.regret_updates:
             updates.cancel_join_thread()
