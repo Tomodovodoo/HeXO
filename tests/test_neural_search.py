@@ -1585,11 +1585,11 @@ class NativeScheduler(unittest.TestCase):
         pool = self.pool([graph,self.graph()], quantum=16, views=1, work=16, cache=0)
         service = InferenceService([pool],[SimpleNamespace(model_version='scheduler')], latency_ms=20.)
         token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
+        counts = np.empty(10,np.uint64)
         try:
             service.start(continuous=True)
             service.retarget(0,0,history,work=16,views=1)
             service.retarget(0,1,[(0,0)],work=16,views=1)
-            counts = np.empty(10,np.uint64)
             until = time.monotonic()+2
             while time.monotonic()<until:
                 native.hxb_stats(service.ptr,counts.ctypes.data)
@@ -1602,10 +1602,20 @@ class NativeScheduler(unittest.TestCase):
             event = service.event()
             self.assertEqual((event['game'],event['exact_winner']), (0,0))
         finally:
+            # Cancel the producer before aborting its copied device lease.
+            # Otherwise the empty abort result can finish the root as a failed
+            # span before close() gets a chance to request cancellation.
+            service.cancel()
+            until = time.monotonic()+2
+            while time.monotonic()<until:
+                native.hxb_stats(service.ptr,counts.ctypes.data)
+                if not counts[9]:break
+                time.sleep(.001)
             if token.value:
                 checked(native.hxb_abort(service.ptr,token))
                 native.hxgp_free(snapshot)
             final = service.close(completions=True)
+        self.assertEqual(counts[9], 0)
         self.assertEqual(len(final), 1)
         self.assertEqual((final[0]['game'],final[0]['token'],final[0]['history'],final[0]['error']),
                          (1,1,[[0,0]],'cancelled'))
