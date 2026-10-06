@@ -269,7 +269,7 @@ struct Pool {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
  std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
- void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
+ void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;uint64_t (*proof_collect)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
  void (*proof_bind)(void*,int)=nullptr;
  bool (*proof_ready)(void*)=nullptr;void (*proof_listen)(void*,std::shared_ptr<Signal>)=nullptr;
  void* inference_owner=nullptr;

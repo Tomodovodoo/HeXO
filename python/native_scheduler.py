@@ -35,6 +35,7 @@ for name, result, args in (
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
+    ('profile', C.c_int, [ptr, C.c_int]), ('feedback', C.c_int, [ptr, C.c_int]), ('schedule_stats', None, [ptr, ptr]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
     ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
@@ -417,7 +418,7 @@ class InferenceService:
     available with ms=0; interactive comparisons use a common clock.
     """
     def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
-                 merge_cells=32768, latency_ms=.2, flights=2):
+                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
@@ -427,11 +428,14 @@ class InferenceService:
             raise ValueError('One frozen evaluator is required for every pool model version')
         self.batch_size, self.pending, self.leases, self._stats = batch_size, [], {}, None
         self.flight_limit = flights
+        self.interleave_feedback = bool(interleave_feedback)
         self._ptr = native.hxb_new(quantum, pending, merge_cells, latency_ms)
         if not self._ptr:
             checked(False)
         try:
             checked(native.hxb_flights(self._ptr, flights))
+            checked(native.hxb_profile(self._ptr, bool(profile)))
+            checked(native.hxb_feedback(self._ptr, self.interleave_feedback))
             for pool in pools:
                 self.attach(pool,self.models[versions.index(pool.model_version)])
         except BaseException:
@@ -631,6 +635,27 @@ class InferenceService:
         native.hxb_flight_stats(self.ptr, flights.ctypes.data)
         result.update(zip(('batch_flight_limit', 'batch_flight_high_water',
                            'snapshot_limit_per_producer'), map(int, flights)))
+        # Opt-in observations and owner wall spans. Repeated queue samples are
+        # not unique work; sums over concurrent producers are not CPU occupancy.
+        timing = np.empty(39, np.uint64)
+        native.hxb_schedule_stats(self.ptr, timing.ctypes.data)
+        # Admission/gate counters are repeated observations, not unique rows or wait time.
+        # Urgent-at-entry marks certificates, checked solver endpoints or errors
+        # already awaiting collection; spans are whole installs, not exact delay overlap.
+        # Burst spans include interleaved collection time; these totals overlap.
+        names = ('profile_enabled', 'admission_samples', 'flight_capacity_samples', 'ready_samples',
+                 'ready_row_samples', 'head_age_ns', 'head_age_max_ns', 'partial_head_samples',
+                 'full_alternative_samples', 'larger_alternative_samples', 'lease_reservations',
+                 'partial_leases', 'idle_partial_leases', 'aged_partial_leases', 'full_leases',
+                 'partial_wait_samples', 'completion_packets', 'completion_rows',
+                 'completion_queue_age_ns', 'completion_queue_age_max_ns', 'packet_install_ns',
+                 'packet_install_max_ns', 'urgent_at_entry_packets', 'urgent_at_entry_packet_ns',
+                 'completion_bursts', 'burst_packets_max', 'burst_install_ns', 'burst_install_max_ns',
+                 'urgent_at_entry_bursts', 'urgent_at_entry_burst_ns', 'snapshot_gate_samples',
+                 'snapshot_gate_ready_samples', 'snapshot_gate_ready_row_samples', 'snapshot_gate_ready_rows_max', 'urgent_collections', 'urgent_collection_ns', 'urgent_collection_max_ns',
+                 'urgent_certificate_collections', 'urgent_certificates')
+        result.update(('schedule_'+key, int(value)) for key, value in zip(names, timing))
+        result['interleave_feedback'] = self.interleave_feedback
         # Native feed messages installed, including retired/empty messages.
         # This is not a neural-row or search-visit count.
         result['installed_message_rows'] = int(native.hxb_installed(self.ptr))
