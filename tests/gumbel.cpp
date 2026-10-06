@@ -24,6 +24,15 @@ int main(){
    assert(all[k]==gumbel::keys(replay) && all[k]==gumbel::keys(std::vector<Cell>(history.begin(),history.begin()+k)));
    if(k<history.size())replay.make(history[k]);
   }
+ // A node released between evictions, as an archive discard does, still has
+ // its expired index entries swept by the next evict within the store limit.
+ {gumbel::Tree t(29);assert(hxg_share(&t,64));t.root_at({{0,0},{1,0}});t.root_at({});
+  auto key=gumbel::keys(std::vector<Cell>{{0,0},{1,0}}).second;
+  auto expired=[&]{return std::count_if(t.nodes.begin(),t.nodes.end(),[](const auto& e){return e.second.expired();});};
+  {auto node=t.store.at(key);t.store.erase(key);t.discard(node);}
+  assert(expired()==1 && t.store.size()<=t.limit);
+  t.evict();assert(expired()==0 && !t.nodes.contains(key) && t.state->swept==t.state->released);
+  t.evict();assert(t.state->swept==t.state->released);
  }
  // Stored continuations reconnect through both legal orders of a turn, but
  // rule-position identity alone cannot alias different neural turn inputs.

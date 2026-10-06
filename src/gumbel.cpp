@@ -304,6 +304,8 @@ struct GameStore {
  std::unordered_map<Key,Summary,KeyHash> evicted_stats;
  std::unique_ptr<Archive> archive;Tree* primary=nullptr;
  size_t limit=0;uint64_t clock=0;int64_t evicted=0;void* scheduler_owner=nullptr;
+ // Nodes discarded so far, and that count when evict last swept expired index entries.
+ uint64_t released=0,swept=0;
  uint64_t half_losses=0;
  std::unordered_map<const void*,std::vector<Node*>> pins;
  // A native owner may observe installed evidence. Workers never call this.
@@ -573,7 +575,7 @@ struct Tree {
    e.write().child.reset();
   }}
   if(node->n)evicted_stats[node->context]={node->n,node->q,node->value,node->position};
-  node->dormant=false;
+  node->dormant=false;++state->released;
  }
  void trim_archive(bool need_slot=false,bool refresh=true){
   if(!state->archive)return;
@@ -596,6 +598,9 @@ struct Tree {
  void evict() {
   if(!shared || !limit || !requests.empty())return;
   trim_archive();
+  // Expanded nodes are a subset of the store, so a store within its limit has
+  // nothing to evict. Index entries expire only when discard releases a node.
+  if(store.size()<=limit && evicted_stats.size()<=4*limit && outcomes.size()<=16*limit && state->released==state->swept)return;
   auto count=[&]{size_t k=0;for(auto& [key,n]:store)k+=n->expanded;return k;};
   size_t expanded=count();
   const size_t target=expanded>limit?limit-limit/8:expanded;
@@ -623,9 +628,12 @@ struct Tree {
    std::nth_element(order.begin(),order.begin()+(order.size()-4*limit),order.end(),[](const auto& x,const auto& y){return x.first<y.first;});
    for(size_t i=0;i<order.size()-4*limit;++i)evicted_stats.erase(order[i].second);
   }
-  std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
-  for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
-  std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
+  if(state->released!=state->swept){
+   std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
+   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
+   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
+   state->swept=state->released;
+  }
   // Proven outcomes stay while a stored node or a kept summary holds their position; beyond sixteen times `limit` the
   // others go.
   if(outcomes.size()>16*limit){
