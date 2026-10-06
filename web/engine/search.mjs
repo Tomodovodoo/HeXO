@@ -631,7 +631,7 @@ export class NativeOwner {
       if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
       if (frontier) await frontier.close();
       return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
-        ...(frontier ? {proof_scheduler: frontier.finalStats, proof_records: frontier.records, solver_error: frontier.workerError} : {}),
+        ...(frontier ? {proof_scheduler: frontier.finalStats, proof_records: frontier.records, neural_records: frontier.neuralRecords, solver_error: frontier.workerError} : {}),
         batches, largest, network_ms: networkMs, inference, ...(capture ? {capture_pool: network.captureStats()} : {})};
     } catch (error) {
       this.cancel(); throw error;
@@ -652,13 +652,17 @@ export class NativeOwner {
 /** Transport for the compiled proof frontier. query(worker, request) must keep
  * each worker's resident solver table and resolve only after its slice stops. */
 export class NativeProofs {
-  constructor(owner, {query, cancel = null, maxSlice = cancel ? 1000 : 64, workers = 1, slice = 8, table = 4, tasks = 256, stamps = false, stop = () => false} = {}) {
+  constructor(owner, {query, cancel = null, maxSlice = cancel ? 1000 : 64, workers = 1, slice = 8, table = 4, tasks = 256, stamps = false, endpoints = 8, stop = () => false} = {}) {
     if (!owner.pool || owner.proofs || typeof query !== 'function') throw new Error('A free native owner and proof transport are required');
+    if (!Number.isInteger(endpoints) || endpoints < 0 || endpoints > 8) throw new Error('Neural frontier limit must be an integer from 0 to 8');
     if (maxSlice > 64 && typeof cancel !== 'function') throw new Error('Long solver slices require cooperative cancellation');
     this.owner = owner; this.n = owner.n; this.m = owner.m; this.query = query; this.workers = workers; this.stop = stop; this.signal = cancel;
-    this.pending = new Map(); this.failure = null; this.workerError = null; this.closing = null; this.records = [];
+    this.pending = new Map(); this.failure = null; this.workerError = null; this.closing = null; this.records = []; this.neuralRecords = [];
     this.ptr = this.m._hxpe_new(owner.pool, workers, workers, slice, table, tasks, Number(stamps), maxSlice);
-    this.n.checked(this.ptr); owner.proofs = this;
+    this.n.checked(this.ptr);
+    try { this.n.checked(this.m._hxp_neural(this.ptr, 0n, endpoints)); }
+    catch (error) { this.m._hxp_free(this.ptr); this.ptr = 0; throw error; }
+    owner.proofs = this;
   }
   check() { if (this.failure) throw this.failure; }
   cancelActive() { for (const worker of this.pending.keys()) this.signal?.(worker); }
@@ -672,6 +676,13 @@ export class NativeProofs {
     const info = this.n.alloc(104), moves = this.n.cells(cells), result = this.n.alloc(text.length);
     try {
       this.n.view(BigUint64Array, info, 13).set(data.map(BigInt)); this.n.view(Uint8Array, result, text.length).set(text);
+      if (found.neural?.length) {
+        const values = this.n.alloc(found.neural.length * 8);
+        try {
+          this.n.view(BigInt64Array, values, found.neural.length).set(found.neural.map(BigInt));
+          this.n.checked(this.m._hxpe_neural(this.ptr, worker, id, values, found.neural.length));
+        } finally { this.m._free(values); }
+      }
       this.n.checked(this.m._hxpe_complete(this.ptr, worker, id, info, moves, cells.length, result, 0));
     } finally { this.m._free(info); this.m._free(moves); this.m._free(result); }
   }
@@ -721,7 +732,10 @@ export class NativeProofs {
     try {
       this.m._hxp_stats(this.ptr, out, times);
       const values = Array.from(this.n.view(BigUint64Array, out, 16), Number), elapsed = Array.from(this.n.view(Float64Array, times, 4));
+      this.m._hxp_neural_stats(this.ptr, out);
+      const neural = Array.from(this.n.view(BigUint64Array, out, 6), Number);
       return {...Object.fromEntries(['ticks','submitted','started','finished','installed','cancelled','pruned','unknown','fresh_nodes','missing_fresh','queued','active','ready','tasks','facts','records'].map((name, i) => [name, values[i]])),
+        neural_frontier: Object.fromEntries(['paths','candidates','rejected','bytes','install_ns','records'].map((name, i) => [name, neural[i]])),
         ...Object.fromEntries(['worker_service_ms','worker_idle_ms','snapshot_ms','install_ms'].map((name, i) => [name, elapsed[i]]))};
     } finally { this.m._free(out); this.m._free(times); }
   }
@@ -734,6 +748,7 @@ export class NativeProofs {
       await Promise.all([...this.pending.values()]);
       this.n.checked(this.m._hxp_drain(this.ptr)); this.finalStats = this.stats();
       for (let i = 0; i < this.finalStats.records; i++) this.records.push(JSON.parse(this.m.UTF8ToString(this.m._hxp_record(this.ptr, i))));
+      for (let i = 0; i < this.finalStats.neural_frontier.records; i++) this.neuralRecords.push(JSON.parse(this.m.UTF8ToString(this.m._hxp_neural_record(this.ptr, i))));
       this.n.checked(this.m._hxp_free(this.ptr)); this.ptr = 0; this.owner.proofs = null;
       this.check();
     })();

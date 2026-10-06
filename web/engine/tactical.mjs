@@ -32,7 +32,18 @@ export function proofAnswer(result, request) {
       info[0] = verdict; info[1] = result.winner + 1; info[2] = result.proof_turns;
     }
   }
-  return {info, moves: info[0] ? moves : [], raw: info[0] ? JSON.stringify(result) : '',
+  const neural = [];
+  if ((result.neural_frontier?.length || 0) > (request.neural_frontier || 0)) throw new Error('Invalid solver neural frontier count');
+  for (const endpoint of result.neural_frontier || []) {
+    const path = endpoint.path;
+    if (!request.neural_frontier || neural.length + 2 + 2 * path.length > request.neural_frontier * 130
+        || !path.length || path.length > 64 || ![0, 1].includes(endpoint.reason)
+        || !path.every(p => p.length === 2 && p.every(n => Number.isInteger(n) && Math.abs(n) <= 1000000))) {
+      throw new Error('Invalid solver neural frontier');
+    }
+    neural.push(path.length, endpoint.reason, ...path.flat());
+  }
+  return {info, moves: info[0] ? moves : [], neural, raw: info[0] || neural.length ? JSON.stringify(result) : '',
     reason: result.reason, resident_reused: result.resident_reused, frontier_reused_nodes: result.frontier_reused_nodes};
 }
 
@@ -144,7 +155,7 @@ export async function loadTactical(source) {
   }
 
   function history(history, { nodes = 2500, ms = 1000, idtt_nodes = 0, depth = 8, attacker = 'mover',
-                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, known = [],
+                               certificate, root_moves, table_mb = 0, shortest = false, bounds = false, resume = false, neural_frontier = 0, known = [],
                                 stamps = false, library = null, replay = [], cancel = null } = {}) {
     checkBudgets(ms, nodes, idtt_nodes, depth, attacker, table_mb);
     if (resume && !table_mb) throw new RangeError('Solver resume requires a positive table_mb');
@@ -166,6 +177,7 @@ export async function loadTactical(source) {
     if (shortest) request.shortest = true;
     if (bounds) request.bounds = true;
     if (resume) request.resume = true;
+    if (neural_frontier) request.neural_frontier = neural_frontier;
     if (JSON.stringify(request).length > REQUEST_LIMIT) return unknown('request size limit');
     const result = { ...unknown('native error'), nodes_fresh: null, ...query(request, cancel) };
     if (performance.now() - start >= ms) Object.assign(result, {

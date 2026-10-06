@@ -2158,6 +2158,39 @@ class NativeProofs(unittest.TestCase):
                 self.fail('Native proof work did not finish')
             time.sleep(.002)
 
+    def test_quiet_solver_endpoint_enters_neural_queue_without_a_game_verdict(self):
+        history=[[0,0],[4,0],[7,0],[-1,0],[-2,0]]
+        endpoint=history+[[5,0],[6,0],[2,0],[8,0]]
+        graph=self.graph(history)
+        pool=self.pool([graph],quantum=16,views=8,depth=1,work=1024)
+        proofs=pool.enable_proofs(slice_ms=8,table_mb=1,workers=1,queue=1,endpoints=8)
+        pool.step();self.answer(pool);proofs.step()
+        self.wait(lambda:proofs.stats()['finished']>0);proofs.step()
+        self.assertGreater(proofs.stats()['neural_frontier']['candidates'],0)
+        self.assertEqual(native.hxg_exact(graph.ptr),-1)
+        seen=set()
+        for _ in range(300):
+            pool.step();batch=pool.feed.take(128)
+            if batch is not None:
+                seen.update(tuple(map(tuple,h.tolist())) for _,_,h in batch[1])
+                self.answer(pool,batch)
+            if tuple(map(tuple,endpoint)) in seen:break
+        self.assertIn(tuple(map(tuple,endpoint)),seen)
+        self.assertTrue(all(r['result']['status']=='UNKNOWN' for r in proofs.frontier_records()))
+        self.assertEqual(native.hxg_exact(graph.ptr),-1)
+        pool.cancel();proofs.drain();pool.abandon_fenced()
+        self.assertEqual(pool.games[0].stats()['pending'],0)
+        self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()),pool.games[0].stats()['root_completed'])
+
+    def test_rejected_endpoint_limit_leaves_proof_owner_reusable(self):
+        pool=self.pool([self.graph([[0,0]])],work=32)
+        for endpoints in [-1,9,1.5]:
+            with self.assertRaises(ValueError):pool.enable_proofs(endpoints=endpoints)
+            self.assertIsNone(pool.proofs)
+        proofs=pool.enable_proofs(endpoints=0,workers=1,queue=1,table_mb=1)
+        proofs.close()
+        self.assertIsNone(pool.proofs)
+
     def test_parallel_host_phases_deliver_proofs_without_cross_game_credits(self):
         from tactical_proof import independent_verify
         pool = self.pool([self.graph(self.opening) for _ in range(12)], quantum=16,

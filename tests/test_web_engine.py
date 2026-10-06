@@ -660,6 +660,28 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_worker_cannot_return_more_endpoints_than_requested(self):
+        request=dict(history=[[0,0]],attacker='mover',neural_frontier=1)
+        endpoint=dict(path=[[1,0]],reason=0)
+        answer=node(dict(kind='proof-answer',request=request,result=dict(status='UNKNOWN',neural_frontier=[endpoint,endpoint])))
+        self.assertIn('frontier count',answer['error'])
+
+    def test_rejected_browser_endpoint_limit_does_not_leak_owner(self):
+        answer=node(dict(kind='native-proofs',history=[[0,0]],ms=80,delay=1,rejectEndpoints=True,endpoints=0))
+        self.assertEqual(len(answer['rejectedEndpoints']),3)
+        self.assertNotIn('error',answer)
+        self.assertEqual((answer['stats']['pending'],answer['proof']['active'],answer['waits']),(0,0,0))
+
+    def test_cpu_quiet_endpoint_gets_neural_search_and_retains_unknown_status(self):
+        history=[[0,0],[4,0],[7,0],[-1,0],[-2,0]]
+        endpoint=history+[[5,0],[6,0],[2,0],[8,0]]
+        answer=node(dict(kind='native-proofs',history=history,ms=1000,slice=64,delay=1,views=8,depth=1))
+        self.assertNotIn('error',answer)
+        self.assertGreater(answer['proof']['neural_frontier']['candidates'],0)
+        self.assertIn(endpoint,answer['viewHistories'])
+        self.assertTrue(any(r['result']['status']=='UNKNOWN' for r in answer['neuralRecords']))
+        self.assertEqual((answer['stats']['pending'],answer['proof']['active'],answer['waits']),(0,0,0))
+
     def test_native_owner_work_limit_survives_default_and_explicit_clocks(self):
         for clock in [dict(defaultClock=True),dict(ms=1000)]:
             answer = node(dict(kind='native-owner',history=[[0,0]],work=32,delay=2,**clock))

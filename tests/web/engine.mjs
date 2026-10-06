@@ -196,7 +196,12 @@ if (job.kind === 'encode') {
       if(job.offer){middle=graph.view(job.offer.history.slice(0,-1));await middle.search({simulations:4,rootSamples:4,evaluate});
         peer=graph.view(job.offer.peer || job.offer.history);}
     }
-    const owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4});
+    const owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4,depth:job.depth??6});
+    const rejectedEndpoints=[];
+    if(job.rejectEndpoints)for(const endpoints of [-1,9,1.5]){
+      try{new NativeProofs(owner,{query:()=>Promise.resolve({info:Array(13).fill(0)}),endpoints});}
+      catch(error){rejectedEndpoints.push(String(error));}
+    }
     const network = new Network(null,null,'fp32',{model_version:'test'},1);
     network.forward = async (input,count,size)=>{
       forwards++;inForward=true;await new Promise(resolve=>setTimeout(resolve,job.delay??20));inForward=false;
@@ -238,11 +243,17 @@ if (job.kind === 'encode') {
         } finally {await frontier.close();if(answer){answer.proof=frontier.finalStats;answer.records=frontier.records;}owner.cancel();}
       } else {
         try {
-          const result=await owner.search({network,batchSize:16,proofs:{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false},stop:()=>cancelled});
-          answer={result,proof:result.proof_scheduler,records:result.proof_records};
+          const result=await owner.search({network,batchSize:16,proofs:{query,cancel:i=>Atomics.store(controls[i],0,1),workers:workers.length,slice:job.slice??8,stamps:false,endpoints:job.endpoints??8},stop:()=>cancelled});
+          answer={result,proof:result.proof_scheduler,records:result.proof_records,neuralRecords:result.neural_records};
         } catch(e){error=String(e);answer={error};}
       }
-      answer.stats=owner.stats();answer.events=events;answer.forwards=forwards;answer.waits=waits.size;answer.cancelled=cancelled;
+      answer.stats=owner.stats();answer.events=events;answer.forwards=forwards;answer.waits=waits.size;answer.cancelled=cancelled;answer.rejectedEndpoints=rejectedEndpoints;
+      answer.viewHistories=[];
+      for(let i=0;i<answer.stats.records;i++){
+        const count=native.m._hxgo_record_history(owner.ptr,i,0), buffer=native.alloc(count*16);
+        try{native.m._hxgo_record_history(owner.ptr,i,buffer);answer.viewHistories.push(native.pairs(buffer,count));}
+        finally{native.m._free(buffer);}
+      }
       owner.close();graph.at(job.history);answer.graph=graph.counters();
     } finally {owner.close();peer?.close();middle?.close();graph.close();}
   } finally {await Promise.all(workers.map(w=>w.terminate()));}
@@ -559,6 +570,8 @@ if (job.kind === 'encode') {
     const again = await graph.search({simulations: 32, rootSamples: 8, batchSize: 8, cache: new EvaluationCache(), evaluate});
     answer = {first: pick(first), back: pick(back), again: pick(again)};
   } finally { graph.close(); }
+} else if (job.kind === 'proof-answer') {
+  try{answer={result:proofAnswer(job.result,job.request)};}catch(error){answer={error:String(error)};}
 } else if (job.kind === 'tactical') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   answer = job.queries.map(({history, options}) => solver.history(history, options));

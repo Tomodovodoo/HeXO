@@ -16,7 +16,7 @@ extern "C" int hxgf_root_value(void*,void*,double*);
 extern "C" int hxgf_install(void*,const uint64_t*,int,const int64_t*,const int64_t*,const double*,const double*,void**,int);
 namespace owner {
 using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
-struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;};
+struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false;};
 struct View {std::unique_ptr<Tree> tree;Key key;std::vector<Cell> history;double relevance=1;uint64_t id=0,generation=0,completed=0,issued=0,cancelled=0;int depth=0,passes=0;bool active=false,discovered=false;};
 struct Record {uint64_t id,generation,completed,shared,context_a,context_b;int depth,exact;bool raw_known,estimate_known;double value,net,ms;std::vector<Cell> history;};
 struct FeedDeleter {void operator()(void* p)const{if(p)hxgf_free(p);}};
@@ -100,9 +100,32 @@ struct Owner {
   v.discovered=true;discover_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
  }
  bool live(const Key& key)const {for(auto& v:views)if(v.active && v.key==key)return true;return false;}
+ // Solver paths enter the same bounded queue as internally discovered views.
+ // Every intermediate position remains searchable; a quiet endpoint is not a proof.
+ size_t solver_path(const std::vector<Cell>& history,size_t begin,double relevance){
+  if(stopped || expired() || begin>=history.size())return 0;
+  size_t added=0;std::vector<Cell> prefix(history.begin(),history.begin()+begin);
+  for(size_t i=begin;i<history.size();++i){
+   prefix.push_back(history[i]);if(prefix.size()<=focus.size())continue;
+   // Automatic neural discovery keeps max_depth. A visited CPU line can end
+   // deeper; cap this separate, explicit handoff at 128 placements from focus.
+   int depth=int(prefix.size()-focus.size());if(depth>128)break;
+   auto keys=gumbel::keys(prefix);Key key=keys.second;
+   if(game->outcomes.contains(keys.first))break;
+   if(key==views[0].key || live(key))continue;
+   if(auto found=candidates.find(key);found!=candidates.end()){
+    found->second.solver=true;found->second.relevance=std::max(found->second.relevance,relevance/(1.+.05*double(i-begin)));continue;
+   }
+   if(candidates.size()>=16384)break;
+   auto found=game->nodes.find(key);if(found!=game->nodes.end())if(auto node=found->second.lock())if(node->exact_winner>=0)break;
+   Candidate c;c.history=prefix;c.depth=depth;c.solver=true;c.relevance=relevance/(1.+.05*double(i-begin));c.seen=allocations;
+   candidates.emplace(key,std::move(c));++added;
+  }
+  return added;
+ }
  Candidate* choose(Key& selected){
   Candidate* best=nullptr;double score=-1;bool explore=allocations%5==4;
-  for(auto& [key,c]:candidates){if(c.depth==0 || c.depth>max_depth || live(key))continue;
+  for(auto& [key,c]:candidates){if(c.depth==0 || (c.depth>max_depth && !c.solver) || live(key))continue;
    if(auto n=game->nodes.find(key);n!=game->nodes.end())if(auto node=n->second.lock())if(node->exact_winner>=0)continue;
    double age=double(allocations-c.last+1);double x=explore?age/std::sqrt(1.+c.completed):c.relevance*(1.+std::min(16.,age/16.))/std::sqrt(c.cost*(1.+double(c.completed)/quantum));
    // Stable key breaks ties; pointer/map iteration is not the schedule's ordering.

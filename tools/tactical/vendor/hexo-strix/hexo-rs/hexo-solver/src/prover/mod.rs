@@ -22,7 +22,7 @@ pub mod pn;
 pub mod portfolio;
 
 use hexo_engine::game::{GameConfig, GameState};
-use hexo_engine::types::Coord;
+use hexo_engine::types::{Coord, Player};
 use certificate::ProofCertificate;
 use io::{Line, Position, Report, Stats, UnverifiedBranch, Verdict};
 use std::rc::Rc;
@@ -88,6 +88,8 @@ pub struct ProverConfig {
     /// puzzle-dependence where low-branching positions want larger budgets.
     pub pn2_scale: u64,
     pub pn2_scale_inverse: bool,
+    /// Bounded CPU-to-neural paths. Zero leaves fixed-work proving unchanged.
+    pub neural_frontier: usize,
     pub leaf_budget: u64,
     pub leaf_budget_max: u64,
     /// Optional total level-1 node budget for PDS-PN root-attack screening in
@@ -111,6 +113,7 @@ impl Default for ProverConfig {
             pn2_nodes: 50_000,
             pn2_scale: 0,
             pn2_scale_inverse: false,
+            neural_frontier: 0,
             leaf_budget: 1_000_000,
             leaf_budget_max: 10_000_000,
             root_screen_budget: 0,
@@ -227,6 +230,15 @@ pub struct DriverResult {
     pub frontier_reused_nodes: u64,
     /// Accounted resident frontier capacity, excluding allocator metadata.
     pub frontier_bytes: u64,
+    pub neural_frontier: Vec<NeuralEndpoint>,
+}
+
+/// A visited forcing path, not a certificate or complete opponent coverage.
+#[derive(Clone, Debug)]
+pub struct NeuralEndpoint {
+    pub turns: Vec<(Vec<Coord>, Player)>,
+    /// 0: forcing search reached a quiet position; 1: unfinished slice.
+    pub reason: u8,
 }
 
 impl DriverResult {
@@ -242,6 +254,7 @@ impl DriverResult {
             resident_reused: false,
             frontier_reused_nodes: 0,
             frontier_bytes: 0,
+            neural_frontier: Vec::new(),
         }
     }
 }

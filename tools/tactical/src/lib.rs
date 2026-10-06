@@ -59,6 +59,8 @@ struct Request {
     #[serde(default)] bounds:bool,
     /// Carry resident entries and proven witnesses through table resizes.
     #[serde(default)] resume:bool,
+    /// Quiet/unfinished forcing paths offered to the native neural frontier.
+    #[serde(default)] neural_frontier:usize,
     #[serde(default)] known:Vec<Known>,
     #[serde(default)] stamps:bool,
     #[serde(default)] library:Option<Vec<StampSource>>,
@@ -283,7 +285,7 @@ fn run_controlled(req:Request, start:Instant, cancel:Arc<AtomicBool>) -> Result<
 fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTreeMap<Key,Solved>>,meter:&Meter) -> Result<Value,String> {
     if req.history.len()>800 || req.ms==0 || req.ms>60000 || req.nodes==0 || req.nodes>10_000_000
         || req.idtt_nodes>=req.nodes || req.depth==0 || req.depth>64 || req.table_mb>256
-        || (req.resume && req.table_mb==0) || req.known.len()>4096
+        || (req.resume && req.table_mb==0) || req.known.len()>4096 || req.neural_frontier>8
         || req.known.iter().map(|k|k.history.len()).sum::<usize>()>200_000
         || (!req.replay.is_empty() && (!req.stamps || req.certificate.is_some() || req.root_moves.is_some()))
         || (req.attacker==Attacker::Defender && req.root_moves.is_some()) {return Err("invalid tactical limits".into());}
@@ -343,6 +345,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
     let mut resident_reused=false;
     let mut frontier_reused_nodes=0;
     let mut frontier_bytes=0;
+    let mut neural_frontier=Vec::new();
     let mut incomplete=None;
     let cert=if !req.replay.is_empty() {
         match stamps::replay(&req.replay,&board,ply,side,&ctl,req.nodes) {Ok(cert)=>Some(cert),Err(reason)=>{incomplete=Some(reason);None}}
@@ -358,7 +361,8 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         } else {
             let pos=position(&board,side,remaining);
             let cfg=ProverConfig{driver:DriverKind::Pdspn,wide:true,depth_cap:req.depth,
-                node_budget:req.nodes,tt_mb:(req.nodes/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,..Default::default()};
+                node_budget:req.nodes,tt_mb:(req.nodes/NODES_PER_TT_MB).clamp(1,16) as usize,pn2_nodes:1000,
+                neural_frontier:req.neural_frontier,..Default::default()};
             if req.idtt_nodes>0 {
                 // A dedicated meter bounds the whole probe, PV reconstruction included.
                 let share=Meter::new(req.idtt_nodes);
@@ -372,6 +376,7 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
                 let found={let _time=stamps::measure("search");prover::pdspn::solve(&pos,&cfg,&ctl)};
                 proof_numbers=found.proof_numbers;resident_reused=found.resident_reused;
                 frontier_reused_nodes=found.frontier_reused_nodes;frontier_bytes=found.frontier_bytes;
+                neural_frontier=found.neural_frontier;
                 found.certificate
             };
             match found {
@@ -399,6 +404,24 @@ fn run_cached(req:Request,start:Instant,cancel:Arc<AtomicBool>,cache:&Mutex<BTre
         response["resident_reused"]=json!(resident_reused);
         response["frontier_reused_nodes"]=json!(frontier_reused_nodes);
         response["frontier_bytes"]=json!(frontier_bytes);
+    }
+    if req.neural_frontier>0 {
+        let mut paths=Vec::new();
+        for endpoint in neural_frontier {
+            let mut b=board.clone();let mut n=req.history.len();let mut path=Vec::new();let mut valid=true;
+            for (mut cells,player) in endpoint.turns {
+                let expected=if check::phase(n).0==0 {Player::P1}else{Player::P2};
+                if player!=expected {valid=false;break;}
+                let mut applied=check::apply(&b,n,&cells);
+                if applied.is_err() && cells.len()==2 {cells.reverse();applied=check::apply(&b,n,&cells);}
+                match applied {
+                    Ok((next,ply,false))=>{b=next;n=ply;path.extend(cells);}
+                    _=>{valid=false;break;}
+                }
+            }
+            if valid && !path.is_empty() && path.len()<=64 {paths.push(json!({"path":path,"reason":endpoint.reason}));}
+        }
+        response["neural_frontier"]=json!(paths);
     }
     if let Some(cert)=cert {
         let prepared=if let Some(ProofNode::Stamp{source})=cert.nodes.get(cert.root as usize) {

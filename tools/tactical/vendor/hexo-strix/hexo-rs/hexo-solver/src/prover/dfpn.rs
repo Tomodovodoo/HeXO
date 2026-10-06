@@ -263,13 +263,14 @@ pub struct Dfpn<'a> {
 
 impl<'a> Dfpn<'a> {
     fn new(
-        k: KernelCtx,
+        mut k: KernelCtx,
         cfg: &ProverConfig,
         ctl: &'a Ctl,
         pds_mode: bool,
         hints: Option<Rc<WinDepthHints>>,
         resident: Option<Resident>,
     ) -> Dfpn<'a> {
+        k.neural_limit(cfg.neural_frontier);
         let state = resident.unwrap_or_else(|| Resident::new(cfg.tt_mb));
         let frontier_limit = if RESIDENT_RESUME.with(|c| c.get()) {
             RESIDENT_MB.with(|c| c.get()) * 1024 * 1024
@@ -478,6 +479,7 @@ impl<'a> Dfpn<'a> {
         remaining: Option<u8>,
     ) -> (u32, u32) {
         if self.tick(depth) {
+            self.k.offer_neural(node, 1);
             return (1, 1); // bail; caller ignores the value once `exceeded`
         }
         let entry_nodes = self.nodes;
@@ -1090,6 +1092,7 @@ pub(crate) fn solve_mode_at_guided(
             }
         }
     }
+    res.neural_frontier = std::mem::take(&mut d.k.neural_frontier);
     res.stats = d.stats(elapsed);
     res.frontier_reused_nodes = d.frontier_reused_nodes;
     res.frontier_bytes = d.frontier_bytes as u64;

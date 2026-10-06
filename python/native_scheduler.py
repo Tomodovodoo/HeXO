@@ -52,6 +52,9 @@ for name, result, args in (
 ):
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
+bind('hxp_neural', C.c_int, ptr, C.c_uint64, C.c_int)
+bind('hxp_neural_stats', None, ptr, ptr)
+bind('hxp_neural_record', C.c_char_p, ptr, C.c_int)
 for name, result, args in (
     ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
     ('drain', C.c_int, [ptr]), ('free', C.c_int, [ptr]),
@@ -70,7 +73,9 @@ class ProofLoop:
     Recursive level-1 frames and kernel memos are still rebuilt per query.
     """
     def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
-                 tasks=256, stamps=False):
+                 tasks=256, stamps=False, endpoints=8):
+        if not isinstance(endpoints,int) or not 0<=endpoints<=8:
+            raise ValueError('Neural frontier limit must be an integer from 0 to 8')
         from tactical_proof import NativeTactics, PACKAGE
         self.pool = pool
         self.library = NativeTactics(PACKAGE if package is None else package)
@@ -78,10 +83,19 @@ class ProofLoop:
                  'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
         functions = np.asarray([C.cast(getattr(self.library.lib, 'hexo_tactical_'+name), ptr).value
                                 for name in names], np.uint64)
-        self._ptr = native.hxp_new(pool.ptr, functions.ctypes.data, workers, queue, slice_ms,
-                                   table_mb, tasks, bool(stamps))
-        if not self._ptr:
-            checked(False)
+        self._ptr = None
+        try:
+            callback=C.cast(self.library.lib.hexo_tactical_answer_frontier, ptr).value if endpoints else 0
+            self._ptr = native.hxp_new(pool.ptr, functions.ctypes.data, workers, queue, slice_ms,
+                                       table_mb, tasks, bool(stamps))
+            if not self._ptr:
+                checked(False)
+            checked(native.hxp_neural(self._ptr, callback, endpoints))
+        except BaseException:
+            if self._ptr:
+                checked(native.hxp_free(self._ptr));self._ptr=None
+            self.library.close()
+            raise
 
     @property
     def ptr(self):
@@ -120,12 +134,20 @@ class ProofLoop:
         native.hxp_scope_stats(self.ptr, scope.ctypes.data)
         result['scope'] = dict(zip(('refreshes', 'changed', 'unchanged', 'refresh_ns', 'available_facts',
                                    'sent_facts', 'empty_jobs', 'quantum_ms', 'indexed_cells', 'closed_scopes'), map(int, scope)))
+        frontier=np.empty(6, np.uint64)
+        native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
+        result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
         return result
 
     def records(self):
         """Inspect verified evidence and its actual conditional request context."""
         import json
         return [json.loads(native.hxp_record(self.ptr, i)) for i in range(self.stats()['records'])]
+
+    def frontier_records(self):
+        """CPU-to-neural paths are exploration records, never proof targets."""
+        import json
+        return [json.loads(native.hxp_neural_record(self.ptr, i)) for i in range(self.stats()['neural_frontier']['records'])]
 
     def effort(self, game):
         """Actual fresh work charged to the dispatched game/search generation.
