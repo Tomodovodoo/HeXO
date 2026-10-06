@@ -2409,6 +2409,28 @@ class DenseDataTests(unittest.TestCase):
                 stream.close()
             self.assertTrue(any((Path(tmp)/'cache'/'policies').glob('*.f32')))
 
+    def test_render_worker_failures_reach_the_consumer(self):
+        settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0.)
+        with tempfile.TemporaryDirectory() as tmp:
+            stream = dense_data.Renderers(tmp, settings, [4], workers=1, depth=1)    # no shards: the worker waits
+            try:
+                stream.processes[0].terminate()
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, 'render worker exited'):
+                        next(stream)
+            finally:
+                stream.close()
+            rng = np.random.default_rng(5)
+            write_games(Path(tmp)/'shards'/'000001', [(random_game(rng, 16)[0], -1, None), (winning_game(), 0, None)])
+            rows = Path(tmp)/'shards'/'000001'/'rows.json'
+            rows.write_text(rows.read_text().replace('"ply": 0', '"ply": 1', 1))
+            stream = dense_data.Renderers(tmp, settings, [4], workers=1, depth=1)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'Render worker failed'):
+                    next(stream)
+            finally:
+                stream.close()
+
     def test_pipeline_benchmark_copies_newest_shards_and_times_stages(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('bench_dense_data', ROOT/'tools'/'bench_dense_data.py')
