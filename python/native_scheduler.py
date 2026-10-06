@@ -141,13 +141,13 @@ class ProofLoop:
         frontier=np.empty(6, np.uint64)
         native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
         result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
-        counts, idle = np.empty(10, np.uint64), np.empty(6, np.float64)
+        counts, idle = np.empty(11, np.uint64), np.empty(5, np.float64)
         native.hxp_supply_stats(self.ptr, counts.ctypes.data, idle.ctypes.data)
-        result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_cooldown', 'supply_pending',
+        result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_deferred', 'supply_pending',
                            'supply_closed', 'supply_dormant', 'supply_full_exits', 'supply_empty_exits',
-                           'supply_first_queries'), map(int, counts)))
-        result.update(zip(('idle_capacity_ms', 'idle_cooldown_ms', 'idle_pending_ms', 'idle_closed_ms',
-                           'idle_empty_ms', 'idle_refill_ms'), map(float, idle)))
+                           'supply_first_queries', 'supply_deferred_dispatched'), map(int, counts)))
+        result.update(zip(('idle_capacity_ms', 'idle_pending_ms', 'idle_closed_ms', 'idle_dormant_ms',
+                           'idle_empty_ms'), map(float, idle)))
         return result
 
     def records(self):
