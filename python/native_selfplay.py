@@ -96,6 +96,7 @@ class NativeGames:
                 self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size,
                     quantum=min(128,batch_size),pending=4)
                 self.service.start(continuous=True)
+                self.service.launch()
                 for key in self.idle:
                     self.service.release(*key,expected=0)
             except BaseException:
@@ -131,6 +132,7 @@ class NativeGames:
                                             if proof_workers else None)
             self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size)
             self.service.start(continuous=True)
+            self.service.launch()
             for index in range(len(games)):
                 self.next_root(index)
         except BaseException:
@@ -344,9 +346,12 @@ class NativeGames:
     def resume(self):
         self.service.resume()
 
-    def step(self):
-        """Pump bulk inference and consume immutable placement/lifecycle events."""
-        self.service.pump()
+    def step(self, wait_ms=50.):
+        """Consume immutable placement/lifecycle events, waiting up to `wait_ms` for one.
+
+        The service's launcher thread keeps forwards running meanwhile.
+        """
+        self.service.wait(wait_ms)
         finished = []
         while (event:=self.service.event()) is not None:
             key = event['producer'],event['game']

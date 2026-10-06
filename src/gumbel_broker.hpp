@@ -346,6 +346,12 @@ struct Broker {
  void publish(Producer& p,int game,uint64_t token,RootEvent event,bool released=false){
   std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
  }
+ // Block a consumer until a root event, a failure or the end of all producers.
+ bool wait_event(double ms){
+  std::unique_lock lock(mutex);
+  wake.wait_for(lock,std::chrono::duration<double,std::milli>(ms),[&]{return !events.empty() || !error.empty() || cancelled || done_locked();});
+  return !events.empty();
+ }
  bool next_event(){
   std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return false;
   auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);return true;
@@ -643,6 +649,7 @@ HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);i
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_release(void* p,int producer,int game,uint64_t expected){try{static_cast<inference::Broker*>(p)->release(producer,game,expected);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_wait_event(void* p,double ms){return static_cast<inference::Broker*>(p)->wait_event(ms);}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 // Borrowed immutable storage lasts until the next event or service destruction.
 // Copy it before continuing. count=-1 denotes a metadata-only lifecycle/error.
