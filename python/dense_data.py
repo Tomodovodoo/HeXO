@@ -531,7 +531,10 @@ def trained_rows(side, game, ply):
 
 def shard_dirs(run_dir):
     root = Path(run_dir)/'shards'
-    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()) if root.exists() else []
+    if not root.exists():
+        return []
+    with os.scandir(root) as entries:   # directory entries carry their type, so no stat per shard
+        return sorted(root/e.name for e in entries if e.name.isdigit() and e.is_dir())
 
 
 def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
@@ -629,6 +632,28 @@ class ReplayWindow:
                     errors[i] = regret
         return errors
 
+    def priority_rows(self, name, entries):
+        """(ascending row indices, weights) of admitted shard `name`'s priority rows: restart buffer `entries`
+        [(game, ply, weight)] matched to rows by game and ply, and the shard's certified value errors; a row in
+        both takes the larger weight."""
+        s = self.shards[name]
+        keys = s.game.astype(np.int64)*2**16+s.ply
+        order = np.argsort(keys)
+        entries = [(game*2**16+ply, weight) for game, ply, weight in entries
+                   if 0 <= game < 2**31 and 0 <= ply < 2**15 and len(keys)]
+        wanted = np.array([key for key, _ in entries], np.int64)
+        at = np.minimum(np.searchsorted(keys, wanted, sorter=order), len(keys)-1)
+        hit = keys[order[at]] == wanted
+        errors = self.exact_regret[name]
+        rows = np.concatenate([order[at[hit]], np.fromiter(errors, np.int64, len(errors))])
+        weights = np.concatenate([np.array([weight for _, weight in entries], np.float64)[hit],
+                                  np.fromiter(errors.values(), np.float64, len(errors))])
+        order = np.lexsort((-weights, rows))
+        rows, weights = rows[order], weights[order]
+        first = np.ones(len(rows), bool)
+        first[1:] = rows[1:] != rows[:-1]
+        return rows[first], weights[first]
+
     def load(self, name):
         path = self.run_dir/'shards'/name
         episodes, rows = read_shard(path, policies=False)
@@ -696,7 +721,11 @@ class ReplayWindow:
                     self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
         self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
-        self.starts = {}; candidates = 0; loss_positions = {}; train_offset = 0
+        self.starts = {}; candidates = 0; train_offset = 0
+        listed = {}
+        for (name, game, ply), weight in self.regret_entries.items():
+            listed.setdefault(name, []).append((game, ply, weight))
+        priority_positions, priority_weights = [], []
         for k, (name, take) in enumerate(self.admitted):
             s = self.shards[name]; full = np.diff(s.offsets) > 0; positions = np.flatnonzero(full)
             start = self.starts[name] = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
@@ -707,10 +736,11 @@ class ReplayWindow:
             train = i[~held]; candidates += len(train)
             if self.cheap_row_fraction < 1:
                 train = train[retained(self.seed, name, full, (s.proven != 0) | (s.known_result != 0), self.cheap_row_fraction)[train]]
-            for row, regret in self.exact_regret[name].items():
-                position = int(np.searchsorted(train, row))
-                if position < len(train) and train[position] == row:
-                    loss_positions[train_offset+position] = regret
+            priority, weight = self.priority_rows(name, listed.get(name, ()))
+            position = np.searchsorted(train, priority)
+            found = position < len(train)
+            found[found] = train[position[found]] == priority[found]
+            priority_positions.append(train_offset+position[found]); priority_weights.append(weight[found])
             train_offset += len(train)
             for (ids, rows), chosen in zip(parts, (train, i[held])):
                 ids.append(np.full(len(chosen), k, np.int32)); rows.append(chosen)
@@ -719,16 +749,8 @@ class ReplayWindow:
         self.index, self.validation = (Rows(names, flat(ids), flat(rows)) for ids, rows in parts)
         self.rows = candidates+len(self.validation)
         self.retained_rows = len(self.index); self.retained_fraction = self.retained_rows/candidates if candidates else 1.
-        priorities = {}
-        if self.regret_entries:
-            for k, (name, i) in enumerate(self.index):
-                weight = self.regret_entries.get((name, int(self.shards[name].game[i]), int(self.shards[name].ply[i])))
-                if weight is not None:
-                    priorities[k] = weight
-        for position, regret in loss_positions.items():
-            priorities[position] = max(priorities.get(position, 0.), regret)
-        self.regret_positions = np.array(sorted(priorities), np.int32)
-        self.regret_weights = np.array([priorities[k] for k in self.regret_positions], np.float64)
+        self.regret_positions = np.concatenate([np.zeros(0, np.int32), *priority_positions]).astype(np.int32)
+        self.regret_weights = np.concatenate([np.zeros(0), *priority_weights])
         self.regret_rows = len(self.regret_positions)
         self.regret_probability_cache = {}
         self.regret_distribution_cache = {}
