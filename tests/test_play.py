@@ -774,6 +774,23 @@ class Jobs(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.session.undo([2])
 
+    def test_an_unseen_analysis_failure_belongs_to_its_settings_and_position(self):
+        self.engines.evaluate = unittest.mock.Mock(side_effect=RuntimeError('weights unreadable'))
+        old = self.session.analyse(0)
+        wait(lambda: self.session.jobs[old].status == 'failed')
+        # The page has not polled the failure before changing its selected preset.
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=False)
+        self.assertFalse(self.session.state()['jobs'])
+        current = self.session.analyse(0, force=True)
+        wait(lambda: self.session.jobs[current].status == 'failed')
+        self.assertEqual([j['id'] for j in self.session.state()['jobs']], [current])
+        self.assertEqual(self.session.state()['jobs'][0]['error'], 'weights unreadable')
+        self.session.load([(0, 0), (1, 0)], True)
+        branch = self.session.analyse(2, force=True)
+        wait(lambda: self.session.jobs[branch].status == 'failed')
+        self.session.load([(0, 0), (0, 1)], True)
+        self.assertNotIn(branch, [j['id'] for j in self.session.state()['jobs']])
+
     def test_failures_reach_the_page_and_rescans_drop_vanished_engines(self):
         def broken(*args, **options):
             raise RuntimeError('weights unreadable')
