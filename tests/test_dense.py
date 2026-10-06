@@ -4571,6 +4571,53 @@ class EngineTests(unittest.TestCase):
         service.close()
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
 
+    def test_launcher_thread_feeds_forwards_until_pause_and_raises_its_failure(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        histories = [[[0,0],[1,r]] for r in range(-2,2)]
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,h) for h in histories],views=1,work=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=16)
+        service = InferenceService([pool],[evaluator],batch_size=8,quantum=64)
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.launch()
+        def collect(count):
+            # The caller only waits for and reads events; it never pumps.
+            events, end = [], time.monotonic()+10
+            while len(events)<count and time.monotonic()<end:
+                service.wait(100.)
+                while (event:=service.event()) is not None:
+                    events.append(event)
+            return events
+        tokens = {}
+        for index, history in enumerate(histories):
+            service.retarget(0,index,history,work=8,views=1)
+        for event in collect(len(histories)):
+            tokens[event['game']] = event['token']
+        self.assertEqual(set(tokens),set(range(len(histories))))
+        service.pause()
+        launched = service.stats()['launched_rows']
+        for index, history in enumerate(histories):
+            service.retarget(0,index,history+[[3,0]],expected=tokens[index],work=8,views=1)
+        self.assertFalse(service.wait(50.))
+        self.assertEqual(service.stats()['launched_rows'],launched)
+        service.resume()
+        events = collect(len(histories))
+        self.assertEqual({e['game'] for e in events},set(range(len(histories))))
+        self.assertTrue(all(e['completed']==8 for e in events))
+        self.assertGreater(service.stats()['launched_rows'],launched)
+        with unittest.mock.patch.object(native_dense,'submit',side_effect=RuntimeError('forward failed')):
+            token = next(e['token'] for e in events if e['game']==0)
+            service.retarget(0,0,histories[0]+[[3,0],[4,0]],expected=token,work=8,views=1)
+            with self.assertRaisesRegex(RuntimeError,'forward failed'):
+                end = time.monotonic()+10
+                while time.monotonic()<end:
+                    service.wait(50.)
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']),(0,0))
+
     def test_continuous_pause_fences_forwards_then_resumes_every_game(self):
         from native_scheduler import InferenceService
         from neural_search import native
@@ -6999,7 +7046,7 @@ class ActorModelTests(unittest.TestCase):
             self.pick('latest')
 
     def test_worker_switches_between_games(self):
-        """The pointer moves as the first shard is written: the game started before it keeps the first model, the
+        """The pointer moves as the first shard is published: the game started before it keeps the first model, the
         next game plays the second, and the switch is an 'actor_model' event."""
         self.export('main/000010', 1.)
         self.export('main/000020', 2.)
@@ -7011,12 +7058,12 @@ class ActorModelTests(unittest.TestCase):
         dense_config.save(self.run, config)
         pointer = lambda cid: (self.run/'actor.json').write_text(json.dumps(dict(checkpoint=cid, reason='newest', vetoed=[])))
         pointer('main/000010')
-        write_shard = dense_data.write_shard
+        name = dense_selfplay.shard_name
 
-        def publish(path, identity, *args):
+        def publish():
             pointer('main/000020')
-            return write_shard(path, identity, *args)
-        with unittest.mock.patch.object(dense_data, 'write_shard', publish):
+            return name()
+        with unittest.mock.patch.object(dense_selfplay, 'shard_name', publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
         self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
@@ -7042,11 +7089,12 @@ class ActorModelTests(unittest.TestCase):
                 opening_random_plies=0.))
         dense_config.save(self.run,config)
         (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010',reason='newest',vetoed=[])))
-        write_shard = dense_data.write_shard
-        def publish(path,identity,*args):
+        name = dense_selfplay.shard_name
+        def publish():
+            # The controller rotates the checkpoint as the first shard is published.
             (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020',reason='newest',vetoed=[])))
-            return write_shard(path,identity,*args)
-        with unittest.mock.patch.object(dense_data,'write_shard',publish):
+            return name()
+        with unittest.mock.patch.object(dense_selfplay,'shard_name',publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=6,initial_model=None))
         status = json.loads((self.run/'actor-status.json').read_text())
         self.assertEqual((status['stage'],status['games_completed']),('finished',6))
@@ -9749,7 +9797,7 @@ class DenseTimedWorker(unittest.TestCase):
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
                             if native:
                                 self.assertTrue(result['settings']['native_scheduler'])
-                                self.assertEqual(len(result['stones']), 2)
+                                self.assertEqual(len(result['stones']), 2, result)
                                 self.assertEqual([s['move'] for s in result['stones']], result['moves'])
                                 self.assertEqual(result['stones'][0]['history'], history)
                                 self.assertEqual(result['stones'][1]['history'], history+[result['moves'][0]])
@@ -9843,6 +9891,7 @@ class DenseTimedWorker(unittest.TestCase):
                     service.event.side_effect = completion
                     service.close.side_effect = lambda **kw: [frames[1]] if kw.get('completions') else None
                     result = player.turn(game, 1000)
+                    service.launch.assert_called_once()
                     service.cancel.assert_called_once()
                     service.pump.assert_not_called()
                     self.assertIn(unittest.mock.call(completions=True), service.close.call_args_list)

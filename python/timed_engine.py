@@ -306,6 +306,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
         service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=64,
                                    pending=2, flights=2, interleave_feedback=True)
         service.start(continuous=True)
+        # Inference collection may wait for a whole CPU/GPU batch. Keep it off
+        # the turn thread so a ready root choice can be published immediately.
+        service.launch()
         selected, token = [], 0
         while game.player == side and game.winner < 0 and not stopped():
             first = remaining == 2 and not selected
@@ -341,7 +344,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                             raise ValueError('Multiple final completions for one native turn root')
                         found = finals[0] if finals else None
                     break
-                service.pump()
+                service.wait(max(0., min(1., (normal-time.monotonic())*1000)))
             if found is None:
                 break
             token += 1
