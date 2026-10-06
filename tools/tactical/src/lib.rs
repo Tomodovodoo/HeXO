@@ -778,6 +778,18 @@ mod tests {
         assert_eq!(result["nodes_fresh"],0);
     }
     #[test]
+    fn certificates_keep_checked_attacker_alternatives() {
+        let (pos,..)=setup(5000);
+        let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":60000,"nodes":5000,"idtt_nodes":0,"depth":8})).unwrap();
+        let result=run(req,Instant::now()).unwrap();
+        assert_eq!(result["status"],"PROVEN_WIN");
+        let cert:ProofCertificate=serde_json::from_value(result["certificate"].clone()).unwrap();
+        let alternatives:usize=cert.nodes.iter().map(|n|match n {ProofNode::AttackerMove{alternatives,..}=>alternatives.len(),_=>0}).sum();
+        assert!(alternatives>0);
+        // This checker walks every alternative subtree, not only the primary strategy.
+        assert!(prover::certificate::verify(&pos,&cert).is_ok());
+    }
+    #[test]
     fn completed_expired_setup_reports_work_without_a_strategy() {
         let req=serde_json::from_value(json!({"history":OPEN_THREE,"ms":1,"nodes":100000,
             "idtt_nodes":0,"depth":8})).unwrap();
