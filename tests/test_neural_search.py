@@ -2514,6 +2514,17 @@ class NativeProofs(unittest.TestCase):
         self.wait(closed)
         return pool, proofs
 
+    def test_only_unstamped_loops_skip_the_quiet_defender(self):
+        for stamps in (False, True):
+            graph = self.graph([[0,0]])
+            pool = self.pool([graph], quantum=4, views=1, work=4096)
+            proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=1, queue=1, tasks=8, stamps=stamps)
+            proofs.offer(0, [[0,0],[1,-1],[1,1]])
+            proofs.step()
+            # Stamped solvers search quiet defender zones; unstamped ones cannot start there.
+            self.assertEqual(proofs.stats()['scope']['closed_scopes'], 0 if stamps else 1)
+            proofs.drain();proofs.close();pool.close();graph.close()
+
     def test_closed_positions_give_way_to_new_offers(self):
         pool, proofs = self.quiet_closed_frontier()
         before = proofs.stats()

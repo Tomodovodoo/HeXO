@@ -34,10 +34,10 @@ struct Frontier {
  struct Effort {uint64_t fresh=0,queries=0,missing=0;};
  std::map<uint64_t,Effort> effort;
  std::unordered_map<Key,std::shared_ptr<Task>,KeyHash> tasks;std::unordered_map<Key,Fact,KeyHash> facts;
- std::deque<Key> fact_order;uint64_t generation=1,revision=0,next=0,offers=0;size_t capacity;
+ std::deque<Key> fact_order;uint64_t generation=1,revision=0,next=0,offers=0;size_t capacity;bool stamps;
  Premises occupied;std::unordered_map<Cell,std::array<Premises,2>,CellHash> members;
  uint64_t scope_checks=0,scope_changed=0,scope_unchanged=0,scope_ns=0;
- explicit Frontier(size_t cap):capacity(cap){}
+ Frontier(size_t cap,bool stamped):capacity(cap),stamps(stamped){}
  void forget(Key key){
   auto& fact=facts.at(key);
   for(size_t n=0;n<fact.history.size();++n){auto it=members.find(fact.history[n]);
@@ -95,8 +95,9 @@ struct Frontier {
   }
   auto task=std::make_shared<Task>();task->key=key;task->node=node;task->history=history;task->generation=generation;
    task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;
-   Board board;for(Cell c:history)board.make(c);
-   if(!board.completions(board.player,board.remaining).empty() || board.completions(1-board.player).empty())task->closed=task->fixed=2;
+   // Stamped solvers search quiet defender zones, so only unstamped loops close them.
+   if(!stamps){Board board;for(Cell c:history)board.make(c);
+    if(!board.completions(board.player,board.remaining).empty() || board.completions(1-board.player).empty())task->closed=task->fixed=2;}
    tasks.emplace(key,std::move(task));
  }
 };
@@ -149,7 +150,7 @@ struct Loop {
  }
   Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps),external(!functions){
   if(pool.proof_owner || count<1 || count>16 || queue<count || queue>128 || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
-  frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks);
+  frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks,stamps);
   try {
     for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();if(!external){worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");}workers.push_back(std::move(worker));}
 #ifndef __EMSCRIPTEN__
