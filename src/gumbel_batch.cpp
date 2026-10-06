@@ -1,6 +1,7 @@
 #include "hexo.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -79,10 +80,20 @@ struct Costs {
 // Snapshot the pending requests while their trees are alive. Afterwards this object owns
 // all encoding and output mappings, so a cancelled subscriber need not keep a tree alive.
 struct Batch {
+ struct Row { Batch* storage;int index; };
+ std::atomic<unsigned> owners{1};
+ std::vector<Row> sources;
+ std::vector<Batch*> retained;
  std::vector<int64_t> info,offsets,cells,actions;
  std::vector<uint8_t> planes,decoded;
  std::vector<double> logits,values;
  std::vector<Group> groups;bool sealed=false,mixed=false;
+ void retain(){owners.fetch_add(1,std::memory_order_relaxed);}
+ void release(){if(owners.fetch_sub(1,std::memory_order_acq_rel)==1)delete this;}
+ ~Batch(){for(auto* storage:retained)storage->release();}
+ Row source(int id){return sources.empty()?Row{this,id}:sources[id];}
+ const uint8_t* row_planes(int id){auto row=source(id);return row.storage->planes.data()+row.storage->info[12*int64_t(row.index)+10];}
+ const int64_t* row_cells(int id){auto row=source(id);return row.storage->cells.data()+row.storage->offsets[row.index];}
  Batch(void* const* trees,const int* requests,int count,int merge_cells):info(12*int64_t(count)),offsets(count+1),decoded(count) {
   if(count<1 || merge_cells<0)throw std::runtime_error("Invalid packed batch size");
   if(!hxg_encode_many(trees,requests,count,info.data(),nullptr,0,nullptr,nullptr,0))throw std::runtime_error(gumbel::error);
@@ -97,25 +108,34 @@ struct Batch {
   // Match the evaluator's adjacent-size merge, retaining every row's original mapping.
   regroup(std::move(by_size),merge_cells);
  }
- // Combine immutable row snapshots. The inference service never reads live trees.
+ // Keep immutable encoding alive instead of recopying it for each forward.
+ // Flatten references to original snapshots so repeated combinations do not
+ // retain intermediate prediction buffers or create chains of batch owners.
  Batch(void* const* sources,const int* rows,int count,int merge_cells,bool):info(12*int64_t(count)),offsets(count+1),decoded(count){
   if(count<1 || merge_cells<0)throw std::runtime_error("Invalid snapshot combination");
   std::map<int,std::vector<int>> by_size;
+  this->sources.reserve(count);retained.reserve(count);
+  int64_t legal=0;
   for(int i=0;i<count;++i){
    if(!sources[i])throw std::runtime_error("Missing row snapshot");
    auto& source=*static_cast<Batch*>(sources[i]);int id=rows[i];
    if(id<0 || id>=int(source.decoded.size()))throw std::runtime_error("Invalid snapshot row");
    const auto* original=source.info.data()+12*int64_t(id);auto* row=info.data()+12*int64_t(i);
-   std::copy(original,original+12,row);row[10]=int64_t(planes.size());row[11]=int64_t(cells.size());offsets[i]=int64_t(cells.size());
+   std::copy(original,original+12,row);row[10]=0;row[11]=legal;offsets[i]=legal;
+   auto origin=source.source(id);this->sources.push_back(origin);
+   if(std::find(retained.begin(),retained.end(),origin.storage)==retained.end())retained.push_back(origin.storage);
    if(row[0]==-2){decoded[i]=1;continue;}
-   int64_t first=source.offsets[id],last=source.offsets[id+1],bytes=8*row[0]*row[0];
-   planes.insert(planes.end(),source.planes.begin()+original[10],source.planes.begin()+original[10]+bytes);
-   cells.insert(cells.end(),source.cells.begin()+first,source.cells.begin()+last);
-   actions.insert(actions.end(),source.actions.begin()+2*first,source.actions.begin()+2*last);
+   int64_t first=source.offsets[id],last=source.offsets[id+1];legal+=last-first;
    by_size[int(row[0])].push_back(i);
   }
-  offsets[count]=int64_t(cells.size());logits.resize(cells.size());values.resize(cells.size());
+  actions.reserve(2*legal);
+  for(int i=0;i<count;++i){auto& source=*static_cast<Batch*>(sources[i]);int id=rows[i];
+   actions.insert(actions.end(),source.actions.begin()+2*source.offsets[id],source.actions.begin()+2*source.offsets[id+1]);}
+  offsets[count]=legal;logits.resize(legal);values.resize(legal);
   regroup(std::move(by_size),merge_cells);
+  // Nothing after these increments throws. The caller keeps source handles
+  // alive for construction; later owner and device releases may race.
+  for(auto* storage:retained)storage->retain();
  }
  void regroup(std::map<int,std::vector<int>> by_size,int merge_cells){
   mixed=by_size.size()>1;
@@ -175,12 +195,12 @@ struct Batch {
   int64_t bytes=8*int64_t(area)*count;
   if(!output || capacity<bytes)throw std::runtime_error("Packed plane buffer too small");
   sealed=true;
-  std::memset(output,0,size_t(bytes));
   for(int i=0;i<count;++i){auto* row=info.data()+12*int64_t(g.rows[start+i]);int side=int(row[0]);
-   const auto* src=planes.data()+row[10];auto* dst=output+8*int64_t(area)*i;
+   const auto* src=row_planes(g.rows[start+i]);auto* dst=output+8*int64_t(area)*i;
    if(side==g.side)std::memcpy(dst,src,8*size_t(area));
-   else for(int channel=0;channel<8;++channel)for(int y=0;y<side;++y)
-    std::memcpy(dst+channel*area+y*g.side,src+channel*side*side+y*side,size_t(side));
+   else {std::memset(dst,0,8*size_t(area));
+    for(int channel=0;channel<8;++channel)for(int y=0;y<side;++y)
+     std::memcpy(dst+channel*area+y*g.side,src+channel*side*side+y*side,size_t(side));}
   }
  }
  void pack(int index,uint8_t* output,int64_t capacity){pack_range(index,0,int(group(index).rows.size()),output,capacity);}
@@ -217,7 +237,8 @@ struct Batch {
  void decode_row(const Group& g,int id,const float* policy,float far_logit,float value){
   auto* row=info.data()+12*int64_t(id);int side=int(row[0]);double q=std::tanh(double(value)/2);
   double far=double(far_logit)-(row[9]?std::log(double(row[9])):0);
-  for(int64_t j=offsets[id];j<offsets[id+1];++j){int64_t cell=cells[j];
+  auto* legal=row_cells(id);
+  for(int64_t j=offsets[id];j<offsets[id+1];++j){int64_t cell=legal[j-offsets[id]];
    logits[j]=cell<0?far:double(policy[cell/side*g.side+cell%side]);values[j]=q;
   }decoded[id]=1;
  }
@@ -258,7 +279,7 @@ HX_API void* hxgp_combine(void* const* sources,const int* rows,int count,int mer
  if(!sources || !rows)throw std::runtime_error("Missing snapshot combination");
  return new packing::Batch(sources,rows,count,merge_cells,true);
 }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
-HX_API void hxgp_free(void* p){delete static_cast<packing::Batch*>(p);}
+HX_API void hxgp_free(void* p){if(p)static_cast<packing::Batch*>(p)->release();}
 HX_API int hxgp_groups(void* p){return int(static_cast<packing::Batch*>(p)->groups.size());}
 HX_API int hxgp_mixed(void* p){return static_cast<packing::Batch*>(p)->mixed;}
 HX_API int hxgp_group(void* p,int index,int64_t* out){try{
