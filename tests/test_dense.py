@@ -3106,9 +3106,9 @@ class ValidationSourceTests(unittest.TestCase):
                 if key.startswith('certified_policy'):
                     self.assertEqual(value, weighted[key], key)
             refs = [window.ref('1000000000001', ply) for ply in (11, 12)]
-            self.assertEqual(learner.row_losses(window, refs)['policy_weight'].tolist(), [.25, .25])
+            self.assertEqual(learner.row_losses(learner.render(window, refs))['policy_weight'].tolist(), [.25, .25])
             learner.settings = replace(learner.settings, proof_policy_weight=0.)
-            per_row = learner.row_losses(window, refs)
+            per_row = learner.row_losses(learner.render(window, refs))
             self.assertTrue(np.isnan(per_row['policy_ce']).all())
             self.assertTrue(np.isfinite(per_row['certified_policy_mass']).all())
             self.assertEqual(per_row['placements'].tolist(), [2., 1.])
@@ -3497,7 +3497,7 @@ class ValidationSourceTests(unittest.TestCase):
             held = sets.subsets['fresh', 'held']
             finished = [r for r in held if r.episode['winner'] >= 0]
             self.assertTrue(finished and len(finished) < len(held))
-            r = learner.row_losses(sets, held)
+            r = learner.row_losses(learner.render(sets, held))
             f, p = r['finished'] > 0, np.isfinite(r['policy_ce'])
             self.assertEqual(sorted(r['remaining'][f]), sorted(len(x.episode['moves'])-x.row['ply'] for x in finished))
             self.assertEqual(sorted(r['ply']), sorted(x.row['ply'] for x in held))

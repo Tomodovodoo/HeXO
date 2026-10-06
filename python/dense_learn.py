@@ -855,19 +855,25 @@ class Learner:
             result.update(deblunder_split(*np.concatenate(deblundered, 1)))
         return result
 
-    def subset_losses(self, sets, refs):
-        """EMA weighted_means (policy_ce, value_bce, future loss) over `refs` under symmetries drawn from a fixed seed
-        (a row keeps its symmetry while rows are appended)."""
-        s = self.settings
+    def render(self, sets, refs):
+        """dense_data.examples of `refs` in chunks of settings.batch rows under symmetries drawn from a fixed seed (a
+        row keeps its symmetry while rows are appended): [(chunk, samples, targets, collated batch)]."""
         rng = np.random.default_rng(self.config.seed)
-        batches = (dense_data.collate(*dense_data.examples(sets, refs[k:k+s.batch], rng, **self.targets()))
-                   for k in range(0, len(refs), s.batch))
-        means = self.weighted_means(batches)
+        rendered = []
+        for k in range(0, len(refs), self.settings.batch):
+            chunk = refs[k:k+self.settings.batch]
+            samples, targets = dense_data.examples(sets, chunk, rng, **self.targets())
+            rendered.append((chunk, samples, targets, dense_data.collate(samples, targets)))
+        return rendered
+
+    def subset_losses(self, rendered):
+        """EMA weighted_means (policy_ce, value_bce, future loss) over the rows of `rendered` (render)."""
+        means = self.weighted_means(batch for *_, batch in rendered)
         return tuple(means[i] for i in (0, 1, 4))
 
-    def row_losses(self, sets, refs):
-        """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
-        ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
+    def row_losses(self, rendered):
+        """Per-row EMA losses over the rows of `rendered` (render): float arrays with one entry per
+        ref, aligned across keys (not in the order of the refs): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_weight, policy_ce (against the improved policy; nan on rows without a policy
         target), policy_target_entropy, policy_kl, policy_top1, policy_top2, policy_argmax_mass (nan without a
@@ -875,16 +881,12 @@ class Learner:
         (searched_value at the row), proven (the row's `proven`), proof_action (1 with a witness)
         and deblundered (0/1). certified_policy_mass and certified_policy_top1 measure the winning witness
         independently of training targets (nan without one); placements is the stones remaining this turn."""
-        s = self.settings
-        rng = np.random.default_rng(self.config.seed)
         rows = []
         with torch.no_grad():
-            for k in range(0, len(refs), s.batch):
-                chunk = refs[k:k+s.batch]
-                samples, targets = dense_data.examples(sets, chunk, rng, **self.targets())
+            for chunk, samples, targets, batch in rendered:
                 order = sorted(range(len(chunk)), key=lambda i: samples[i].size)    # collate's row order
                 losses = []
-                for b in dense_data.collate(samples, targets).values():
+                for b in batch.values():
                     indices = order[len(losses):len(losses)+len(b['counts'])]
                     out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
                     pair = pair_policy_rows(out, b, [samples[i] for i in indices],
@@ -936,12 +938,15 @@ class Learner:
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
         for source in dense_data.SOURCES:
-            held, train = (self.subset_losses(sets, sets.subsets[source, split]) for split in ('held', 'train'))
+            train = self.subset_losses(self.render(sets, sets.subsets[source, 'train']))
+            rendered = self.render(sets, sets.subsets[source, 'held'])
+            held = self.subset_losses(rendered)
             for name, v, w in zip(('policy_ce', 'value_bce', self.heads[4]), held, train):
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
-            r = self.row_losses(sets, sets.subsets[source, 'held'])
+            r = self.row_losses(rendered)
+            del rendered
             out.update({f'{source}_{k}': v for k, v in certified_policy_summary(
                 r['certified_policy_mass'], r['certified_policy_top1'], r['placements']).items()})
             proof = (r['proven'] > 0) & (r['proof_action'] > 0) & np.isfinite(r['policy_ce'])

@@ -816,7 +816,7 @@ class ProvenLabelTests(unittest.TestCase):
         learner = dense_learn.Learner(self.run, config.learner, config)
         sets = dense_data.ValidationSets(self.run, 1., 0, 100, 100)
         metrics = learner.validate_sources(sets)
-        rows = learner.row_losses(sets, sets.subsets['fresh', 'held'])
+        rows = learner.row_losses(learner.render(sets, sets.subsets['fresh', 'held']))
         changed = rows['deblundered'] > 0
         self.assertEqual(metrics['fresh_deblundered_rows'], 4)
         self.assertAlmostEqual(metrics['fresh_value_bce_deblundered'], float(rows['value_bce'][changed].mean()))
@@ -925,7 +925,7 @@ class ProvenLabelTests(unittest.TestCase):
                         proof_action={str(r.row['ply']): [r.episode['moves'][r.row['ply']]]}) for r in chosen]
         dense_solve.write_sidecar(run/'shards'/'1000000000001', windows)
         out = learner.validate_sources(sets)
-        rows = learner.row_losses(sets, sets.subsets['newest', 'held'])
+        rows = learner.row_losses(learner.render(sets, sets.subsets['newest', 'held']))
         proven = rows['proven'] != 0
         self.assertEqual(out['newest_proven_rows'], len({(r.row['game'], r.row['ply']) for r in chosen}))
         self.assertAlmostEqual(out['newest_value_regret_proven'], float(np.mean(1-np.exp(-rows['value_bce'][proven]))))
@@ -948,7 +948,7 @@ class ProvenLabelTests(unittest.TestCase):
         sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=12)
         out = learner.validate_sources(sets)
         for source in ('fresh', 'newest'):
-            r = learner.row_losses(sets, sets.subsets[source, 'held'])
+            r = learner.row_losses(learner.render(sets, sets.subsets[source, 'held']))
             exact = r['proven'] != 0
             self.assertTrue(exact.any() and (~exact).any())
             self.assertEqual((out[f'{source}_outcome_bce_exact_rows'], out[f'{source}_outcome_bce_unproven_rows']),
