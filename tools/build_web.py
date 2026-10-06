@@ -55,10 +55,14 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
                   'hxgo_new', 'hxgo_free', 'hxgo_step', 'hxgo_step_ready', 'hxgo_cancel', 'hxgo_done', 'hxgo_feed', 'hxgo_admit',
                   'hxgo_root', 'hxgo_install', 'hxgo_choice', 'hxgo_stats', 'hxgo_records', 'hxgo_record_history',
+                  'hxgm_new', 'hxgm_free', 'hxgm_step', 'hxgm_cancel', 'hxgm_done', 'hxgm_feed', 'hxgm_admit',
+                  'hxgm_clock', 'hxgm_ready_limit', 'hxgm_owner', 'hxgm_install', 'hxgm_retarget',
+                  'hxpe_new', 'hxpe_take', 'hxpe_request', 'hxpe_complete', 'hxpe_cancelled',
+                  'hxp_step', 'hxp_cancel', 'hxp_drain', 'hxp_free', 'hxp_stats', 'hxp_record', 'hxp_offer',
                   'hxgf_layout', 'hxgf_take', 'hxgf_stats', 'hxgf_queued', 'hxgf_abandon_all',
                   'hxgp_new', 'hxgp_free', 'hxgp_groups', 'hxgp_group', 'hxgp_features', 'hxgp_decode_split', 'hxgp_outputs',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
-GUMBEL_SOURCES = ('gumbel_owner.cpp', 'gumbel_feed.cpp', 'gumbel_batch.cpp')
+GUMBEL_SOURCES = ('gumbel_proof.cpp', 'gumbel_feed.cpp', 'gumbel_batch.cpp')
 NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')
 WASM_FLAGS = ['-std=c++20', '-O3', '-fwasm-exceptions', '-msimd128', '-sMODULARIZE', '-sEXPORT_ES6',
                 '-sENVIRONMENT=web,worker,node', '-sALLOW_MEMORY_GROWTH', '-sMAXIMUM_MEMORY=4GB', '-sFILESYSTEM=0',
@@ -92,7 +96,7 @@ def digest(path):
 
 def sources():
     """{relative path: sha256} of every source the wasm artefacts are built from."""
-    paths = [ROOT/'src'/name for name in ('gumbel.cpp', *GUMBEL_SOURCES, 'gumbel_parallel.hpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
+    paths = [ROOT/'src'/name for name in ('gumbel.cpp', 'gumbel_owner.cpp', *GUMBEL_SOURCES, 'gumbel_parallel.hpp', 'hexo.cpp', 'hexo.hpp', 'nnue.hpp')]
     paths += sorted(p for p in TACTICAL.rglob('*') if p.suffix in ('.rs', '.toml', '.lock') and 'target' not in p.parts)
     paths.append(TACTICAL/'stamps.json')
     paths += sorted(p for p in SHRIMP.rglob('*') if (p.suffix in ('.rs', '.lock') or p.name == 'Cargo.toml')

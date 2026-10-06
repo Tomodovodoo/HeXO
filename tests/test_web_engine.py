@@ -660,6 +660,55 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_native_proof_shared_cancel_interrupts_a_long_slice(self):
+        history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
+        answer = node(dict(kind='native-proofs',history=history,ms=2000,slice=1000,delay=30,cancelAfterMs=8))
+        self.assertTrue(answer['cancelled'])
+        self.assertGreater(answer['events'][0]['request']['ms'], 250)
+        self.assertEqual(answer['events'][0]['info'][0], 0)
+        self.assertLess(answer['events'][0]['ms'], 250)
+        self.assertEqual((answer['proof']['installed'],answer['proof']['active'],answer['waits']),(0,0,0))
+
+    def test_browser_worker_native_proofs_return_checked_evidence(self):
+        history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
+        answer = node(dict(kind='worker-turn',history=history,simulations=4096,nodes=32768,ms=2000,nativeOwner=True,nativeProof=True,solverSlice=128,proofStamps=False))
+        self.assertTrue(answer['proofs'])
+        self.assertTrue(answer['proof'])
+        self.assertTrue(answer['solved'])
+        self.assertGreater(answer['actual_solver_nodes'], 0)
+        self.assertGreater(answer['native_scheduler'][0]['proof']['installed'], 0)
+
+    def test_native_proof_frontier_settles_during_inference_and_drains_both_producers(self):
+        history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
+        answer = node(dict(kind='native-proofs',history=history,ms=2000,slice=16,delay=30))
+        self.assertNotIn('error', answer)
+        self.assertEqual(answer['result']['exact_winner'], 0)
+        self.assertGreater(answer['proof']['installed'], 0)
+        self.assertTrue(any(e['duringForward'] for e in answer['events']))
+        self.assertEqual((answer['proof']['queued'],answer['proof']['active'],answer['proof']['ready'],answer['waits']),(0,0,0,0))
+        self.assertEqual((answer['stats']['pending'],answer['stats']['tasks'],answer['stats']['subscribers']),(0,0,0))
+        self.assertEqual(answer['graph']['views'], 1)
+        for record in answer['records']:
+            found, request = record['result'], record['request']
+            self.assertEqual(tactical_proof.independent_verify(found['certificate'],request['history'],attacker=found['attacker'],known=request['known']),found['status'])
+
+    def test_native_proof_cancellation_rejects_late_answers_and_releases_workers(self):
+        answer = node(dict(kind='native-proofs',history=[[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]],ms=2000,slice=16,delay=30,cancelOnDispatch=True))
+        self.assertTrue(answer['cancelled'])
+        self.assertEqual(answer['proof']['installed'], 0)
+        self.assertGreater(answer['proof']['cancelled'], 0)
+        self.assertEqual((answer['proof']['queued'],answer['proof']['active'],answer['proof']['ready'],answer['waits']),(0,0,0,0))
+        self.assertEqual((answer['stats']['pending'],answer['stats']['tasks'],answer['stats']['subscribers']),(0,0,0))
+
+    def test_native_proof_unknown_bounds_do_not_create_game_losses(self):
+        answer = node(dict(kind='native-proofs',history=[[0,0],[1,2],[3,-1]],ms=160,slice=8,delay=10,workers=2))
+        self.assertNotIn('error', answer)
+        self.assertEqual(answer['result']['exact_winner'], -1)
+        self.assertGreater(answer['proof']['unknown'], 0)
+        self.assertEqual(answer['proof']['installed'], 0)
+        self.assertTrue(all(e['request']['ms'] <= 1000 for e in answer['events']))
+        self.assertEqual((answer['proof']['queued'],answer['proof']['active'],answer['proof']['ready'],answer['waits']),(0,0,0,0))
+
     def test_native_owner_features_keep_the_browser_model_input_contract(self):
         histories = [[], [[0,0]], [[0,0],[4,0]], [[0,0],[4,0],[7,0]],
                      [[7*i,0] for i in range(36)]]
