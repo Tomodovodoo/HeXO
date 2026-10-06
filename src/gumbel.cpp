@@ -581,7 +581,11 @@ struct Tree {
  }
  void evict() {
   if(!shared || !limit || !requests.empty())return;
+  const uint64_t released=evicted+(state->archive?state->archive->discarded:0);
   trim_archive();
+  // Expanded nodes are a subset of the store, so a store within its limit has
+  // nothing to evict. Index entries expire only when a node leaves the store.
+  if(store.size()<=limit && outcomes.size()<=16*limit && evicted+(state->archive?state->archive->discarded:0)==released)return;
   auto count=[&]{size_t k=0;for(auto& [key,n]:store)k+=n->expanded;return k;};
   size_t expanded=count();
   const size_t target=expanded>limit?limit-limit/8:expanded;
@@ -609,9 +613,11 @@ struct Tree {
    std::nth_element(order.begin(),order.begin()+(order.size()-4*limit),order.end(),[](const auto& x,const auto& y){return x.first<y.first;});
    for(size_t i=0;i<order.size()-4*limit;++i)evicted_stats.erase(order[i].second);
   }
-  std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
-  for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
-  std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
+  if(evicted+(state->archive?state->archive->discarded:0)!=released){
+   std::erase_if(nodes,[](const auto& entry){return entry.second.expired();});
+   for(auto& [key,list]:positions)std::erase_if(list,[](const auto& w){return w.expired();});
+   std::erase_if(positions,[](const auto& entry){return entry.second.empty();});prune_continuations();
+  }
   // Proven outcomes stay while a stored node or a kept summary holds their position; beyond sixteen times `limit` the
   // others go.
   if(outcomes.size()>16*limit){
