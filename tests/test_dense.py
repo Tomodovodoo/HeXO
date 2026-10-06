@@ -9705,6 +9705,7 @@ class DenseTimedWorker(unittest.TestCase):
                                 self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
                                 self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
                                 if solver:
+                                    self.assertLessEqual(result['scheduler_completed'], 64)
                                     if turn == 0:
                                         self.assertGreater(result['proof_work']['finished'], 0)
                                     self.assertEqual(result['solver_nodes'], result['proof_work']['fresh_nodes'])
@@ -9736,6 +9737,23 @@ class DenseTimedWorker(unittest.TestCase):
                             engine.wait_idle()
                         finally:
                             game.close()
+
+
+            from dense_player import DensePlayer
+            player = DensePlayer(Path(folder), 'cpu', model=path, native_scheduler=True, net_kernels='reference')
+            game = Game([[0, 0]])
+            try:
+                player.configure(dict(solver=True, solver_nodes=512))
+                with self.assertRaisesRegex(ValueError, 'time slices'):
+                    player.turn(game, 1000)
+                player.configure(dict(solver=False, simulations=16))
+                result = player.turn(game, 1000)
+                self.assertEqual(result['settings']['simulations'], 16)
+                self.assertLessEqual(result['scheduler_completed'], 16)
+                self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
+            finally:
+                game.close()
+                player.close()
 
 
 class DenseBrowser(unittest.TestCase):

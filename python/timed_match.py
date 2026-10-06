@@ -302,6 +302,11 @@ def side_settings(path):
     for group, options in settings.items():
         if not isinstance(options, dict) or options.keys()-allowed[group]:
             raise ValueError(f'Unsupported {group} settings: {options}')
+    if settings.get('search', {}).get('native_scheduler') and settings.get('search', {}).get('enabled', True) and settings.get('solver', {}).get('enabled', True):
+        if 'nodes' in settings.get('solver', {}):
+            raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
+        if settings.get('solver', {}).get('leaf'):
+            raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
     return settings
 
 
@@ -384,7 +389,7 @@ def main(argv=None):
     parser.add_argument('--sprt', action='store_true', help='Stop at a completed pair on SPRT 0 vs +30 Elo')
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
     parser.add_argument('--net-kernels', choices=['fused', 'reference'], default='fused')
-    parser.add_argument('--solver-nodes', type=int, default=32768)
+    parser.add_argument('--solver-nodes', type=int, help='Legacy solver nodes per query (default32768);0 disables solving')
     parser.add_argument('--concurrency', type=int, choices=[1], default=1)
     parser.add_argument('--max-placements', type=int, default=512)
     parser.add_argument('--out', type=Path, required=True)
@@ -413,10 +418,12 @@ def main(argv=None):
                 resolved = checkpoint
             checkpoints[checkpoint] = resolved
         checkpoint = checkpoints[checkpoint]
+        solver = dict(enabled=args.solver_nodes is None or args.solver_nodes > 0)
+        if args.solver_nodes is not None:
+            solver['nodes'] = max(1, args.solver_nodes)
         return dict(kind='bubble', run=str(args.run.resolve()), checkpoint=checkpoint,
                     model=str((args.run/'checkpoints'/checkpoint/'ema.pt').resolve()),
-                    device=args.device, net_kernels=args.net_kernels,
-                    solver=dict(enabled=args.solver_nodes > 0, nodes=max(1, args.solver_nodes)))
+                    device=args.device, net_kernels=args.net_kernels, solver=solver)
     opponent = (dict(kind='six', command=args.b_command) if args.b_command else
                 dict(kind='htttx', url=args.b_url) if args.b_url else config(args.b))
     specs = [config(args.a), opponent]

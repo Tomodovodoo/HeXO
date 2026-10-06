@@ -245,6 +245,10 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
 def native_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
     """Clocked native graph owner, batched inference and concurrent proof slices."""
     started = time.monotonic()
+    if player.options['solver'] and player.solver_nodes_explicit:
+        raise ValueError('Native timed solving uses time slices; omit solver_nodes or disable native_scheduler')
+    if limits.get('leaf_solver'):
+        raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
     import numpy as np
     from neural_search import GameGraph
     from native_scheduler import SearchPool, InferenceService
@@ -393,10 +397,12 @@ def _worker(connection, cancellation, config):
                                  native_scheduler=search.get('native_scheduler', False))
             if player.prover is not None:
                 player.prover.stamps = bool(solver.get('stamps', False))
-            player.configure(dict(search=search.get('enabled', True),
-                                  simulations=search.get('simulations', 128),
-                                  solver=solver.get('enabled', player.prover is not None),
-                                  solver_nodes=solver.get('nodes', 32768)))
+            options = dict(search=search.get('enabled', True), solver=solver.get('enabled', player.prover is not None))
+            if 'simulations' in search:
+                options['simulations'] = search['simulations']
+            if 'nodes' in solver:
+                options['solver_nodes'] = solver['nodes']
+            player.configure(options)
             t0 = time.monotonic()
             player.evaluator.evaluate([[(0, 0)]])
             player.batch_seconds = time.monotonic()-t0
@@ -491,7 +497,12 @@ def _worker(connection, cancellation, config):
 class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
-        search = config.get('search', {})
+        search, solver = config.get('search', {}), config.get('solver', {})
+        if config.get('kind') == 'bubble' and search.get('native_scheduler') and search.get('enabled', True) and solver.get('enabled', True):
+            if 'nodes' in solver:
+                raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
+            if solver.get('leaf'):
+                raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
         cap = search.get('max_simulations', search.get('simulations'))
         if cap is not None and (type(cap) is not int or cap <= 0):
             raise ValueError('simulation cap must be a positive integer')

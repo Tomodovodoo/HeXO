@@ -14,6 +14,7 @@ class DensePlayer:
         if type(native_scheduler) is not bool:
             raise ValueError('native_scheduler must be on or off')
         self.native_scheduler = native_scheduler
+        self.solver_nodes_explicit = self.simulations_explicit = False
         self.run, self.device = run, device
         self.model_path = Path(model).resolve() if model else None
         self.tactical_package = tactical_package
@@ -87,6 +88,8 @@ class DensePlayer:
             if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
                 raise ValueError(f'{key} must be 1..{maximum}')
         self.options = updated
+        self.solver_nodes_explicit |= 'solver_nodes' in options
+        self.simulations_explicit |= 'simulations' in options
 
     def set_history(self, history=()):
         from neural_search import EvaluationCache
@@ -133,13 +136,15 @@ class DensePlayer:
             local.close()
 
     def turn(self, game, milliseconds=None, analyze=False):
-        """Keep the first stone's search continuation, with a fresh budget for each placement."""
+        """Choose a complete legal turn with an optional whole-turn clock."""
         if milliseconds is not None:
             from threading import Event
             from timed_engine import dense_turn
             from time_control import allowance
-            return dense_turn(self, [cell[:2] for cell in game.cells], allowance(movetime=milliseconds),
-                              Event(), analyze=analyze)
+            limits = allowance(movetime=milliseconds)
+            if self.native_scheduler and self.simulations_explicit:
+                limits['simulations'] = self.options['simulations']
+            return dense_turn(self, [cell[:2] for cell in game.cells], limits, Event(), analyze=analyze)
         import numpy as np
         from neural_search import NeuralSearch
         from dense_selfplay import root_value
