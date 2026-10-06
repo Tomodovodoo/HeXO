@@ -660,8 +660,9 @@ class InferenceService:
             # Keep feeding its spare slot instead of blocking in collect().
             event = self.pending[0][1].event
             while len(self.pending)<2 and event is not None and not event.query():
-                if not launch(.5):
-                    # Control events or a pause can make take return early.
+                if not launch(0):
+                    # A timed take flushes a partial batch at its timeout.
+                    # Preserve the configured batching latency while waiting.
                     time.sleep(.0001)
             token, handle = self.pending[0]
             self.complete(token, handle.collect())
