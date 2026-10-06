@@ -1895,17 +1895,27 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual(pool.feed.queued(), 0)
 
     def test_watermark_does_not_split_a_tree_visit_layer(self):
-        pool = self.pool([self.graph()], quantum=16, views=1, work=32)
-        pool.limit_ready(1)
-        pool.step()
-        self.assertEqual(pool.feed.queued(), 1)
-        self.answer(pool)
-        pool.step()
-        # Finish gathering the layer even when it exceeds the queue watermark.
-        self.assertGreater(pool.feed.queued(), 1)
-        self.assertLessEqual(pool.feed.queued(), 16)
-        self.finish(pool)
-        self.assertEqual(pool.games[0].stats()['completed'], 32)
+        for views in (1, 4, 16):
+            with self.subTest(views=views):
+                pool = self.pool([self.graph()], quantum=16, views=views, work=128)
+                pool.limit_ready(1)
+                pool.step()
+                self.assertEqual(pool.feed.queued(), 1)
+                self.answer(pool)
+                pool.step()
+                # Finish gathering the layer even when it exceeds the watermark.
+                self.assertGreater(pool.feed.queued(), 1)
+                self.assertLessEqual(pool.feed.queued(), 16)
+                # A supplied queue needs at most one continuation held ready;
+                # raising the ceiling must not eagerly open every root view.
+                self.assertLessEqual(pool.games[0].stats()['slots'], 2)
+                self.finish(pool)
+                stats = pool.games[0].stats()
+                self.assertEqual(stats['completed'], 128)
+                self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+                self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()), stats['root_completed'])
+                if views > 1:
+                    self.assertGreater(stats['depth'], 0)
 
     def test_bounded_supply_keeps_deeper_views_and_sampling_credits_separate(self):
         pool = self.pool([self.graph(), self.graph([(0, 0), (1, 0), (2, 0)])],
