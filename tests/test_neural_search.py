@@ -2501,38 +2501,183 @@ class NativeProofs(unittest.TestCase):
         finally:
             native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
-    def test_unknown_task_observes_cooldown_then_rejoins_underfilled_queue(self):
+    def quiet_closed_frontier(self, count=8, prepare=None):
+        """A full frontier of quiet positions whose mover and defender searches are both closed.
+
+        `prepare(graph)` runs before the pool takes the graph over."""
+        graph = self.graph([[0,0]])
+        if prepare:
+            prepare(graph)
+        pool = self.pool([graph], quantum=4, views=1, work=4096)
+        proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=2, queue=4, tasks=count)
+        for k in range(1, count+1):
+            proofs.offer(0, [[0,0],[k,-1],[k,1]])
+        def closed():
+            proofs.step()
+            return proofs.stats()['scope']['closed_scopes'] == 2*count
+        self.wait(closed)
+        return graph, pool, proofs
+
+    def test_only_unstamped_loops_skip_the_quiet_defender(self):
+        for stamps in (False, True):
+            graph = self.graph([[0,0]])
+            pool = self.pool([graph], quantum=4, views=1, work=4096)
+            proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=1, queue=1, tasks=8, stamps=stamps)
+            proofs.offer(0, [[0,0],[1,-1],[1,1]])
+            proofs.step()
+            # Stamped solvers search quiet defender zones; unstamped ones cannot start there.
+            self.assertEqual(proofs.stats()['scope']['closed_scopes'], 0 if stamps else 1)
+            proofs.drain();proofs.close();pool.close();graph.close()
+
+    def test_closed_positions_give_way_to_new_offers(self):
+        graph, pool, proofs = self.quiet_closed_frontier()
+        before = proofs.stats()
+        self.assertEqual(before['tasks'], 8)
+        # Far weaker than any retained entry, yet only closed entries stand in its way.
+        proofs.offer(0, [[0,0],[-3,1],[-3,2]], relevance=1e-6)
+        proofs.step()
+        after = proofs.stats()
+        self.assertEqual(after['tasks'], 8)
+        self.assertEqual(after['submitted'], before['submitted']+1)
+        self.assertEqual(after['supply_first_queries'], before['supply_first_queries']+1)
+        proofs.drain()
+
+    def test_a_new_fact_keeps_closed_positions_until_their_scope_is_refreshed(self):
+        won = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8],[3,0],[4,0],[8,8],[10,8]]
+        def prepare(graph):
+            view = graph.view(won)
+            self.addCleanup(view.close)
+            self.assertTrue(native.hxg_tactics(view.ptr, 1))
+            view.search(1, root_samples=1, batch_size=1)
+            self.assertEqual(native.hxg_exact(view.ptr), 0)
+        graph, pool, proofs = self.quiet_closed_frontier(prepare=prepare)
+        proofs.offer(0, won)
+        before = proofs.stats()
+        self.assertEqual(before['facts'], 1)
+        # Offers are counted; this repeat keeps the weak offer below off the periodic admission.
+        proofs.offer(0, [[0,0],[1,-1],[1,1]])
+        # The fact may reopen any closed entry, so none of them is disposable yet.
+        proofs.offer(0, [[0,0],[-3,1],[-3,2]], relevance=1e-6)
+        proofs.step()
+        after = proofs.stats()
+        self.assertEqual(after['tasks'], 8)
+        self.assertEqual(after['supply_first_queries'], before['supply_first_queries'])
+        proofs.drain()
+
+    def test_idle_workers_are_charged_to_the_refill_that_left_them_idle(self):
+        import time
+        graph = self.graph([[0,0]])
+        pool = self.pool([graph], quantum=4, views=1, work=4096)
+        empty = pool.enable_proofs(slice_ms=50, table_mb=1, workers=2, queue=4, tasks=8)
+        empty.step();time.sleep(.05)
+        stats = empty.stats()
+        self.assertGreaterEqual(stats['idle_empty_ms'], 2*45)
+        self.assertEqual([stats[k] for k in ('idle_capacity_ms','idle_held_ms','idle_pending_ms','idle_closed_ms','idle_dormant_ms')], [0]*5)
+        empty.close()
+        graph, pool, proofs = self.quiet_closed_frontier()
+        stats = proofs.stats()
+        self.assertEqual(stats['supply_seen'], stats['supply_eligible']+stats['supply_pending']
+                         +stats['supply_closed']+stats['supply_dormant'])
+        self.assertEqual(stats['supply_first_queries'], 8)
+        self.assertEqual(stats['submitted'], 8)
+        before = stats['idle_closed_ms']
+        time.sleep(.05);proofs.step();time.sleep(.05)
+        stats = proofs.stats()
+        self.assertGreaterEqual(stats['idle_closed_ms']-before, 2*90)
+        self.assertEqual(stats['submitted'], 8)
+        proofs.drain()
+
+    def test_retries_take_only_idle_workers_and_never_queue_ahead_of_fresh_work(self):
         import ctypes as C
         import json
-        import time
+        from neural_search import bind, checked, ptr
+        bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
+        bind('hxpe_take', C.c_uint64, ptr, C.c_int)
+        bind('hxpe_request', C.c_char_p, ptr, C.c_int)
+        bind('hxpe_complete', C.c_int, ptr, C.c_int, C.c_uint64, ptr, ptr, C.c_int, C.c_char_p, C.c_char_p)
+        first,second,fresh=[[0,0],[4,0],[5,0]],[[0,0],[4,0],[5,1]],[[0,0],[4,0],[5,0],[6,1]]
+        graph=self.graph(first)
+        graph.search(1,root_samples=1,batch_size=1)
+        pool=self.pool([graph],quantum=4,views=1,work=4096)
+        loop=native.hxpe_new(pool.ptr,1,4,10,1,64,0,1000)
+        self.assertTrue(loop)
+        def offer(moves):
+            cells=np.asarray(moves,np.int64)
+            checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),1.))
+        def take():
+            job=native.hxpe_take(loop,0)
+            self.assertNotIn(job,(0,2**64-1))
+            return job,json.loads(native.hxpe_request(loop,0))['history']
+        def unknown(job,history):
+            info=np.zeros(13,np.uint64);info[4]=1;info[5]=7;info[10]=2 if len(history)%2 else 1;info[12]=1
+            checked(native.hxpe_complete(loop,0,job,info.ctypes.data,None,0,None,None))
+        try:
+            offer(first);offer(second)
+            checked(native.hxp_step(loop))
+            job,history=take()
+            unknown(job,history)
+            # The other fresh task is still queued, so the free worker has work and
+            # the cooling retry stays out of the queue.
+            checked(native.hxp_step(loop))
+            job,other=take()
+            self.assertNotEqual(other,history)
+            offer(fresh)
+            unknown(job,other)
+            checked(native.hxp_step(loop))
+            job,history=take()
+            self.assertEqual(history,fresh)
+            unknown(job,history)
+            self.assertEqual(native.hxpe_take(loop,0),0)
+            # Three retries are due later; the one idle worker continues one of them.
+            checked(native.hxp_step(loop))
+            job,history=take()
+            unknown(job,history)
+            self.assertEqual(native.hxpe_take(loop,0),0)
+        finally:
+            native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
+
+    def test_unknown_task_waits_behind_fresh_work_then_continues_with_a_larger_slice(self):
+        import ctypes as C
+        import json
         from neural_search import bind, checked, ptr
         bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
         bind('hxpe_take', C.c_uint64, ptr, C.c_int)
         bind('hxpe_request', C.c_char_p, ptr, C.c_int)
         bind('hxpe_complete', C.c_int, ptr, C.c_int, C.c_uint64, ptr, ptr, C.c_int, C.c_char_p, C.c_char_p)
         history=[[0,0],[4,0],[5,0]]
+        fresh=history+[[6,1]]
         graph=self.graph(history)
         graph.search(1,root_samples=1,batch_size=1)
         pool=self.pool([graph],quantum=4,views=1,work=4096)
-        loop=native.hxpe_new(pool.ptr,1,4,100,1,64,0,64)
+        loop=native.hxpe_new(pool.ptr,2,4,10,1,64,0,1000)
         self.assertTrue(loop)
-        try:
-            cells=np.asarray(history,np.int64)
+        def offer(moves):
+            cells=np.asarray(moves,np.int64)
             checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),1.))
+        def take(worker):
+            job=native.hxpe_take(loop,worker)
+            self.assertNotIn(job,(0,2**64-1))
+            return job,json.loads(native.hxpe_request(loop,worker))
+        def unknown(worker,job,side,stones):
+            # A searched UNKNOWN: nodes were used, no disproof.
+            info=np.zeros(13,np.uint64);info[4]=1;info[5]=7;info[9]=0;info[10]=2 if stones%2 else 1;info[11]=side;info[12]=1
+            checked(native.hxpe_complete(loop,worker,job,info.ctypes.data,None,0,None,None))
+        try:
+            offer(history)
             checked(native.hxp_step(loop))
-            first=native.hxpe_take(loop,0)
-            self.assertNotIn(first,(0,2**64-1))
-            info=np.zeros(13,np.uint64);info[4]=1;info[10]=2;info[12]=1
-            checked(native.hxpe_complete(loop,0,first,info.ctypes.data,None,0,None,None))
+            first,request=take(0)
+            self.assertEqual((request['history'],request['ms']),(history,10))
+            unknown(0,first,0,3)
+            offer(fresh)
             checked(native.hxp_step(loop))
-            self.assertEqual(native.hxpe_take(loop,0),0)
-            time.sleep(.21)
-            checked(native.hxp_step(loop))
-            retry=native.hxpe_take(loop,0)
-            self.assertNotIn(retry,(0,first,2**64-1))
-            self.assertEqual(json.loads(native.hxpe_request(loop,0))['history'],history)
-            info[11]=1
-            checked(native.hxpe_complete(loop,0,retry,info.ctypes.data,None,0,None,None))
+            # The retry is due later, so the fresh position goes first; the idle
+            # second worker still continues the retry now, with a doubled slice.
+            # The quiet defender has nothing to search, so the retry stays with the mover.
+            job,request=take(0)
+            self.assertEqual(request['history'],fresh)
+            retry,again=take(1)
+            self.assertEqual((again['history'],again['attacker'],again['ms']),(history,'mover',20))
+            unknown(0,job,0,4);unknown(1,retry,0,3)
             self.assertEqual(native.hxg_exact(graph.ptr),-1)
         finally:
             native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
@@ -2588,7 +2733,8 @@ class NativeProofs(unittest.TestCase):
         self.answer(pool)
         def tried_both():
             proofs.step()
-            return proofs.stats()['unknown'] >= 2
+            stats = proofs.stats()
+            return stats['unknown'] >= 1 and stats['scope']['closed_scopes'] >= 2
         self.wait(tried_both)
         self.assertEqual(native.hxg_exact(graph.ptr), -1)
         self.assertTrue(pool.games[0].evidence()['eligible'].all())
@@ -2614,21 +2760,24 @@ class NativeProofs(unittest.TestCase):
         def closed():
             proofs.step()
             stats = proofs.stats()
-            return stats['unknown'] >= 2 and stats['scope']['closed_scopes'] == 1
+            return stats['unknown'] >= 1 and stats['scope']['closed_scopes'] == 2
+        # The mover's forcing search is disproved; the quiet defender has no threat to search,
+        # so it is never queried.
         self.wait(closed)
         before = proofs.stats()
-        self.assertEqual(before['unknown'], 2)
+        self.assertEqual(before['unknown'], 1)
         for moves in (unrelated, wrong_color):
             proofs.offer(0, moves)
             proofs.step()
             stats = proofs.stats()
             self.assertEqual(stats['submitted'], before['submitted'])
-            self.assertEqual(stats['scope']['closed_scopes'], 1)
+            self.assertEqual(stats['scope']['closed_scopes'], 2)
         self.assertEqual(proofs.stats()['scope']['unchanged']-before['scope']['unchanged'], 2)
         proofs.offer(0, relevant)
         proofs.step()
         after = proofs.stats()
-        self.assertEqual(after['scope']['closed_scopes'], 0)
+        # Relevant facts reopen the mover; the quiet defender stays closed under any premises.
+        self.assertEqual(after['scope']['closed_scopes'], 1)
         self.assertEqual(after['submitted'], before['submitted']+1)
         self.assertEqual(after['scope']['sent_facts']-before['scope']['sent_facts'], 1)
         # Retrying a changed premise set keeps the effort already invested in this task.
