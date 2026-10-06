@@ -508,7 +508,11 @@ export class NativeOwner {
       this.n.view(Uint32Array, source, 1)[0] = graph.ptr; this.n.view(Uint8Array, name, version.length).set(version);
       this.pool = this.m._hxgm_new(source, 1, capacity, quantum, views, depth, BigInt(work || quantum), name, BigInt(seed));
       this.n.checked(this.pool);
-      if (ms) this.n.checked(this.m._hxgm_clock(this.pool, ms));
+      if (ms && work) {
+        const history = this.n.cells(graph.history);
+        try { this.n.checked(this.m._hxgm_retarget(this.pool, 0, history, graph.history.length, BigInt(work), ms)); }
+        finally { this.m._free(history); }
+      } else if (ms) this.n.checked(this.m._hxgm_clock(this.pool, ms));
       this.ptr = this.m._hxgm_owner(this.pool, 0); this.feed = this.m._hxgm_feed(this.pool);
     } catch (error) {
       if (this.pool) this.m._hxgm_free(this.pool); this.pool = 0; throw error;

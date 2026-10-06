@@ -660,6 +660,12 @@ class Loading(unittest.TestCase):
 
 
 class Bundle(unittest.TestCase):
+    def test_native_owner_work_limit_survives_default_and_explicit_clocks(self):
+        for clock in [dict(defaultClock=True),dict(ms=1000)]:
+            answer = node(dict(kind='native-owner',history=[[0,0]],work=32,delay=2,**clock))
+            self.assertLessEqual(answer['stats']['issued'],32)
+            self.assertEqual((answer['stats']['pending'],answer['stats']['tasks'],answer['stats']['subscribers']),(0,0,0))
+
     def test_solver_cancellation_before_dispatch_does_not_start_a_slice(self):
         answer = node(dict(kind='native-proofs',history=[[0,0],[1,2],[3,-1]],cancelBeforeDispatch=True))
         self.assertEqual(answer['queries'],0)

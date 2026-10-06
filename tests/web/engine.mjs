@@ -121,7 +121,7 @@ if (job.kind === 'encode') {
   }
 } else if (job.kind === 'native-owner') {
   const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
-    work: job.ms ? 0 : job.work ?? 256, ms: job.ms ?? 0, views: job.views ?? 8, quantum: 32});
+    work: job.work ?? (job.ms ? 0 : 256), ...(job.defaultClock ? {} : {ms: job.ms ?? 0}), views: job.views ?? 8, quantum: 32});
   const network = new Network(null, null, 'fp32', {model_version: 'test'}, 1), snapshots = [];
   network.maxBatch = job.maxBatch ?? network.maxBatch;
   let sent = 0, rejected = false, lateProof = false, blockedClose = false, readyBeforeResult = 0, forwardsFinished = 0;
