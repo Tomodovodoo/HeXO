@@ -634,10 +634,11 @@ class InferenceService:
     def pump(self):
         """Launch/collect bulk forwards once, leaving per-game control to the caller."""
         import native_dense
-        while len(self.pending)<2:
-            batch = self.take(0 if self.pending else 2.)
+        import time
+        def launch(wait):
+            batch = self.take(wait)
             if batch is None:
-                break
+                return False
             token, model, rows = batch
             try:
                 handle = native_dense.submit(self.models[model], rows)
@@ -650,10 +651,26 @@ class InferenceService:
                     self.abandon_fenced(token)
                 raise
             self.pending.append((token, handle))
+            return True
+        while len(self.pending)<2:
+            if not launch(0 if self.pending else 2.):
+                break
         if self.pending:
+            # A partial batch may become ready while the oldest forward runs.
+            # Keep feeding its spare slot instead of blocking in collect().
+            event = self.pending[0][1].event
+            while len(self.pending)<2 and event is not None and not event.query():
+                if not launch(0):
+                    # A timed take flushes a partial batch at its timeout.
+                    # Preserve the configured batching latency while waiting.
+                    time.sleep(.0001)
             token, handle = self.pending[0]
             self.complete(token, handle.collect())
             self.pending.pop(0)
+            # Actor event processing can take longer than a forward. Leave
+            # ready work running before handing control back to that caller.
+            while len(self.pending)<2 and launch(0):
+                pass
 
     def run(self, ms=0):
         try:
