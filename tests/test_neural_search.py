@@ -2287,27 +2287,70 @@ class NativeProofs(unittest.TestCase):
 
     def test_workers_consume_queued_jobs_without_owner_polling(self):
         from tactical_proof import independent_verify
-        graphs = [self.graph(self.opening) for _ in range(4)]
+        graphs = [self.graph(self.opening) for _ in range(19)]
         pool = self.pool(graphs, quantum=16, views=1, work=4096)
         proofs = self.loop(pool, workers=2, queue=8)
         pool.step()
         self.assertEqual(self.answer(pool), 1)  # Identical neural contexts coalesce across games.
         proofs.step()
         submitted = proofs.stats()['submitted']
-        self.assertEqual(submitted, 4)
-        # stats() neither admits work nor installs results. Workers consume all four jobs themselves.
+        self.assertEqual(submitted, 8)
+        # Workers consume each refill without polling. More games than queue slots
+        # exercise cursor rotation and selection of the remaining eligible games.
         self.wait(lambda: proofs.stats()['finished'] == submitted)
-        self.assertEqual(proofs.stats()['ready'], 4)
+        self.assertEqual(proofs.stats()['ready'], 8)
         proofs.step()
-        self.assertEqual(proofs.stats()['installed'], 4)
+        self.assertEqual(proofs.stats()['submitted'], 16)
+        self.wait(lambda: proofs.stats()['finished'] == 16)
+        proofs.step()
+        self.assertEqual(proofs.stats()['submitted'], 19)
+        self.wait(lambda: proofs.stats()['finished'] == 19)
+        proofs.step()
+        self.assertEqual(proofs.stats()['installed'], 19)
         self.assertEqual({native.hxg_exact(g.ptr) for g in graphs}, {0})
         records = proofs.records()
-        self.assertEqual(len({r['id'] for r in records}), 4)
-        self.assertEqual({r['game'] for r in records}, set(range(4)))
+        self.assertEqual(len({r['id'] for r in records}), 19)
+        self.assertEqual({r['game'] for r in records}, set(range(19)))
         for row in records:
             self.assertEqual(row['request']['history'], self.opening)
             self.assertEqual(independent_verify(row['result']['certificate'], self.opening,
                              known=row['request']['known']), 'PROVEN_WIN')
+
+    def test_refill_explores_an_older_low_priority_position_without_duplicates(self):
+        import ctypes as C
+        import json
+        from neural_search import bind, checked, ptr
+        bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
+        bind('hxpe_take', C.c_uint64, ptr, C.c_int)
+        bind('hxpe_request', C.c_char_p, ptr, C.c_int)
+        bind('hxpe_complete', C.c_int, ptr, C.c_int, C.c_uint64, ptr, ptr, C.c_int, C.c_char_p, C.c_char_p)
+        graph=self.graph([[0,0]])
+        starts=[[[0,0],[q,r],[q+1,r]] for q,r in
+                ((4,0),(4,1),(4,-1),(3,1),(3,-1),(2,2),(2,-2),(1,3),(1,-3))]
+        for history in starts:
+            view=graph.view(history);self.addCleanup(view.close)
+            view.search(1,root_samples=1,batch_size=1)
+        pool=self.pool([graph],quantum=4,views=1,work=4096)
+        loop=native.hxpe_new(pool.ptr,1,8,8,1,64,0,64)
+        self.assertTrue(loop)
+        try:
+            for i,history in enumerate(starts):
+                cells=np.asarray(history,np.int64)
+                checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),.01 if i<2 else i+1.))
+            checked(native.hxp_step(loop))
+            seen=[];ids=[]
+            while job:=native.hxpe_take(loop,0):
+                self.assertNotEqual(job,2**64-1)
+                row=json.loads(native.hxpe_request(loop,0));seen.append(row['history']);ids.append(job)
+                info=np.zeros(13,np.uint64);info[4]=1
+                checked(native.hxpe_complete(loop,0,job,info.ctypes.data,None,0,None,None))
+            self.assertEqual(seen[:4],list(reversed(starts[5:])))
+            self.assertEqual(seen[4],starts[0])
+            self.assertEqual(len(ids),8)
+            self.assertEqual(len(set(ids)),8)
+            self.assertEqual(len({tuple(map(tuple,h)) for h in seen}),8)
+        finally:
+            native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
     def test_root_proof_overrides_late_neural_rows_and_releases_reservations(self):
         graph = self.graph(self.opening)
