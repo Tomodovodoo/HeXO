@@ -1,4 +1,5 @@
 import copy
+import ctypes as C
 import hashlib
 import json
 from pathlib import Path
@@ -122,6 +123,114 @@ class NativeStrategy(unittest.TestCase):
             self.assertEqual((learned['status'], warm['status'], cold['status']),
                              ('PROVEN_WIN', 'PROVEN_WIN', 'UNKNOWN'))
         self.assertEqual(independent_verify(warm['certificate'], changed), 'PROVEN_WIN')
+
+    def test_direct_workers_bind_to_execution_thread_and_isolate_replacements(self):
+        lib=self.engine.lib
+        signatures={
+            'worker_new_direct':(C.c_void_p,[]), 'worker_free_direct':(None,[C.c_void_p]),
+            'worker_answer_direct':(C.c_void_p,[C.c_void_p,C.c_char_p]),
+            'worker_busy_direct':(C.c_bool,[C.c_void_p]),
+            'answer_json':(C.c_void_p,[C.c_void_p]), 'answer_free':(None,[C.c_void_p]),
+        }
+        for name,(result,args) in signatures.items():
+            function=getattr(lib,'hexo_tactical_'+name);function.restype=result;function.argtypes=args
+        def query(worker,history=OPEN_THREE,**options):
+            request=dict(history=history,nodes=20000,idtt_nodes=0,ms=5000,depth=8,
+                         table_mb=4,resume=True,**options)
+            answer=lib.hexo_tactical_worker_answer_direct(worker,json.dumps(request).encode())
+            self.assertTrue(answer)
+            try:
+                raw=lib.hexo_tactical_answer_json(answer)
+                try:return json.loads(C.string_at(raw))
+                finally:lib.hexo_tactical_free(raw)
+            finally:lib.hexo_tactical_answer_free(answer)
+        first=lib.hexo_tactical_worker_new_direct();second=lib.hexo_tactical_worker_new_direct()
+        self.assertTrue(first and second)
+        try:
+            cold=query(first);warm=query(first)
+            self.assertEqual(independent_verify(cold['certificate'],OPEN_THREE),'PROVEN_WIN')
+            self.assertGreater(cold['nodes_fresh'],0);self.assertEqual(warm['nodes_fresh'],0)
+            self.assertTrue(warm['cache_hit'])
+            rejected=query(second)
+            self.assertEqual((rejected['status'],rejected['nodes_fresh']),('UNKNOWN',0))
+            self.assertIn('already owned',rejected['reason'])
+            migrated=[]
+            thread=threading.Thread(target=lambda:migrated.append(query(first)))
+            thread.start();thread.join(2);self.assertFalse(thread.is_alive())
+            self.assertEqual(migrated[0]['status'],'UNKNOWN')
+            self.assertIn('thread changed',migrated[0]['reason'])
+            query(first,stamps=True,library=[])
+            changed=OPEN_THREE+[[8,8],[10,8],[8,10],[10,10]]
+            self.assertEqual(query(first,changed,stamps=True,library=[])['status'],'PROVEN_WIN')
+            self.assertFalse(lib.hexo_tactical_worker_busy_direct(first))
+        finally:lib.hexo_tactical_worker_free_direct(first)
+        try:
+            # An unbound second handle can take over after the first retires.
+            separate=query(second)
+            self.assertEqual(separate['status'],'PROVEN_WIN')
+            self.assertFalse(separate['cache_hit']);self.assertFalse(separate['resident_reused'])
+            self.assertGreater(separate['nodes_fresh'],0)
+            request=dict(history=changed,nodes=1,idtt_nodes=0,ms=5000,depth=8,
+                         stamps=True,library=[])
+            answer=lib.hexo_tactical_worker_answer_direct(second,json.dumps(request).encode())
+            raw=lib.hexo_tactical_answer_json(answer)
+            try:self.assertEqual(json.loads(C.string_at(raw))['status'],'UNKNOWN')
+            finally:lib.hexo_tactical_free(raw);lib.hexo_tactical_answer_free(answer)
+        finally:lib.hexo_tactical_worker_free_direct(second)
+
+    def test_direct_cancellation_releases_one_worker_without_cancelling_another(self):
+        lib=self.engine.lib
+        for name,result,args in (
+            ('worker_new_direct',C.c_void_p,[]), ('worker_free_direct',None,[C.c_void_p]),
+            ('worker_answer_direct',C.c_void_p,[C.c_void_p,C.c_char_p]),
+            ('worker_busy_direct',C.c_bool,[C.c_void_p]),
+            ('answer_json',C.c_void_p,[C.c_void_p]), ('answer_free',None,[C.c_void_p]),
+        ):
+            function=getattr(lib,'hexo_tactical_'+name);function.restype=result;function.argtypes=args
+        workers=[lib.hexo_tactical_worker_new_direct() for _ in range(2)]
+        self.assertTrue(all(workers));token=lib.hexo_tactical_prepare()
+        alternatives=[dict(action=[[0,0],[i,1]],child=0) for i in range(20000)]
+        certificate=dict(version=1,width='wide',root=0,nodes=[dict(kind='attacker_move',
+                         action=[[0,0],[1,1]],child=0,alternatives=alternatives)])
+        request=dict(history=OPEN_THREE,nodes=20000,idtt_nodes=0,ms=5000,depth=8,
+                     request_id=token,stamps=True,library=[],
+                     replay=[dict(history=OPEN_THREE,winner=0,pv=[],certificate=certificate)])
+        results=[[],[]];errors=[]
+        def query(worker,request):
+            answer=lib.hexo_tactical_worker_answer_direct(worker,json.dumps(request).encode())
+            self.assertTrue(answer)
+            raw=lib.hexo_tactical_answer_json(answer)
+            try:return json.loads(C.string_at(raw))
+            finally:lib.hexo_tactical_free(raw);lib.hexo_tactical_answer_free(answer)
+        def execute(index):
+            try:
+                if index==0:results[0].append(query(workers[0],request))
+                results[index].append(query(workers[index],dict(history=IMMEDIATE,nodes=100,
+                                      idtt_nodes=0,ms=2000,depth=8)))
+            except BaseException as error:errors.append(error)
+        threads=[threading.Thread(target=execute,args=(i,)) for i in range(2)]
+        try:
+            threads[0].start();deadline=time.monotonic()+2
+            while not lib.hexo_tactical_worker_busy_direct(workers[0]) and threads[0].is_alive() and time.monotonic()<deadline:
+                time.sleep(.001)
+            self.assertTrue(lib.hexo_tactical_worker_busy_direct(workers[0]))
+            threads[1].start();start=time.perf_counter()
+            self.assertTrue(lib.hexo_tactical_cancel(token))
+            for thread in threads:thread.join(2)
+            self.assertFalse(any(t.is_alive() for t in threads));self.assertFalse(errors,errors)
+            self.assertLess(time.perf_counter()-start,.5)
+            cancelled=results[0][0]
+            self.assertEqual(cancelled['status'],'UNKNOWN');self.assertFalse(cancelled['native_verified'])
+            self.assertIsInstance(cancelled['nodes_fresh'],int)
+            for row in (results[0][1],results[1][0]):
+                self.assertEqual(independent_verify(row['certificate'],IMMEDIATE),'PROVEN_WIN')
+            self.assertFalse(any(lib.hexo_tactical_worker_busy_direct(w) for w in workers))
+        finally:
+            lib.hexo_tactical_cancel(token)
+            for thread in threads:
+                if thread.ident is not None:thread.join()
+            lib.hexo_tactical_release(token)
+            for worker in workers:lib.hexo_tactical_worker_free_direct(worker)
 
     def test_replay_indexes_shared_branches_and_keeps_later_evidence(self):
         with NativeTactics(independent=True) as native:

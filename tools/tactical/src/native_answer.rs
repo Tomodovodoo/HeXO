@@ -4,6 +4,69 @@ use super::*;
 
 struct Answer {value:Value,info:[u64;13],moves:Vec<(i32,i32)>,frontier:Vec<i64>}
 
+// The native pool already has one stable dispatcher thread per handle. Bind on
+// first execution, not construction: the pool creates handles on its owner.
+struct DirectState {worker:WorkerState,thread:Mutex<Option<std::thread::ThreadId>>}
+struct DirectWorker {state:Arc<DirectState>}
+thread_local! {
+    static DIRECT_OWNER:std::cell::RefCell<std::sync::Weak<DirectState>>=const{std::cell::RefCell::new(std::sync::Weak::new())};
+}
+impl DirectWorker {
+    fn bind(&self)->Result<(),String> {
+        let current=std::thread::current().id();
+        let mut thread=self.state.thread.lock().map_err(|_|"direct worker affinity lock")?;
+        if thread.is_some_and(|owner|owner!=current) {return Err("direct worker thread changed".into());}
+        DIRECT_OWNER.with(|slot| {
+            let mut owner=slot.borrow_mut();
+            if let Some(other)=owner.upgrade() {
+                if !Arc::ptr_eq(&other,&self.state) {return Err("direct worker thread already owned".into());}
+            } else {
+                // Replacing a retired handle must not inherit its cache,
+                // retained search frontier, learned stamps or seeding progress.
+                CACHE.with(|cache|cache.lock().map_err(|_|"result cache lock").map(|mut c|c.clear()))?;
+                prover::dfpn::set_resident(0);
+                stamps::reset_worker();
+                *owner=Arc::downgrade(&self.state);
+            }
+            *thread=Some(current);Ok(())
+        })
+    }
+}
+struct Active<'a>(&'a WorkerState);
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active)=self.0.active.lock() {*active=None;}
+        self.0.busy.store(false,Ordering::Release);
+    }
+}
+fn finish(value:&mut Value,cancel:&AtomicBool,deadline:Instant) {
+    if cancel.load(Ordering::Acquire) || Instant::now()>=deadline {
+        value["status"]=json!("UNKNOWN");value["native_verified"]=json!(false);
+        value["moves"]=json!([]);value["certificate"]=Value::Null;
+        value["proof_turns"]=Value::Null;value["shortest"]=json!(false);
+        value["reason"]=json!("cancelled or deadline; completion collected");
+    }
+}
+fn complete_direct(worker:&DirectWorker,req:Request,start:Instant,dispatched:&mut bool)->Result<Value,String> {
+    if req.ms==0 || req.ms>60000 {return Err("invalid deadline".into());}
+    let deadline=start+Duration::from_millis(req.ms as u64);
+    let cancel=query_control(req.request_id)?;
+    if cancel.load(Ordering::Acquire) {return Err("cancelled".into());}
+    let state=&worker.state.worker;
+    if state.busy.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err() {
+        return Err("direct worker busy".into());
+    }
+    let _active=Active(state);
+    worker.bind()?;
+    *state.active.lock().map_err(|_|"worker cancellation lock")?=Some(Arc::clone(&cancel));
+    let budget_ms=req.ms;let cpu_start=thread_cpu_ms();
+    *dispatched=true;
+    let result=std::panic::catch_unwind(||run_controlled(req,start,Arc::clone(&cancel)))
+        .unwrap_or_else(|_|Err("native worker panic".into()));
+    state.record(start,budget_ms,&cancel,cpu_start);
+    let mut value=result?;finish(&mut value,&cancel,deadline);Ok(value)
+}
+
 // A native scheduler already owns a background dispatcher. After the slice ends
 // it must collect the cancelled worker's meter, rather than abandon its reply.
 // Legacy query callers keep their bounded-wait dispatch_on contract.
@@ -31,12 +94,7 @@ fn complete(worker:&Worker,req:Request,start:Instant,dispatched:&mut bool)->Resu
     };
     // A queued reply can also be received after the clock. Neither receive
     // route may expose an exact answer after cancellation or the deadline.
-    if cancel.load(Ordering::Acquire) || Instant::now()>=deadline {
-        value["status"]=json!("UNKNOWN");value["native_verified"]=json!(false);
-        value["moves"]=json!([]);value["certificate"]=Value::Null;
-        value["proof_turns"]=Value::Null;value["shortest"]=json!(false);
-        value["reason"]=json!("cancelled or deadline; completion collected");
-    }
+    finish(&mut value,&cancel,deadline);
     Ok(value)
 }
 
@@ -50,6 +108,40 @@ pub unsafe extern "C" fn hexo_tactical_worker_answer(worker:*mut std::ffi::c_voi
             complete(worker,req,start,dispatched)
         })};
         worker.stats(&mut value);
+        make_answer(value,scope)
+    })).unwrap_or(std::ptr::null_mut())
+}
+
+/// Direct handles own no background thread. Do not free during an ABI call;
+/// the native pool joins its dispatcher before releasing the handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn hexo_tactical_worker_new_direct()->*mut std::ffi::c_void {
+    Box::into_raw(Box::new(DirectWorker{state:Arc::new(DirectState{
+        worker:WorkerState::default(),thread:Mutex::new(None)})})).cast()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_answer_direct(worker:*mut std::ffi::c_void,input:*const c_char)->*mut std::ffi::c_void {
+    if worker.is_null() {return std::ptr::null_mut();}
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let worker=unsafe{&*worker.cast::<DirectWorker>()};let mut scope=None;
+        let mut value=unsafe{query_value(input,|req,start,dispatched| {
+            scope=Some((req.history.len(),req.attacker));
+            complete_direct(worker,req,start,dispatched)
+        })};
+        worker.state.worker.stats(&mut value);
+        make_answer(value,scope)
+    })).unwrap_or(std::ptr::null_mut())
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_busy_direct(worker:*mut std::ffi::c_void)->bool {
+    !worker.is_null() && unsafe{&*worker.cast::<DirectWorker>()}.state.worker.busy.load(Ordering::Acquire)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hexo_tactical_worker_free_direct(worker:*mut std::ffi::c_void) {
+    if !worker.is_null() {drop(unsafe{Box::from_raw(worker.cast::<DirectWorker>())});}
+}
+
+fn make_answer(value:Value,scope:Option<(usize,Attacker)>)->*mut std::ffi::c_void {
         let mut info=[0;13];let mut moves=vec![];
         if let Some((stones,side))=scope {
             let (player,remaining)=check::phase(stones);
@@ -85,7 +177,6 @@ pub unsafe extern "C" fn hexo_tactical_worker_answer(worker:*mut std::ffi::c_voi
             }
         }
         Box::into_raw(Box::new(Answer{value,info,moves,frontier})).cast()
-    })).unwrap_or(std::ptr::null_mut())
 }
 
 /// out: verdict(0/1/3), winner+1, proof turns, fresh nodes, fresh known,
@@ -124,4 +215,19 @@ pub unsafe extern "C" fn hexo_tactical_answer_json(answer:*const std::ffi::c_voi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hexo_tactical_answer_free(answer:*mut std::ffi::c_void) {
     if !answer.is_null() {drop(unsafe{Box::from_raw(answer.cast::<Answer>())});}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn direct_active_state_clears_when_execution_unwinds() {
+        let state=WorkerState::default();
+        state.busy.store(true,Ordering::Release);
+        *state.active.lock().unwrap()=Some(Arc::new(AtomicBool::new(false)));
+        let failed=std::panic::catch_unwind(|| {let _active=Active(&state);panic!("interrupted execution");});
+        assert!(failed.is_err());
+        assert!(!state.busy.load(Ordering::Acquire));
+        assert!(state.active.lock().unwrap().is_none());
+    }
 }
