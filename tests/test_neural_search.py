@@ -2229,6 +2229,81 @@ class NativeScheduler(unittest.TestCase):
         self.assertIsNone(record['raw_value'])
 
 
+    def test_replaced_slots_finish_cleanup_and_keep_retirement_bounded(self):
+        import time
+        from types import SimpleNamespace
+        from native_scheduler import InferenceService
+        graphs = [self.graph() for _ in range(8)]
+        pool = self.pool(graphs, quantum=8, views=1, work=8, cache=0)
+        service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')])
+        try:
+            service.start(continuous=True)
+            for game in range(len(graphs)):
+                service.release(0, game, expected=0)
+            released, end = set(), time.monotonic()+5
+            while len(released)<len(graphs) and time.monotonic()<end:
+                event = service.event()
+                if event is None:
+                    time.sleep(.001)
+                    continue
+                self.assertEqual((event['kind'], event['token']), ('released', 1))
+                released.add(event['game'])
+            self.assertEqual(len(released), len(graphs))
+            for graph in graphs:
+                graph.close()
+            for game in range(len(graphs)):
+                service.replace(0, game, self.graph(), expected=1, views=1)
+            replaced, end = set(), time.monotonic()+5
+            while len(replaced)<len(graphs) and time.monotonic()<end:
+                stats = service.stats()
+                self.assertLessEqual(stats['reclaim_queued']+stats['reclaim_active']+stats['reclaim_reserved'], 2)
+                event = service.event()
+                if event is None:
+                    time.sleep(.001)
+                    continue
+                self.assertEqual((event['kind'], event['token']), ('replaced', 2))
+                replaced.add(event['game'])
+            self.assertEqual(len(replaced), len(graphs))
+        finally:
+            service.close()
+        stats = service.stats()
+        self.assertEqual(stats['reclaimed_games'], len(graphs))
+        self.assertEqual((stats['reclaim_queued'], stats['reclaim_active'], stats['reclaim_reserved'],
+                          stats['pending_rows'], stats['active_producers']), (0, 0, 0, 0, 0))
+
+
+    def test_cancelling_queued_replacements_drains_cleanup_reservations(self):
+        import time
+        from types import SimpleNamespace
+        from native_scheduler import InferenceService
+        graphs = [self.graph() for _ in range(8)]
+        pool = self.pool(graphs, quantum=8, views=1, work=8, cache=0)
+        service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')])
+        try:
+            service.start(continuous=True)
+            for game in range(len(graphs)):
+                service.release(0, game, expected=0)
+            released, end = set(), time.monotonic()+5
+            while len(released)<len(graphs) and time.monotonic()<end:
+                event = service.event()
+                if event is None:
+                    time.sleep(.001)
+                    continue
+                released.add(event['game'])
+            self.assertEqual(len(released), len(graphs))
+            for graph in graphs:
+                graph.close()
+            for game in range(len(graphs)):
+                service.replace(0, game, self.graph(), expected=1, views=1)
+            service.cancel()
+        finally:
+            service.close()
+        stats = service.stats()
+        self.assertEqual((stats['reclaim_queued'], stats['reclaim_active'], stats['reclaim_reserved'],
+                          stats['pending_rows'], stats['inflight_batches'], stats['active_producers']),
+                         (0, 0, 0, 0, 0, 0))
+
+
 class NativeProofs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
