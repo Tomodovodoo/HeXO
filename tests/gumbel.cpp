@@ -16,6 +16,27 @@ int main(){
    auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);
   }
  }
+ // Discarding a child graph must not discard the second stone of a retained
+ // winning turn. Orphan proof records do not keep their own descendants alive.
+ {gumbel::Tree t(29);assert(hxg_share(&t,1));t.tactics=true;
+  std::vector<Cell> history{{0,0},{0,5},{1,5},{1,0},{2,0},{3,5},{4,5},{3,0},{-1,1},{6,6},{7,7}};
+  t.root_at(history);gumbel::Path path;t.capture(path);t.root->expanded=true;
+  for(auto c:path.legal){gumbel::Edge edge(&t.root->empty);edge.action=c;t.root->edges.push_back(std::move(edge));}
+  t.classify(path,*t.root);t.learn(*t.root);assert(t.root->exact_winner==0);
+  Cell first{-2,0},second{-1,0};Board half=t.board;half.make(first);
+  auto key=gumbel::keys(half).first;
+  t.record(key,{0,0,1,int(half.cells.size()),false,{{second,0,1,false}}});
+  Board finished=half;finished.make(second);assert(finished.winner==0);
+  gumbel::Key orphan{11,12},orphan_half=gumbel::child_keys(orphan,history,first).first;
+  t.outcomes[orphan]={0,0,2,int(history.size()),false,{{first,0,2,false}}};
+  t.outcomes[orphan_half]={0,0,1,int(half.cells.size()),false,{{second,0,1,false}}};
+  for(uint64_t i=100;i<132;++i)t.outcomes[{i,i+1234}]={};
+  t.evict();assert(t.outcomes.contains(key) && !t.outcomes.contains(orphan) && !t.outcomes.contains(orphan_half));
+  assert(t.outcomes.size()==2);t.advance(first);t.proof_root();
+  assert(t.root->expanded && t.root->exact_winner==0);
+  auto edge=std::find_if(t.root->edges.begin(),t.root->edges.end(),[&](const auto& e){return e.action==second;});
+  assert(edge!=t.root->edges.end() && edge->read().eligible && edge->read().exact_winner==0);
+ }
  // A node released between evictions, as an archive discard does, still has
  // its expired index entries swept by the next evict within the store limit.
  {gumbel::Tree t(29);assert(hxg_share(&t,64));t.root_at({{0,0},{1,0}});t.root_at({});

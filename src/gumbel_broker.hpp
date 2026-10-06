@@ -587,6 +587,23 @@ inline void Producer::run()noexcept{
   broker.retirement_reserved-=retirement_reserved;retirement_reserved=0;done=true;
  }broker.wake.notify_all();
 }
+// Copy a complete winning turn while the producer owns the graph. No consumer
+// needs to re-root mutable search or ask the network for a certified second stone.
+inline std::vector<Cell> winning_turn(owner::Owner& owner,Cell first){
+ auto& t=*owner.views[0].tree;auto& root=*t.root;const int side=t.board.player;
+ if(root.exact_winner!=side)return {};
+ auto edge=std::find_if(root.edges.begin(),root.edges.end(),[&](const auto& e){return e.action==first;});
+ if(edge==root.edges.end() || edge->read().exact_winner!=side)return {};
+ Board after=t.board;if(!after.legal(first))return {};after.make(first);
+ if(after.winner>=0 || after.player!=side)return {first};
+ if(after.remaining!=1)return {};
+ for(auto& completion:after.completions(side,1))if(completion.size()==1 && after.legal(completion[0]))return {first,completion[0]};
+ auto found=owner.game->outcomes.find(gumbel::keys(after).first);
+ if(found==owner.game->outcomes.end() || found->second.player!=side || found->second.winner!=side)return {};
+ const gumbel::EdgeProof* second=nullptr;
+ for(auto& e:found->second.edges)if(e.winner==side && after.legal(e.action) && (!second || e.distance<second->distance))second=&e;
+ return second?std::vector<Cell>{first,second->action}:std::vector<Cell>{};
+}
 inline RootEvent Producer::result(int index,uint64_t token){
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
  if(pool.failed[index] || (!n.expanded && o.deadline)){
@@ -614,6 +631,7 @@ inline RootEvent Producer::result(int index,uint64_t token){
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i]/total,double(e.read().visits),double(i<o.direct_root_credits.size()?o.direct_root_credits[i]:0),double(e.read().eligible)});}
+ out<<",\"winning_turn\":";cells(winning_turn(o,{action[0],action[1]}));
  out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"exact_prefixes\":[";Board prefix;size_t count=0;
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(gumbel::keys(prefix).first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;

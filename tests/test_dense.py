@@ -9819,6 +9819,43 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
                     self.assertEqual(result['stones'][1]['exact_winner'], winner)
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # A real immediate pair is committed before the first winning
+                # publication can cancel the worker. No second inference is needed.
+                from timed_engine import dense_turn
+                from time_control import allowance
+                import threading
+                history = [[0,0],[0,5],[1,5],[1,0],[2,0],[3,5],[4,5],[3,0],[-1,1],[6,6],[7,7]]
+                player.set_history(history)
+                cancelled, published = threading.Event(), []
+                def stop_at_win(event):
+                    published.append(event)
+                    if event['proof_status'] == 'PROVEN_WIN':
+                        cancelled.set()
+                result = dense_turn(player, history, allowance(movetime=1000), cancelled, stop_at_win)
+                self.assertTrue(cancelled.is_set())
+                self.assertEqual(result['winning_turn'], result['moves'])
+                self.assertEqual(len(result['moves']), 2)
+                self.assertEqual(result['evaluated'], 0)
+                self.assertEqual(result['stones'][1]['source'], 'proof_witness')
+                self.assertEqual(result['stones'][1]['root_completed'], 0)
+                finished = Game(history)
+                try:
+                    for action in result['moves']:
+                        finished.play(*action)
+                    self.assertEqual(finished.winner, 0)
+                finally:
+                    finished.close()
+                self.assertTrue(all(event['moves'] == result['moves'] for event in published
+                                    if event['proof_status'] == 'PROVEN_WIN'))
+                # A bare exact value cannot certify an arbitrary second stone.
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=0)
+                    service.event.return_value = dict(producer=0, game=0, model=0, token=1,
+                        history=[[0,0]], context='unwitnessed', action=[1,0], exact_winner=1,
+                        root_completed=1, completed=1, edges=np.array([[1,0,0,0,1,1,0,0,1]], float))
+                    with self.assertRaisesRegex(ValueError, 'complete turn witness'):
+                        player.turn(game, 1000)
                 # Release retained search and captures before replacement allocations.
                 old_pool = player._timed_native[1]
                 old_graph = unittest.mock.Mock()
