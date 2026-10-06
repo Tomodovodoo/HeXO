@@ -9890,6 +9890,24 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
                     self.assertEqual(result['stones'][1]['exact_winner'], winner)
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # Play follows the full improved policy, including a move outside
+                # the owner's last halving finalists, and retargets that position.
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=2)
+                    service.event.side_effect = [
+                        dict(producer=0, game=0, model=0, token=1, history=[[0,0]], context='first',
+                             action=[1,0], exact_winner=-1, root_completed=2, completed=3,
+                             edges=np.array([[1,0,0,0,.1,.1,2,2,1], [0,1,0,0,.7,.9,0,0,1]], float)),
+                        dict(producer=0, game=0, model=0, token=2, history=[[0,0],[0,1]], context='second',
+                             action=[0,2], exact_winner=-1, root_completed=3, completed=4,
+                             edges=np.array([[0,2,0,0,.6,1,3,3,1]], float))]
+                    result = player.turn(game, 1000)
+                    self.assertEqual(service.retarget.call_args_list[1].args[2], [[0,0],[0,1]])
+                self.assertEqual(result['moves'], [[0,1],[0,2]])
+                self.assertEqual(result['stones'][1]['history'], [[0,0],[0,1]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
+                self.assertEqual((result['completed'], result['scheduler_completed']), (5,7))
                 # The searched second root can arrive only at shutdown. Its
                 # matching final frame replaces the provisional legal filler.
                 clock = [0.]
@@ -9947,6 +9965,26 @@ class DenseTimedWorker(unittest.TestCase):
                     finished.close()
                 self.assertTrue(all(event['moves'] == result['moves'] for event in published
                                     if event['proof_status'] == 'PROVEN_WIN'))
+                # A complete certified turn stays authoritative even when the
+                # estimated policy assigns more mass to a different legal stone.
+                finished = Game(history)
+                try:
+                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                        service = service_type.return_value
+                        service.stats.return_value = dict(launched_rows=0)
+                        service.event.return_value = dict(producer=0, game=0, model=0, token=1,
+                            history=history, context='witnessed', action=[4,0], winning_turn=[[4,0],[5,0]],
+                            exact_winner=0, root_completed=1, completed=1,
+                            edges=np.array([[4,0,0,0,1,.1,0,2,1], [2,5,0,0,.5,.9,-1,-1,1]], float))
+                        result = player.turn(finished, 1000)
+                    self.assertEqual(result['moves'], [[4,0],[5,0]])
+                    self.assertEqual(result['winning_turn'], result['moves'])
+                    for action in result['moves']:
+                        finished.play(*action)
+                    self.assertEqual(finished.winner, 0)
+                    self.assertEqual(service.retarget.call_count, 1)
+                finally:
+                    finished.close()
                 # A bare exact value cannot certify an arbitrary second stone.
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                     service = service_type.return_value

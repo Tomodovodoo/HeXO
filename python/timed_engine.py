@@ -370,6 +370,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 # a losing chosen continuation does not cover its alternatives.
                 result.update(win_probability=1., proof_status='PROVEN_WIN')
             action = found['action']
+            if winner < 0 and edges[:, 5].sum() > 0:
+                action = edges[np.argmax(edges[:, 5]), :2].astype(np.int64).tolist()
             witness = found.get('winning_turn', [])
             if witness:
                 if winner != side or witness[0] != action:
