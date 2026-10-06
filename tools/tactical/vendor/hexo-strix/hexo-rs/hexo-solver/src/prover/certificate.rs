@@ -16,7 +16,7 @@ fn check_control(ctl: &Ctl) -> Result<(), String> {
     if ctl.expired() { Err("certificate cancelled or deadline".into()) } else { Ok(()) }
 }
 use super::kernel::{AndEval, KernelCtx, Node, OrEval};
-use super::pn::{after_attacker, node_key_at};
+use super::pn::{after_attacker, eval_child_at, node_key_at};
 use crate::forcing::{CellSet2, WinDepthHints};
 use hexo_engine::types::{Coord, Player};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -369,9 +369,14 @@ impl ProofBuilder<'_> {
                         self.k.place_attacker(action);
                         let child_node = Node::And;
                         let child_key = node_key_at(self.k.hash(), child_node, child_remaining);
+                        // Search closes an OR node at its first proved move, so
+                        // later moves that are won on sight never reach `proven`.
+                        // Re-evaluate them here to keep them as alternatives.
                         let built = if self.proven.contains(&child_key) {
                             Some(self.emit(child_node, child_remaining))
-                        } else if self.hint_proven(child_node, child_remaining) {
+                        } else if self.hint_proven(child_node, child_remaining)
+                            || eval_child_at(&mut self.k, child_node, child_remaining).0 == 0
+                        {
                             self.proven.insert(child_key);
                             Some(self.emit(child_node, child_remaining))
                         } else {
