@@ -200,7 +200,8 @@ class ActorGraph:
                         # The submitting adapter must retain staging if even its
                         # failure fence cannot include writes on this stream.
                         error.gpu_unfenced = True
-                        error.add_note(f'graph stream handoff failed: {fence_error}')
+                        if hasattr(error, 'add_note'):
+                            error.add_note(f'graph stream handoff failed: {fence_error}')
                 raise
         return packed
 

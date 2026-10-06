@@ -1117,6 +1117,25 @@ class FusedCudaTests(unittest.TestCase):
         self.assertTrue(runner.stream.query())
         self.assert_bf16_close(expected_partial, destination[:16])
         self.assertTrue(torch.isnan(destination[16:]).all())
+        class LegacyError(RuntimeError):
+            def __getattribute__(self, name):
+                if name == 'add_note':
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+        failure = LegacyError('legacy exception after partial copy')
+        caller = torch.cuda.current_stream()
+        wait_stream = torch.cuda.Stream.wait_stream
+        def fail_handoff(stream, other):
+            if stream.cuda_stream == caller.cuda_stream and other.cuda_stream == runner.stream.cuda_stream:
+                raise RuntimeError('cannot establish graph handoff')
+            return wait_stream(stream, other)
+        with unittest.mock.patch.object(runner, '_segments', fail_after_first), \
+             unittest.mock.patch.object(torch.cuda.Stream, 'wait_stream', fail_handoff):
+            with self.assertRaises(LegacyError) as raised:
+                runner.copy_predictions(partial, destination)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(failure.gpu_unfenced)
+        runner.stream.synchronize()  # This test retains the destination until its writes finish.
         self.assertIn((24, 128), runner.graphs)
         self.assertIn((32, 64), runner.graphs)
         self.assertIn((40, 64), runner.graphs)
@@ -5111,15 +5130,22 @@ class EngineTests(unittest.TestCase):
         import native_dense
         from native_feed import NativeFeed
         from neural_search import native, checked
+        class LegacyError(RuntimeError):
+            def __getattribute__(self, name):
+                if name == 'add_note':
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
         def predict(x):
+            self.assertEqual(x.dtype, torch.bfloat16)  # Custom predict-only graphs retain floating inputs.
             count, _, side, _ = x.shape
             return dict(policy=torch.zeros(count, side*side), far=torch.zeros(count), value_logit=torch.zeros(count))
         allocate = hexnet.staging_buffer
-        for failure in ('create', 'record'):
+        for failure in ('create', 'record', 'create-legacy', 'record-legacy', 'unfenced-legacy'):
             with self.subTest(failure=failure):
                 tree = NeuralSearch(None, 'test', [(0,0)])
                 feed = NativeFeed(8)
-                evaluator = SimpleNamespace(cuda=True, free=[], graph=None, max_batch=8,
+                evaluator = SimpleNamespace(cuda=True, free=[], graph=SimpleNamespace(supports=lambda canvas: False),
+                                            packing_adaptive=False, max_batch=8,
                                             device=torch.device('cpu'), memory_format=torch.contiguous_format,
                                             predict=unittest.mock.Mock(side_effect=predict))
                 try:
@@ -5128,13 +5154,20 @@ class EngineTests(unittest.TestCase):
                     feed.gather(tree)
                     _, rows = feed.take_packed(8)
                     event = unittest.mock.Mock()
-                    event.record.side_effect = RuntimeError('fence failed')
-                    make_event = unittest.mock.Mock(side_effect=RuntimeError('fence failed')) if failure == 'create' else unittest.mock.Mock(return_value=event)
+                    error = (LegacyError if failure.endswith('legacy') else RuntimeError)('fence failed')
+                    event.record.side_effect = error
+                    make_event = unittest.mock.Mock(side_effect=error) if failure.startswith('create') else unittest.mock.Mock(return_value=event)
+                    if failure == 'unfenced-legacy':
+                        error.gpu_unfenced = True
+                        evaluator.predict.side_effect = error
                     with unittest.mock.patch.object(native_dense, '_quarantined', []), \
                          unittest.mock.patch.object(native_dense.torch.cuda, 'Event', make_event), \
                          unittest.mock.patch.object(hexnet, 'staging_buffer', side_effect=lambda *a: allocate(*a[:-1], False)):
-                        with self.assertRaisesRegex(RuntimeError, 'fence failed'):
+                        with self.assertRaisesRegex(RuntimeError, 'fence failed') as raised:
                             native_dense.submit(evaluator, rows)
+                        self.assertIs(raised.exception, error)
+                        if failure == 'unfenced-legacy':
+                            make_event.assert_not_called()
                         self.assertGreater(evaluator.predict.call_count, 0)
                         handle = native_dense._quarantined[0]
                         self.assertIsNotNone(handle.staging)
