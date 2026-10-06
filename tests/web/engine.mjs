@@ -675,6 +675,44 @@ if (job.kind === 'encode') {
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
     checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
     : messages.find(m => m.type === 'result').result;
+} else if (job.kind === 'analysis-failure') {
+  const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
+  let calls = 0;
+  const entry = {id:'test',kind:'bubble',presets:{standard:{simulations:4,solver_nodes:0}}};
+  session.registerEngine(entry,{turn:async()=>{
+    if (++calls === 1) throw Error('Temporary inference failure');
+    return {value:.5,moves:[[0,1],[1,0]],top:[[0,1,1,.5]],solved:true};
+  }});
+  session.history = [[0,0]]; session.analysis = session.spec({engine:'test',preset:'standard',auto:true});
+  session.enqueue('analyse',session.history,session.analysis); await session.pump();
+  const elements = new Map(), requests = [], notices = [];
+  const element = () => ({classList:{toggle(){}},style:{setProperty(){}},firstChild:{style:{}},children:[],
+    replaceChildren(){},append(){},setAttribute(k,v){this[k]=v;}});
+  const page = {S:null,view:0,COLORS:['yellow','blue'],STOPS:['standard'],STOP_ICON:[''],asked:new Map(),
+    performance,placing:[],placed:new Set(),landed:new Map(),seenLabels:new Map(),fitted:false,
+    $:id=>{if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+    setIcon:(e,icon)=>{e.icon=icon;},toast:text=>notices.push(text),
+    fit(){},draw(){},tickClocks(){},renderPanels(){},renderAnalysis(){},
+    post:async(path,body)=>{requests.push([path,body]);},key:(q,r)=>`${q},${r}`};
+  runInNewContext(source.match(/^const playerAt=.*$/m)[0]+'\n'
+    + source.slice(source.indexOf('const failures='),source.indexOf('/* board geometry:'))
+    + source.slice(source.indexOf('function finished('),source.indexOf('function renderAnalysis('))
+    + source.slice(source.indexOf('function autoAnalyse('),source.indexOf('function renderGraph('))
+    + source.slice(source.indexOf('function renderJobs('),source.indexOf('/* game actions */')),page);
+  page.accept(session.state());
+  // Polling the same revision must keep the error visible without resubmitting it.
+  page.accept(session.state());
+  const failure = {stage:elements.get('analysis-stage').textContent,title:elements.get('analysis-stage').title,
+    retry:elements.get('again')['aria-label'],requests:requests.length,notices:[...notices],calls};
+  await elements.get('again').onclick();
+  const retry = requests.at(-1);
+  await session.request(...retry,'POST'); await session.idle;
+  page.accept(session.state());
+  const recovered = {calls,value:session.lookup(session.history)?.value,stage:elements.get('analysis-stage').textContent,
+    label:elements.get('again')['aria-label']};
+  page.accept({...session.state(),revision:session.revision+1,jobs:[{id:99,kind:'analyse',status:'queued',ply:1,done:0,total:1}]});
+  answer = {failure,retry,recovered,queued:{stage:elements.get('analysis-stage').textContent,
+    progress:elements.get('analysis-progress').style.visibility,label:elements.get('again')['aria-label']}};
 } else if (job.kind === 'analysis-bar') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
   answer = job.cases.map(({history, value, live, top = [], node_value}) => {

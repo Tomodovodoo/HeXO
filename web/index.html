@@ -87,7 +87,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
   background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--c,var(--text)) 75%,transparent),transparent);animation:wait 1.6s ease-in-out infinite}
 @keyframes wait{from{transform:translateX(-100%)}to{transform:translateX(340%)}}
 .busy{display:flex;align-items:center;gap:6px;height:12px}.busy .bar{flex:1}
-.stage{font:10px var(--mono);color:var(--dim);white-space:nowrap}
+.stage{font:10px var(--mono);color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .spacer{flex:1}
 .row{display:flex;gap:6px;align-items:center}
 .stack{display:grid;gap:8px}
@@ -516,6 +516,7 @@ function accept(data){
   if(S&&data.instance===S.instance&&data.revision<S.revision)return;
   if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
   if(S&&'history' in data&&data.instance===S.instance&&data.revision===S.revision)data={instance:data.instance,revision:data.revision,jobs:data.jobs,clock:data.clock};
+  data.failedJobs=data.jobs.filter(j=>j.status==='failed');
   data.jobs=active(data.jobs,data.instance);
   if(data.notice&&data.notice!==noticed)toast(noticed=data.notice);
   if('history' in data){
@@ -527,7 +528,7 @@ function accept(data){
     if(grown<0||before===null){seenLabels.clear();landed.clear();hot=null;renderAnalysis.sig=null}
     if(!fitted||before===null||grown<0||grown>2)fit();
     renderPanels();
-  }else{S.jobs=data.jobs;if('clock' in data)S.clock=data.clock}
+  }else{S.jobs=data.jobs;S.failedJobs=data.failedJobs;if('clock' in data)S.clock=data.clock}
   if('clock' in data)clockAt=performance.now();
   renderJobs();tickClocks();draw();
 }
@@ -984,6 +985,7 @@ function renderStudy(){
 }
 function autoAnalyse(){
   if(S.importing)return;
+  if(S.failedJobs?.some(j=>j.kind==='analyse'&&j.ply===view))return;
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
   const short=!ev||(S.stale||[]).includes(view)||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
   if(!short||!S.analysis||!S.analysis.auto||job||finished())return;
@@ -1115,12 +1117,13 @@ function renderJobs(){
   renderAnalysis();
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view),analysing=S.jobs.filter(j=>j.kind==='analyse');
   $('evalbar').classList.toggle('pending',pending);
-  const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view&&j.status==='running'),progress=$('analysis-progress');
+  const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view),failed=S.failedJobs?.find(j=>j.kind==='analyse'&&j.ply===view),progress=$('analysis-progress');
   progress.style.visibility=ajob?'visible':'hidden';progress.style.setProperty('--c',COLORS[playerAt(view)]);
-  progress.classList.toggle('running',!!ajob);progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
-  $('analysis-stage').textContent=ajob?.stage||'';
-  const again=$('again');if(again){setIcon(again,analysing.length?'close':'again');
-    again.onclick=async()=>{if(!analysing.length)return post('/analyse',{ply:view,force:true});
+  progress.classList.toggle('running',ajob?.status==='running');progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
+  const stage=$('analysis-stage');stage.textContent=failed?`Analysis failed: ${failed.error}`:ajob?.status==='queued'?'Waiting for engine':ajob?.stage||'';stage.title=stage.textContent;
+  const again=$('again');if(again){setIcon(again,!failed&&analysing.length?'close':'again');
+    again.setAttribute('aria-label',failed?'Retry analysis':analysing.length?'Cancel analysis':'Analyse again');
+    again.onclick=async()=>{if(failed||!analysing.length)return post('/analyse',{ply:view,force:true});
       const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});
       for(const j of analysing)await post('/cancel',{id:j.id})}}
 }
