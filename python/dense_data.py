@@ -311,6 +311,35 @@ def short_value_targets(e, horizon, full_only):
     return targets, weights
 
 
+def geometry_summary(episodes):
+    """Played-stone geometry only. Reconstructed frames never restrict legal actions or training targets."""
+    groups, extremes = {}, {}
+    for game, episode in enumerate(episodes):
+        moves = np.asarray(episode['moves'], np.int64).reshape(-1, 2)
+        forced = (episode.get('book') or episode.get('restart') or {}).get('ply', 0)
+        line = (episode.get('adjudicated') or {}).get('ply', len(moves))
+        for ply, action in enumerate(moves):
+            source = 'forced-prefix' if ply < forced else 'proof-line' if ply >= line else 'played'
+            phase = 'opening' if ply < 16 else 'middle' if ply < 64 else 'late'
+            group = groups.setdefault(f'{source}/{phase}', dict(placements=0, nearest=Counter(), extension=Counter(),
+                                                               tensor_edge=Counter(), crop_edge=Counter(), tensor_shape=Counter()))
+            measured = hexcrop.move_geometry(moves[:ply], action)
+            group['placements'] += 1
+            for key in ('nearest', 'extension', 'tensor_edge', 'crop_edge'):
+                if measured[key] is not None:
+                    group[key][str(measured[key])] += 1
+            if measured['tensor_shape']:
+                group['tensor_shape']['x'.join(map(str, measured['tensor_shape']))] += 1
+            if measured['nearest'] is not None:
+                examples = extremes.setdefault(source, [])
+                examples.append(dict(game=game, ply=ply, action=action.tolist(), source=source, **measured))
+                examples.sort(key=lambda x: (x['nearest'], x['extension']), reverse=True)
+                del examples[8:]
+    return dict(games=len(episodes), groups=groups, extremes=extremes,
+                tensor_frame='reconstructed deterministic square crop, not a GPU submission receipt',
+                effect='measurement only; legal radius, model inputs and targets unchanged')
+
+
 def write_shard(path, identity, episodes, rows, origin='actor'):
     """Atomically publish a shard of `origin` (one of ORIGINS). `identity` must carry `actor_sha256`; each row
     carries `policy` (float array over the legal moves, or None/empty for no policy target) besides the stored
@@ -350,6 +379,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                         files={name: digest(stage/name) for name in FILES}, counts=counts)
         if tactical := tactical_results(episodes):
             manifest['tactical'] = tactical
+        if origin == 'actor':
+            manifest['move_geometry'] = geometry_summary(episodes)
         write_json(stage/'manifest.json', manifest)
         stage.rename(path)
     return manifest

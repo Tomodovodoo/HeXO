@@ -114,7 +114,7 @@ if (job.kind === 'encode') {
     try {
       owner.step(); batch = owner.take();
       if (!batch || batch.count !== 1 || batch.groups.length !== 1) throw new Error('Expected one root encoding');
-      const input = batch.features(0, 0, 1), sample = encode(history, native.legal(history));
+      const input = batch.features(0, 0, 1), sample = encode(history, native.legal(history), true);
       answer.push({size: batch.groups[0].size, features: Buffer.from(input.buffer).toString('base64'),
         reference: Buffer.from(features(sample).buffer).toString('base64'), far: sample.far});
     } finally { batch?.close(); owner.close(); graph.close(); }
@@ -151,7 +151,7 @@ if (job.kind === 'encode') {
       try { owner.close(); } catch { blockedClose = true; }
     }
     if (job.prove && !lateProof && forwardCalls >= (job.proveAfter ?? 1)) {graph.proveLoss(1-native.game(job.history).player, 7);lateProof = true;}
-    const policy = new Float32Array(count * size * size), far = new Float32Array(count), value = new Float32Array(count);
+    const policy = new Float32Array(count * (Array.isArray(size) ? size[0]*size[1] : size*size)), far = new Float32Array(count), value = new Float32Array(count);
     if (job.nonfinite) policy[0] = NaN;
     forwardsFinished++;
     return {policy, far, value};
@@ -205,7 +205,7 @@ if (job.kind === 'encode') {
     const network = new Network(null,null,'fp32',{model_version:'test'},1);
     network.forward = async (input,count,size)=>{
       forwards++;inForward=true;await new Promise(resolve=>setTimeout(resolve,job.delay??20));inForward=false;
-      return {policy:new Float32Array(count*size*size),far:new Float32Array(count),value:new Float32Array(count)};
+      return {policy:new Float32Array(count*(Array.isArray(size) ? size[0]*size[1] : size*size)),far:new Float32Array(count),value:new Float32Array(count)};
     };
     const query = (index,request)=>new Promise(resolve=>{
       // This fixture tests delivery from the offered interior position. A root
@@ -315,15 +315,16 @@ if (job.kind === 'encode') {
   const ort={env:{webgpu:{device}},Tensor:{fromGpuBuffer(gpuBuffer,{dims}){return {gpuBuffer,dims,dispose(){}};}},InferenceSession:{
     async create(graph,options){
       created++;await new Promise(resolve=>setTimeout(resolve,1));
-      const {batch:rows,size}=options.freeDimensionOverrides;
-      const session={rows,size,async run({features}){
+      const {batch:rows,size,height=size,width=size}=options.freeDimensionOverrides;
+      const session={rows,size,height,width,async run({features}){
         active++;let output;
         try{
           await new Promise(resolve=>setTimeout(resolve,1));
           if(features.gpuBuffer.destroyed)throw Error('Input freed during inference');
-          const values=new Float32Array(features.gpuBuffer.bytes),stride=20*size*size;output={};
+          if(features.dims.join()!==[rows,20,height,width].join())throw Error('Wrong captured input shape');
+          const values=new Float32Array(features.gpuBuffer.bytes),stride=20*height*width;output={};
           for(const name of ['policy','far','value']){
-            const columns=name==='policy'?size*size:1,buffer=device.createBuffer({size:16*Math.ceil(rows*columns/4)}),data=new Float32Array(buffer.bytes);
+            const columns=name==='policy'?height*width:1,buffer=device.createBuffer({size:16*Math.ceil(rows*columns/4)}),data=new Float32Array(buffer.bytes);
             for(let row=0;row<rows;row++)for(let cell=0;cell<columns;cell++)data[row*columns+cell]=values[row*stride]+graph[0]+cell/100;
             output[name]={type:'float32',gpuBuffer:buffer,dispose(){if(failDispose){failDispose=false;throw Error('Output release failed');}buffer.destroy();}};
           }
@@ -338,13 +339,13 @@ if (job.kind === 'encode') {
     }
   }};
   const network = new Network(ort,{async release(){}},'fp32',{model_version:'A'},1,{provider:'webgpu',graph:new Uint8Array([1])});
-  const input = (rows,size,value) => {const data=new Float32Array(rows*20*size*size);for(let row=0;row<rows;row++)data[row*20*size*size]=value+row;return data;};
+  const input = (rows,size,value) => {const area=Array.isArray(size)?size[0]*size[1]:size*size;const data=new Float32Array(rows*20*area);for(let row=0;row<rows;row++)data[row*20*area]=value+row;return data;};
   const other = new Network(ort,{async release(){}},'fp32',{model_version:'B'},1,{provider:'webgpu',graph:new Uint8Array([7])});
   let baseReleases = 0;
   const faulty = new Network(ort,{async release(){baseReleases++;}},'fp32',{model_version:'C'},1,{provider:'webgpu',graph:new Uint8Array([9])});
   let evictionBaseReleases=0;
   const evicting = new Network(ort,{async release(){evictionBaseReleases++;}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
-  let replacement;
+  let replacement, rectangular;
   try{
     const first=await network.forwardCaptured(input(3,24,2),3,24),second=await network.forwardCaptured(input(3,24,5),3,24);
     const concurrent=await Promise.all([network.forwardCaptured(input(3,24,8),3,24),network.forwardCaptured(input(3,24,11),3,24)]);
@@ -375,8 +376,12 @@ if (job.kind === 'encode') {
     await evicting.close();answer.eviction_base_releases=evictionBaseReleases;
     replacement=new Network(ort,{async release(){}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
     answer.reloaded_value=(await replacement.forwardCaptured(input(1,24,2),1,24)).value[0];await replacement.close();
+    rectangular=new Network(ort,{async release(){}},'fp32',{model_version:'R',spatial_axes:['height','width']},1,{provider:'webgpu',graph:new Uint8Array([1])});
+    const r=await rectangular.forwardCaptured(input(3,[24,72],2),3,[24,72]);
+    answer.rectangular={policy:r.policy.length,far:r.far.length,value:r.value[0],physical:r.physical_rows};
+    await rectangular.close();
     answer.final={active,freedBusy,mapped,buffers:buffers.size,sessions:sessions.size,created,released,stats:network.captureStats()};
-  }finally{await network.close();await other.close();await faulty.close();await evicting.close();await replacement?.close();}
+  }finally{await network.close();await other.close();await faulty.close();await evicting.close();await replacement?.close();await rectangular?.close();}
 } else if (job.kind === 'owner-profile') {
   // Runtime measurements, not old/new search-row or playing-strength checks.
   answer = {features: [], searches: []};
@@ -605,7 +610,7 @@ if (job.kind === 'encode') {
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluateNative: Network.prototype.evaluateNative, maxBatch: 64,
-      forward: async (input, count, size) => ({policy: new Float32Array(count*size*size), far: new Float32Array(count), value: new Float32Array(count)}),
+      forward: async (input, count, size) => ({policy: new Float32Array(count*(Array.isArray(size) ? size[0]*size[1] : size*size)), far: new Float32Array(count), value: new Float32Array(count)}),
       evaluate: async leaves => leaves.map(({history, actions}) => {
         if (messages.some(m => m.type === 'ready')) evaluations.push(history);
         const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;

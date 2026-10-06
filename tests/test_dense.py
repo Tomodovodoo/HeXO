@@ -96,6 +96,61 @@ POSITIONS = [h for h in fixed_positions() if active(h)]
 
 
 class HexcropTests(unittest.TestCase):
+    def test_rectangles_keep_full_legal_geometry_and_decode_after_tree_close(self):
+        import ctypes as C
+        from native_dense import PackedRows
+        from neural_search import GameGraph, native, checked
+        histories = [line_history(n, 4) for n in (1, 3, 7, 15, 25)]
+        trees = [GameGraph(None, 'rectangles', h, tactics=False) for h in histories]
+        self.addCleanup(lambda: [t.close() for t in trees])
+        requests = []
+        samples = [hexcrop.encode(h, rectangular=True) for h in histories]
+        self.assertTrue(any(h != w for h, w in (s.shape for s in samples)))
+        for tree, history, expected in zip(trees, histories, samples):
+            checked(native.hxg_begin(tree.ptr, 1, 1))
+            request = native.hxg_next(tree.ptr)
+            requests.append(request)
+            actual = hexcrop.encode_leaf(native, tree.ptr, request, history, rectangular=True)
+            np.testing.assert_array_equal(actual.planes, expected.planes)
+            np.testing.assert_array_equal(actual.cells, expected.cells)
+            legal = np.empty_like(actual.actions)
+            self.assertEqual(native.hxg_legal(tree.ptr, request, legal.ctypes.data), len(legal))
+            np.testing.assert_array_equal(actual.actions, legal)
+            self.assertEqual(actual.far, 0)
+            for i, action in zip(actual.cells, actual.actions):
+                self.assertEqual(actual.point(i), tuple(action))
+        rows = PackedRows([t.ptr for t in trees], requests, 0, rectangular=True)
+        self.addCleanup(rows.close)
+        for tree in trees:
+            tree.close()
+        groups = hexcrop.group_by_shape(samples)
+        for index, (canvas, count) in enumerate(rows.groups):
+            height, width = (canvas, canvas) if isinstance(canvas, int) else canvas
+            planes = np.empty((count, 8, height, width), np.uint8)
+            rows.pack(index, planes)
+            for row, sample_index in enumerate(groups[height, width]):
+                np.testing.assert_array_equal(planes[row], samples[sample_index].planes)
+            prediction = np.zeros((count, height*width+2), np.float32)
+            prediction[:, :-2] = np.arange(height*width)
+            rows.decode(index, 0, prediction)
+        outputs = rows.outputs()
+        offsets = np.ctypeslib.as_array(C.cast(outputs[0], C.POINTER(C.c_int64)), shape=(len(samples)+1,))
+        logits = np.ctypeslib.as_array(C.cast(outputs[2], C.POINTER(C.c_double)), shape=(int(offsets[-1]),))
+        for i, sample in enumerate(samples):
+            np.testing.assert_array_equal(logits[offsets[i]:offsets[i+1]], sample.cells)
+
+    def test_move_geometry_preserves_distant_legal_replies_as_measurements(self):
+        sample = hexcrop.encode([[0, 0]], rectangular=True)
+        measured = hexcrop.move_geometry([[0, 0]], [8, 0], sample)
+        self.assertEqual(measured['nearest'], 8)
+        self.assertEqual(measured['extension'], 8)
+        self.assertEqual(measured['crop_edge'], 0)
+        self.assertIn([8, 0], sample.actions.tolist())
+        rotated = hexcrop.move_geometry([[0, 0]], [0, -8])
+        self.assertEqual(rotated['nearest'], 8)
+        self.assertEqual(rotated['extension'], 8)
+        self.assertEqual(rotated['crop_edge'], 0)
+
     def test_combined_rows_keep_encoding_after_original_and_intermediate_close(self):
         import ctypes as C
         from native_dense import PackedRows
@@ -679,22 +734,22 @@ class HexNetTests(unittest.TestCase):
         conv = hexnet.LineConv(3, 5)
         with torch.no_grad():
             conv.weight.normal_()
-        x = torch.randn(2, 3, 9, 9)          # crops are square
+        x = torch.randn(2, 3, 9, 13)
         expected = line_conv_reference(x, conv.weight.detach())
         torch.testing.assert_close(conv(x), expected, atol=1e-5, rtol=1e-5)
         with torch.no_grad():
             torch.testing.assert_close(conv(x), expected, atol=1e-5, rtol=1e-5)
             conv.weight.mul_(2)
             torch.testing.assert_close(conv(x), 2*expected, atol=1e-5, rtol=1e-5)   # matrices follow updates
-            wide = torch.randn(1, 3, 130, 130)
+            wide = torch.randn(1, 3, 130, 24)
             torch.testing.assert_close(conv(wide), line_conv_reference(wide, conv.weight), atol=1e-5, rtol=1e-5)
 
     def test_line_conv_gradients_match_direct_sum(self):
         conv = hexnet.LineConv(3, 5)
         with torch.no_grad():
             conv.weight.normal_()
-        x = torch.randn(4, 3, 9, 9, dtype=torch.float64, requires_grad=True)
-        grad = torch.randn(4, 3, 9, 9, dtype=torch.float64)
+        x = torch.randn(4, 3, 9, 13, dtype=torch.float64, requires_grad=True)
+        grad = torch.randn(4, 3, 9, 13, dtype=torch.float64)
         conv.double()
         got = torch.autograd.grad(conv(x), (x, conv.weight), grad)
         expected = torch.autograd.grad(line_conv_reference(x, conv.weight), (x, conv.weight), grad)
@@ -982,9 +1037,10 @@ class FusedCudaTests(unittest.TestCase):
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model, max_batch=128)
         inputs, outputs, saved = [], [], []
-        for rows, side in ((19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
+        for rows, shape in ((7, (24, 72)), (3, (72, 24)), (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
                            (49, 40), (56, 40), (57, 40), (64, 24), (80, 24), (96, 24), (128, 24), (64, 32), (64, 40)):
-            x = torch.randint(0, 2, (rows, 8, side, side), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
+            height, width = (shape, shape) if isinstance(shape, int) else shape
+            x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
             x[:, 3] = 1
             with torch.autocast('cuda', torch.bfloat16):
                 expected = model(x, x[:, 3:4], aux=False)
@@ -1635,6 +1691,11 @@ class DenseDataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as run:
             path = Path(run)/'shards'/'000001'
             manifest = dense_data.write_shard(path, dict(actor_sha256='test'), [episode], rows)
+            geometry = manifest['move_geometry']
+            self.assertEqual(geometry['games'], 1)
+            self.assertEqual(geometry['groups']['forced-prefix/opening']['placements'], 3)
+            self.assertEqual(geometry['groups']['played/opening']['placements'], 4)
+            self.assertEqual(sum(g['placements'] for g in geometry['groups'].values()), len(moves))
             result = manifest['tactical'][0]
             self.assertEqual((result['expected_winner'], result['winner'], result['actors']), (0, 1, episode['actors']))
             self.assertAlmostEqual(result['p2_value'], .2)

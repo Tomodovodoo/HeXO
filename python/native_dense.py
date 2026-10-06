@@ -9,6 +9,8 @@ from neural_search import native, bind, ptr, checked
 
 
 bind('hxgp_new', ptr, ptr, ptr, C.c_int, C.c_int)
+bind('hxgp_new_rect', ptr, ptr, ptr, C.c_int, C.c_int)
+bind('hxgp_shape', C.c_int, ptr, C.c_int, ptr)
 bind('hxgp_free', None, ptr)
 bind('hxgp_groups', C.c_int, ptr)
 bind('hxgp_mixed', C.c_int, ptr)
@@ -21,6 +23,7 @@ bind('hxgp_costs_free', None, ptr)
 bind('hxgp_costs_learn', C.c_int, ptr, ptr, C.c_int)
 bind('hxgp_costs_stats', None, ptr, ptr)
 bind('hxgp_plan', C.c_int, ptr, ptr, ptr, C.c_int, C.c_int)
+bind('hxgp_plan_rect', C.c_int, ptr, ptr, ptr, C.c_int, C.c_int)
 _quarantined = []  # Keep host storage alive when GPU completion cannot be established.
 
 
@@ -50,11 +53,12 @@ class PackingCosts:
 
 
 class PackedRows:
-    def __init__(self, trees, requests, merge_cells=32768):
+    def __init__(self, trees, requests, merge_cells=32768, *, rectangular=False):
         trees, requests = np.ascontiguousarray(trees, np.uintp), np.ascontiguousarray(requests, np.int32)
         if trees.ndim != 1 or requests.ndim != 1 or len(trees) != len(requests):
             raise ValueError('Invalid packed batch handles')
-        self.ptr = native.hxgp_new(trees.ctypes.data, requests.ctypes.data, len(requests), merge_cells)
+        create = native.hxgp_new_rect if rectangular else native.hxgp_new
+        self.ptr = create(trees.ctypes.data, requests.ctypes.data, len(requests), merge_cells)
         if not self.ptr:
             checked(False)
         self.count = len(requests)
@@ -72,26 +76,30 @@ class PackedRows:
         self.mixed = bool(native.hxgp_mixed(self.ptr))
         self.groups = []
         for index in range(native.hxgp_groups(self.ptr)):
-            info = np.empty(2, np.int64)
-            checked(native.hxgp_group(self.ptr, index, info.ctypes.data))
-            self.groups.append(tuple(map(int, info)))
+            info = np.empty(3, np.int64)
+            checked(native.hxgp_shape(self.ptr, index, info.ctypes.data))
+            height, width, count = map(int, info)
+            self.groups.append((height if height == width else (height, width), count))
 
     def plan(self, costs, limits, step):
         if not self.ptr:
             raise ValueError('Packed batch closed')
-        caps = np.ascontiguousarray(limits, np.int64).reshape(-1, 2)
-        checked(native.hxgp_plan(self.ptr, costs.ptr, caps.ctypes.data, len(caps), step))
+        caps = np.ascontiguousarray([(side, side, cap) if isinstance(side, int) else (*side, cap)
+                                     for side, cap in limits], np.int64).reshape(-1, 3)
+        checked(native.hxgp_plan_rect(self.ptr, costs.ptr, caps.ctypes.data, len(caps), step))
         self._groups()
 
     def pack(self, index, output):
         side, count = self._group(index)
-        if output.dtype != np.uint8 or not output.flags.c_contiguous or not output.flags.writeable or output.shape != (count, 8, side, side):
+        height, width = (side, side) if isinstance(side, int) else side
+        if output.dtype != np.uint8 or not output.flags.c_contiguous or not output.flags.writeable or output.shape != (count, 8, height, width):
             raise ValueError('Packed planes require a writable contiguous uint8 group')
         checked(native.hxgp_pack(self.ptr, index, output.ctypes.data, output.size))
 
     def decode(self, index, start, output):
         side, _ = self._group(index)
-        if output.dtype != np.float32 or not output.flags.c_contiguous or output.ndim != 2 or output.shape[1] != side*side+2:
+        height, width = (side, side) if isinstance(side, int) else side
+        if output.dtype != np.float32 or not output.flags.c_contiguous or output.ndim != 2 or output.shape[1] != height*width+2:
             raise ValueError('Packed predictions require contiguous float32 rows')
         checked(native.hxgp_decode(self.ptr, index, start, len(output), output.ctypes.data, output.size))
 
@@ -176,27 +184,29 @@ def submit(evaluator, rows, max_cells=48*48*48):
             if costs is None:
                 costs = graph.packing_costs = PackingCosts()
             if rows.mixed:
-                limits = [] if graph.budget_exhausted else [(side, graph._limit(side, graph.max_batch)) for side in graph.CANVASES]
+                limits = [] if graph.budget_exhausted else [(side, graph._limit(side, graph.max_batch))
+                         for side, _ in rows.groups if graph.supports(side)]
                 rows.plan(costs, limits, evaluator.max_batch)
             handle.costs = costs
         observe = handle.costs is not None and handle.costs.sample()
         for index, (side, count) in enumerate(rows.groups):
-            host = hexnet.staging_buffer(handle.staging, ('planes', side), count, (8, side, side),
+            height, width = (side, side) if isinstance(side, int) else side
+            host = hexnet.staging_buffer(handle.staging, ('planes', side), count, (8, height, width),
                                          torch.uint8, evaluator.cuda)
-            result = hexnet.staging_buffer(handle.staging, ('out', side), count, (side*side+2,),
+            result = hexnet.staging_buffer(handle.staging, ('out', side), count, (height*width+2,),
                                            torch.float32, evaluator.cuda)
             began = time.perf_counter() if observe else 0.
             rows.pack(index, host.numpy())
             pack_ms = (time.perf_counter()-began)*1000 if observe else 0.
-            graphed = evaluator.graph is not None and side in evaluator.graph.CANVASES
-            step = evaluator.max_batch if graphed else max(1, min(evaluator.max_batch, max_cells//(side*side)))
+            graphed = evaluator.graph is not None and evaluator.graph.supports(side)
+            step = evaluator.max_batch if graphed else max(1, min(evaluator.max_batch, max_cells//(height*width)))
             if observe and graphed:
                 pieces = [cap for start in range(0, count, step)
                           for _, cap in graph._segments(min(step, count-start), graph._limit(side, graph.max_batch), side)]
                 if all((side, cap) in graph.graphs for cap in pieces):
                     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     begin.record()
-                    handle.observations[index] = [sum(pieces)*side*side, len(pieces), begin, end, pack_ms, 0.]
+                    handle.observations[index] = [sum(pieces)*height*width, len(pieces), begin, end, pack_ms, 0.]
             for start in range(0, count, step):
                 size = min(step, count-start)
                 x = host[start:start+size].to(evaluator.device, non_blocking=True)

@@ -1679,7 +1679,7 @@ class NativeScheduler(unittest.TestCase):
         import time
         from neural_search import bind, ptr
         bind('hxgp_groups', C.c_int, ptr)
-        bind('hxgp_group', C.c_int, ptr, C.c_int, ptr)
+        bind('hxgp_shape', C.c_int, ptr, C.c_int, ptr)
         bind('hxgp_decode', C.c_int, ptr, C.c_int, C.c_int, C.c_int, ptr, C.c_int64)
         bind('hxgp_outputs', C.c_int, ptr, ptr)
         bind('hxgp_free', None, ptr)
@@ -1702,10 +1702,10 @@ class NativeScheduler(unittest.TestCase):
                     count=native.hxb_take(service,1,1000.,C.byref(token),C.byref(model),C.byref(snapshot))
                     self.assertEqual(count,1)
                     for group in range(native.hxgp_groups(snapshot)):
-                        info=np.empty(2,np.int64)
-                        self.assertTrue(native.hxgp_group(snapshot,group,info.ctypes.data))
-                        side,rows=map(int,info)
-                        output=np.zeros((rows,side*side+2),np.float32)
+                        info=np.empty(3,np.int64)
+                        self.assertTrue(native.hxgp_shape(snapshot,group,info.ctypes.data))
+                        height,width,rows=map(int,info)
+                        output=np.zeros((rows,height*width+2),np.float32)
                         self.assertTrue(native.hxgp_decode(snapshot,group,0,rows,
                                                          output.ctypes.data,output.size))
                     outputs=(ptr*4)()
@@ -1730,9 +1730,9 @@ class NativeScheduler(unittest.TestCase):
                             self.assertGreaterEqual(count,0)
                             if not count:continue
                             for group in range(native.hxgp_groups(snapshot)):
-                                self.assertTrue(native.hxgp_group(snapshot,group,info.ctypes.data))
-                                side,rows=map(int,info)
-                                output=np.zeros((rows,side*side+2),np.float32)
+                                self.assertTrue(native.hxgp_shape(snapshot,group,info.ctypes.data))
+                                height,width,rows=map(int,info)
+                                output=np.zeros((rows,height*width+2),np.float32)
                                 self.assertTrue(native.hxgp_decode(snapshot,group,0,rows,
                                                                  output.ctypes.data,output.size))
                             self.assertTrue(native.hxgp_outputs(snapshot,outputs))

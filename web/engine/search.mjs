@@ -442,16 +442,16 @@ export class NativeBatch {
     const trees = this.n.alloc(4 * count), requests = this.n.alloc(4 * count);
     try {
       this.n.checked(this.m._hxgf_take(owner.feed, count, this.ids, trees, requests, 0, 0, 0n));
-      this.ptr = this.m._hxgp_new(trees, requests, count, 0);
+      this.ptr = this.m._hxgp_new_rect(trees, requests, count, 0);
       this.n.checked(this.ptr);
       owner.batches.add(this);
       this.groups = [];
-      const info = this.n.alloc(16);
+      const info = this.n.alloc(24);
       try {
         for (let i = 0; i < this.m._hxgp_groups(this.ptr); i++) {
-          this.n.checked(this.m._hxgp_group(this.ptr, i, info));
-          const [size, rows] = Array.from(this.n.view(BigInt64Array, info, 2), Number);
-          this.groups.push({size, rows});
+          this.n.checked(this.m._hxgp_shape(this.ptr, i, info));
+          const [height, width, rows] = Array.from(this.n.view(BigInt64Array, info, 3), Number);
+          this.groups.push({size: Math.max(height, width), height, width, rows});
         }
       } finally { this.m._free(info); }
     } catch (error) {
@@ -465,7 +465,8 @@ export class NativeBatch {
   }
   features(group, start, count) {
     if (!this.ptr) throw new Error('Native batch is closed');
-    const length = count * 20 * this.groups[group].size ** 2, buffer = this.n.alloc(4 * length);
+    const {height, width} = this.groups[group];
+    const length = count * 20 * height * width, buffer = this.n.alloc(4 * length);
     try {
       this.n.checked(this.m._hxgp_features(this.ptr, group, start, count, buffer, BigInt(length)));
       return this.n.view(Float32Array, buffer, length).slice();
@@ -473,7 +474,7 @@ export class NativeBatch {
   }
   decode(group, start, count, {policy, far, value}) {
     if (!this.ptr) throw new Error('Native batch is closed');
-    const area = this.groups[group].size ** 2;
+    const {height, width} = this.groups[group], area = height * width;
     if (policy.length !== count * area || far.length !== count || value.length !== count) throw new Error('Wrong native prediction shape');
     // Allocate before making heap views, since any allocation may grow memory.
     const p = this.n.alloc(4 * policy.length), f = this.n.alloc(4 * count), v = this.n.alloc(4 * count);

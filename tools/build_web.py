@@ -61,7 +61,7 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxp_neural', 'hxp_neural_stats', 'hxp_neural_record',
                   'hxp_step', 'hxp_cancel', 'hxp_drain', 'hxp_free', 'hxp_stats', 'hxp_record', 'hxp_offer',
                   'hxgf_layout', 'hxgf_take', 'hxgf_stats', 'hxgf_queued', 'hxgf_abandon_all',
-                  'hxgp_new', 'hxgp_free', 'hxgp_groups', 'hxgp_group', 'hxgp_features', 'hxgp_decode_split', 'hxgp_outputs',
+                  'hxgp_new', 'hxgp_new_rect', 'hxgp_shape', 'hxgp_free', 'hxgp_groups', 'hxgp_group', 'hxgp_features', 'hxgp_decode_split', 'hxgp_outputs',
                   'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_moves')
 GUMBEL_SOURCES = ('gumbel_proof.cpp', 'gumbel_feed.cpp', 'gumbel_batch.cpp')
 NATIVE_EXPORTS = ('malloc', 'free', 'hx_new', 'hx_free', 'hx_play', 'hx_winner', 'hx_player', 'hx_remaining', 'hx_search')

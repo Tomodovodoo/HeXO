@@ -64,6 +64,36 @@ class Recorder:
 
 @unittest.skipUnless(importlib.util.find_spec('onnxruntime'), 'needs onnx and onnxruntime (requirements/web.txt)')
 class Export(unittest.TestCase):
+    @unittest.skipUnless(NODE, 'needs node')
+    def test_legacy_export_accepts_distinct_static_rectangle_axes(self):
+        import onnx
+        import onnxruntime as ort
+        h = onnx.helper
+        weight = onnx.numpy_helper.from_array(np.array(1., np.float32), 'weight')
+        graph = h.make_graph([h.make_node('Add', ['features', 'weight'], ['result'])], 'legacy',
+                            [h.make_tensor_value_info('features', onnx.TensorProto.FLOAT, ['batch', 20, 'size', 'size'])],
+                            [h.make_tensor_value_info('result', onnx.TensorProto.FLOAT, ['batch', 20, 'size', 'size'])], [weight])
+        model = h.make_model(graph, opset_imports=[h.make_opsetid('', 17)], ir_version=10)
+        script = (f"import {{rectangularGraph}} from {json.dumps((ENGINE/'network.mjs').as_uri())};"
+                  "let input=''; for await (const part of process.stdin) input+=part;"
+                  "process.stdout.write(Buffer.from(rectangularGraph(Buffer.from(input,'base64'))).toString('base64'));")
+        changed = subprocess.run([NODE, '--input-type=module', '-e', script],
+                                 input=base64.b64encode(model.SerializeToString()).decode(),
+                                 capture_output=True, text=True, check=True)
+        converted = onnx.load_from_string(base64.b64decode(changed.stdout))
+        self.assertEqual(list(converted.graph.node), list(model.graph.node))
+        self.assertEqual(list(converted.graph.initializer), list(model.graph.initializer))
+        self.assertEqual([d.dim_param for d in converted.graph.input[0].type.tensor_type.shape.dim],
+                         ['batch', '', 'height', 'width'])
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        for name, value in dict(batch=1, height=24, width=72).items():
+            options.add_free_dimension_override_by_name(name, value)
+        session = ort.InferenceSession(converted.SerializeToString(), options, providers=['CPUExecutionProvider'])
+        x = np.zeros((1, 20, 24, 72), np.float32)
+        np.testing.assert_array_equal(session.run(None, dict(features=x))[0], x+1)
+
     def test_graphs_match_the_reference_path(self):
         model = random_model()
         with tempfile.TemporaryDirectory() as folder:
@@ -71,6 +101,9 @@ class Export(unittest.TestCase):
                 export_web.export_onnx(model, Path(folder)/name, half)
                 worst = export_web.parity(model, Path(folder)/name, export_web.histories(every=13), half)
                 self.assertLess(max(worst.values()), tolerance, (name, worst))
+                rectangle = export_web.parity(model, Path(folder)/name, [[[4*i,0] for i in range(15)]],
+                                             half, rectangular=True)
+                self.assertLess(max(rectangle.values()), tolerance, (name, rectangle))
 
 
 def page(job):
@@ -904,6 +937,8 @@ class Bundle(unittest.TestCase):
         answer = node(dict(kind='capture-runtime'))
         self.assertEqual(answer['values'], [3,6,9,12,9])
         self.assertEqual(answer['shapes'], [3*24*24,3,3])
+        self.assertEqual({k:answer['rectangular'][k] for k in ('policy','far','value','physical')},
+                         dict(policy=3*24*72,far=3,value=3,physical=4))
         self.assertEqual((answer['physical'], answer['reused']), (4,1))
         self.assertLessEqual(answer['bounds']['actual_cells'], 65536)
         self.assertGreater(answer['bounds']['stats']['evictions'], 0)

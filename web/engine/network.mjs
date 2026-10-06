@@ -8,6 +8,73 @@ import {nextTask} from './tasks.mjs';
 const LIMITED_BYTES = 2 ** 28;
 const probes = new Map(), TIMED_OUT = Symbol('timed out');
 
+/** Give older Bubble exports distinct spatial input symbols before static
+ * capture. Only features' shape metadata changes; tensor weights stay intact. */
+export function rectangularGraph(bytes) {
+  bytes = new Uint8Array(bytes);
+  const text = new TextDecoder(), encode = new TextEncoder();
+  const read = (data, start) => {
+    let value = 0, scale = 1, end = start;
+    do {
+      if (end >= data.length) throw new Error('Truncated ONNX field');
+      const byte = data[end++]; value += (byte & 127) * scale; scale *= 128;
+      if (!(byte & 128)) return [value, end];
+    } while (end - start < 10);
+    throw new Error('Invalid ONNX varint');
+  };
+  const length = value => {
+    const out = [];
+    do { const byte = value % 128; value = Math.floor(value / 128); out.push(byte | (value ? 128 : 0)); } while (value);
+    return Uint8Array.from(out);
+  };
+  const fields = (data, tag, change) => {
+    const parts = []; let altered = false;
+    for (let start = 0; start < data.length;) {
+      const [key, head] = read(data, start), wire = key % 8; let end, first;
+      if (wire === 2) {
+        const [size, payload] = read(data, head); first = payload; end = first + size;
+      } else if (wire === 0) [, end] = read(data, head);
+      else if (wire === 1 || wire === 5) end = head + (wire === 1 ? 8 : 4);
+      else throw new Error('Unsupported ONNX field');
+      if (end > data.length) throw new Error('Truncated ONNX payload');
+      if (wire === 2 && Math.floor(key / 8) === tag) {
+        const original = data.subarray(first, end), replacement = change(original);
+        if (replacement !== original) {
+          parts.push(data.subarray(start, head), length(replacement.length), replacement); altered = true;
+        } else parts.push(data.subarray(start, end));
+      } else parts.push(data.subarray(start, end));
+      start = end;
+    }
+    if (!altered) return data;
+    const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0)); let offset = 0;
+    for (const part of parts) { out.set(part, offset); offset += part.length; }
+    return out;
+  };
+  let found = false;
+  const graph = fields(bytes, 7, graph => fields(graph, 11, input => {
+    let name;
+    fields(input, 1, value => { name = text.decode(value); return value; });
+    if (name !== 'features') return input;
+    found = true;
+    return fields(input, 2, type => fields(type, 1, tensor => fields(tensor, 2, shape => {
+      let axis = 0, spatial = 0;
+      const result = fields(shape, 1, dimension => {
+        const i = axis++;
+        if (i !== 2 && i !== 3) return dimension;
+        return fields(dimension, 2, symbol => {
+          spatial++;
+          const name = i === 2 ? 'height' : 'width';
+          return text.decode(symbol) === name ? symbol : encode.encode(name);
+        });
+      });
+      if (axis !== 4 || spatial !== 2) throw new Error('Bubble requires dynamic spatial input axes');
+      return result;
+    })));
+  }));
+  if (!found) throw new Error('Bubble features input is missing');
+  return graph;
+}
+
 /**
  * The device to run on, decided once per context and `prefer`: {provider: 'webgpu' | 'wasm', precisions: candidate
  * graphs, adapter, fallback?}. WebGPU offers fp16 (shader-f16 adapters) and fp32, WebAssembly fp32; a limited adapter
@@ -150,10 +217,11 @@ export class Network {
   static async create({model = 'model/manifest.json', device, ort, stages}) {
     stages.enter('download');
     const {manifest, files} = await modelFiles(device.precisions, model);
-    const graphs = await Promise.all(files.map(file => cached(file, stages.file(file.path))));
+    const graphs = (await Promise.all(files.map(file => cached(file, stages.file(file.path))))).map(rectangularGraph);
     const networks = [];
     for (const [i, precision] of device.precisions.entries()) {
-      networks.push(new Network(ort, await session(ort, graphs[i], device.provider, stages), precision, manifest, ort.env.wasm.numThreads,
+      networks.push(new Network(ort, await session(ort, graphs[i], device.provider, stages), precision,
+        {...manifest, spatial_axes: ['height', 'width']}, ort.env.wasm.numThreads,
         {graph: graphs[i], provider: device.provider}));
     }
     if (networks.length === 1) return networks[0];
@@ -173,6 +241,7 @@ export class Network {
     this.session = session;
     this.precision = precision;
     this.version = manifest.model_version;
+    this.rectangularCaptures = manifest.spatial_axes?.join() === 'height,width';
     this.threads = threads;
     this.maxBatch = 64;
     this.timings = null;
@@ -195,8 +264,9 @@ export class Network {
 
   /** policy [B*S*S], far [B], value [B] (Float32Arrays) for `count` stacked inputs (encode.mjs features) of side `size`. */
   async forward(input, count, size) {
+    const [height, width] = Array.isArray(size) ? size : [size, size];
     const half = this.precision === 'fp16';
-    const tensor = new this.ort.Tensor(half ? 'float16' : 'float32', half ? toHalf(input) : input, [count, CHANNELS, size, size]);
+    const tensor = new this.ort.Tensor(half ? 'float16' : 'float32', half ? toHalf(input) : input, [count, CHANNELS, height, width]);
     const out = await this.session.run({features: tensor});
     tensor.dispose?.();
     const result = {policy: out.policy.data, far: out.far.data, value: out.value.data};
@@ -232,10 +302,11 @@ export class Network {
 
   /** Predictions [{logits, q}] for leaves [{history, actions}], as hexnet.DenseEvaluator.evaluate gives them. */
   async evaluate(leaves) {
-    const samples = leaves.map(leaf => encode(leaf.history, leaf.actions)), result = new Array(leaves.length), groups = new Map();
-    samples.forEach((s, i) => { if (!groups.has(s.size)) groups.set(s.size, []); groups.get(s.size).push(i); });
-    for (const [size, indices] of groups) {
-      const area = size * size, stride = CHANNELS * area;
+    const samples = leaves.map(leaf => encode(leaf.history, leaf.actions, true)), result = new Array(leaves.length), groups = new Map();
+    samples.forEach((s, i) => { const key = `${s.height}x${s.width}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(i); });
+    for (const indices of groups.values()) {
+      const {height, width} = samples[indices[0]], size = height === width ? height : [height, width];
+      const area = height * width, stride = CHANNELS * area;
       for (let start = 0; start < indices.length; start += this.maxBatch) {
         const chunk = indices.slice(start, start + this.maxBatch), input = new Float32Array(chunk.length * stride);
         chunk.forEach((i, row) => features(samples[i], input, row * stride));
@@ -257,13 +328,15 @@ export class Network {
    * on large canvases. The ONNX forward still returns its three output arrays. */
   async evaluateNative(batch, {stop = () => batch.owner.done(), capture = false} = {}) {
     for (let group = 0; group < batch.groups.length; group++) {
-      const {size, rows} = batch.groups[group];
-      const limit = Math.min(this.maxBatch, Math.max(1, Math.floor(64 * 32 * 32 / (size * size))));
+      const g = batch.groups[group], rows = g.rows, height = g.height ?? g.size, width = g.width ?? g.size;
+      const size = height === width ? height : [height, width];
+      const captured = capture && (height === width || this.rectangularCaptures);
+      const limit = Math.min(this.maxBatch, Math.max(1, Math.floor(64 * 32 * 32 / (height * width))));
       for (let start = 0; start < rows; start += limit) {
         if (stop()) return false;
         const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
         if (stop()) return false;
-        const prediction = capture ? await this.forwardCaptured(input, count, size, stop) : await this.forward(input, count, size);
+        const prediction = captured ? await this.forwardCaptured(input, count, size, stop) : await this.forward(input, count, size);
         if (!prediction) return false;
         batch.inference ??= {rows: 0, physical: 0, forwards: 0};
         batch.inference.rows += count; batch.inference.physical += prediction.physical_rows ?? count; batch.inference.forwards++;
@@ -316,35 +389,37 @@ class Captures {
     if (error) throw error;
   }
   async entry(count, size) {
-    const maximum = Math.floor(64 * 32 * 32 / (size * size));
+    const [height, width] = Array.isArray(size) ? size : [size, size], area = height * width;
+    if (height !== width && !this.network.rectangularCaptures) throw new Error('Model capture requires distinct height/width axes');
+    const maximum = Math.floor(64 * 32 * 32 / area);
     if (!(count > 0 && count <= maximum)) throw new Error('Captured batch exceeds canvas capacity');
-    const quantum = size >= 40 ? 8 : 16;
+    const quantum = Math.max(height, width) >= 40 ? 8 : 16;
     const rows = Math.min(maximum, count <= 16 ? 2 ** Math.ceil(Math.log2(count)) : quantum * Math.ceil(count / quantum));
-    const key = `${size}/${rows}`;
+    const key = `${height}x${width}/${rows}`;
     if (this.entries.has(key)) {
       const entry = this.entries.get(key); this.entries.delete(key); this.entries.set(key, entry); return entry;
     }
     const device = await this.network.ort.env.webgpu.device;
     if (!device) throw new Error('WebGPU device is unavailable');
     const limited = device.limits.maxBufferSize <= LIMITED_BYTES, limit = limited ? 65536 : 524288, slots = limited ? 8 : 24;
-    const cells = rows * size * size;
+    const cells = rows * area;
     while (this.entries.size && (this.entries.size >= slots || this.cells + cells > limit)) {
       const [old, entry] = this.entries.entries().next().value;
       try { await this.release(entry); }
       catch (error) { this.closed = this.network.closed = true; throw error; }
       this.entries.delete(old); this.cells -= entry.cells; this.counts.evictions++;
     }
-    const half = this.network.precision === 'fp16', length = rows * (size * size + 2), features = rows * CHANNELS * size * size;
-    const entry = {size, rows, cells, device, session: null, input: null, tensor: null, download: null,
+    const half = this.network.precision === 'fp16', length = rows * (area + 2), features = rows * CHANNELS * area;
+    const entry = {size, height, width, rows, cells, device, session: null, input: null, tensor: null, download: null,
       values: half ? new Uint16Array(features) : new Float32Array(features)};
     this.entries.set(key, entry); this.cells += cells;
     const align = bytes => 16 * Math.ceil(bytes / 16), start = performance.now();
     try {
       entry.input = device.createBuffer({size: align(entry.values.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-      entry.tensor = this.network.ort.Tensor.fromGpuBuffer(entry.input, {dataType: half ? 'float16' : 'float32', dims: [rows, CHANNELS, size, size]});
+      entry.tensor = this.network.ort.Tensor.fromGpuBuffer(entry.input, {dataType: half ? 'float16' : 'float32', dims: [rows, CHANNELS, height, width]});
       entry.download = device.createBuffer({size: align(length * 4), usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
       entry.session = await this.network.ort.InferenceSession.create(new Uint8Array(this.network.graph), {
-        executionProviders: [{name: 'webgpu', device}], freeDimensionOverrides: {batch: rows, size},
+        executionProviders: [{name: 'webgpu', device}], freeDimensionOverrides: this.network.rectangularCaptures ? {batch: rows, height, width} : {batch: rows, size: height},
         preferredOutputLocation: 'gpu-buffer', enableGraphCapture: true, graphOptimizationLevel: 'all', logSeverityLevel: 3});
       this.counts.creates++;
       return entry;
@@ -369,7 +444,8 @@ class Captures {
       if (stop()) return null;
       entry = await this.entry(count, size);
       if (stop()) return null;
-      const values = this.network.precision === 'fp16' ? toHalf(input) : input, stride = CHANNELS * size * size;
+      const area = entry.height * entry.width;
+      const values = this.network.precision === 'fp16' ? toHalf(input) : input, stride = CHANNELS * area;
       entry.values.set(values);
       // Padded rows copy a real input so every mask and reduction remains valid.
       for (let row = count; row < entry.rows; row++) entry.values.set(values.subarray(0, stride), row * stride);
@@ -380,14 +456,14 @@ class Captures {
       const command = entry.device.createCommandEncoder(); let offset = 0;
       for (const name of ['policy', 'far', 'value']) {
         if (outputs[name].type !== 'float32') throw new Error('Captured output must be float32');
-        const length = name === 'policy' ? entry.rows * size * size : entry.rows;
+        const length = name === 'policy' ? entry.rows * area : entry.rows;
         command.copyBufferToBuffer(outputs[name].gpuBuffer, 0, entry.download, offset, length * 4); offset += length * 4;
       }
       entry.device.queue.submit([command.finish()]);
       await entry.download.mapAsync(GPUMapMode.READ); mapped = true;
       const data = new Float32Array(entry.download.getMappedRange()).slice(0, offset / 4);
-      return {physical_rows: entry.rows, policy: data.slice(0, count * size * size), far: data.slice(entry.rows * size * size, entry.rows * size * size + count),
-        value: data.slice(entry.rows * (size * size + 1), entry.rows * (size * size + 1) + count)};
+      return {physical_rows: entry.rows, policy: data.slice(0, count * area), far: data.slice(entry.rows * area, entry.rows * area + count),
+        value: data.slice(entry.rows * (area + 1), entry.rows * (area + 1) + count)};
     } finally {
       // A rejected run may already have submitted device work. Its fence must
       // settle before output tensors can release buffers referenced by commands.

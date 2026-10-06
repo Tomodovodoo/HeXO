@@ -34,7 +34,7 @@ function choose([low, high], halo) {
  * Encodes a non-terminal position: `history` [[q, r], ...], `actions` its legal moves in native order. Returns
  * {planes Uint8Array [8*size*size], size, cells Int32Array (flat crop index per action, -1 when far), far}.
  */
-export function encode(history, actions) {
+export function encode(history, actions, rectangular = false) {
   const n = history.length, player = ((n + 1) >> 1) % 2, remaining = n % 2 ? 2 : 1;
   let box = bounds(history, actions), halo = 0, [k, side] = choose(box, 0);
   if (side > BUCKETS[BUCKETS.length - 1]) {
@@ -49,27 +49,29 @@ export function encode(history, actions) {
     low[j] = (POSITIVE[k][j] ? box[0][a] : -box[1][a]) - halo;
     extent[j] = (POSITIVE[k][j] ? box[1][a] : -box[0][a]) + halo - low[j] + 1;
   }
-  const ox = Math.floor((size - extent[0]) / 2), oy = Math.floor((size - extent[1]) / 2);
-  const sx = ox - low[0], sy = oy - low[1], area = size * size;
+  const width = rectangular ? Math.max(24, 8 * Math.ceil(extent[0] / 8)) : size;
+  const height = rectangular ? Math.max(24, 8 * Math.ceil(extent[1] / 8)) : size;
+  const ox = Math.floor((width - extent[0]) / 2), oy = Math.floor((height - extent[1]) / 2);
+  const sx = ox - low[0], sy = oy - low[1], area = height * width;
   const at = ([q, r]) => [q * m[0][0] + r * m[1][0] + sx, q * m[0][1] + r * m[1][1] + sy];
   const planes = new Uint8Array(PLANES * area), cells = new Int32Array(actions.length);
   let far = 0;
   actions.forEach((action, i) => {
     const [x, y] = at(action);
     if (halo && !(x >= ox && x < ox + extent[0] && y >= oy && y < oy + extent[1])) { cells[i] = -1; far++; return; }
-    cells[i] = y * size + x;
+    cells[i] = y * width + x;
     planes[2 * area + cells[i]] = 1;
   });
   history.forEach((point, i) => {
     const [x, y] = at(point);
-    planes[(((i + 1) >> 1) % 2 === player ? 0 : area) + y * size + x] = 1;
+    planes[(((i + 1) >> 1) % 2 === player ? 0 : area) + y * width + x] = 1;
   });
-  for (let y = oy; y < oy + extent[1]; y++) planes.fill(1, 3 * area + y * size + ox, 3 * area + y * size + ox + extent[0]);
+  for (let y = oy; y < oy + extent[1]; y++) planes.fill(1, 3 * area + y * width + ox, 3 * area + y * width + ox + extent[0]);
   planes.fill(1, (remaining === 1 ? 4 : 5) * area, (remaining === 1 ? 5 : 6) * area);
   const start = remaining === 2 || n === 0 ? n : n - 1;
-  if (start < n) { const [x, y] = at(history[n - 1]); planes[6 * area + y * size + x] = 1; }
-  for (const point of history.slice(Math.max(0, start - 2), start)) { const [x, y] = at(point); planes[7 * area + y * size + x] = 1; }
-  return {planes, size, cells, far};
+  if (start < n) { const [x, y] = at(history[n - 1]); planes[6 * area + y * width + x] = 1; }
+  for (const point of history.slice(Math.max(0, start - 2), start)) { const [x, y] = at(point); planes[7 * area + y * width + x] = 1; }
+  return {planes, size, height, width, cells, far};
 }
 
 /**
@@ -79,34 +81,34 @@ export function encode(history, actions) {
  * enemy stone, divided by six; then empty cells where the best own count is >= 4, opponent >= 4, own >= 5,
  * opponent >= 5) and two zero channels, all times the crop mask.
  */
-export function features({planes, size}, out = new Float32Array(CHANNELS * size * size), offset = 0) {
-  const area = size * size, own = planes.subarray(0, area), opp = planes.subarray(area, 2 * area), mask = planes.subarray(3 * area, 4 * area);
+export function features({planes, size, height = size, width = size}, out = new Float32Array(CHANNELS * height * width), offset = 0) {
+  const area = height * width, own = planes.subarray(0, area), opp = planes.subarray(area, 2 * area), mask = planes.subarray(3 * area, 4 * area);
   for (let c = 0; c < PLANES; c++) for (let i = 0; i < area; i++) out[offset + c * area + i] = planes[c * area + i] * mask[i];
-  const inside = (x, y) => x >= 0 && x < size && y >= 0 && y < size;
+  const inside = (x, y) => x >= 0 && x < width && y >= 0 && y < height;
   const mine = new Uint8Array(area), theirs = new Uint8Array(area), open = [new Uint8Array(area), new Uint8Array(area)];
   AXES.forEach(([dx, dy], a) => {
     open[0].fill(0); open[1].fill(0);
-    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
       let o = 0, p = 0, m = 0;
       for (let i = 0; i < WINDOW; i++) {
         const u = x + i * dx, v = y + i * dy;
         if (!inside(u, v)) break;
-        const j = v * size + u;
+        const j = v * width + u;
         o += own[j]; p += opp[j]; m += mask[j];
       }
       if (m < WINDOW) continue;
-      if (!p) open[0][y * size + x] = o;
-      if (!o) open[1][y * size + x] = p;
+      if (!p) open[0][y * width + x] = o;
+      if (!o) open[1][y * width + x] = p;
     }
     for (let side = 0; side < 2; side++) {
       const channel = offset + (PLANES + 3 * side + a) * area, best = side ? theirs : mine;
-      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
         let b = 0;
         for (let i = 0; i < WINDOW; i++) {
           const u = x - i * dx, v = y - i * dy;
-          if (inside(u, v) && open[side][v * size + u] > b) b = open[side][v * size + u];
+          if (inside(u, v) && open[side][v * width + u] > b) b = open[side][v * width + u];
         }
-        const j = y * size + x;
+        const j = y * width + x;
         out[channel + j] = Math.fround(b / WINDOW) * mask[j];
         if (b > best[j]) best[j] = b;
       }

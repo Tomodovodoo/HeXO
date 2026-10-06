@@ -145,7 +145,7 @@ class Evaluator(hexnet.DenseEvaluator):
 
     @torch.inference_mode()
     def submit_leaves(self, leaves):
-        return self.submit(hexcrop.encode_leaves(native, leaves, allow_span=True))
+        return self.submit(hexcrop.encode_leaves(native, leaves, allow_span=True, rectangular=True))
 
     @torch.inference_mode()
     def submit(self, histories, legal=None):
@@ -157,30 +157,32 @@ class Evaluator(hexnet.DenseEvaluator):
                 continue
             try:
                 samples.append(h if isinstance(h, hexcrop.Sample) else
-                               hexcrop.encode_game(hexcrop.Position(h), h, actions=None if legal is None else legal[i]))
+                               hexcrop.encode_game(hexcrop.Position(h), h, actions=None if legal is None else legal[i], rectangular=True))
             except hexcrop.SpanError:
                 samples.append(None)
                 continue
-            groups.setdefault(samples[i].size, []).append(i)
+            groups.setdefault(samples[i].shape, []).append(i)
         sizes = sorted(groups)
         for small, large in zip(sizes, sizes[1:]):
-            if len(groups[small])*(large*large-small*small) < MERGE_CELLS:
+            if all(a <= b for a, b in zip(small, large)) and len(groups[small])*(large[0]*large[1]-small[0]*small[1]) < MERGE_CELLS:
                 groups[large] = groups.pop(small)+groups[large]
         chunks, staging = [], self.free.pop() if self.free else {}
-        for size, indices in groups.items():
-            host = hexnet.staging_buffer(staging, ('planes', size), len(indices), (len(hexcrop.PLANES), size, size),
+        for shape, indices in groups.items():
+            height, width = shape
+            size = height if height == width else shape
+            host = hexnet.staging_buffer(staging, ('planes', size), len(indices), (len(hexcrop.PLANES), height, width),
                                          torch.uint8, self.cuda)
-            result = hexnet.staging_buffer(staging, ('out', size), len(indices), (size*size+2,), torch.float32, self.cuda)
+            result = hexnet.staging_buffer(staging, ('out', size), len(indices), (height*width+2,), torch.float32, self.cuda)
             view = host.numpy()
             for j, i in enumerate(indices):
                 planes = samples[i].planes
-                if planes.shape[-1] == size:
+                if planes.shape[-2:] == shape:
                     view[j] = planes
                 else:
                     view[j] = 0
-                    view[j, :, :planes.shape[-1], :planes.shape[-1]] = planes
-            graphed = self.graph is not None and size in self.graph.CANVASES
-            step = self.max_batch if graphed else max(1, min(self.max_batch, MAX_CELLS//(size*size)))
+                    view[j, :, :planes.shape[-2], :planes.shape[-1]] = planes
+            graphed = self.graph is not None and self.graph.supports(size)
+            step = self.max_batch if graphed else max(1, min(self.max_batch, MAX_CELLS//(height*width)))
             for start in range(0, len(indices), step):
                 chunk = indices[start:start+step]
                 x = host[start:start+len(chunk)].to(self.device, non_blocking=True)
@@ -200,12 +202,13 @@ class Evaluator(hexnet.DenseEvaluator):
             event.synchronize()
         result = [None]*len(samples)
         for size, chunk, packed in chunks:
+            height, width = (size, size) if isinstance(size, int) else size
             packed = packed.numpy()
             if not np.isfinite(packed).all():
                 raise FloatingPointError('Nonfinite dense model predictions')
             for row, i in zip(packed, chunk):
                 s = samples[i]
-                cells = s.cells if s.size == size else np.where(s.cells >= 0, s.cells//s.size*size+s.cells % s.size, -1)
+                cells = s.cells if s.shape[1] == width else np.where(s.cells >= 0, s.cells//s.shape[1]*width+s.cells % s.shape[1], -1)
                 logits = row[np.maximum(cells, 0)].astype(np.float64)
                 if s.far:
                     logits[cells < 0] = row[-2]-np.log(s.far)
