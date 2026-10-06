@@ -76,7 +76,8 @@ struct Broker {
  std::unordered_map<Key,std::shared_ptr<Task>,Hash> tasks;
  std::deque<std::shared_ptr<Task>> ready;
  std::map<uint64_t,std::vector<std::shared_ptr<Task>>> flights;
- int quantum,pending,merge_cells;double latency_ms;
+ int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
+ uint64_t flight_high_water=0;
  std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
@@ -91,6 +92,11 @@ struct Broker {
   if(q<1 || q>128 || p<1 || p>4 || merge<0 || !std::isfinite(latency) || latency<0 || latency>20)
    throw std::runtime_error("Invalid native inference service limits");
   garbage.reserve(2);
+ }
+ void configure_flights(int count){
+  std::lock_guard lock(mutex);
+  if(started || count<1 || count>8)throw std::runtime_error("Configure 1 to 8 inference batch flights before starting");
+  flight_limit=count;
  }
  int attach(owner::Pool& pool,int model){
   std::lock_guard lock(mutex);
@@ -356,7 +362,7 @@ struct Broker {
   for(;;){
    if(!error.empty())throw std::runtime_error(error);
    if(cancelled || paused)return 0;
-   if(flights.size()>=2){if(!events.empty() || !wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
+   if(flights.size()>=size_t(flight_limit)){if(!events.empty() || !wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
    std::erase_if(ready,[](const auto& t){return !t->live || t->flight;});
    if(!ready.empty()){
     int selected=ready.front()->model;int count=int(std::count_if(ready.begin(),ready.end(),[&](const auto& t){return t->model==selected;}));
@@ -369,7 +375,7 @@ struct Broker {
       auto task=*it;if(task->model!=selected){++it;continue;}
       task->flight=true;batch.push_back(task);it=ready.erase(it);
      }
-     uint64_t id=++next;flights.emplace(id,batch);launched+=batch.size();++batches;
+     uint64_t id=++next;flights.emplace(id,batch);flight_high_water=std::max(flight_high_water,uint64_t(flights.size()));launched+=batch.size();++batches;
      lock.unlock();std::vector<void*> sources;std::vector<int> rows;
      for(auto& task:batch){sources.push_back(task->representative->snapshot.get());rows.push_back(task->row);}
      auto packed=hxgp_combine(sources.data(),rows.data(),int(rows.size()),merge_cells);
@@ -540,6 +546,9 @@ inline RootEvent Producer::result(int index,uint64_t token){
 }
 extern "C" {
 HX_API void* hxb_new(int quantum,int pending,int merge,double latency){try{return new inference::Broker(quantum,pending,merge,latency);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+HX_API int hxb_flights(void* p,int count){try{static_cast<inference::Broker*>(p)->configure_flights(count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API void hxb_flight_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);
+ std::array<uint64_t,3> values{uint64_t(b.flight_limit),b.flight_high_water,uint64_t(b.pending)};std::copy(values.begin(),values.end(),out);}
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_model_pending(void* p,int model){return static_cast<inference::Broker*>(p)->model_pending(model);}

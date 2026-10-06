@@ -4889,6 +4889,60 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(samples), len(refs))
             self.assertTrue(all(np.isfinite(t['value']) for t in targets))
 
+    def test_inference_service_batch_capacity_is_separate_from_producer_snapshots(self):
+        import native_dense
+        from native_scheduler import InferenceService
+        from neural_search import checked, native
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        for limit in (1,2,4):
+            with self.subTest(limit=limit):
+                graphs = [NativeScheduler.graph(self,[(0,0),(i,0),(i,1)]) for i in range(1,8)]
+                pool = NativeScheduler.pool(self,graphs,views=1,work=16,quantum=16)
+                service = InferenceService([pool],[evaluator],batch_size=1,pending=4,flights=limit)
+                self.addCleanup(service.close)
+                service.start()
+                with self.assertRaisesRegex(ValueError,'before starting'):
+                    checked(native.hxb_flights(service.ptr,limit))
+                leased = [service.take(100.) for _ in range(limit)]
+                self.assertTrue(all(batch is not None for batch in leased))
+                self.assertIsNone(service.take())
+                stats = service.stats()
+                self.assertEqual((stats['batch_flight_limit'],stats['batch_flight_high_water'],
+                                  stats['inflight_batches'],stats['snapshot_limit_per_producer']),
+                                 (limit,limit,limit,4))
+                token,model,rows = leased.pop(0)
+                service.complete(token,native_dense.submit(evaluator,rows).collect())
+                replacement = service.take(100.)
+                self.assertIsNotNone(replacement)
+                leased.append(replacement)
+                self.assertEqual(service.stats()['inflight_batches'],limit)
+                for token,model,rows in leased:
+                    service.complete(token,native_dense.submit(evaluator,rows).collect())
+                while not service.done():
+                    service.pump()
+                service.close()
+                self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
+                for game in pool.games:
+                    self.assertEqual((game.stats()['issued'],game.stats()['completed'],game.stats()['pending']),
+                                     (16,16,0))
+                    self.assertEqual(int(game.evidence()['lifetime_credits'].sum()),16)
+                self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
+
+    def test_inference_service_rejects_invalid_batch_capacity_without_owning_pools(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=16)
+        for limit in (0,9):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError,'1 to 8'):
+                InferenceService([pool],[evaluator],flights=limit)
+            self.assertIsNotNone(pool.ptr)
+        service = InferenceService([pool],[evaluator])
+        self.addCleanup(service.close)
+        self.assertEqual(service.stats()['batch_flight_limit'],2)
+        service.run()
+
     def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
         import ctypes
         from native_scheduler import InferenceService
