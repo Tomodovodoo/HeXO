@@ -64,6 +64,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -1425,7 +1426,8 @@ class Renderers:
     trainer's GIL; at most depth * workers rendered batches wait in the queue. Worker i draws from its own generator
     seeded [*seed, i]; `run_seed` keys cheap-row retention (ReplayWindow seed). Settings (a LearnerSettings) are
     fixed per pool: close() it and start another to change them; set_calibration() replaces the Calibration of batches rendered from then on. Iterate to consume {S: batch of
-    torch tensors}; a worker's exception or death is raised in the consumer."""
+    torch tensors}; a worker's exception or death is raised in the consumer. A receiving thread reads the next batch
+    from the worker queue while the consumer trains on the current one."""
 
     def __init__(self, run, settings, seed, workers=2, depth=3, calibration=None, policy_dir=None, regret_entries=None,
                  run_seed=0):
@@ -1439,6 +1441,32 @@ class Renderers:
                                                 self.regret_updates[i], regret_entries, run_seed))
                           for i in range(workers)]
         start_hidden(self.processes)
+        self.ready, self.stopped = queue.Queue(1), threading.Event()
+        self.receiver = threading.Thread(target=self.receive, daemon=True)
+        self.receiver.start()
+
+    def receive(self):
+        """Move rendered batches into `ready` as torch tensors, one ahead of the consumer, until close(); a worker's
+        exception, or RuntimeError for a worker that exited, is passed on in place of a batch."""
+        while not self.stopped.is_set():
+            try:
+                item = self.queue.get(timeout=1)
+                if not isinstance(item, BaseException):
+                    item = tensors(item)
+            except queue.Empty:
+                if all(p.is_alive() for p in self.processes):
+                    continue
+                item = RuntimeError('A render worker exited')
+            except BaseException as error:
+                item = error
+            while not self.stopped.is_set():
+                try:
+                    self.ready.put(item, timeout=1)
+                    break
+                except queue.Full:
+                    pass
+            if isinstance(item, BaseException):
+                return
 
     def set_calibration(self, calibration):
         self.calibration[:] = pack_calibration(calibration)
@@ -1451,22 +1479,19 @@ class Renderers:
         return self
 
     def __next__(self):
-        while True:
-            try:
-                item = self.queue.get(timeout=5)
-            except queue.Empty:
-                if not all(p.is_alive() for p in self.processes):
-                    raise RuntimeError('A render worker exited')
-                continue
-            if isinstance(item, BaseException):
-                raise item
-            return tensors(item)
+        item = self.ready.get()
+        if isinstance(item, BaseException):
+            self.ready.put(item)
+            raise item
+        return item
 
     def close(self):
+        self.stopped.set()
         for process in self.processes:
             process.terminate()
         for process in self.processes:
             process.join()
+        self.receiver.join(5)    # a worker terminated mid-batch can leave it blocked on a partial read
         self.queue.cancel_join_thread()
         for updates in self.regret_updates:
             updates.cancel_join_thread()
