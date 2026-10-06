@@ -76,7 +76,9 @@ struct Frontier {
   task.scope=std::move(selected);task.facts=revision;task.scoped=true;
   scope_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-began).count();
  }
- void offer(const std::shared_ptr<Node>& node,const std::vector<Cell>& history,double impact,double change){
+ // quiet: the leaf's own defender query cannot start (1), can (0), or is unknown
+ // without the selection path's completions (-1), which a board replay settles.
+ void offer(const std::shared_ptr<Node>& node,const std::vector<Cell>& history,double impact,double change,int quiet=-1){
   ++offers;remember(history,*node);if(node->exact_winner>=0)return;
   auto key=gumbel::keys(history).first;auto found=tasks.find(key);
   if(found!=tasks.end()){
@@ -96,8 +98,8 @@ struct Frontier {
   auto task=std::make_shared<Task>();task->key=key;task->node=node;task->history=history;task->generation=generation;
    task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;
    // Stamped solvers search quiet defender zones, so only unstamped loops close them.
-   if(!stamps){Board board;for(Cell c:history)board.make(c);
-    if(!board.completions(board.player,board.remaining).empty() || board.completions(1-board.player).empty())task->closed=task->fixed=2;}
+   if(!stamps && quiet<0){Board board;for(Cell c:history)board.make(c);quiet=!board.completions(board.player,board.remaining).empty() || board.completions(1-board.player).empty();}
+   if(!stamps && quiet)task->closed=task->fixed=2;
    tasks.emplace(key,std::move(task));
  }
 };
@@ -191,7 +193,8 @@ struct Loop {
   auto& f=frontiers[i];double relevance=1;for(auto& v:pool.games[i]->views)if(v.tree.get()==&t){relevance=v.relevance;break;}
   double share=1;for(auto [parent,index]:path.edges){const auto& edge=parent->edges[index];share*=std::max(.001,parent->prior(edge));}
   double forcing=1+std::min(size_t(8),path.own.size()+path.threats.size());
-  f.offer(path.leaf->shared_from_this(),path.history,std::max(.0001,relevance*share)*forcing,std::abs(path.leaf->q-path.leaf->value));
+  f.offer(path.leaf->shared_from_this(),path.history,std::max(.0001,relevance*share)*forcing,std::abs(path.leaf->q-path.leaf->value),
+   t.tactics?int(!path.own.empty() || path.threats.empty()):-1);
   for(auto [parent,index]:path.edges)if(parent->exact_winner>=0 && parent->stones<=int(path.history.size()))f.remember(std::vector<Cell>(path.history.begin(),path.history.begin()+parent->stones),*parent);
  }
  std::string context(size_t i,const Task& task){
