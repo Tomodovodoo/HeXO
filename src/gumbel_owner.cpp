@@ -3,6 +3,8 @@
 #include "gumbel.cpp"
 #include <chrono>
 #include <deque>
+#include <condition_variable>
+#include <mutex>
 extern "C" int hxgf_begin(void*,void*,const int64_t*,int);
 extern "C" void* hxgf_new(int);
 extern "C" void hxgf_free(void*);
@@ -245,12 +247,19 @@ extern "C" HX_API int hxgo_policy_audit(void* p,double* out){auto& o=*static_cas
 
 // One writer per game and one neural queue across independent games of one model.
 namespace owner {
+// A worker can retain this signal after its broker detaches. It never owns or
+// dereferences a graph, producer, or broker through the notification.
+struct Signal {
+ std::mutex mutex;std::condition_variable wake;
+ void notify(){std::lock_guard lock(mutex);wake.notify_all();}
+};
 struct Pool {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
  std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
  void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
  void (*proof_bind)(void*,int)=nullptr;
+ bool (*proof_ready)(void*)=nullptr;void (*proof_listen)(void*,std::shared_ptr<Signal>)=nullptr;
  void* inference_owner=nullptr;
  Pool(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed):owned_feed(hxgf_new(capacity)),feed(owned_feed.get()),model(version?version:""){
   if(!sources || count<1 || count>1024 || !feed || model.empty())throw std::runtime_error("Invalid multi-game pool");
