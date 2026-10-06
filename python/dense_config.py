@@ -34,6 +34,7 @@ class ActorSettings:
     native_scheduler: bool = False # persistent native owners, one model-keyed inference queue
     native_round_barrier: bool = False # explicit root sets, drain only before halving
     native_producers: int = 4
+    native_model_producers: int = 1 # producers splitting each model's actor slots, within native_producers
     native_quantum: int = 32
     native_views: int = 8
     native_depth: int = 8
@@ -130,8 +131,10 @@ class ActorSettings:
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,
                      self.solver_deep_nodes,self.solver_leaf_nodes))):
             raise ValueError('native_scheduler requires game_graph and frontier slices instead of legacy solver budgets or PV checks')
-        if self.native_scheduler and self.historical_fraction and self.native_producers<2:
-            raise ValueError('Native historical games require at least two host workers')
+        if not 1 <= self.native_model_producers <= self.native_producers:
+            raise ValueError('native_model_producers must lie between one and native_producers')
+        if self.native_scheduler and self.historical_fraction and self.native_producers<2*self.native_model_producers:
+            raise ValueError('Native historical games require two models of producers within native_producers')
         if self.native_scheduler and (not 1<=self.games_in_flight<=1024 or not 1<=self.leaf_batch<=1024):
             raise ValueError('Native game slots and inference batches must lie in [1, 1024]')
         if self.native_packing and not self.native_feed:
