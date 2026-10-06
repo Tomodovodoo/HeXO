@@ -157,25 +157,73 @@ struct Loop {
    text+="{\"history\":";cells(fact.history);text+=",\"winner\":"+std::to_string(fact.winner)+",\"plies\":"+std::to_string(fact.distance)+'}';
   }text+="]}";snapshot_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();return text;
  }
- std::shared_ptr<Task> take(size_t& game){
-  std::shared_ptr<Task> chosen;double best=-1;auto now=Clock::now();bool explore=submitted%5==4;
+ struct Ready {
+  struct Choice {std::shared_ptr<Task> task;double priority=0,age=0;bool picked=false;};
+  Choice only;bool single=false;std::vector<Choice> choices;std::array<std::vector<size_t>,2> heaps;
+  Choice& choice(size_t i){return single?only:choices[i];}
+  double score(size_t i,bool explore)const{const auto& c=single?only:choices[i];return explore?c.age:c.priority;}
+  auto lower(bool explore){return [this,explore](size_t a,size_t b){
+   double x=score(a,explore),y=score(b,explore);return x==y?a>b:x<y;
+  };}
+  void build(){
+   if(single)return;
+   for(auto& heap:heaps){heap.reserve(choices.size());for(size_t i=0;i<choices.size();++i)heap.push_back(i);}
+   std::make_heap(heaps[0].begin(),heaps[0].end(),lower(false));
+   std::make_heap(heaps[1].begin(),heaps[1].end(),lower(true));
+  }
+  size_t best(bool explore){
+   if(single)return only.task && !only.picked?0:SIZE_MAX;
+   auto& heap=heaps[explore];while(!heap.empty() && choices[heap.front()].picked){
+    std::pop_heap(heap.begin(),heap.end(),lower(explore));heap.pop_back();
+   }return heap.empty()?SIZE_MAX:heap.front();
+  }
+ };
+ std::vector<Ready> prepare(size_t available,Clock::time_point& retry){
+  retry={};
+  std::vector<Ready> ready(frontiers.size());auto now=Clock::now();bool explore=submitted%5==4;
   for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped)continue;
+   auto& candidates=ready[i];candidates.single=available==1;if(!candidates.single)candidates.choices.reserve(f.tasks.size());
    for(auto it=f.tasks.begin();it!=f.tasks.end();){auto task=it->second;auto node=task->node.lock();
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
     if(task->flight || !node || node->dormant)continue;
     f.scope(*task,stamps);
-    if(task->closed==3 || task->ready>now)continue;
+    if(task->closed==3)continue;
+    if(task->ready>now){if(retry==Clock::time_point{} || task->ready<retry)retry=task->ready;continue;}
     bool pending=node->pending;if(auto peers=o.game->positions.find(task->key);peers!=o.game->positions.end())for(auto& weak:peers->second)if(auto peer=weak.lock())pending|=peer->pending;
     if(pending)continue;double age=double(f.next-task->born+1);
-    double score=explore?age:task->impact*(1+task->change)/std::max(.05,task->cost)+.0001*age;
-    if(score>best){best=score;chosen=task;game=i;}
+    double score=task->impact*(1+task->change)/std::max(.05,task->cost)+.0001*age;
+    if(candidates.single){if(!candidates.only.task || (explore?age:score)>candidates.score(0,explore))candidates.only={task,score,age};}
+    else candidates.choices.push_back({task,score,age});
    }
-  }return chosen;
+   candidates.build();
+  }return ready;
+ }
+ std::shared_ptr<Task> take(std::vector<Ready>& ready,size_t& game){
+  double best=-1;size_t selected=SIZE_MAX;bool explore=submitted%5==4;
+  for(size_t n=0;n<ready.size();++n){size_t i=(cursor+n)%ready.size();auto& candidates=ready[i];auto next=candidates.best(explore);
+   if(next==SIZE_MAX)continue;double score=candidates.score(next,explore);
+   if(score>best){best=score;selected=next;game=i;}
+  }
+  if(selected==SIZE_MAX)return {};
+  auto& chosen=ready[game].choice(selected);chosen.picked=true;return chosen.task;
  }
  void admit(){
+  // The graph owner cannot change candidates while this refill is dispatching.
+  // Rank eligibility once, then consume priority/age heaps instead of rescanning
+  // every position for each job. Worker completions install on the next step.
+  std::vector<Ready> ready;Clock::time_point retry{};
   for(;;){
-   {std::lock_guard lock(mutex);if(stopping || !enabled || live.size()>=capacity)return;}
-   size_t i=0;auto task=take(i);if(!task)return;auto node=task->node.lock();auto& o=*pool.games[i];
+   size_t available;
+   {std::lock_guard lock(mutex);if(stopping || !enabled || live.size()>=capacity)return;available=capacity-live.size();}
+   if(ready.empty())ready=prepare(available,retry);
+   size_t i=0;auto task=take(ready,i);
+   if(!task){
+    // Ranking/dispatch can outlast a retry delay. Refresh only when an excluded
+    // cooldown has elapsed, without waiting or rescanning for every job.
+    if(retry==Clock::time_point{} || retry>Clock::now())return;
+    ready.clear();continue;
+   }
+   auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
     // Without a shared cancel flag, bound the synchronous WASM call by a short
