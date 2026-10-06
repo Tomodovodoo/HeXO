@@ -203,6 +203,12 @@ if (job.kind === 'encode') {
       return {policy:new Float32Array(count*size*size),far:new Float32Array(count),value:new Float32Array(count)};
     };
     const query = (index,request)=>new Promise(resolve=>{
+      // This fixture tests delivery from the offered interior position. A root
+      // proof can otherwise finish first and correctly cancel that query.
+      if(job.offer && JSON.stringify(request.history)!==JSON.stringify(job.offer.history)){
+        const info=proofAnswer({status:'UNKNOWN',nodes_fresh:0},request);
+        events.push({request,info:info.info});resolve(info);return;
+      }
       if(job.cooldown){
         const info=proofAnswer({status:'UNKNOWN',nodes_fresh:0,proof_numbers:request.attacker==='mover'?{scope:'wide-forcing',game_exact:false,pn:1073741824,dn:0}:null},request);
         events.push({request,info:info.info});resolve(info);return;
