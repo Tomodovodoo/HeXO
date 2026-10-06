@@ -16,7 +16,7 @@ extern "C" int hxgf_root_value(void*,void*,double*);
 extern "C" int hxgf_install(void*,const uint64_t*,int,const int64_t*,const int64_t*,const double*,const double*,void**,int);
 namespace owner {
 using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
-struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false;};
+struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false,active=false;};
 struct View {std::unique_ptr<Tree> tree;Key key;std::vector<Cell> history;double relevance=1;uint64_t id=0,generation=0,completed=0,issued=0,cancelled=0;int depth=0,passes=0;bool active=false,discovered=false;};
 struct Record {uint64_t id,generation,completed,shared,context_a,context_b;int depth,exact;bool raw_known,estimate_known;double value,net,ms;std::vector<Cell> history;};
 struct FeedDeleter {void operator()(void* p)const{if(p)hxgf_free(p);}};
@@ -45,7 +45,8 @@ struct Owner {
  bool start(View& v){
   uint64_t room=work_limit?work_limit-std::min(work_limit,completed+reserved()):uint64_t(quantum);
   int budget=int(std::min<uint64_t>(quantum,room));if(!budget || stopped || expired())return false;
-  v.tree->begin(budget,std::min(sample_limit,budget));v.active=true;v.discovered=false;++v.generation;++allocations;attach(v);return true;
+  v.tree->begin(budget,std::min(sample_limit,budget));v.active=true;v.discovered=false;++v.generation;++allocations;
+  candidates[v.key].active=true;attach(v);return true;
  }
  void save_credits(Tree& t){
   if(direct_root_credits.empty())direct_root_credits.resize(t.root_edges.size());
@@ -67,7 +68,7 @@ struct Owner {
   uint64_t credits=t.completed;completed+=credits;issued+=t.issued;cancelled+=t.cancelled;
   v.completed+=credits;v.issued+=t.issued;v.cancelled+=t.cancelled;++v.passes;v.active=false;
   if(!v.depth)save_credits(t);
-  auto& c=candidates[v.key];c.history=v.history;c.depth=v.depth;c.relevance=std::max(c.relevance,v.relevance);c.completed+=credits;c.last=allocations;c.seen=allocations;
+  auto& c=candidates[v.key];c.active=false;c.history=v.history;c.depth=v.depth;c.relevance=std::max(c.relevance,v.relevance);c.completed+=credits;c.last=allocations;c.seen=allocations;
   record(v,credits);
   if(v.depth==0 && t.completed){last_root=t.root_edges;last_members=t.round.members;}
   discover(v);
@@ -76,7 +77,7 @@ struct Owner {
   auto begin=std::chrono::steady_clock::now();auto& t=*v.tree;auto& node=*t.root;
   if(!node.expanded || node.exact_winner>=0 || v.depth>=max_depth)return;
   if(candidates.size()>=14336){
-   std::vector<std::pair<double,Key>> victims;for(auto& [key,c]:candidates)if(c.depth && !live(key))victims.push_back({c.relevance/std::sqrt(1.+c.completed),key});
+   std::vector<std::pair<double,Key>> victims;for(auto& [key,c]:candidates)if(c.depth && !c.active)victims.push_back({c.relevance/std::sqrt(1.+c.completed),key});
    std::sort(victims.begin(),victims.end(),[](const auto& a,const auto& b){if(a.first!=b.first)return a.first<b.first;if(a.second.a!=b.second.a)return a.second.a<b.second.a;return a.second.b<b.second.b;});
    size_t drop=std::min(size_t(2048),victims.size());for(size_t i=0;i<drop;++i){candidates.erase(victims[i].second);++reclaimed;}
   }
@@ -99,7 +100,7 @@ struct Owner {
   }
   v.discovered=true;discover_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
  }
- bool live(const Key& key)const {for(auto& v:views)if(v.active && v.key==key)return true;return false;}
+ bool live(const Key& key)const {auto c=candidates.find(key);return c!=candidates.end() && c->second.active;}
  // Solver paths enter the same bounded queue as internally discovered views.
  // Every intermediate position remains searchable; a quiet endpoint is not a proof.
  size_t solver_path(const std::vector<Cell>& history,size_t begin,double relevance){
@@ -125,50 +126,60 @@ struct Owner {
  }
  Candidate* choose(Key& selected){
   Candidate* best=nullptr;double score=-1;bool explore=allocations%5==4;
-  for(auto& [key,c]:candidates){if(c.depth==0 || (c.depth>max_depth && !c.solver) || live(key))continue;
+  for(auto& [key,c]:candidates){if(c.depth==0 || (c.depth>max_depth && !c.solver) || c.active)continue;
    if(auto n=game->nodes.find(key);n!=game->nodes.end())if(auto node=n->second.lock())if(node->exact_winner>=0)continue;
    double age=double(allocations-c.last+1);double x=explore?age/std::sqrt(1.+c.completed):c.relevance*(1.+std::min(16.,age/16.))/std::sqrt(c.cost*(1.+double(c.completed)/quantum));
    // Stable key breaks ties; pointer/map iteration is not the schedule's ordering.
    if(x>score || (x==score && (key.a<selected.a || (key.a==selected.a && key.b<selected.b)))){score=x;best=&c;selected=key;}
   }return best;
  }
- bool allocate(){
-  if(stopped || expired())return false;size_t slot=1;
+ int allocate(){
+  if(stopped || expired())return -1;size_t slot=1;
   while(slot<views.size() && views[slot].active)++slot;
-  if(slot==views.size() && views.size()>=size_t(max_views))return false;
-  Key key{};auto* c=choose(key);if(!c)return false;
-  if(work_limit && completed+reserved()>=work_limit)return false;
+  if(slot==views.size() && views.size()>=size_t(max_views))return -1;
+  Key key{};auto* c=choose(key);if(!c)return -1;
+  if(work_limit && completed+reserved()>=work_limit)return -1;
   auto history=c->history;double relevance=c->relevance;int depth=c->depth;c->last=allocations;
   if(slot<views.size()){hxgf_detach(feed,views[slot].tree.get());views[slot].tree->cancel();++retired;}
   View v;v.tree=std::make_unique<Tree>(rng(),game);v.tree->shared=v.tree->graph=true;
   v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->round_barrier=views[0].tree->round_barrier;
   v.tree->root_at(history);v.history=std::move(history);v.key=key;v.depth=depth;v.relevance=relevance;v.id=next_id++;++created;
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
-  return start(views[slot]);
+  return start(views[slot])?int(slot):-1;
  }
  int step(int ready_limit=0,bool admitted=false){
   if(stopped)return 0;auto begin=std::chrono::steady_clock::now();++ticks;
   if(expired()){deadline=true;stop();return 0;}
-  auto& root=views[0];
+  auto* root=views[0].tree.get();
   for(auto& v:views){if(v.active && v.tree->done())finish(v);else if(v.active && !v.discovered && v.tree->root->expanded)discover(v);if(expired()){deadline=true;stop();return 0;}}
-  if(root.tree->board.winner>=0 || (root.tree->root->expanded && root.tree->root->exact_winner>=0)){stop();return 0;}
-  if(!root.active)start(root);
-  while(allocate()){if(expired()){deadline=true;stop();return 0;}}
+  if(root->board.winner>=0 || (root->root->expanded && root->root->exact_winner>=0)){stop();return 0;}
+  if(!views[0].active)start(views[0]);
+  // Keep one continuation eligible even under a tiny watermark. Beyond that,
+  // existing views get the first chance to supply work before opening more.
+  if(std::none_of(views.begin()+1,views.end(),[](const auto& v){return v.active;}))allocate();
   int progress=0;
+  auto gather=[&](View& v){
+   if(expired()){deadline=true;stop();return;}
+   int64_t out[4];int status=hxgf_gather(feed,v.tree.get(),out);
+   if(status==-2)throw std::runtime_error(gumbel::error);
+   progress+=int(out[0])+int(out[3]);
+   if(expired()){deadline=true;stop();return;}
+   if(root->board.winner>=0 || (root->root->expanded && root->root->exact_winner>=0))stop();
+  };
   size_t visited=0,first=ready_limit?view_cursor:0;
   while(visited<views.size()){
    if(ready_limit && !admitted && hxgf_queued(feed)>=ready_limit)break;
    auto& v=views[(first+visited++)%views.size()];if(!v.active)continue;
-   if(expired()){deadline=true;stop();return 0;}int64_t out[4];int status=hxgf_gather(feed,v.tree.get(),out);
-   admitted=false;
-   if(status==-2)throw std::runtime_error(gumbel::error);
+   admitted=false;gather(v);
    // Cached fulfillments and exact edges advance search without adding NN rows.
-   progress+=int(out[0])+int(out[3]);if(expired()){deadline=true;stop();return 0;}
-   if(root.tree->board.winner>=0 || (root.tree->root->expanded && root.tree->root->exact_winner>=0)){stop();break;}
+   if(stopped)break;
   }
   // Pause between whole gathers, never inside a root visit layer. Resume with
   // the next view so deeper work remains eligible when the queue has space.
   if(ready_limit)view_cursor=(first+visited)%views.size();
+  while(!stopped && (!ready_limit || hxgf_queued(feed)<ready_limit)){
+   int slot=allocate();if(slot<0)break;gather(views[slot]);
+  }
   bool active=false;for(auto& v:views)active|=v.active;
   if(!active)stop();
   views[0].tree->trim_archive(false,false);
@@ -184,6 +195,7 @@ struct Owner {
     record(v,t.completed);
    }
    hxgf_detach(feed,v.tree.get());v.tree->cancel();if(active){cancelled+=v.tree->cancelled;v.cancelled+=v.tree->cancelled;}v.active=false;
+   if(auto c=candidates.find(v.key);c!=candidates.end())c->second.active=false;
   }
   views[0].tree->trim_archive(false,false);
  }
