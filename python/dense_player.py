@@ -75,6 +75,8 @@ class DensePlayer:
             cuda_graphs=self.native_scheduler and self.net_kernels == 'fused')
         if self.native_scheduler:
             self.evaluator.free = []  # Packed forwards own staging until their completion fence.
+            if self.evaluator.graph is not None:
+                self.evaluator.graph.max_batch = 128
         self.checkpoint, self.model_sha256 = checkpoint, digest(path)
         self.set_history()
 
