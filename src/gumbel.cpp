@@ -68,15 +68,29 @@ Key predecessor(Key child,size_t stones,Cell action) {
  return {child.a-mix(player*3+remaining+17)+mix(mover*3+before+17)-mix(h^mix(mover+1)),
          child.b-mix(player*3+remaining+71)+mix(mover*3+before+71)-mix(h+mix(mover+911))};
 }
-// The same keys from a placement history, without replaying it: stone i belongs to player ((i + 1) / 2) % 2.
-std::pair<Key,Key> keys(const std::vector<Cell>& history) {
- const size_t n=history.size();const int player=int((n+1)/2%2),remaining=n==0 || n%2==0?1:2;
- Key position{mix(player*3+remaining+17),mix(player*3+remaining+71)};
- for(size_t i=0;i<n;++i){auto h=CellHash{}(history[i]);int p=int((i+1)/2%2);position.a+=mix(h^mix(p+1));position.b+=mix(h+mix(p+911));}
+// The term placement i adds to a position key: stone i belongs to player ((i + 1) / 2) % 2.
+Key stone_key(Cell cell,size_t i){auto h=CellHash{}(cell);int p=int((i+1)/2%2);return {mix(h^mix(p+1)),mix(h+mix(p+911))};}
+// Keys of the first n placements of `history`, given the sum of their stone terms.
+std::pair<Key,Key> prefix_key(const std::vector<Cell>& history,size_t n,Key stones) {
+ const int player=int((n+1)/2%2),remaining=n==0 || n%2==0?1:2;
+ Key position{mix(player*3+remaining+17)+stones.a,mix(player*3+remaining+71)+stones.b};
  Key context=position;const size_t start=n%2 || n==0?n:n-1;
  if(start<n){auto h=CellHash{}(history[start]);context.a^=mix(h+0x51);context.b^=mix(h+0x93);}
  for(size_t i=start>=2?start-2:0;i<start;++i){auto h=CellHash{}(history[i]);context.a+=mix(h+0x7f1);context.b+=mix(h+0x3c9);}
  return {position,context};
+}
+// The same keys from a placement history, without replaying it.
+std::pair<Key,Key> keys(const std::vector<Cell>& history) {
+ Key stones;for(size_t i=0;i<history.size();++i){auto s=stone_key(history[i],i);stones.a+=s.a;stones.b+=s.b;}
+ return prefix_key(history,history.size(),stones);
+}
+// keys() of every prefix of `history`, the empty one first, in one pass.
+std::vector<std::pair<Key,Key>> prefix_keys(const std::vector<Cell>& history) {
+ std::vector<std::pair<Key,Key>> out;out.reserve(history.size()+1);Key stones;
+ for(size_t n=0;;++n){
+  out.push_back(prefix_key(history,n,stones));if(n==history.size())return out;
+  auto s=stone_key(history[n],n);stones.a+=s.a;stones.b+=s.b;
+ }
 }
 // Untouched legal actions share an immutable empty state. Allocate mutable
 // search/proof state only when an action receives work or a changed verdict.
@@ -497,10 +511,10 @@ struct Tree {
  // Shared graph: the stored positions `history`'s strict prefixes reach, the longest first, each with the index of
  // its edge along `history` (-1 when the node is unexpanded).
  std::vector<std::pair<Node*,int>> prefixes(const std::vector<Cell>& history) {
-  std::vector<std::pair<Node*,int>> out;std::vector<Cell> prefix(history);
-  while(!prefix.empty()){
-   const Cell action=prefix.back();prefix.pop_back();
-   auto found=nodes.find(keys(prefix).second);if(found==nodes.end())continue;
+  std::vector<std::pair<Node*,int>> out;const auto all=prefix_keys(history);
+  for(size_t k=history.size();k-->0;){
+   const Cell action=history[k];
+   auto found=nodes.find(all[k].second);if(found==nodes.end())continue;
    auto n=found->second.lock();if(!n)continue;
    int index=-1;for(int i=0;i<int(n->edges.size());++i)if(n->edges[i].action==action){index=i;break;}
    out.emplace_back(n.get(),index);

@@ -605,7 +605,7 @@ inline RootEvent Producer::result(int index,uint64_t token){
  for(size_t i=0;i<n.edges.size();++i)if(n.edges[i].read().eligible)highest=std::max(highest,n.edges[i].logit+(q[i]-lo)/range*(50.+maximum)*.1+t.bonus(n.edges[i]));
  for(size_t i=0;i<n.edges.size();++i)if(n.edges[i].read().eligible)total+=weights[i]=std::exp(n.edges[i].logit+(q[i]-lo)/range*(50.+maximum)*.1+t.bonus(n.edges[i])-highest);
  int64_t action[2];if(!o.choice(action))throw std::runtime_error("Continuous root cannot select a move");
- double raw=o.root_raw;bool raw_known=o.root_raw_known;auto key=gumbel::keys(o.focus).second;
+ double raw=o.root_raw;bool raw_known=o.root_raw_known;const auto prefixes=gumbel::prefix_keys(o.focus);auto key=prefixes.back().second;
  int producer=this->index;
  std::ostringstream out;out<<std::setprecision(17);
  auto cells=[&](const std::vector<Cell>& h){out<<'[';for(size_t j=0;j<h.size();++j){if(j)out<<',';out<<'['<<h[j].q<<','<<h[j].r<<']';}out<<']';};
@@ -614,10 +614,10 @@ inline RootEvent Producer::result(int index,uint64_t token){
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i]/total,double(e.read().visits),double(i<o.direct_root_credits.size()?o.direct_root_credits[i]:0),double(e.read().eligible)});}
- out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"exact_prefixes\":[";Board prefix;size_t count=0;
- for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(gumbel::keys(prefix).first);if(fact!=o.game->outcomes.end()){
+ out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"exact_prefixes\":[";size_t count=0;
+ for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(prefixes[ply].first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;
-  for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}prefix.make(o.focus[ply]);}
+  for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}}
  out<<"]}";result.text=out.str();return result;
 }
 }
