@@ -5008,6 +5008,26 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(samples), len(refs))
             self.assertTrue(all(np.isfinite(t['value']) for t in targets))
 
+    def test_played_roots_keep_their_network_value_without_a_prediction_cache(self):
+        from native_selfplay import play_cohort
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-raw', 'model-raw', 'cpu', 32, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=16, root_samples=4, game_graph=192,
+                                             max_plies=6, tactics=False, opening_random_plies=0.)
+        games = [dense_selfplay.SelfPlayGame([model, model], settings, 140+i, native_owner=True) for i in range(2)]
+        events = []
+        # No feed cache: a root expanded earlier as a child still reports the
+        # prediction its graph node installed, never a missing value.
+        with unittest.mock.patch.object(model.evaluator, 'evaluate') as evaluate:
+            episodes, rows, _ = play_cohort(games, producers=2, quantum=8, views=4, cache=0,
+                                            progress=lambda index, event: events.append(event))
+        evaluate.assert_not_called()
+        searched = [event for event in events if 'error' not in event]
+        self.assertEqual(len(searched), len(rows))
+        self.assertTrue(all(event['network_value'] is not None and -1 <= event['network_value'] <= 1
+                            for event in searched))
+        self.assertTrue(all(value is not None for e in episodes for value in e['network_values']))
+
     def test_inference_service_batch_capacity_is_separate_from_producer_snapshots(self):
         import native_dense
         from native_scheduler import InferenceService

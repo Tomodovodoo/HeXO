@@ -58,6 +58,8 @@ struct Owner {
  void record(View& v,uint64_t credits){
   auto& t=*v.tree;auto& node=*t.root;double raw=0;
   bool raw_known=hxgf_root_value(feed,v.tree.get(),&raw)!=0;
+  // An evicted cache entry does not lose the prediction an expanded root kept.
+  if(!raw_known && node.raw_known){raw=node.raw;raw_known=true;}
   if(!v.depth && raw_known){root_raw=raw;root_raw_known=true;}
   int winner=t.board.winner>=0?t.board.winner:node.exact_winner;
   bool known=winner>=0 || node.expanded || node.n>0;
