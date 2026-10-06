@@ -806,14 +806,18 @@ class Learner:
             m.momentum = momentum
         self.ema.eval()
 
-    def weighted_means(self, batches):
-        """Per head of HEADS, the EMA's weighted mean loss over every row of the collated `batches` with that
-        target; None for a head without target weight."""
-        total = torch.zeros(len(HEADS), device=self.device); mass = torch.zeros(len(HEADS), device=self.device)
+    def weighted_sums(self, batch):
+        """(weighted loss totals, target weight sums), each [len(HEADS)], of the EMA over one collated batch."""
+        weights = torch.stack([sum(b[w].sum() for b in batch.values()) for w in WEIGHTS]).to(self.device)
         with torch.no_grad():
-            for batch in batches:
-                weights = torch.stack([sum(b[w].sum() for b in batch.values()) for w in WEIGHTS]).to(self.device)
-                total += batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights; mass += weights
+            return batch_losses(self.ema, batch, None, self.device, self.memory_format, False)*weights, weights
+
+    def weighted_means(self, sums):
+        """Per head of HEADS, the weighted mean loss over the weighted_sums pairs `sums`; None for a head without
+        target weight."""
+        total = torch.zeros(len(HEADS), device=self.device); mass = torch.zeros(len(HEADS), device=self.device)
+        for loss, weight in sums:
+            total += loss; mass += weight
         return [float(total[h]/mass[h]) if mass[h] > 0 else None for h in range(len(HEADS))]
 
     def validate(self, window):
@@ -848,26 +852,37 @@ class Learner:
                 if s.deblunder_weight:
                     value_bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, b['value'], reduction='none')
                     deblundered.append(np.stack([value_bce.numpy(), b['deblundered'].numpy()]))
-        result = (dict(zip(self.heads, self.weighted_means(batches))) | outcome_split(*np.concatenate(rows, 1))
+        result = (dict(zip(self.heads, self.weighted_means(map(self.weighted_sums, batches))))
+                  | outcome_split(*np.concatenate(rows, 1))
                   | policy_summary(*np.concatenate(policy_rows, 1))
                   | certified_policy_summary(*np.concatenate(certified_rows, 1)))
         if s.deblunder_weight:
             result.update(deblunder_split(*np.concatenate(deblundered, 1)))
         return result
 
-    def subset_losses(self, sets, refs):
-        """EMA weighted_means (policy_ce, value_bce, future loss) over `refs` under symmetries drawn from a fixed seed
-        (a row keeps its symmetry while rows are appended)."""
-        s = self.settings
+    def render(self, sets, refs):
+        """Yield dense_data.examples of `refs` in chunks of settings.batch rows under symmetries drawn from a fixed
+        seed (a row keeps its symmetry while rows are appended) as (chunk, samples, targets, collated batch)."""
         rng = np.random.default_rng(self.config.seed)
-        batches = (dense_data.collate(*dense_data.examples(sets, refs[k:k+s.batch], rng, **self.targets()))
-                   for k in range(0, len(refs), s.batch))
-        means = self.weighted_means(batches)
+        for k in range(0, len(refs), self.settings.batch):
+            chunk = refs[k:k+self.settings.batch]
+            samples, targets = dense_data.examples(sets, chunk, rng, **self.targets())
+            yield chunk, samples, targets, dense_data.collate(samples, targets)
+
+    def scored(self, rendered, sums):
+        """Yield the chunks of `rendered`, appending each chunk's weighted_sums to `sums` first."""
+        for item in rendered:
+            sums.append(self.weighted_sums(item[3]))
+            yield item
+
+    def subset_losses(self, sums):
+        """weighted_means (policy_ce, value_bce, future loss) of the weighted_sums pairs `sums`."""
+        means = self.weighted_means(sums)
         return tuple(means[i] for i in (0, 1, 4))
 
-    def row_losses(self, sets, refs):
-        """Per-row EMA losses over `refs` under symmetries drawn from a fixed seed: float arrays with one entry per
-        ref, aligned across keys (not in the order of `refs`): ply (from the start), remaining (len(moves) - ply),
+    def row_losses(self, rendered):
+        """Per-row EMA losses over the rows of `rendered` (render): float arrays with one entry per
+        ref, aligned across keys (not in the order of the refs): ply (from the start), remaining (len(moves) - ply),
         finished (1. when winner >= 0, else 0.), value_bce, value (its target), outcome_bce, outcome (the hard
         outcome; .5 for capped games), policy_weight, policy_ce (against the improved policy; nan on rows without a policy
         target), policy_target_entropy, policy_kl, policy_top1, policy_top2, policy_argmax_mass (nan without a
@@ -875,16 +890,12 @@ class Learner:
         (searched_value at the row), proven (the row's `proven`), proof_action (1 with a witness)
         and deblundered (0/1). certified_policy_mass and certified_policy_top1 measure the winning witness
         independently of training targets (nan without one); placements is the stones remaining this turn."""
-        s = self.settings
-        rng = np.random.default_rng(self.config.seed)
         rows = []
         with torch.no_grad():
-            for k in range(0, len(refs), s.batch):
-                chunk = refs[k:k+s.batch]
-                samples, targets = dense_data.examples(sets, chunk, rng, **self.targets())
+            for chunk, samples, targets, batch in rendered:
                 order = sorted(range(len(chunk)), key=lambda i: samples[i].size)    # collate's row order
                 losses = []
-                for b in dense_data.collate(samples, targets).values():
+                for b in batch.values():
                     indices = order[len(losses):len(losses)+len(b['counts'])]
                     out = forward(self.ema, b['planes'], self.device, self.memory_format)[0]
                     pair = pair_policy_rows(out, b, [samples[i] for i in indices],
@@ -936,12 +947,14 @@ class Learner:
         self.ema.eval()
         out = dict(newest_checkpoint=sets.newest_checkpoint)
         for source in dense_data.SOURCES:
-            held, train = (self.subset_losses(sets, sets.subsets[source, split]) for split in ('held', 'train'))
+            train = self.subset_losses(self.weighted_sums(batch) for *_, batch in self.render(sets, sets.subsets[source, 'train']))
+            sums = []
+            r = self.row_losses(self.scored(self.render(sets, sets.subsets[source, 'held']), sums))
+            held = self.subset_losses(sums)
             for name, v, w in zip(('policy_ce', 'value_bce', self.heads[4]), held, train):
                 out.update({f'{source}_{name}': v, f'{source}_train_{name}': w,
                             f'{source}_gap_{name}': None if v is None or w is None else v-w})
             out[f'{source}_rows'] = len(sets.subsets[source, 'held'])
-            r = self.row_losses(sets, sets.subsets[source, 'held'])
             out.update({f'{source}_{k}': v for k, v in certified_policy_summary(
                 r['certified_policy_mass'], r['certified_policy_top1'], r['placements']).items()})
             proof = (r['proven'] > 0) & (r['proof_action'] > 0) & np.isfinite(r['policy_ce'])
