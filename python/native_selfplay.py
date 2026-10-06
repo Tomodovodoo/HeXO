@@ -48,12 +48,16 @@ class NativeGames:
     `step` exposes a finished game only after every one of its model owners has
     returned final fresh work. Dynamic mode attaches frozen checkpoints while
     older games continue; fixed cohorts retain their original model set.
+    In dynamic mode `producers` bounds producer threads plus host workers, and
+    each model's slots are split over `model_producers` independent producers.
     """
     def __init__(self, games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                  batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0, progress=None,
-                 dynamic=False):
+                 dynamic=False, model_producers=1):
         if not games or any(not g.native_owner for g in games) or producers<1:
             raise ValueError('A nonempty cohort of native-owner games is required')
+        if not 1<=model_producers<=producers:
+            raise ValueError('Producers per model must lie between one and the host allocation')
         self.games = list(games)
         models = [model for g in games for model in g.trees]
         self.models = list({m.sha:m for m in models}.values()) if dynamic else list(dict.fromkeys(models))
@@ -71,18 +75,19 @@ class NativeGames:
         self.options = dict(quantum=quantum,views=views,depth=depth,work=quantum,cache=cache,
                             workers=max(1,producers//len(self.models)))
         self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
+        self.split = min(model_producers,len(self.games))
         self.proof_options = dict(package=proof_package,workers=proof_workers,
                                   queue=max(4,proof_workers*2),slice_ms=slice_ms,table_mb=4)
         if dynamic:
             try:
-                if any(len({m.sha for m in g.trees})>self.host_budget for g in games):
+                if any(not self.fits({m.sha for m in g.trees}) for g in games):
                     raise ValueError('Initial model set exceeds the native host allocation')
                 initial = list(self.models)
                 self.models = []
                 admitted = set()
                 for game in games:
                     candidate = {m.sha for m in game.trees}
-                    if len(admitted|candidate)<=self.host_budget:
+                    if self.fits(admitted|candidate):
                         admitted.update(candidate)
                 for model in initial:
                     if model.sha in admitted:
@@ -136,41 +141,62 @@ class NativeGames:
     def done(self):
         return len(self.finished)==len(self.games)
 
+    def fits(self, shas):
+        """Whether these models' producers fit the host allocation."""
+        return len(shas)*self.split<=self.host_budget
+
+    @staticmethod
+    def shares(count, parts):
+        return [count//parts+(j<count%parts) for j in range(parts)]
+
     def register(self, model):
-        """One frozen producer per model, with a reusable graph slot for each game."""
+        """Split each frozen model's reusable game slots over `split` producers.
+
+        A retiring model admits no games until all of its producers have left.
+        """
         if model.sha in self.groups:
-            return True
-        if len(self.groups)>=self.host_budget:
+            return not self.groups[model.sha]['retiring']
+        if sum(len(g['producers']) for g in self.groups.values())+self.split>self.host_budget:
             return False
         if model.evaluator.graph is not None:
             graph = model.evaluator.graph
             graph.max_batch = max(b for b in graph.BATCHES if b<=min(128,self.batch_size))
-        sources, placeholders = [], {}
+        placeholders = {}
         for index,game in enumerate(self.games):
             s = game.settings
             source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
             if s.native_round_barrier:
                 checked(native.hxg_round_barrier(source.ptr, 1))
             placeholders[index] = source
-            sources.append(source)
-        workers = self.allocate(model.sha).get(model.sha,1) if self.service else self.options['workers']
-        pool = SearchPool(sources,seed=self.games[0].seed,**dict(self.options,workers=workers))
+        workers = self.allocate(model.sha).get(model.sha,self.split) if self.service else max(self.split,self.options['workers'])
+        pools, attached, keys = [], [], {}
         try:
-            proof = pool.enable_proofs(**self.proof_options) if self.proof_options['workers'] else None
+            for part,share in enumerate(self.shares(workers,self.split)):
+                slots = range(part,len(self.games),self.split)
+                pool = SearchPool([placeholders[i] for i in slots],seed=self.games[0].seed+part,**dict(self.options,workers=share))
+                pools.append(pool)
+                proof = pool.enable_proofs(**self.proof_options) if self.proof_options['workers'] else None
+                if self.service is None:
+                    producer,model_id = len(self.pools),len(self.models)
+                    self.pools.append(pool);self.proof_loops.append(proof)
+                else:
+                    producer,model_id = self.service.attach(pool,model.evaluator)
+                    while len(self.pools)<=producer:
+                        self.pools.append(None);self.proof_loops.append(None)
+                    self.pools[producer],self.proof_loops[producer] = pool,proof
+                attached.append(producer)
+                for owner,index in enumerate(slots):
+                    keys[index] = producer,owner
             if self.service is None:
-                producer,model_id = len(self.pools),len(self.models)
-                self.pools.append(pool);self.proof_loops.append(proof);self.models.append(model)
+                self.models.append(model)
             else:
-                producer,model_id = self.service.attach(pool,model.evaluator)
-                while len(self.pools)<=producer:
-                    self.pools.append(None);self.proof_loops.append(None)
-                self.pools[producer],self.proof_loops[producer] = pool,proof
                 while len(self.models)<=model_id:
                     self.models.append(None)
                 self.models[model_id] = model
-            self.groups[model.sha] = dict(model=model,producer=producer,model_id=model_id,free=set(),workers=workers)
-            for index,game in enumerate(self.games):
-                key = producer,index
+            self.groups[model.sha] = dict(model=model,producers=attached,model_id=model_id,keys=keys,
+                                          slots={key:index for index,key in keys.items()},
+                                          free=set(),workers=workers,retiring=False)
+            for index,key in keys.items():
                 self.epochs[key] = 0
                 self.lookup[key] = None
                 self.idle[key] = placeholders[index]
@@ -178,18 +204,20 @@ class NativeGames:
                     self.service.release(*key,expected=0)
             return True
         except BaseException:
-            if getattr(pool,'_service',None) is None:
-                pool.close()
+            for pool in pools:
+                if getattr(pool,'_service',None) is None:
+                    pool.close()
+            if not attached:
                 for tree in placeholders.values():
                     tree.close()
             raise
 
     def allocate(self, extra=None):
         keys = [*self.groups,*([extra] if extra else [])]
-        counts = dict.fromkeys(keys,1)
+        counts = {sha:len(self.groups[sha]['producers']) if sha in self.groups else self.split for sha in keys}
         weights = {sha:max(1,sum(any(m.sha==sha for m in game.trees) for i,game in enumerate(self.games)
                                 if i not in self.finished)) for sha in keys}
-        for _ in range(self.host_budget-len(keys)):
+        for _ in range(self.host_budget-sum(counts.values())):
             sha = max(keys,key=lambda k:weights[k]/counts[k])
             counts[sha] += 1
         # Shrink before growing so a rotation never multiplies active CPU work.
@@ -197,7 +225,8 @@ class NativeGames:
             for sha,group in self.groups.items():
                 count = counts[sha]
                 if count!=group['workers'] and (count>group['workers'])==grow:
-                    self.service.workers(group['producer'],count)
+                    for producer,share in zip(group['producers'],self.shares(count,len(group['producers']))):
+                        self.service.workers(producer,share)
                     group['workers'] = count
         return counts
 
@@ -208,7 +237,7 @@ class NativeGames:
             for model in self.slot_models[index]:
                 key = self.mapping.pop((index,model))
                 self.lookup[key] = None
-                self.groups[model.sha]['free'].add(key[1])
+                self.groups[model.sha]['free'].add(index)
             self.unbound.add(index)
 
     def maintain(self):
@@ -218,23 +247,26 @@ class NativeGames:
         needed = set(active)
         for index in sorted(self.waiting):
             candidate = {m.sha for m in self.games[index].trees}
-            if len(active|candidate)<=self.host_budget:
+            if self.fits(active|candidate):
                 needed.update(candidate)
                 break
         for sha,group in list(self.groups.items()):
-            producer,model_id = group['producer'],group['model_id']
-            if sha in needed or len(group['free'])!=len(self.games):
+            if not group['retiring'] and (sha in needed or len(group['free'])!=len(self.games)):
                 continue
-            if not self.service.reclaim_ready():
-                continue
-            self.service.detach(producer)
-            loop = self.proof_loops[producer]
-            if loop:
-                self.archived_stats.append(dict(loop.stats(),model=sha))
-                self.archived_proofs.extend(dict(r,model=sha) for r in loop.records())
-            self.service.reclaim(self.pools[producer])
-            self.pools[producer],self.proof_loops[producer] = None,None
-            del self.groups[sha]
+            # Reclamation is bounded, so a model's producers may leave over several calls.
+            group['retiring'] = True
+            while group['producers'] and self.service.reclaim_ready():
+                producer = group['producers'].pop()
+                group['slots'] = {key:index for key,index in group['slots'].items() if key[0]!=producer}
+                self.service.detach(producer)
+                loop = self.proof_loops[producer]
+                if loop:
+                    self.archived_stats.append(dict(loop.stats(),model=sha))
+                    self.archived_proofs.extend(dict(r,model=sha) for r in loop.records())
+                self.service.reclaim(self.pools[producer])
+                self.pools[producer],self.proof_loops[producer] = None,None
+            if not group['producers']:
+                del self.groups[sha]
         for model_id,model in enumerate(self.models):
             if model is not None and model.sha not in self.groups and not self.service.model_pending(model_id):
                 if model.evaluator.graph is not None:
@@ -247,7 +279,7 @@ class NativeGames:
         for index in sorted(self.waiting):
             game = self.games[index]
             candidate = {m.sha for m in game.trees}
-            if len(active|candidate)>self.host_budget:
+            if not self.fits(active|candidate):
                 continue
             if not all(self.register(m) for m in game.trees):
                 continue
@@ -258,9 +290,8 @@ class NativeGames:
             self.warming[index] = set()
             for k,model in enumerate(game.trees):
                 group = self.groups[model.sha]
-                producer,owner = group['producer'],index
-                key = producer,owner
-                group['free'].remove(owner)
+                key = group['keys'][index]
+                group['free'].remove(index)
                 self.mapping[index,model] = key
                 self.lookup[key] = index,model
                 self.warming[index].add(key)
@@ -289,7 +320,7 @@ class NativeGames:
         if any(tree.ptr for tree in self.games[index].trees.values()):
             raise ValueError('Publish and close the retired game before replacing its slot')
         if self.dynamic:
-            if len({m.sha for m in game.trees})>self.host_budget:
+            if not self.fits({m.sha for m in game.trees}):
                 raise ValueError('Replacement model set exceeds the native host allocation')
             self.unbind()
             self.games[index] = game
@@ -320,12 +351,12 @@ class NativeGames:
         while (event:=self.service.event()) is not None:
             key = event['producer'],event['game']
             if key in self.idle:
-                group = next(g for g in self.groups.values() if g['producer']==key[0])
+                group = next(g for g in self.groups.values() if key in g['slots'])
                 if event.get('kind')!='released' or event['token']!=self.epochs[key]+1 or event['model']!=group['model_id']:
                     raise ValueError('Unexpected idle native graph retirement')
                 self.epochs[key] = event['token']
                 self.idle.pop(key).close()
-                group['free'].add(key[1])
+                group['free'].add(group['slots'][key])
                 continue
             index,model = self.lookup[key]
             game = self.games[index]
@@ -459,7 +490,7 @@ class ActorEngine:
             self.engine = NativeGames(self.slots,dynamic=True,producers=s.native_producers,
                 quantum=s.native_quantum,views=s.native_views,depth=s.native_depth,
                 cache=s.cache_positions,batch_size=s.leaf_batch,proof_workers=s.native_proof_workers,
-                slice_ms=s.native_proof_slice_ms,progress=self.progress)
+                slice_ms=s.native_proof_slice_ms,progress=self.progress,model_producers=s.native_model_producers)
         finished = self.engine.step()
         self.account()
         for index,game in finished:

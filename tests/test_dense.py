@@ -4195,6 +4195,53 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.engine.receipt['inference']['pending_rows'],0)
         self.assertGreater(engine.evals,0)
 
+    def test_native_actor_splits_model_slots_over_producers_within_the_host_allocation(self):
+        from native_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'split-{k}',f'fixed-{k}','cpu',64,128) for k in range(3)]
+        settings = dense_config.ActorSettings(native_scheduler=True,native_round_barrier=True,native_producers=4,
+            native_model_producers=2,native_views=4,native_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,
+            full_fraction=.5,max_plies=5,leaf_batch=64,opening_random_plies=0.)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        for i in range(4):
+            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,50+i,native_owner=True))
+        episodes,producers,parked = [],set(),False
+        end = time.monotonic()+20
+        while engine.slots and time.monotonic()<end:
+            for game in engine.step():
+                episodes.append(game.episode())
+                if len(episodes)==1:
+                    # Two more models need four producers while the first still holds two.
+                    engine.add(dense_selfplay.SelfPlayGame([models[1],models[2]],settings,60,
+                                                         opponent='fixed-2',native_owner=True))
+            summary = engine.summary()
+            producers.add(summary['producers'])
+            parked |= bool(engine.engine.waiting)
+            self.assertLessEqual(summary['host_workers'],settings.native_producers)
+            self.assertLessEqual(summary['producers'],settings.native_producers)
+        self.assertFalse(engine.slots)
+        self.assertTrue(parked)
+        self.assertIn(2,producers)
+        self.assertEqual(len(episodes),5)
+        for episode,rows in episodes:
+            self.assertEqual(len(episode['moves']),5)
+            self.assertTrue(all(r['search']['model']==episode['actors'][str(r['player'])] for r in rows))
+            self.assertTrue(all(r['search']['comparison_credits']==r['search']['root_completed'] for r in rows))
+        engine.drain()
+        inference = engine.engine.receipt['inference']
+        self.assertEqual((inference['active_producers'],inference['pending_rows'],inference['inflight_batches']),(0,0,0))
+
+    def test_model_producer_setting_stays_within_the_host_allocation(self):
+        with self.assertRaisesRegex(ValueError,'native_model_producers'):
+            dense_config.ActorSettings(native_producers=2,native_model_producers=3)
+        with self.assertRaisesRegex(ValueError,'two models of producers'):
+            dense_config.ActorSettings(native_scheduler=True,game_graph=192,native_producers=3,
+                                       native_model_producers=2,historical_fraction=.5)
+        settings = dense_config.ActorSettings(native_scheduler=True,game_graph=192,native_producers=4,
+                                              native_model_producers=2,historical_fraction=.5)
+        self.assertEqual(settings.native_model_producers,2)
+
     def test_native_pause_waits_for_acknowledgement_unless_caller_sets_timeout(self):
         from native_scheduler import InferenceService
         from tests.test_neural_search import NativeScheduler
