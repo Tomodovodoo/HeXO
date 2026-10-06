@@ -2542,12 +2542,12 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(stats['supply_seen'], stats['supply_eligible']+stats['supply_pending']
                          +stats['supply_closed']+stats['supply_dormant'])
         self.assertEqual(stats['supply_first_queries'], 8)
-        self.assertEqual(stats['submitted'], 16)
+        self.assertEqual(stats['submitted'], 8)
         before = stats['idle_closed_ms']
         time.sleep(.05);proofs.step();time.sleep(.05)
         stats = proofs.stats()
         self.assertGreaterEqual(stats['idle_closed_ms']-before, 2*90)
-        self.assertEqual(stats['submitted'], 16)
+        self.assertEqual(stats['submitted'], 8)
         proofs.drain()
 
     def test_retries_take_only_idle_workers_and_never_queue_ahead_of_fresh_work(self):
@@ -2634,18 +2634,13 @@ class NativeProofs(unittest.TestCase):
             offer(fresh)
             checked(native.hxp_step(loop))
             # The retry is due later, so the fresh position goes first; the idle
-            # second worker still continues the retry now instead of waiting.
+            # second worker still continues the retry now, with a doubled slice.
+            # The quiet defender has nothing to search, so the retry stays with the mover.
             job,request=take(0)
             self.assertEqual(request['history'],fresh)
             retry,again=take(1)
-            self.assertEqual((again['history'],again['attacker']),(history,'defender'))
-            unknown(0,job,0,4);unknown(1,retry,1,3)
-            checked(native.hxp_step(loop))
-            later=[take(0),take(1)]
-            mover=next(r for _,r in later if r['history']==history)
-            self.assertEqual((mover['attacker'],mover['ms']),('mover',20))
-            for worker,(job,request) in enumerate(later):
-                unknown(worker,job,0 if request['attacker']=='mover' else 1,len(request['history']))
+            self.assertEqual((again['history'],again['attacker'],again['ms']),(history,'mover',20))
+            unknown(0,job,0,4);unknown(1,retry,0,3)
             self.assertEqual(native.hxg_exact(graph.ptr),-1)
         finally:
             native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
@@ -2701,7 +2696,8 @@ class NativeProofs(unittest.TestCase):
         self.answer(pool)
         def tried_both():
             proofs.step()
-            return proofs.stats()['unknown'] >= 2
+            stats = proofs.stats()
+            return stats['unknown'] >= 1 and stats['scope']['closed_scopes'] >= 2
         self.wait(tried_both)
         self.assertEqual(native.hxg_exact(graph.ptr), -1)
         self.assertTrue(pool.games[0].evidence()['eligible'].all())
@@ -2727,11 +2723,12 @@ class NativeProofs(unittest.TestCase):
         def closed():
             proofs.step()
             stats = proofs.stats()
-            return stats['unknown'] >= 2 and stats['scope']['closed_scopes'] == 2
-        # The mover's forcing search is disproved; the quiet defender has no threat to search.
+            return stats['unknown'] >= 1 and stats['scope']['closed_scopes'] == 2
+        # The mover's forcing search is disproved; the quiet defender has no threat to search,
+        # so it is never queried.
         self.wait(closed)
         before = proofs.stats()
-        self.assertEqual(before['unknown'], 2)
+        self.assertEqual(before['unknown'], 1)
         for moves in (unrelated, wrong_color):
             proofs.offer(0, moves)
             proofs.step()
@@ -2742,7 +2739,8 @@ class NativeProofs(unittest.TestCase):
         proofs.offer(0, relevant)
         proofs.step()
         after = proofs.stats()
-        self.assertEqual(after['scope']['closed_scopes'], 0)
+        # Relevant facts reopen the mover; the quiet defender stays closed under any premises.
+        self.assertEqual(after['scope']['closed_scopes'], 1)
         self.assertEqual(after['submitted'], before['submitted']+1)
         self.assertEqual(after['scope']['sent_facts']-before['scope']['sent_facts'], 1)
         # Retrying a changed premise set keeps the effort already invested in this task.

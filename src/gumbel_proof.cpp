@@ -23,7 +23,10 @@ struct Dependency {Key key;int distance;bool operator==(const Dependency&)const=
 using Premises=std::bitset<256>;
 struct Task {
   Key key;std::vector<Cell> history;std::weak_ptr<Node> node;uint64_t generation=0,born=0,facts=0;double impact=0,cost=.2,change=0,observed_change=0,attempted_change=0;
- int side=0,closed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false,scoped=false,queried=false;Clock::time_point ready{};
+ // closed: sides whose search is exhausted under the current premises. fixed:
+ // sides closed under every premise set, the defender when the solver cannot
+ // start there (no two-stone completion to defend, or the mover wins now).
+ int side=0,closed=0,fixed=0,worker=-1;std::array<unsigned,2> attempts{};bool flight=false,scoped=false,queried=false;Clock::time_point ready{};
  std::vector<Dependency> scope;
 };
 struct Fact {std::vector<Cell> history;int winner,distance,slot;};
@@ -68,7 +71,7 @@ struct Frontier {
    words+=cost;selected.push_back({key,fact.distance});}
   // Generalized stamps can apply beyond exact-board containment. Their opt-in
   // path keeps conservative global invalidation until it has a library epoch.
-  if(!task.scoped || selected!=task.scope || stamps){task.closed=0;task.ready={};++scope_changed;}
+  if(!task.scoped || selected!=task.scope || stamps){task.closed=task.fixed;task.ready={};++scope_changed;}
   else ++scope_unchanged;
   task.scope=std::move(selected);task.facts=revision;task.scoped=true;
   scope_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-began).count();
@@ -91,7 +94,10 @@ struct Frontier {
    if(victim==tasks.end() || (weakest>=impact/.2 && offers%5!=0))return;tasks.erase(victim);
   }
   auto task=std::make_shared<Task>();task->key=key;task->node=node;task->history=history;task->generation=generation;
-   task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;tasks.emplace(key,std::move(task));
+   task->impact=impact;task->change=task->observed_change=change;task->born=++next;task->facts=revision;
+   Board board;for(Cell c:history)board.make(c);
+   if(!board.completions(board.player,board.remaining).empty() || board.completions(1-board.player).empty())task->closed=task->fixed=2;
+   tasks.emplace(key,std::move(task));
  }
 };
 struct Job {
@@ -123,10 +129,16 @@ struct Loop {
  // refill stopped: every slot held, retries held back for fresh work, or no
  // dispatchable task, split over the exclusions (pending neural work, closed
  // scope, dormant) or none at all.
+ // The owner counts one refill locally and publishes it under the mutex.
  enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Reasons};
+ enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,Counts};
+ using Census=std::array<uint64_t,Counts>;
  std::array<double,Reasons> idle_ms{};size_t idle_workers=0;Clock::time_point idle_mark=Clock::now();Idle stop=Empty;
- std::array<uint64_t,3> scan{},excluded{},excluded_total{};
- uint64_t scans=0,seen=0,eligible=0,deferred=0,deferred_dispatched=0,full_exits=0,held_exits=0,empty_exits=0,first_queries=0;
+ std::array<uint64_t,3> excluded{};Census census{};
+ void publish(const Census& refill,Idle reason,int exit){
+  account(Clock::now());stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
+  if(reason==Empty)std::copy_n(refill.begin()+Excluded,3,excluded.begin());
+ }
  void account(Clock::time_point now){
   if(idle_workers && now>idle_mark){
    double ms=std::chrono::duration<double,std::milli>(now-idle_mark).count()*double(idle_workers),total=double(excluded[0]+excluded[1]+excluded[2]);
@@ -214,26 +226,26 @@ struct Loop {
  // worker idle at this refill continues it with the larger slice, so retries
  // never queue ahead of fresh positions the owner offers next.
  static double later(double x){return -1/(1+x);}
- std::vector<Ready> prepare(size_t available){
-  scan={};++scans;
+ std::vector<Ready> prepare(size_t available,Census& c){
+  ++c[Scans];
   std::vector<Ready> ready(frontiers.size());auto now=Clock::now();bool explore=submitted%5==4;
   for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped)continue;
    auto& candidates=ready[i];candidates.single=available==1;if(!candidates.single)candidates.choices.reserve(f.tasks.size());
    for(auto it=f.tasks.begin();it!=f.tasks.end();){auto task=it->second;auto node=task->node.lock();
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
     if(task->flight || !node)continue;
-    ++seen;if(node->dormant){++scan[2];continue;}
+    ++c[Seen];if(node->dormant){++c[Excluded+2];continue;}
     f.scope(*task,stamps);
-    if(task->closed==3){++scan[1];continue;}
+    if(task->closed==3){++c[Excluded+1];continue;}
     bool pending=node->pending;if(auto peers=o.game->positions.find(task->key);peers!=o.game->positions.end())for(auto& weak:peers->second)if(auto peer=weak.lock())pending|=peer->pending;
-    if(pending){++scan[0];continue;}++eligible;double age=double(f.next-task->born+1);
+    if(pending){++c[Excluded];continue;}++c[Eligible];double age=double(f.next-task->born+1);
     double score=task->impact*(1+task->change)/std::max(.05,task->cost)+.0001*age;
-    if(task->ready>now){++deferred;score=later(score);age=later(age);}
+    if(task->ready>now){++c[Deferred];score=later(score);age=later(age);}
     if(candidates.single){if(!candidates.only.task || (explore?age:score)>candidates.score(0,explore))candidates.only={task,score,age};}
     else candidates.choices.push_back({task,score,age});
    }
    candidates.build();
-  }for(size_t k=0;k<scan.size();++k)excluded_total[k]+=scan[k];return ready;
+  }return ready;
  }
  std::shared_ptr<Task> take(std::vector<Ready>& ready,size_t& game){
   double best=-std::numeric_limits<double>::infinity();size_t selected=SIZE_MAX;bool explore=submitted%5==4;
@@ -248,18 +260,18 @@ struct Loop {
   // The graph owner cannot change candidates while this refill is dispatching.
   // Rank eligibility once, then consume priority/age heaps instead of rescanning
   // every position for each job. Worker completions install on the next step.
-  std::vector<Ready> ready;
+  std::vector<Ready> ready;Census refill{};
   for(;;){
    size_t available,spare;
    {std::lock_guard lock(mutex);if(stopping || !enabled)return;
-    if(live.size()>=capacity){account(Clock::now());stop=Full;++full_exits;return;}available=capacity-live.size();
+    if(live.size()>=capacity){publish(refill,Full,FullExits);return;}available=capacity-live.size();
     size_t idle=std::count_if(workers.begin(),workers.end(),[](const auto& w){return !w->active;});spare=idle>queued.size()?idle-queued.size():0;}
-   if(ready.empty())ready=prepare(available);
+   if(ready.empty())ready=prepare(available,refill);
    size_t i=0;auto task=take(ready,i);
-   if(!task){std::lock_guard lock(mutex);account(Clock::now());stop=Empty;excluded=scan;++empty_exits;return;}
+   if(!task){std::lock_guard lock(mutex);publish(refill,Empty,EmptyExits);return;}
    bool cooling=task->ready>Clock::now();
-   if(cooling && !spare){std::lock_guard lock(mutex);account(Clock::now());stop=Held;++held_exits;return;}
-   first_queries+=!task->queried;task->queried=true;deferred_dispatched+=cooling;
+   if(cooling && !spare){std::lock_guard lock(mutex);publish(refill,Held,HeldExits);return;}
+   refill[FirstQueries]+=!task->queried;task->queried=true;refill[Retries]+=cooling;
    auto node=task->node.lock();auto& o=*pool.games[i];
    auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
@@ -398,10 +410,7 @@ struct Loop {
    }
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
    f.scope(task,stamps);bool same_scope=job.scope==task.scope && (!stamps || job.facts==f.revision);
-   // A disproof closes this side for the same premises, and so does a query
-   // with nothing to search: a quiet defender has no threat to start from.
-   bool disproof=job.info[8] && job.info[6]>=1073741824 && job.info[7]==0,nothing=!job.info[8] && job.info[4] && !job.info[5] && job.elapsed<job.quantum;
-   if(same_scope && (disproof || nothing))task.closed|=1<<job.side;
+   if(same_scope && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
    int next_side=1-job.side;task.side=(task.closed&(1<<next_side))?job.side:next_side;
    task.ready=same_scope?Clock::now()+std::chrono::milliseconds(slice*int(uint64_t(1)<<std::min(6u,task.attempts[job.side]))):Clock::time_point{};
   }
@@ -474,8 +483,7 @@ extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cas
 // task, first queries of frontier entries, dispatches inside a retry delay.
 // idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, and no candidate at all.
 extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.account(proving::Clock::now());
- std::array<uint64_t,12> values{loop.scans,loop.seen,loop.eligible,loop.deferred,loop.excluded_total[0],loop.excluded_total[1],loop.excluded_total[2],loop.full_exits,loop.held_exits,loop.empty_exits,loop.first_queries,loop.deferred_dispatched};
- std::copy(values.begin(),values.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
+ std::copy(loop.census.begin(),loop.census.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
 extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;
  for(auto& f:loop.frontiers){checks+=f.scope_checks;changed+=f.scope_changed;unchanged+=f.scope_unchanged;ns+=f.scope_ns;cells+=f.members.size();for(auto& [key,task]:f.tasks)closed+=bool(task->closed&1)+bool(task->closed&2);}
  std::array<uint64_t,10> values{checks,changed,unchanged,ns,loop.available_facts,loop.sent_facts,loop.empty_scope_jobs,loop.quantum_ms,cells,closed};std::copy(values.begin(),values.end(),out);}
