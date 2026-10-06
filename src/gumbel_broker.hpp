@@ -12,6 +12,7 @@ void* hxgp_combine(void* const*,const int*,int,int);
 void hxgp_free(void*);
 int hxgp_outputs(void*,void**);
 int hxgf_layout(void*,int,int64_t*);
+int64_t hxgf_queued(void*);
 int hxgf_take(void*,int,uint64_t*,void**,int*,int64_t*,int64_t*,int64_t);
 const int64_t* hxgf_key(void*,uint64_t,int64_t*);
 int hxgf_retire(void*,uint64_t);
@@ -37,9 +38,9 @@ struct Job {
  std::vector<uint64_t> ids;std::vector<Key> keys;
  std::vector<std::shared_ptr<const Prediction>> results;
  std::vector<bool> installed;
- int remaining=0;bool completion_queued=false;
+ int remaining=0;bool completion_queued=false;Clock::time_point published{};
 };
-struct Completion {std::shared_ptr<Job> job;std::vector<int> rows;bool finished;};
+struct Completion {std::shared_ptr<Job> job;std::vector<int> rows;bool finished;Clock::time_point published;};
 struct Subscriber {std::shared_ptr<Job> job;int row;};
 struct Task {
  Key key;int model,row;std::shared_ptr<Job> representative;
@@ -78,6 +79,9 @@ struct Broker {
  std::map<uint64_t,std::vector<std::shared_ptr<Task>>> flights;
  int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
  uint64_t flight_high_water=0;
+ // Optional repeated admission observations and owner wall spans, not occupancy.
+ bool profile_enabled=false,interleave_feedback=false;std::array<uint64_t,38> schedule{};
+ std::vector<std::pair<int,int>> model_rows;
  std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
@@ -97,6 +101,61 @@ struct Broker {
   std::lock_guard lock(mutex);
   if(started || count<1 || count>8)throw std::runtime_error("Configure 1 to 8 inference batch flights before starting");
   flight_limit=count;
+ }
+ void configure_profile(bool enabled){
+  std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure scheduler profiling before starting");
+  profile_enabled=enabled;if(enabled)model_rows.reserve(16);
+ }
+ void configure_feedback(bool enabled){
+  std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure interleaved solver feedback before starting");
+  interleave_feedback=enabled;
+ }
+ void collected(Clock::time_point start,uint64_t proofs){
+  if(!profile_enabled)return;
+  auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());
+  std::lock_guard lock(mutex);++schedule[33];schedule[34]+=ns;schedule[35]=std::max(schedule[35],ns);
+  schedule[36]+=proofs!=0;schedule[37]+=proofs;
+ }
+ void sample_admission(int limit,Clock::time_point now){
+  if(!profile_enabled)return;
+  ++schedule[0];bool capped=flights.size()>=size_t(flight_limit);schedule[1]+=capped;
+  model_rows.clear();Task* head=nullptr;int rows=0;
+  for(auto& t:ready)if(t->live && !t->flight){
+   if(!head)head=t.get();++rows;
+   auto group=std::find_if(model_rows.begin(),model_rows.end(),[&](const auto& g){return g.first==t->model;});
+   if(group==model_rows.end())model_rows.emplace_back(t->model,1);else ++group->second;
+  }
+  if(!head)return;
+  ++schedule[2];schedule[3]+=rows;
+  auto age=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-head->queued).count());
+  schedule[4]+=age;schedule[5]=std::max(schedule[5],age);
+  int count=std::find_if(model_rows.begin(),model_rows.end(),[&](const auto& g){return g.first==head->model;})->second;
+  if(count>=limit)return;++schedule[6];
+  if(capped || flights.empty() || std::chrono::duration<double,std::milli>(now-head->queued).count()>=latency_ms)return;
+  bool full=false,larger=false;
+  for(auto [model,n]:model_rows)if(model!=head->model){full|=n>=limit;larger|=n>count;}
+  schedule[7]+=full;schedule[8]+=larger;
+ }
+ void installed(int rows,Clock::time_point start,Clock::time_point published,bool proof_ready){
+  uint64_t elapsed=0,age=0;
+  if(profile_enabled){auto now=Clock::now();elapsed=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count());
+   age=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(start-published).count());}
+  std::lock_guard lock(mutex);installed_messages+=rows;
+  if(!profile_enabled)return;
+  ++schedule[15];schedule[16]+=rows;schedule[17]+=age;schedule[18]=std::max(schedule[18],age);
+  schedule[19]+=elapsed;schedule[20]=std::max(schedule[20],elapsed);schedule[21]+=proof_ready;
+  if(proof_ready)schedule[22]+=elapsed;
+ }
+ void installed_burst(size_t packets,Clock::time_point start,bool proof_ready){
+  if(!profile_enabled || !packets)return;
+  auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());
+  std::lock_guard lock(mutex);++schedule[23];schedule[24]=std::max(schedule[24],uint64_t(packets));
+  schedule[25]+=ns;schedule[26]=std::max(schedule[26],ns);schedule[27]+=proof_ready;if(proof_ready)schedule[28]+=ns;
+ }
+ void snapshot_gate(int64_t rows){
+  if(!profile_enabled)return;
+  std::lock_guard lock(mutex);++schedule[29];if(rows<=0)return;
+  ++schedule[30];schedule[31]+=uint64_t(rows);schedule[32]=std::max(schedule[32],uint64_t(rows));
  }
  int attach(owner::Pool& pool,int model){
   std::lock_guard lock(mutex);
@@ -314,7 +373,7 @@ struct Broker {
   --s.job->remaining;
   // A snapshot can span device batches. Wake its native owner after any
   // returned row, without waiting for unrelated rows or queueing it twice.
-  if(!s.job->completion_queued){s.job->completion_queued=true;s.job->owner->completed.push_back(s.job);}
+  if(!s.job->completion_queued){s.job->completion_queued=true;if(profile_enabled)s.job->published=Clock::now();s.job->owner->completed.push_back(s.job);}
  }
  void enqueue(const std::shared_ptr<Job>& job){
   std::lock_guard lock(mutex);
@@ -345,7 +404,7 @@ struct Broker {
   std::lock_guard lock(mutex);std::vector<std::shared_ptr<Job>> jobs(producer.completed.begin(),producer.completed.end());
   producer.completed.clear();
   std::vector<Completion> out;
-  for(auto& job:jobs){job->completion_queued=false;Completion c{job,{},job->remaining==0};
+  for(auto& job:jobs){job->completion_queued=false;Completion c{job,{},job->remaining==0,job->published};
    for(size_t row=0;row<job->results.size();++row)if(job->results[row] && !job->installed[row]){c.rows.push_back(int(row));job->installed[row]=true;}
    if(!c.rows.empty() || c.finished)out.push_back(std::move(c));
   }
@@ -362,6 +421,7 @@ struct Broker {
   for(;;){
    if(!error.empty())throw std::runtime_error(error);
    if(cancelled || paused)return 0;
+   if(profile_enabled)sample_admission(limit,Clock::now());
    if(flights.size()>=size_t(flight_limit)){if(!events.empty() || !wait_ms || Clock::now()>=until)return 0;wake.wait_until(lock,until);continue;}
    std::erase_if(ready,[](const auto& t){return !t->live || t->flight;});
    if(!ready.empty()){
@@ -375,6 +435,8 @@ struct Broker {
       auto task=*it;if(task->model!=selected){++it;continue;}
       task->flight=true;batch.push_back(task);it=ready.erase(it);
      }
+     if(profile_enabled){++schedule[9];if(int(batch.size())>=limit)++schedule[13];
+      else {++schedule[10];schedule[11]+=flights.empty();schedule[12]+=Clock::now()>=due;}}
      uint64_t id=++next;flights.emplace(id,batch);flight_high_water=std::max(flight_high_water,uint64_t(flights.size()));launched+=batch.size();++batches;
      lock.unlock();std::vector<void*> sources;std::vector<int> rows;
      for(auto& task:batch){sources.push_back(task->representative->snapshot.get());rows.push_back(task->row);}
@@ -387,6 +449,7 @@ struct Broker {
     }
     // Control events do not wait for a batch that is accumulating behind
     // an existing flight. An idle queue has already dispatched above.
+    if(profile_enabled)++schedule[14];
     if(!events.empty() || !wait_ms)return 0;wake.wait_until(lock,std::min(until,due));
    }else{
     if(!events.empty() || done_locked() || Clock::now()>=until)return 0;wake.wait_until(lock,until);
@@ -432,16 +495,29 @@ inline void Producer::run()noexcept{
     if(!hxgf_workers(pool.feed,count,[](void* tree)->void*{return static_cast<gumbel::Tree*>(tree)->state.get();}))throw std::runtime_error(gumbel::error);
     pool.host_workers=count;broker.workers_ready(*this);
    }
-   for(auto& completion:broker.completions(*this)){
+   auto burst_start=broker.profile_enabled?Clock::now():Clock::time_point{};
+   bool burst_proof=broker.profile_enabled && pool.proof_ready && pool.proof_ready(pool.proof_owner);
+   auto completions=broker.completions(*this);
+   for(auto& completion:completions){
+    // Joined neural install phases and this producer are the graph's only
+    // writers. Collect urgent facts/endpoints without frontier admission or
+    // waiting for a running solver. Late predictions retain their leases.
+    if(broker.interleave_feedback && pool.proof_collect && pool.proof_ready && pool.proof_ready(pool.proof_owner)){
+     auto start=broker.profile_enabled?Clock::now():Clock::time_point{};
+     auto proofs=pool.proof_collect(pool.proof_owner);broker.collected(start,proofs);
+    }
+    auto install_start=broker.profile_enabled?Clock::now():Clock::time_point{};
+    bool install_proof=broker.profile_enabled && pool.proof_ready && pool.proof_ready(pool.proof_owner);
     auto& job=completion.job;std::vector<uint64_t> ids;
     std::vector<int64_t> offsets(1,0),actions;std::vector<double> logits,values;
     for(int row:completion.rows){auto& p=job->results[row];ids.push_back(job->ids[row]);actions.insert(actions.end(),p->actions.begin(),p->actions.end());logits.insert(logits.end(),p->logits.begin(),p->logits.end());values.insert(values.end(),p->values.begin(),p->values.end());offsets.push_back(int64_t(logits.size()));}
     if(!ids.empty()){
      pool.install(ids.data(),int(ids.size()),offsets.data(),actions.data(),logits.data(),values.data());
-     std::lock_guard lock(broker.mutex);broker.installed_messages+=ids.size();
+     broker.installed(int(ids.size()),install_start,completion.published,install_proof);
     }
     if(completion.finished)std::erase(outstanding,job);
    }
+   broker.installed_burst(completions.size(),burst_start,burst_proof);
    for(auto& command:broker.commands(*this)){
     if(command.kind==1){
      pool.games[command.game]->stop();
@@ -482,6 +558,7 @@ inline void Producer::run()noexcept{
    if(broker.continuous)for(size_t i=0;i<active.size();++i)if(active[i] && pool.games[i]->stopped){
     auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
    }
+   if(broker.profile_enabled && neural && !pool.stopped && int(outstanding.size())>=broker.pending)broker.snapshot_gate(hxgf_queued(pool.feed));
    if(neural && int(outstanding.size())<broker.pending && !pool.stopped){
     int64_t layout[2];if(!hxgf_layout(pool.feed,broker.quantum,layout))throw std::runtime_error(gumbel::error);
     int count=int(layout[0]);if(count){
@@ -549,6 +626,9 @@ HX_API void* hxb_new(int quantum,int pending,int merge,double latency){try{retur
 HX_API int hxb_flights(void* p,int count){try{static_cast<inference::Broker*>(p)->configure_flights(count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxb_flight_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);
  std::array<uint64_t,3> values{uint64_t(b.flight_limit),b.flight_high_water,uint64_t(b.pending)};std::copy(values.begin(),values.end(),out);}
+HX_API int hxb_profile(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_profile(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_feedback(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_feedback(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API void hxb_schedule_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);out[0]=b.profile_enabled;std::copy(b.schedule.begin(),b.schedule.end(),out+1);}
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_model_pending(void* p,int model){return static_cast<inference::Broker*>(p)->model_pending(model);}

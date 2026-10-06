@@ -1,12 +1,12 @@
 {
  "sources": {
   "src/gumbel.cpp": "9837495573ab2d97e530f4e2506e111e7d2aeef66e0423832347aeec35899600",
-  "src/gumbel_owner.cpp": "76494d51e37bc1d3048f156350d362f74481bf418fe63c9faafe69a394a63eb1",
-  "src/gumbel_proof.cpp": "9af15e615e13e46fb4f5c66b5b1d8e2a61dc34d9e5a83f9b776833f4582bd660",
+  "src/gumbel_owner.cpp": "c1ca1d1aeaceaec17cd4baa5236f3e9e4ab83bafb284cc280eeb9323c1636dfe",
+  "src/gumbel_proof.cpp": "a49bcb7a545090b22e25b466bd1e5ce6c3efda66eab76c9e725dd909967d1922",
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
   "src/gumbel_batch.cpp": "a5defcd282fd94191c9db41ba069ecff5b11ee058f5b91dcb6523ef551bebf28",
   "src/gumbel_parallel.hpp": "123bee0c1cecbd53fc4bed49e3f9d574f40530dcd34579afc34578378e975e4a",
-  "src/gumbel_broker.hpp": "7a5caa08e845eb1ecbcab80b32fba234caa677784de06ab06cffba721e01c4d2",
+  "src/gumbel_broker.hpp": "8b91c42000225bc633dcac5459693b201fadcdaef7a9eafa88f6320e7437e51d",
   "src/hexo.cpp": "93fa7def5fa3196473c9218ea58ecbe6ef796402e674a5a51f4fe8e678d4fe06",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
@@ -91,7 +91,7 @@
  },
  "artefacts": {
   "gumbel.mjs": "375a3d325ee875a7413031585ab9373c506b2ac5b6de4edb5be20222dc8173d7",
-  "gumbel.wasm": "4ed51d82b4b6b5c8ef058a03db2411c2532caa0a300e8de305ea651aa3cefa2d",
+  "gumbel.wasm": "a37f253c7106f8714a347d8281f7989a68e53c510c84bc04a5a634e3aa5047c1",
   "tactical.wasm": "8701ab6f52ce7b9ca8c07e29ea030facbf532849b163a0e747a09aa4aff336b2",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "d0218ad42e1223353e629ccf536f55048f637ef93a2140a4c1fa9ebc35587dbb",
