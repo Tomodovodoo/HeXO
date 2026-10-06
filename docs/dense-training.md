@@ -57,3 +57,14 @@ The replay window follows KataGo: at least `window_min_rows` full-search rows, t
 ## Kernels
 
 `--net-kernels fused` on the learner, actors and evaluator selects the Triton kernels described in [gpu-kernels.md](gpu-kernels.md). Checkpoints load in either mode.
+
+## Throughput
+
+Measured on the RTX 3070 Ti with a read-only copy of the run at `reset/195000` (batch 256, `--net-kernels fused`, idle machine):
+
+| | samples/s |
+|---|---:|
+| learner at 0341850 (three runs) | 746, 785, 808 |
+| current learner (two runs) | 1010, 1011 |
+
+A steady export takes 31 s instead of 35 s, so a 2500-step export cycle trains about 960 samples/s instead of 750. Before, the training thread stalled 2.8 s every 30 seconds rebuilding replay priorities, buckets were padded to 16 rows (25% more cells than the rows hold), each batch was read from the worker pipe on the training thread, and the line convolution and pooling took 29% of the GPU step. Two 1500-step runs from the same checkpoint give the same training losses and validation metrics within their noise.

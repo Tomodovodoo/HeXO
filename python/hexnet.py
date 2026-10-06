@@ -282,8 +282,14 @@ def act(x, ceiling):
     return torch.clamp(x, x.new_zeros(()), ceiling)
 
 
-def pool(x, count):
-    """Masked mean and max of non-negative, mask-zeroed features x: [B, 2C]."""
+def pool(x, count, ceiling=None, fused=False):
+    """Masked mean and max of act(x, ceiling), or of x without a ceiling (then non-negative and zero off the crop):
+    [B, 2C]. `fused` runs hexnet_kernels.masked_pool on contiguous NCHW CUDA inputs."""
+    if (fused and x.is_cuda and x.is_contiguous() and x.dtype in (torch.float32, torch.bfloat16)
+            and (ceiling is None or ceiling.stride()[2:] == (x.shape[3], 1))):
+        from hexnet_kernels import masked_pool
+        return masked_pool(x, count, ceiling)
+    x = x if ceiling is None else act(x, ceiling)
     return torch.cat((x.sum((2, 3))/count, x.amax((2, 3))), 1)
 
 
@@ -300,7 +306,8 @@ class Block(nn.Module):
         """x may hold junk on padding cells; every convolution input is zero there."""
         y = self.conv1(self.norm1(x, mask, cells, ceiling))
         if self.pool is not None:
-            y = y+self.pool(pool(act(y, ceiling), count))[:, :, None, None]
+            fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
+            y = y+self.pool(pool(y, count, ceiling, fused))[:, :, None, None]
         if self.line is not None:
             y = y*mask
             train_line = (getattr(self.line, 'net_kernels', 'reference') == 'fused' and
@@ -378,7 +385,7 @@ class HexNet(nn.Module):
         for block in self.blocks:
             x = block(x, mask, ceiling, count, cells)
         x = self.norm(x, mask, cells, ceiling)
-        pooled = pool(x, count)
+        pooled = pool(x, count, fused=self.net_kernels == 'fused')
         hidden, value = F.relu(self.policy_hidden(x)), F.relu(self.value_hidden(pooled))
         out = dict(policy=self.policy(hidden).flatten(1).float(), far=self.far(pooled)[:, 0].float(),
                    value_logit=self.value(value)[:, 0].float())
