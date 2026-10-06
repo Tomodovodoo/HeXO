@@ -59,6 +59,7 @@ export class BubbleEngine extends EngineWorker {
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
    * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Optional native_owner
    * selects the compiled multi-view feeding path; its solver still uses root queries, not a continuous frontier.
+   * Optional native_capture uses bounded static WebGPU sessions and combined readback with that owner.
    * Optional leaf_nodes adds
    * a per-turn leaf-proof allowance, capped at 2048 nodes and leaf_ms (default 10) per query. Under a clock
    * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
@@ -70,6 +71,7 @@ export class BubbleEngine extends EngineWorker {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
       nativeOwner: budget.native_owner ?? false,
+      nativeCapture: budget.native_capture ?? false,
       leafNodes: budget.leaf_nodes ?? 0, leafQueryMs: budget.leaf_ms ?? 10,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,

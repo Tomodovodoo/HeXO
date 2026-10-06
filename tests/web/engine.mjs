@@ -174,7 +174,109 @@ if (job.kind === 'encode') {
   globalThis.fetch = fetch;
   const engine = new BubbleEngine({model:'test'});engine.call = async request => request;
   answer = [await engine.turn([[0,0]], {simulations:128,solver_nodes:0}),
-    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,native_owner:true})];
+    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,native_owner:true,native_capture:true})];
+} else if (job.kind === 'worker-model-cache') {
+  const messages=[],created=[],live=new Set(),attempts=[],workerUrl=new URL('../../web/engine/worker.mjs',import.meta.url);
+  let fail=true,largest=0;
+  const context={onmessage:null,Stages,errorReport,URL,performance,setTimeout,clearTimeout,postMessage:m=>messages.push(m),
+    Network:{async create({model}){
+      await new Promise(resolve=>setTimeout(resolve,1));created.push(model);live.add(model);largest=Math.max(largest,live.size);
+      return {closed:false,async time(){if(this.closed)throw Error('Closed active network');return model;},
+        async close(){this.closed=true;attempts.push(model);if(model==='A'&&fail)throw Error('Persistent session release failure');live.delete(model);}};
+    }}};
+  const source=readFileSync(workerUrl,'utf8').replace(/^import .*;\r?$/gm,'').replaceAll('import.meta.url',JSON.stringify(workerUrl.href));
+  runInNewContext(source,context);
+  let id=0;const use=model=>context.onmessage({data:{type:'use',id:++id,model}});
+  try {
+    await use('A');await use('B');await Promise.all(['C','D','E'].map(use));await use('A');
+    const bench=++id;await context.onmessage({data:{type:'bench',id:bench,batches:[1],sizes:[24],repeats:1}});
+    answer={blocked:{created:[...created],live:[...live],errors:messages.filter(m=>m.type==='error').map(m=>m.message)}};
+    answer.active_model=messages.find(m=>m.id===bench&&m.type==='result')?.result['24']['1'];
+    fail=false;await Promise.all(['F','G','H'].map(use));
+    answer.recovered={created:[...created],live:[...live],largest,attempts:[...attempts]};
+  }finally{fail=false;await runInNewContext('Promise.all([...held.values()].map(n=>n.close()))',context);}
+  answer.remaining=live.size;
+} else if (job.kind === 'capture-runtime') {
+  globalThis.GPUBufferUsage = {STORAGE:1,COPY_DST:2,COPY_SRC:4,MAP_READ:8};globalThis.GPUMapMode = {READ:1};
+  let active = 0, freedBusy = 0, created = 0, released = 0, mapped = 0, stop = false, failFence = false, failDispose = false, failRelease = null;
+  const buffers = new Set(), sessions = new Set();
+  const device = {limits:{maxBufferSize:2**28},queue:{
+    writeBuffer(buffer,offset,data){new Uint8Array(buffer.bytes).set(new Uint8Array(data.buffer,data.byteOffset,data.byteLength),offset);},
+    submit(commands){for(const command of commands)for(const copy of command)copy();},
+    async onSubmittedWorkDone(){if(failFence){failFence=false;throw Error('Device fence failed');}},
+  },createBuffer({size}){
+    const buffer={size,bytes:new ArrayBuffer(size),destroyed:false,mapped:false,
+      async mapAsync(){if(this.destroyed||this.mapped)throw Error('Invalid mapped buffer');this.mapped=true;mapped++;},
+      getMappedRange(){return this.bytes;},unmap(){if(!this.mapped)throw Error('Not mapped');this.mapped=false;mapped--;},
+      destroy(){if(active)freedBusy++;this.destroyed=true;buffers.delete(this);}};
+    buffers.add(buffer);return buffer;
+  },createCommandEncoder(){const copies=[];return {
+    copyBufferToBuffer(source,start,target,offset,length){copies.push(()=>new Uint8Array(target.bytes,offset,length).set(new Uint8Array(source.bytes,start,length)));},finish(){return copies;}};}};
+  const ort={env:{webgpu:{device}},Tensor:{fromGpuBuffer(gpuBuffer,{dims}){return {gpuBuffer,dims,dispose(){}};}},InferenceSession:{
+    async create(graph,options){
+      created++;await new Promise(resolve=>setTimeout(resolve,1));
+      const {batch:rows,size}=options.freeDimensionOverrides;
+      const session={rows,size,async run({features}){
+        active++;let output;
+        try{
+          await new Promise(resolve=>setTimeout(resolve,1));
+          if(features.gpuBuffer.destroyed)throw Error('Input freed during inference');
+          const values=new Float32Array(features.gpuBuffer.bytes),stride=20*size*size;output={};
+          for(const name of ['policy','far','value']){
+            const columns=name==='policy'?size*size:1,buffer=device.createBuffer({size:16*Math.ceil(rows*columns/4)}),data=new Float32Array(buffer.bytes);
+            for(let row=0;row<rows;row++)for(let cell=0;cell<columns;cell++)data[row*columns+cell]=values[row*stride]+graph[0]+cell/100;
+            output[name]={type:'float32',gpuBuffer:buffer,dispose(){if(failDispose){failDispose=false;throw Error('Output release failed');}buffer.destroy();}};
+          }
+          return output;
+        }finally{active--;}
+      },async release(){
+        if(active)freedBusy++;
+        if(failRelease===this){failRelease=null;throw Error('Session release failed');}
+        released++;sessions.delete(this);
+      }};
+      sessions.add(session);return session;
+    }
+  }};
+  const network = new Network(ort,{async release(){}},'fp32',{model_version:'A'},1,{provider:'webgpu',graph:new Uint8Array([1])});
+  const input = (rows,size,value) => {const data=new Float32Array(rows*20*size*size);for(let row=0;row<rows;row++)data[row*20*size*size]=value+row;return data;};
+  const other = new Network(ort,{async release(){}},'fp32',{model_version:'B'},1,{provider:'webgpu',graph:new Uint8Array([7])});
+  let baseReleases = 0;
+  const faulty = new Network(ort,{async release(){baseReleases++;}},'fp32',{model_version:'C'},1,{provider:'webgpu',graph:new Uint8Array([9])});
+  let evictionBaseReleases=0;
+  const evicting = new Network(ort,{async release(){evictionBaseReleases++;}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+  let replacement;
+  try{
+    const first=await network.forwardCaptured(input(3,24,2),3,24),second=await network.forwardCaptured(input(3,24,5),3,24);
+    const concurrent=await Promise.all([network.forwardCaptured(input(3,24,8),3,24),network.forwardCaptured(input(3,24,11),3,24)]);
+    const different=await other.forwardCaptured(input(3,24,2),3,24);await other.close();
+    answer={values:[first.value[0],second.value[0],...concurrent.map(x=>x.value[0]),different.value[0]],
+      shapes:[first.policy.length,first.far.length,first.value.length],physical:first.physical_rows,reused:network.captureStats().creates};
+    await network.forwardCaptured(input(64,24,1),64,24);await network.forwardCaptured(input(32,32,1),32,32);
+    answer.bounds={stats:network.captureStats(),actual_cells:[...sessions].reduce((sum,s)=>sum+s.rows*s.size*s.size,0)};
+    stop=false;const stopping=network.forwardCaptured(input(1,40,1),1,40,()=>stop);setTimeout(()=>{stop=true;},0);
+    answer.stopped=await stopping===null;stop=false;
+    failFence=true;try{await network.forwardCaptured(input(1,40,1),1,40);}catch(error){answer.fence_error=error.message;}
+    answer.recovered=(await network.forwardCaptured(input(1,40,4),1,40)).value[0];
+    failDispose=true;try{await network.forwardCaptured(input(1,40,4),1,40);}catch(error){answer.dispose_error=error.message;}
+    answer.outputs_retained=network.captureStats().unreleased_outputs;
+    answer.other_outputs_drained=buffers.size===2*network.captureStats().entries+1;
+    const pending=network.forwardCaptured(input(1,40,6),1,40);await new Promise(resolve=>setTimeout(resolve,0));const closing=network.close();
+    answer.last=(await pending).value[0];await closing;
+    try{await network.forwardCaptured(input(1,40,1),1,40);}catch(error){answer.closed_error=error.message;}
+    await faulty.forwardCaptured(input(1,24,1),1,24);await faulty.forwardCaptured(input(1,32,1),1,32);
+    failRelease=[...sessions][0];
+    try{await faulty.close();}catch(error){answer.release_error=error.message;}
+    answer.release_failure={entries:faulty.captureStats().entries,sessions:sessions.size,base_releases:baseReleases,buffers:buffers.size};
+    await faulty.close();await faulty.close();answer.base_releases=baseReleases;
+    await evicting.forwardCaptured(input(1,24,1),1,24);await evicting.forwardCaptured(input(64,24,1),64,24);
+    failRelease=[...sessions].find(s=>s.rows===64);
+    try{await evicting.forwardCaptured(input(32,32,1),32,32);}catch(error){answer.eviction_error=error.message;}
+    answer.poisoned_model=evicting.closed;
+    await evicting.close();answer.eviction_base_releases=evictionBaseReleases;
+    replacement=new Network(ort,{async release(){}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+    answer.reloaded_value=(await replacement.forwardCaptured(input(1,24,2),1,24)).value[0];await replacement.close();
+    answer.final={active,freedBusy,mapped,buffers:buffers.size,sessions:sessions.size,created,released,stats:network.captureStats()};
+  }finally{await network.close();await other.close();await faulty.close();await evicting.close();await replacement?.close();}
 } else if (job.kind === 'owner-profile') {
   // Runtime measurements, not old/new search-row or playing-strength checks.
   answer = {features: [], searches: []};

@@ -568,10 +568,11 @@ export class NativeOwner {
     // advances, so permanent colour conflicts follow the played position.
     this.graph.at(this.graph.history);
   }
-  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel'}) {
+  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel', capture = false}) {
     if (this.busy || !this.ptr) throw new Error('Native owner is closed or already running');
     if (!(batchSize > 0)) throw new Error('Positive native batch size required');
     this.busy = true; const started = performance.now(); let batches = 0, largest = 0, networkMs = 0, batch = null, flight = null;
+    const inference = {rows: 0, physical: 0, forwards: 0};
     try {
       while (!this.done()) {
         if (stop()) { this.cancel(); break; }
@@ -581,7 +582,7 @@ export class NativeOwner {
         if (batch) {
           const begin = performance.now();
           let settled = false;
-          flight = network.evaluateNative(batch, {stop: () => {
+          flight = network.evaluateNative(batch, {capture, stop: () => {
             if (stop()) this.cancel();
             return !this.admit();
           }});
@@ -595,6 +596,7 @@ export class NativeOwner {
             if (!progress) break;
           }
           await observed; const evaluated = await flight; flight = null;
+          if (batch.inference) for (const key of Object.keys(inference)) inference[key] += batch.inference[key];
           networkMs += performance.now() - begin;
           await nextTask();
           if (stop()) this.cancel();
@@ -611,7 +613,7 @@ export class NativeOwner {
       }
       if (this.done()) this.n.checked(this.m._hxgf_abandon_all(this.feed));
       return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
-        batches, largest, network_ms: networkMs};
+        batches, largest, network_ms: networkMs, inference, ...(capture ? {capture_pool: network.captureStats()} : {})};
     } catch (error) {
       this.cancel(); throw error;
     } finally {
