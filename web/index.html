@@ -516,7 +516,10 @@ function accept(data){
   if(S&&data.instance===S.instance&&data.revision<S.revision)return;
   if(S&&!('history' in data)&&data.instance!==S.instance){S.revision=-1;return}
   if(S&&'history' in data&&data.instance===S.instance&&data.revision===S.revision)data={instance:data.instance,revision:data.revision,jobs:data.jobs,clock:data.clock};
-  data.failedJobs=data.jobs.filter(j=>j.status==='failed');
+  const same=S&&data.instance===S.instance&&(!('history' in data)||JSON.stringify([data.history,data.analysis])===JSON.stringify([S.history,S.analysis]));
+  // Keep failures after the server expires its jobs, but do not revive one an active retry replaced.
+  data.failedJobs=[...(same?S.failedJobs||[]:[]),...data.jobs.filter(j=>j.status==='failed'&&!failures.has(data.instance+':'+j.id))]
+    .filter(j=>!data.jobs.some(a=>a.status!=='failed'&&a.kind===j.kind&&a.ply===j.ply));
   data.jobs=active(data.jobs,data.instance);
   if(data.notice&&data.notice!==noticed)toast(noticed=data.notice);
   if('history' in data){
@@ -1117,13 +1120,14 @@ function renderJobs(){
   renderAnalysis();
   const pending=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view),analysing=S.jobs.filter(j=>j.kind==='analyse');
   $('evalbar').classList.toggle('pending',pending);
-  const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view),failed=S.failedJobs?.find(j=>j.kind==='analyse'&&j.ply===view),progress=$('analysis-progress');
+  const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view),failed=!ajob&&S.failedJobs?.find(j=>j.kind==='analyse'&&j.ply===view),progress=$('analysis-progress');
   progress.style.visibility=ajob?'visible':'hidden';progress.style.setProperty('--c',COLORS[playerAt(view)]);
   progress.classList.toggle('running',ajob?.status==='running');progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
   const stage=$('analysis-stage');stage.textContent=failed?`Analysis failed: ${failed.error}`:ajob?.status==='queued'?'Waiting for engine':ajob?.stage||'';stage.title=stage.textContent;
   const again=$('again');if(again){setIcon(again,!failed&&analysing.length?'close':'again');
     again.setAttribute('aria-label',failed?'Retry analysis':analysing.length?'Cancel analysis':'Analyse again');
-    again.onclick=async()=>{if(failed||!analysing.length)return post('/analyse',{ply:view,force:true});
+    again.onclick=async()=>{if(failed||!analysing.length){const ply=view,data=await post('/analyse',{ply,force:true});
+      if(data&&failed&&S.instance===data.instance){S.failedJobs=S.failedJobs.filter(j=>j.id!==failed.id);renderJobs()}return data}
       const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});
       for(const j of analysing)await post('/cancel',{id:j.id})}}
 }

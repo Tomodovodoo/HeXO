@@ -702,17 +702,22 @@ if (job.kind === 'encode') {
   page.accept(session.state());
   // Polling the same revision must keep the error visible without resubmitting it.
   page.accept(session.state());
+  page.accept({instance:session.instance,revision:session.revision,jobs:[]});
   const failure = {stage:elements.get('analysis-stage').textContent,title:elements.get('analysis-stage').title,
     retry:elements.get('again')['aria-label'],requests:requests.length,notices:[...notices],calls};
   await elements.get('again').onclick();
   const retry = requests.at(-1);
-  await session.request(...retry,'POST'); await session.idle;
+  const response = await session.request(...retry,'POST'); page.accept(response[1]); await session.idle;
   page.accept(session.state());
   const recovered = {calls,value:session.lookup(session.history)?.value,stage:elements.get('analysis-stage').textContent,
     label:elements.get('again')['aria-label']};
-  page.accept({...session.state(),revision:session.revision+1,jobs:[{id:99,kind:'analyse',status:'queued',ply:1,done:0,total:1}]});
-  answer = {failure,retry,recovered,queued:{stage:elements.get('analysis-stage').textContent,
-    progress:elements.get('analysis-progress').style.visibility,label:elements.get('again')['aria-label']}};
+  page.accept({...session.state(),revision:session.revision+1,jobs:[
+    {id:1,kind:'analyse',status:'failed',ply:1,error:'Temporary inference failure'},
+    {id:99,kind:'analyse',status:'queued',ply:1,done:0,total:1}]});
+  const queued = {stage:elements.get('analysis-stage').textContent,
+    progress:elements.get('analysis-progress').style.visibility,label:elements.get('again')['aria-label']};
+  page.accept({...session.state(),revision:session.revision+1,jobs:[{id:1,kind:'analyse',status:'failed',ply:1,error:'Temporary inference failure'}]});
+  answer = {failure,retry,recovered,queued,afterRetry:elements.get('analysis-stage').textContent};
 } else if (job.kind === 'analysis-bar') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
   answer = job.cases.map(({history, value, live, top = [], node_value}) => {

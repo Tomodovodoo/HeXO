@@ -1094,6 +1094,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['retry'], ['/analyse', dict(ply=1, force=True)])
         self.assertEqual(result['recovered'], dict(calls=2, value=.5, stage='', label='Analyse again'))
         self.assertEqual(result['queued'], dict(stage='Waiting for engine', progress='visible', label='Cancel analysis'))
+        self.assertEqual(result['afterRetry'], '')
 
     def test_analysis_bar_uses_the_mover_at_half_turn_positions(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
