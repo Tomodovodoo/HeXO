@@ -349,11 +349,15 @@ class NativeGames:
     def step(self, wait_ms=50.):
         """Consume immutable placement/lifecycle events, waiting up to `wait_ms` for one.
 
-        The service's launcher thread keeps forwards running meanwhile.
+        The service's launcher thread keeps forwards running meanwhile, so new
+        events can arrive while these are handled; one step takes at most two
+        per slot and returns, leaving the caller its own work between steps.
         """
         self.service.wait(wait_ms)
         finished = []
-        while (event:=self.service.event()) is not None:
+        for _ in range(2*len(self.games)):
+            if (event:=self.service.event()) is None:
+                break
             key = event['producer'],event['game']
             if key in self.idle:
                 group = next(g for g in self.groups.values() if key in g['slots'])
