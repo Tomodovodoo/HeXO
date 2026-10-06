@@ -1610,6 +1610,7 @@ class NativeScheduler(unittest.TestCase):
 
     def test_native_service_coalesces_producers_and_isolates_model_predictions(self):
         import ctypes as C
+        import time
         from neural_search import bind, ptr
         bind('hxgp_groups', C.c_int, ptr)
         bind('hxgp_group', C.c_int, ptr, C.c_int, ptr)
@@ -1628,8 +1629,18 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(native.hxgm_step(pools[0].ptr), -1)
             self.assertEqual(native.hxgm_free(pools[0].ptr), 0)
             self.assertTrue(native.hxb_start(service, 0.))
+            # Requests share a task only while one is queued. Both identical producers ask for their root before any
+            # answer, so hold the batches until their requests have met, however the threads are scheduled.
+            counters = np.zeros(10, np.uint64)
+            deadline = time.monotonic()+30
+            while not counters[1] and time.monotonic() < deadline:
+                time.sleep(.001)
+                native.hxb_stats(service, counters.ctypes.data)
+            self.assertGreater(counters[1], 0, 'identical requests from two producers did not share a task')
             for _ in range(1000):
-                if native.hxb_done(service):
+                done = native.hxb_done(service)
+                self.assertGreaterEqual(done, 0, native.hxg_error().decode())
+                if done:
                     break
                 token, model, snapshot = C.c_uint64(), C.c_int(), ptr()
                 count = native.hxb_take(service, 128, 50., C.byref(token), C.byref(model), C.byref(snapshot))
@@ -1654,9 +1665,7 @@ class NativeScheduler(unittest.TestCase):
             else:
                 self.fail('Native producer service did not complete bounded work')
             self.assertEqual(models, {0,1})
-            counters = np.empty(10, np.uint64)
             native.hxb_stats(service, counters.ctypes.data)
-            self.assertGreater(counters[1], 0)
             self.assertEqual(tuple(counters[7:]), (0,0,0))
         finally:
             native.hxb_cancel(service)
