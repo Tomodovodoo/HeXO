@@ -87,11 +87,11 @@ struct Frontier {
     if(!t.flight){t.node=node;t.history=history;if(moved>.1)t.ready=Clock::time_point{};}return;
   }
   if(tasks.size()>=capacity){
-   // Exact and closed entries give way first: they cannot be queried until
-   // their scope changes, while a new position can.
+   // Exact entries and entries closed under the current facts give way first:
+   // they cannot be queried until their scope changes, while a new position can.
    auto victim=tasks.end();double weakest=std::numeric_limits<double>::infinity();
    for(auto i=tasks.begin();i!=tasks.end();++i)if(!i->second->flight){auto n=i->second->node.lock();
-    double score=n && n->exact_winner<0 && i->second->closed!=3?i->second->impact/std::max(.05,i->second->cost):-1;
+    double score=n && n->exact_winner<0 && (i->second->closed!=3 || i->second->facts!=revision)?i->second->impact/std::max(.05,i->second->cost):-1;
     if(score<weakest){weakest=score;victim=i;}}
    if(victim==tasks.end() || (weakest>=impact/.2 && offers%5!=0))return;tasks.erase(victim);
   }

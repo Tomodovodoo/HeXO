@@ -2501,9 +2501,13 @@ class NativeProofs(unittest.TestCase):
         finally:
             native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
 
-    def quiet_closed_frontier(self, count=8):
-        """A full frontier of quiet positions whose mover and defender searches are both closed."""
+    def quiet_closed_frontier(self, count=8, prepare=None):
+        """A full frontier of quiet positions whose mover and defender searches are both closed.
+
+        `prepare(graph)` runs before the pool takes the graph over."""
         graph = self.graph([[0,0]])
+        if prepare:
+            prepare(graph)
         pool = self.pool([graph], quantum=4, views=1, work=4096)
         proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=2, queue=4, tasks=count)
         for k in range(1, count+1):
@@ -2512,7 +2516,7 @@ class NativeProofs(unittest.TestCase):
             proofs.step()
             return proofs.stats()['scope']['closed_scopes'] == 2*count
         self.wait(closed)
-        return pool, proofs
+        return graph, pool, proofs
 
     def test_only_unstamped_loops_skip_the_quiet_defender(self):
         for stamps in (False, True):
@@ -2526,7 +2530,7 @@ class NativeProofs(unittest.TestCase):
             proofs.drain();proofs.close();pool.close();graph.close()
 
     def test_closed_positions_give_way_to_new_offers(self):
-        pool, proofs = self.quiet_closed_frontier()
+        graph, pool, proofs = self.quiet_closed_frontier()
         before = proofs.stats()
         self.assertEqual(before['tasks'], 8)
         # Far weaker than any retained entry, yet only closed entries stand in its way.
@@ -2536,6 +2540,28 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(after['tasks'], 8)
         self.assertEqual(after['submitted'], before['submitted']+1)
         self.assertEqual(after['supply_first_queries'], before['supply_first_queries']+1)
+        proofs.drain()
+
+    def test_a_new_fact_keeps_closed_positions_until_their_scope_is_refreshed(self):
+        won = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8],[3,0],[4,0],[8,8],[10,8]]
+        def prepare(graph):
+            view = graph.view(won)
+            self.addCleanup(view.close)
+            self.assertTrue(native.hxg_tactics(view.ptr, 1))
+            view.search(1, root_samples=1, batch_size=1)
+            self.assertEqual(native.hxg_exact(view.ptr), 0)
+        graph, pool, proofs = self.quiet_closed_frontier(prepare=prepare)
+        proofs.offer(0, won)
+        before = proofs.stats()
+        self.assertEqual(before['facts'], 1)
+        # Offers are counted; this repeat keeps the weak offer below off the periodic admission.
+        proofs.offer(0, [[0,0],[1,-1],[1,1]])
+        # The fact may reopen any closed entry, so none of them is disposable yet.
+        proofs.offer(0, [[0,0],[-3,1],[-3,2]], relevance=1e-6)
+        proofs.step()
+        after = proofs.stats()
+        self.assertEqual(after['tasks'], 8)
+        self.assertEqual(after['supply_first_queries'], before['supply_first_queries'])
         proofs.drain()
 
     def test_idle_workers_are_charged_to_the_refill_that_left_them_idle(self):
@@ -2548,7 +2574,7 @@ class NativeProofs(unittest.TestCase):
         self.assertGreaterEqual(stats['idle_empty_ms'], 2*45)
         self.assertEqual([stats[k] for k in ('idle_capacity_ms','idle_held_ms','idle_pending_ms','idle_closed_ms','idle_dormant_ms')], [0]*5)
         empty.close()
-        pool, proofs = self.quiet_closed_frontier()
+        graph, pool, proofs = self.quiet_closed_frontier()
         stats = proofs.stats()
         self.assertEqual(stats['supply_seen'], stats['supply_eligible']+stats['supply_pending']
                          +stats['supply_closed']+stats['supply_dormant'])
