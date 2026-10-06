@@ -609,6 +609,7 @@ class ReplayWindow:
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
         self.manifests = {}; self.shards = {}; self.values = OrderedDict()
+        self.admitted = self.indexed = None
         self.unlabelled = set(); self.deblunders = {}
         self.regret_mtime = None; self.regret_entries = {}; self.exact_regret = {}
         self.refresh()
@@ -688,11 +689,13 @@ class ReplayWindow:
         return shard
 
     def refresh(self):
-        """Rescan manifests, recompute the window and load newly admitted shards; returns window rows."""
+        """Rescan manifests, recompute the window and load newly admitted shards; returns window rows. The indices
+        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed."""
         for path in shard_dirs(self.run_dir):
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
         names = self.names = sorted(self.manifests)
+        self.pacing_rows = None
         for name in [n for n, (_, labelled) in self.counts.items() if not labelled]:
             if (self.run_dir/'shards'/name/SIDECAR).exists():
                 del self.counts[name]
@@ -711,6 +714,7 @@ class ReplayWindow:
             for key in [k for k in self.values if k[0] == name]:
                 del self.values[key]
         self.prune({n for n, _ in admitted})
+        changed = admitted[::-1] != self.admitted or self.regret_entries is not self.indexed
         for name, _ in admitted:
             if name not in self.shards:
                 self.shards[name] = self.load(name)
@@ -720,7 +724,11 @@ class ReplayWindow:
                     label(self.shards[name], labels); self.unlabelled.discard(name)
                     episodes, rows = read_shard(self.run_dir/'shards'/name, policies=False)
                     self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
-        self.admitted = admitted[::-1]; self.full_rows = have; self.proven_rows = 0
+                    changed = True
+        if not changed:
+            return self.rows
+        self.admitted, self.indexed = admitted[::-1], self.regret_entries
+        self.full_rows = have; self.proven_rows = 0
         parts = ([], []), ([], [])    # (shard ids, rows) of the training and validation index
         self.starts = {}; candidates = 0; train_offset = 0
         listed = {}
@@ -759,13 +767,18 @@ class ReplayWindow:
 
     @property
     def total_rows(self):
-        """Retained trained rows of the shards seen by the last refresh, held-out rows included: the pacing count."""
-        if self.cheap_row_fraction >= 1:
-            return sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0) for n in self.names)
-        for name in self.names:
-            if name not in self.counts:
-                self.counts[name] = self.count(name)
-        return sum(self.counts[n][0] for n in self.names)
+        """Retained trained rows of the shards seen by the last refresh, held-out rows included: the pacing count,
+        summed once per refresh."""
+        if self.pacing_rows is None:
+            if self.cheap_row_fraction >= 1:
+                self.pacing_rows = sum(self.manifests[n]['counts']['rows']-self.manifests[n]['counts'].get('opponent_rows', 0)
+                                       for n in self.names)
+            else:
+                for name in self.names:
+                    if name not in self.counts:
+                        self.counts[name] = self.count(name)
+                self.pacing_rows = sum(self.counts[n][0] for n in self.names)
+        return self.pacing_rows
 
     def count(self, name):
         """(retained trained rows, whether its proof sidecar was read) of shard `name`, read from its files; rows the
