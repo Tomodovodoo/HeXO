@@ -24,6 +24,7 @@ int main(){
    assert(all[k]==gumbel::keys(replay) && all[k]==gumbel::keys(std::vector<Cell>(history.begin(),history.begin()+k)));
    if(k<history.size())replay.make(history[k]);
   }
+ }
  // Discarding a child graph must not discard the second stone of a retained
  // winning turn. Orphan proof records do not keep their own descendants alive.
  {gumbel::Tree t(29);assert(hxg_share(&t,1));t.tactics=true;
