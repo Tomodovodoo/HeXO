@@ -350,12 +350,29 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 # a losing chosen continuation does not cover its alternatives.
                 result.update(win_probability=1., proof_status='PROVEN_WIN')
             action = found['action']
+            witness = found.get('winning_turn', [])
+            if witness:
+                if winner != side or witness[0] != action:
+                    raise ValueError('Winning turn does not match the exact root action')
+                legal_turn(current, witness)
+            elif winner == side and game.remaining == 2:
+                raise ValueError('Winning root has no complete turn witness')
             result['stones'].append(dict(history=current, move=action, win_probability=probability,
                                          exact_winner=winner, completed=found['root_completed'],
                                          scheduler_completed=found['completed'],
                                          root_completed=found['root_completed'], context=found['context']))
             game.play(*action)
             selected.append(action)
+            if witness:
+                for second in witness[1:]:
+                    result['stones'].append(dict(history=[list(cell[:2]) for cell in game.cells],
+                        move=second, win_probability=1., exact_winner=side, completed=0,
+                        scheduler_completed=0, root_completed=0, context=None, source='proof_witness'))
+                    game.play(*second)
+                    selected.append(second)
+                result['winning_turn'] = list(selected)
+                emit(selected)
+                break
             emit(complete_candidate(history, selected))
         result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget'
     finally:
