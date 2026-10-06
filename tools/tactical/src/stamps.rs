@@ -414,6 +414,15 @@ thread_local! {
     static DEPTH:Cell<u8>=const{Cell::new(0)};
     static SEEDED:Cell<usize>=const{Cell::new(0)};
 }
+#[cfg(not(target_family="wasm"))]
+pub fn reset_worker() {
+    LIBRARY.with(|l|l.borrow_mut().clear());
+    IMPORTS.with(|i|i.borrow_mut().clear());
+    COMPILED.with(|c|c.borrow_mut().clear());
+    DEPTH.with(|d|d.set(0));
+    SEEDED.with(|s|s.set(0));
+    reset_timings(false);
+}
 pub fn seed(ctl:&Ctl)->Result<(),String> {
     if SEEDED.with(Cell::get)==usize::MAX {return Ok(());}
     let _time=measure("seed");

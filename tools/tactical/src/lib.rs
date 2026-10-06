@@ -534,6 +534,29 @@ type Work=(Request,Instant,Arc<AtomicBool>,mpsc::Sender<Result<Value,String>>);
 #[derive(Default)]
 struct WorkerState {busy:AtomicBool,active:Mutex<Option<Arc<AtomicBool>>>,last:Mutex<Value>}
 #[cfg(not(target_family="wasm"))]
+impl WorkerState {
+    fn record(&self,start:Instant,budget_ms:u32,cancel:&AtomicBool,cpu_start:Option<f64>) {
+        let elapsed=start.elapsed().as_secs_f64()*1000.0;
+        let cpu=thread_cpu_ms().zip(cpu_start).map(|(a,b)|a-b);
+        if let Ok(mut stats)=self.last.lock() {
+            let late=elapsed>=budget_ms as f64;
+            let previous=stats.clone();
+            let row=json!({"elapsed_ms":elapsed,"thread_cpu_ms":cpu,
+                "requested_ms":budget_ms,"completed_after_deadline":late,
+                "cancelled":cancel.load(Ordering::Acquire)});
+            *stats=json!({"latest":row,"completed_queries":previous["completed_queries"].as_u64().unwrap_or(0)+1,
+                "completed_after_deadline_count":previous["completed_after_deadline_count"].as_u64().unwrap_or(0)+u64::from(late),
+                "total_worker_elapsed_ms":previous["total_worker_elapsed_ms"].as_f64().unwrap_or(0.0)+elapsed,
+                "total_thread_cpu_ms":cpu.map(|c|previous["total_thread_cpu_ms"].as_f64().unwrap_or(0.0)+c),
+                "last_after_deadline":if late {row}else{previous["last_after_deadline"].clone()}});
+        }
+    }
+    fn stats(&self,value:&mut Value) {
+        value["background_worker_busy"]=json!(self.busy.load(Ordering::Acquire));
+        value["last_worker_completion"]=self.last.lock().map(|s|s.clone()).unwrap_or(Value::Null);
+    }
+}
+#[cfg(not(target_family="wasm"))]
 struct Worker {sender:Option<mpsc::SyncSender<Work>>,thread:Option<std::thread::JoinHandle<()>>,state:Arc<WorkerState>}
 #[cfg(not(target_family="wasm"))]
 static WORKER:OnceLock<Worker>=OnceLock::new();
@@ -570,20 +593,7 @@ impl Worker {
                 let budget_ms=req.ms;let cpu_start=thread_cpu_ms();
                 let result=std::panic::catch_unwind(||run_controlled(req,start,Arc::clone(&cancel)))
                     .unwrap_or_else(|_|Err("native worker panic".into()));
-                let elapsed=start.elapsed().as_secs_f64()*1000.0;
-                let cpu=thread_cpu_ms().zip(cpu_start).map(|(a,b)|a-b);
-                if let Ok(mut stats)=inner.last.lock() {
-                    let late=elapsed>=budget_ms as f64;
-                    let previous=stats.clone();
-                    let row=json!({"elapsed_ms":elapsed,"thread_cpu_ms":cpu,
-                        "requested_ms":budget_ms,"completed_after_deadline":late,
-                        "cancelled":cancel.load(Ordering::Acquire)});
-                    *stats=json!({"latest":row,"completed_queries":previous["completed_queries"].as_u64().unwrap_or(0)+1,
-                        "completed_after_deadline_count":previous["completed_after_deadline_count"].as_u64().unwrap_or(0)+u64::from(late),
-                        "total_worker_elapsed_ms":previous["total_worker_elapsed_ms"].as_f64().unwrap_or(0.0)+elapsed,
-                        "total_thread_cpu_ms":cpu.map(|c|previous["total_thread_cpu_ms"].as_f64().unwrap_or(0.0)+c),
-                        "last_after_deadline":if late {row}else{previous["last_after_deadline"].clone()}});
-                }
+                inner.record(start,budget_ms,&cancel,cpu_start);
                 if let Ok(mut active)=inner.active.lock() {*active=None;}
                 inner.busy.store(false,Ordering::Release);
                 let _=reply.send(result);
@@ -592,8 +602,7 @@ impl Worker {
         Ok(Self{sender:Some(sender),thread:Some(thread),state})
     }
     fn stats(&self,value:&mut Value) {
-        value["background_worker_busy"]=json!(self.state.busy.load(Ordering::Acquire));
-        value["last_worker_completion"]=self.state.last.lock().map(|s|s.clone()).unwrap_or(Value::Null);
+        self.state.stats(value);
     }
 }
 #[cfg(not(target_family="wasm"))]

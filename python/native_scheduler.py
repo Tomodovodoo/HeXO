@@ -73,7 +73,7 @@ class ProofLoop:
     Recursive level-1 frames and kernel memos are still rebuilt per query.
     """
     def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
-                 tasks=256, stamps=False, endpoints=8):
+                 tasks=256, stamps=False, endpoints=8, direct=False):
         if not isinstance(endpoints,int) or not 0<=endpoints<=8:
             raise ValueError('Neural frontier limit must be an integer from 0 to 8')
         from tactical_proof import NativeTactics, PACKAGE
@@ -81,6 +81,9 @@ class ProofLoop:
         self.library = NativeTactics(PACKAGE if package is None else package)
         names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
                  'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
+        if direct:
+            names = tuple(name+'_direct' if name in ('worker_new','worker_free','worker_answer','worker_busy')
+                          else name for name in names)
         functions = np.asarray([C.cast(getattr(self.library.lib, 'hexo_tactical_'+name), ptr).value
                                 for name in names], np.uint64)
         self._ptr = None
