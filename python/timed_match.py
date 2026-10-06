@@ -295,7 +295,7 @@ def side_settings(path):
     if path is None:
         return {}
     settings = json.loads(path.read_text(encoding='utf-8'))
-    allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor'},
+    allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'native_scheduler'},
                    solver={'enabled', 'nodes', 'leaf'})
     if not isinstance(settings, dict) or settings.keys()-allowed.keys():
         raise ValueError('Side settings contain only search and solver objects')

@@ -273,9 +273,10 @@ class TimedClocks(unittest.TestCase):
         from dense_openings import canonical
         with TemporaryDirectory() as directory:
             path = Path(directory)/'settings.json'
-            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None),
+            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None, native_scheduler=True),
                                             solver=dict(enabled=False))), encoding='utf-8')
             self.assertIsNone(side_settings(path)['search']['max_simulations'])
+            self.assertTrue(side_settings(path)['search']['native_scheduler'])
             path.write_text(json.dumps(dict(search=dict(native_feed=True))), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'Unsupported search'):
                 side_settings(path)
