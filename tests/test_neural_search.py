@@ -1365,6 +1365,66 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class NativeScheduler(unittest.TestCase):
+    def test_launcher_feeds_arriving_rows_during_gpu_wait_and_before_return(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from native_scheduler import InferenceService
+        service = InferenceService.__new__(InferenceService)
+        service.pending = []
+        service.models = [None]
+        launched, collected, delivered = [], [], []
+        batches = iter([(1,0,'first'), None, (2,0,'second'), (3,0,'third')])
+        service.take = lambda wait: next(batches,None)
+        service.complete = lambda token,rows: delivered.append((token,rows))
+        service.cancel = lambda: self.fail('Healthy forwards must not cancel the service')
+        def submit(model,rows):
+            launched.append(rows)
+            def collect():
+                # The newly ready second batch starts before the first fence.
+                self.assertIn('second',launched)
+                collected.append(rows)
+                return rows
+            return SimpleNamespace(event=SimpleNamespace(query=lambda:False),collect=collect)
+        backend = SimpleNamespace(submit=submit,_quarantined=[])
+        with patch.dict(sys.modules, native_dense=backend):
+            service.pump()
+        self.assertEqual(launched,['first','second','third'])
+        self.assertEqual(collected,['first'])
+        self.assertEqual(delivered,[(1,'first')])
+        self.assertEqual([token for token,_ in service.pending],[2,3])
+
+    def test_launcher_keeps_failed_gpu_fence_owned_and_quarantined_submit_live(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from native_scheduler import InferenceService
+        service = InferenceService.__new__(InferenceService)
+        service.pending = []
+        service.models = [None]
+        rows = object()
+        service.take = lambda wait:(1,0,rows)
+        cancelled = []
+        service.cancel = lambda:cancelled.append(True)
+        service.abandon_fenced = lambda token:self.fail('Unfenced storage must stay owned')
+        service.complete = lambda *args:self.fail('Failed forward cannot be delivered')
+        handle = SimpleNamespace(rows=rows)
+        def submit(*args):raise RuntimeError('submission fence failed')
+        backend = SimpleNamespace(submit=submit,_quarantined=[handle])
+        with patch.dict(sys.modules,native_dense=backend):
+            with self.assertRaisesRegex(RuntimeError,'submission fence failed'):
+                service.pump()
+        self.assertEqual(cancelled,[True])
+        self.assertEqual(service.pending,[(1,handle)])
+        def collect():raise RuntimeError('completion fence failed')
+        handle.event = SimpleNamespace(query=lambda:True)
+        handle.collect = collect
+        service.take = lambda wait:None
+        with patch.dict(sys.modules,native_dense=backend):
+            with self.assertRaisesRegex(RuntimeError,'completion fence failed'):
+                service.pump()
+        self.assertEqual(service.pending,[(1,handle)])
+
     def test_round_choice_survives_refuted_finalists_and_new_root_lease(self):
         graph = GameGraph(Uniform(), 'scheduler', [(0,0)], limit=96, round_barrier=True)
         self.addCleanup(graph.close)
