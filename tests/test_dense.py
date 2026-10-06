@@ -9748,6 +9748,7 @@ class DenseTimedWorker(unittest.TestCase):
                     player.turn(game, 1000)
                 player.configure(dict(solver=False, simulations=16))
                 result = player.turn(game, 1000)
+                self.assertEqual(result['model_sha256'], player.model_sha256)
                 self.assertEqual(result['settings']['simulations'], 16)
                 self.assertLessEqual(result['scheduler_completed'], 16)
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])

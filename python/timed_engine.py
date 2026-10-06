@@ -257,7 +257,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     game = Game(history)
     side, remaining = game.player, game.remaining
     result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
-                  player=side, win_probability=None, suggestions=[], winning_line=[], threat=None,
+                  model_sha256=player.model_sha256, player=side, win_probability=None,
+                  suggestions=[], winning_line=[], threat=None,
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
                   settings=dict(player.options) | dict(native_scheduler=True,
                       simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8),
