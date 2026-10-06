@@ -69,6 +69,9 @@ class DensePlayer:
         import hexnet
         from legacy.train import digest
         path = self.model_path or self.run/'checkpoints'/checkpoint/'ema.pt'
+        if self.evaluator is not None:
+            self.close()
+            self.checkpoint = None
         model = hexnet.load_model(path, net_kernels=self.net_kernels)
         self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path),
             max_batch=128 if self.native_scheduler else 16,

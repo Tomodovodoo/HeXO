@@ -9770,6 +9770,25 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
                     self.assertEqual(result['stones'][1]['exact_winner'], winner)
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # Release retained search and captures before replacement allocations.
+                old_pool = player._timed_native[1]
+                old_graph = unittest.mock.Mock()
+                player.evaluator.graph = old_graph
+                player.model_path = None
+                replacement = Path(folder)/'checkpoints/main/000002/ema.pt'
+                replacement.parent.mkdir(parents=True)
+                hexnet.save_model(replacement, model)
+                lifecycle = unittest.mock.Mock()
+                lifecycle.attach_mock(old_graph, 'graph')
+                with unittest.mock.patch('hexnet.DenseEvaluator', wraps=hexnet.DenseEvaluator) as construct:
+                    lifecycle.attach_mock(construct, 'construct')
+                    player.select('main/000002')
+                old_graph.close.assert_called_once()
+                self.assertIsNone(old_pool._ptr)
+                events = [call[0] for call in lifecycle.mock_calls]
+                self.assertLess(events.index('graph.close'), events.index('construct'))
+                self.assertEqual(player.checkpoint, 'main/000002')
+                self.assertIsNotNone(player.evaluator)
             finally:
                 game.close()
                 player.close()
