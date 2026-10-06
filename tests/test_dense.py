@@ -2220,6 +2220,19 @@ class DenseDataTests(unittest.TestCase):
             self.assertAlmostEqual(hits/(4096*16), probability, delta=45/(4096*16))
             self.assertGreater(hits, 85)
 
+    def test_restart_entries_match_training_rows_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            moves, _ = random_game(np.random.default_rng(4), 20)
+            write_games(run/'shards'/'000001', [(moves, -1, None)]*3)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            window.set_regret({('000001', 1, 5): .5, ('000001', 2, 0): .25, ('000001', 0, -1): 1., ('000001', 0, 2**16+5): 1.,
+                               ('000001', 2**40, 0): 1., ('000001', 3, 0): 1., ('000002', 0, 0): 1.})
+            rows = {(ref.row['game'], ref.row['ply']): float(w) for ref, w in
+                    ((window.ref(*window.index[k]), w) for k, w in zip(window.regret_positions, window.regret_weights))}
+            self.assertEqual(rows, {(1, 5): .5, (2, 0): .25})
+            self.assertTrue(np.all(np.diff(window.regret_positions) > 0))
+
     def test_certified_value_errors_enter_bounded_priority_without_restarts(self):
         moves, _ = random_game(np.random.default_rng(4), 20)
         episode, rows = episode_rows(moves, -1, [-1.]*20)
