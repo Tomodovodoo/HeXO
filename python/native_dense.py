@@ -24,6 +24,7 @@ bind('hxgp_costs_learn', C.c_int, ptr, ptr, C.c_int)
 bind('hxgp_costs_stats', None, ptr, ptr)
 bind('hxgp_plan', C.c_int, ptr, ptr, ptr, C.c_int, C.c_int)
 bind('hxgp_plan_rect', C.c_int, ptr, ptr, ptr, C.c_int, C.c_int)
+bind('hxgp_plan_rect_steps', C.c_int, ptr, ptr, ptr, C.c_int, C.c_int)
 _quarantined = []  # Keep host storage alive when GPU completion cannot be established.
 
 
@@ -81,12 +82,17 @@ class PackedRows:
             height, width, count = map(int, info)
             self.groups.append((height if height == width else (height, width), count))
 
-    def plan(self, costs, limits, step):
+    def plan(self, costs, limits, step, max_cells=None):
         if not self.ptr:
             raise ValueError('Packed batch closed')
         caps = np.ascontiguousarray([(side, side, cap) if isinstance(side, int) else (*side, cap)
                                      for side, cap in limits], np.int64).reshape(-1, 3)
-        checked(native.hxgp_plan_rect(self.ptr, costs.ptr, caps.ctypes.data, len(caps), step))
+        if max_cells is None:
+            checked(native.hxgp_plan_rect(self.ptr, costs.ptr, caps.ctypes.data, len(caps), step))
+        else:
+            outer = [max(1, min(step, int(cap), max_cells//(int(h)*int(w)))) for h, w, cap in caps]
+            caps = np.ascontiguousarray(np.c_[caps, outer], np.int64)
+            checked(native.hxgp_plan_rect_steps(self.ptr, costs.ptr, caps.ctypes.data, len(caps), step))
         self._groups()
 
     def pack(self, index, output):
@@ -190,7 +196,7 @@ def submit(evaluator, rows, max_cells=48*48*48):
                 limits = [] if graph.budget_exhausted else [(h if h == w else (h, w),
                           graph._limit(h if h == w else (h, w), graph.max_batch))
                           for h, w in sorted(canvases) if graph.supports((h, w))]
-                rows.plan(costs, limits, evaluator.max_batch)
+                rows.plan(costs, limits, evaluator.max_batch, max_cells)
             handle.costs = costs
         observe = handle.costs is not None and handle.costs.sample()
         for index, (side, count) in enumerate(rows.groups):

@@ -167,13 +167,15 @@ struct Batch {
   }
   for(auto& [shape,rows]:by_size)groups.push_back({shape.first,shape.second,std::move(rows)});
  }
- void plan(const Costs& cost,const int64_t* limits,int size,int step,bool rectangular=false){
+ void plan(const Costs& cost,const int64_t* limits,int size,int step,bool rectangular=false,bool stepped=false){
   if(sealed)throw std::runtime_error("Packed layout already submitted");
   if(size<0 || (size && !limits) || step<1)throw std::runtime_error("Missing inference capture limits");
-  std::map<std::pair<int,int>,int> caps;int fields=rectangular?3:2;
-  for(int i=0;i<size;++i){int64_t s=limits[fields*i],w=rectangular?limits[fields*i+1]:s,cap=limits[fields*i+fields-1];
+  std::map<std::pair<int,int>,int> caps,steps;int fields=stepped?4:rectangular?3:2;
+  for(int i=0;i<size;++i){int64_t s=limits[fields*i],w=rectangular?limits[fields*i+1]:s,cap=limits[fields*i+(rectangular?2:1)];
    if(s<1 || s>256 || w<1 || w>256 || cap<1 || cap>128 || (cap&(cap-1)))throw std::runtime_error("Invalid inference capture limit");
-   caps[{int(s),int(w)}]=int(cap);}
+   caps[{int(s),int(w)}]=int(cap);
+   if(stepped){int64_t outer=limits[fields*i+3];if(outer<1 || outer>step || outer>cap)throw std::runtime_error("Invalid inference transfer step");
+    steps[{int(s),int(w)}]=int(outer);}}
   std::map<std::pair<int,int>,std::vector<int>> by_size;
   for(int i=0;i<int(decoded.size());++i){int side=int(info[13*int64_t(i)]);if(side<1)continue;
    if(decoded[i])throw std::runtime_error("Packed prediction already completed");
@@ -181,7 +183,8 @@ struct Batch {
   groups.clear();for(auto& [shape,rows]:by_size)groups.push_back({shape.first,shape.second,std::move(rows)});
   if(!cost.fitted)return;
   auto units=[&](int rows,int side,int width,int limit){double cells=0;int launches=0;
-   while(rows){int chunk=std::min(rows,step);rows-=chunk;
+   int outer=stepped?steps.at({side,width}):step;
+   while(rows){int chunk=std::min(rows,outer);rows-=chunk;
     while(chunk>limit){cells+=double(limit)*side*width;++launches;chunk-=limit;}
     if(limit>=128 && chunk>64 && chunk<=96){cells+=64.*side*width;++launches;chunk-=64;}
     if(limit>=64 && chunk>32 && chunk<=(side==40 && width==40?56:48)){cells+=32.*side*width;++launches;chunk-=32;}
@@ -312,6 +315,7 @@ HX_API int hxgp_costs_learn(void* p,const double* rows,int count){try{auto& c=*s
 HX_API void hxgp_costs_stats(void* p,double* out){auto& c=*static_cast<packing::Costs*>(p);out[0]=c.count;out[1]=c.cell;out[2]=c.launch;out[3]=c.fitted;}
 HX_API int hxgp_plan(void* p,void* costs,const int64_t* limits,int count,int step){try{static_cast<packing::Batch*>(p)->plan(*static_cast<packing::Costs*>(costs),limits,count,step);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxgp_plan_rect(void* p,void* costs,const int64_t* limits,int count,int step){try{static_cast<packing::Batch*>(p)->plan(*static_cast<packing::Costs*>(costs),limits,count,step,true);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxgp_plan_rect_steps(void* p,void* costs,const int64_t* limits,int count,int step){try{static_cast<packing::Batch*>(p)->plan(*static_cast<packing::Costs*>(costs),limits,count,step,true,true);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void* hxgp_new(void* const* trees,const int* requests,int count,int merge_cells){try{
  if(count<1 || !trees || !requests)throw std::runtime_error("Invalid packed batch inputs");
  return new packing::Batch(trees,requests,count,merge_cells);

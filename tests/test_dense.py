@@ -267,11 +267,13 @@ class HexcropTests(unittest.TestCase):
                        [33,15,0,0,0],[65,15,0,0,0],[80,16,0,0,0],[0,33,16,0,0],[0,0,49,7,0],[0,0,56,1,0]):
             ids=np.asarray([i if i<4 else 4+j%2 for i,n in enumerate(counts) for j in range(n)],np.int32)
             source=np.full(len(ids),bank.ptr,np.uintp)
-            for step in (8,19,128):
+            for step,max_cells in ((8,None),(19,None),(128,None),(100,48*48*48),(100,35*32*32)):
                 pointer=native.hxgp_combine(source.ctypes.data,ids.ctypes.data,len(ids),32768)
                 rows=PackedRows.from_native(pointer,len(ids))
                 try:
-                    rows.plan(costs,limits,step)
+                    rows.plan(costs,limits,step,max_cells)
+                    def outer(s):
+                        return step if max_cells is None else max(1,min(step,ActorGraph._limit(s,128),max_cells//(s*s)))
                     original=[(s,n) for s,n in zip(sides,counts) if n]
                     scores=[]
                     for split in range(1<<(len(original)-1)):
@@ -279,11 +281,11 @@ class HexcropTests(unittest.TestCase):
                         for i,(s,n) in enumerate(original):
                             count+=n
                             if i==len(original)-1 or split&(1<<i):candidate.append((s,count));count=0
-                        parts=[(s,cap) for s,n in candidate for start in range(0,n,step)
-                               for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128),s)]
+                        parts=[(s,cap) for s,n in candidate for start in range(0,n,outer(s))
+                               for _,cap in ActorGraph._segments(min(outer(s),n-start),ActorGraph._limit(s,128),s)]
                         scores.append(sum(s*s*cap*.00013+.7 for s,cap in parts))
-                    parts=[(s,cap) for s,n in rows.groups for start in range(0,n,step)
-                           for _,cap in ActorGraph._segments(min(step,n-start),ActorGraph._limit(s,128),s)]
+                    parts=[(s,cap) for s,n in rows.groups for start in range(0,n,outer(s))
+                           for _,cap in ActorGraph._segments(min(outer(s),n-start),ActorGraph._limit(s,128),s)]
                     self.assertAlmostEqual(sum(s*s*cap*.00013+.7 for s,cap in parts),min(scores))
                     self.assertEqual(sum(n for _,n in rows.groups),len(ids))
                     for index,(side,count) in enumerate(rows.groups):
