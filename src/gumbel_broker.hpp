@@ -326,7 +326,9 @@ struct Broker {
    if(!ready.empty()){
     int selected=ready.front()->model;int count=int(std::count_if(ready.begin(),ready.end(),[&](const auto& t){return t->model==selected;}));
     auto due=ready.front()->queued+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(latency_ms));
-    if(count>=limit || Clock::now()>=due || (wait_ms>0 && Clock::now()>=until)){
+    // Batching can wait behind an existing flight. With no flight, dispatch
+    // useful ready work now instead of leaving inference idle for the timer.
+    if(count>=limit || flights.empty() || Clock::now()>=due || (wait_ms>0 && Clock::now()>=until)){
      std::vector<std::shared_ptr<Task>> batch;
      for(auto it=ready.begin();it!=ready.end() && int(batch.size())<limit;){
       auto task=*it;if(task->model!=selected){++it;continue;}
@@ -342,8 +344,8 @@ struct Broker {
      }
      *token=id;*model=selected;*snapshot=packed;return int(rows.size());
     }
-    // Launch ready batches first. A control event need not wait for a partial
-    // batch's latency allowance, and must not flush that batch prematurely.
+    // Control events do not wait for a batch that is accumulating behind
+    // an existing flight. An idle queue has already dispatched above.
     if(!events.empty() || !wait_ms)return 0;wake.wait_until(lock,std::min(until,due));
    }else{
     if(!events.empty() || done_locked() || Clock::now()>=until)return 0;wake.wait_until(lock,until);

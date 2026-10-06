@@ -1569,9 +1569,9 @@ class NativeScheduler(unittest.TestCase):
                 if counts[0]:break
                 time.sleep(.001)
             self.assertEqual(counts[0], 1)
-            # The one-row batch is full at this requested limit. Deliver it
-            # even though the exact neighbor's root event is still pending.
-            self.assertEqual(native.hxb_take(service.ptr,1,1000.,C.byref(token),C.byref(model),C.byref(snapshot)),1)
+            # A ready row starts inference even though the requested batch
+            # is not full and the exact neighbor's root event is still pending.
+            self.assertEqual(native.hxb_take(service.ptr,128,0.,C.byref(token),C.byref(model),C.byref(snapshot)),1)
             event = service.event()
             self.assertEqual((event['game'],event['exact_winner']), (0,0))
         finally:
