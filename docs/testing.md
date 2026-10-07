@@ -121,7 +121,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_dense.HexcropTests` | 13 | Crop encoding: planes, actions and cells match the engine's legal moves; native, Python and packed paths agree | 3.4 | 0.0 | about 100 replayed positions, 12 symmetries | - | keep |
 | `test_dense.HexNetTests` | 20 | HexNet forward, losses, norms, line convolutions and save/load match reference maths; old checkpoints load | 1.7 | 0.0 | pure-Python line reference | - | keep |
 | `test_dense.FusedCudaTests` | 8 | Fused CUDA kernels and the actor graph runner match the reference within bf16 tolerance | 0.0 | 0.0 | GPU only (HEXO_TEST_CUDA=1) | - | keep, explicit GPU run |
-| `test_dense.DenseConfigTests` | 20 | Settings parse, override, validate and reach actor workers; old configs resume with the same defaults; a run is created from the command line | 1.0 | 0.0 | one subprocess, one HTTP server | - | keep; the learner speed tile is checked in page source |
+| `test_dense.DenseConfigTests` | 21 | Settings parse, override, validate and reach actor workers; hybrid actors without the solver build drop proof workers; old configs resume with the same defaults; a run is created from the command line | 1.0 | 0.0 | one subprocess, one HTTP server | - | keep; the learner speed tile is checked in page source |
 | `test_dense.DenseDataTests` | 32 (1 slow) | Shards write, read and reject tampering; value, outcome, calibration and policy targets; replay window and regret priority; render workers | 11.5 | 4.4 | spawned render workers | - | keep; spawned-children check slow |
 | `test_dense.WindowMemoryTests` | 8 | Replay window index and policy memory-map cache are correct, shared between processes and pruned | 1.2 | 0.0 | synthetic runs | - | keep |
 | `test_dense.CheapRowTests` | 10 | cheap_row_fraction drops only ordinary cheap rows, consistently in learner, render workers and bench tool | 5.0 | 0.0 | two exports | - | keep |
@@ -152,7 +152,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 
 | Class | Tests | What it protects | Fast s | Slow s | What costs time | Overlaps | Decision |
 | --- | ---: | --- | ---: | ---: | --- | --- | --- |
-| `test_bubble.CommandTests` | 4 | The match command and services target the run; flags reach GPU services; actors drop proof workers without the solver | 0.1 | 0.0 | - | - | keep |
+| `test_bubble.CommandTests` | 4 | The match command and services target the run; flags reach GPU services | 0.1 | 0.0 | - | - | keep |
 | `test_bubble.ModelTests` | 3 | Install and download place the weights and champion | 0.0 | 0.0 | - | - | keep |
 | `test_bubble.MembersTests` | 2 | Process-tree membership | 0.0 | 0.0 | - | - | keep |
 | `test_bubble.MatchTests` | 1 | A match process is a member of the tree | 0.0 | 0.0 | - | - | keep |

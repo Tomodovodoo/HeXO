@@ -1508,6 +1508,14 @@ class DenseConfigTests(unittest.TestCase):
         saved['actor'] = {key.replace('hybrid_', 'native_'): value for key, value in saved['actor'].items()}
         self.assertEqual(dense_config.from_dict(saved), config)
 
+    def test_hybrid_actors_drop_proof_workers_without_the_solver_build(self):
+        hybrid, legacy = dense_config.ActorSettings(), dense_config.ActorSettings(hybrid_scheduler=False)
+        with unittest.mock.patch('tactical_proof.NativeTactics', side_effect=OSError('not built')):
+            self.assertEqual(dense_selfplay.without_missing_proofs(hybrid).hybrid_proof_workers, 0)
+            self.assertEqual(dense_selfplay.without_missing_proofs(legacy), legacy)
+        with unittest.mock.patch('tactical_proof.NativeTactics'):
+            self.assertEqual(dense_selfplay.without_missing_proofs(hybrid), hybrid)
+
     def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)

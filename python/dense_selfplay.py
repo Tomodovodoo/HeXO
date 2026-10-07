@@ -1242,10 +1242,27 @@ def shard_name(after=''):
     return f'{ms:013d}{os.getpid() % 1000:03d}'
 
 
+def without_missing_proofs(settings):
+    """`settings` with no hybrid proof workers when the tactical solver build does not load; search itself needs
+    no solver."""
+    if not (settings.hybrid_scheduler and settings.hybrid_proof_workers):
+        return settings
+    try:
+        from tactical_proof import NativeTactics
+        NativeTactics().close()
+    except (OSError, ValueError, KeyError):
+        return replace(settings, hybrid_proof_workers=0)
+    return settings
+
+
 def worker(args):
     run = Path(args.run)
     config = dense_config.load(run)
-    settings = dense_config.override(config.actor, args)
+    requested = dense_config.override(config.actor, args)
+    settings = without_missing_proofs(requested)
+    if settings != requested:
+        log_event(run, 'actor', 'warning', 'tactical solver not built: hybrid search runs without proof workers',
+                  process=args.worker)
     config = replace(config, actor=settings)
     torch.backends.cudnn.benchmark = False
     status_path = run/('actor-status.json' if args.worker == 0 else f'actor-status-{args.worker}.json')

@@ -37,20 +37,18 @@ def resolve_device(device):
 
 
 def commands(run, actors=4, dashboard_port=8766, seal=False, kernels=None, proof=True):
-    """The command line of every service for `run`, as argument lists starting with the interpreter. Both the proof
-    pass and the actors' hybrid proof workers need the tactical solver build: without `proof` the pass is left out
-    and the actors run without proof workers. `kernels` overrides the run's configured network kernels only when
-    given."""
+    """The command line of every service for `run`, as argument lists starting with the interpreter; the proof pass
+    only when `proof`, since it needs the tactical solver build. `kernels` overrides the run's configured network
+    kernels only when given."""
     python = [sys.executable, '-u']
     net = ['--net-kernels', kernels] if kernels else []
     graphs = ['--no-cuda-graphs'] if kernels == 'reference' else []   # CUDA graphs exist only for fused kernels
-    proofs = [] if proof else ['--hybrid-proof-workers', '0']
     evaluator = [*python, str(PYTHON / 'dense_eval.py'), 'loop', '--run', str(run), *net]
     if not seal:
         evaluator += ['--eval-anchor-games', '0', '--no-eval-anchor-on-promotion', '--eval-anchor-target-halfwidth', '0']
     plan = dict(
         learner=[*python, str(PYTHON / 'dense_learn.py'), '--run', str(run), *net],
-        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors), *net, *graphs, *proofs],
+        actors=[*python, str(PYTHON / 'dense_selfplay.py'), '--run', str(run), '--processes', str(actors), *net, *graphs],
         evaluator=evaluator,
         proof=[*python, str(PYTHON / 'dense_solve.py'), '--run', str(run)],
         dashboard=[*python, str(PYTHON / 'dashboard.py'), '--run', str(run), '--port', str(dashboard_port)])
