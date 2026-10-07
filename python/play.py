@@ -588,12 +588,14 @@ def proof_turns(plies, remaining, mover_wins):
 def interruptible(call, watch, abort):
     """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, `abort()` ends the call if it
     is still running and the exception propagates."""
-    result = {}
+    result, finishing = {}, threading.Lock()
     def run():
         try:
-            result['value'] = call()
+            outcome = 'value', call()
         except Exception as error:
-            result['error'] = error
+            outcome = 'error', error
+        with finishing:
+            result[outcome[0]] = outcome[1]
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     while thread.is_alive():
@@ -601,8 +603,9 @@ def interruptible(call, watch, abort):
         try:
             watch(0)
         except Cancelled:
-            if thread.is_alive():
-                abort()
+            with finishing:
+                if not result:
+                    abort()
             raise
     if 'error' in result:
         raise result['error']
