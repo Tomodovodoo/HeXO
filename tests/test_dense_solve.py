@@ -980,6 +980,8 @@ class DashboardTests(unittest.TestCase):
             state = dashboard.dense_run(run, dict(created_at=0.))
             self.assertEqual((state['actor']['restart_buffer'], state['data']['restart_share_6h']), (17, .25))
             self.assertEqual((state['actor']['proofs_verified'], state['actor']['verify_timeouts']), (5, 2))
+            self.assertIn('verify_timeouts', (Path(dashboard.__file__).resolve().parents[1]/'web'/'training.html').read_text(encoding='utf-8'))
+            self.assertIn('restart_share_6h', (Path(dashboard.__file__).resolve().parents[1]/'web'/'training.html').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

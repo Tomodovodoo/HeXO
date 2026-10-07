@@ -417,8 +417,10 @@ class Jobs(unittest.TestCase):
         wait(lambda: not self.session.state()['jobs'])
         calls = len(self.engines.calls)
         self.assertIsNone(self.session.analyse(1))
+        self.engines.hold = True   # a review still running is not queued twice; a finished one may be
         job = self.session.jobs[self.session.review_game()]
         self.assertEqual(self.session.review_game(), job.id)
+        self.engines.release.set()
         wait(lambda: not self.session.state()['jobs'])
         self.assertEqual((job.done, job.total), (4, 4))
         self.assertEqual([len(c[2]) for c in self.engines.calls[calls:]], [3, 2, 0])

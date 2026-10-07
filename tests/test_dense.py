@@ -1592,6 +1592,10 @@ class DenseConfigTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_learner_speed_tile_explains_the_data_wait(self):
+        page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
+        self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
+
     def test_paused_learner_does_not_make_a_run_live(self):
         import dashboard
         with tempfile.TemporaryDirectory() as tmp:
