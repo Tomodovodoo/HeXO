@@ -359,6 +359,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             if 'error' in found:
                 root_search['error'] = found['error']
                 if found['error'] in ('deadline', 'cancelled'):
+                    result['stop_reason'] = 'deadline' if found['error'] == 'deadline' else 'stop'
                     break
                 raise ValueError(f"Native turn search failed: {found['error']}")
             edges = np.asarray(found['edges'], np.float64)
@@ -405,7 +406,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 emit(selected)
                 break
             emit(complete_candidate(history, selected))
-        result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget'
+        result['stop_reason'] = result.get('stop_reason',
+            'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget')
     finally:
         try:
             if service is not None:

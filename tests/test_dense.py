@@ -9977,6 +9977,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(len(result['stones']), 1)
                 self.assertEqual(result['root_searches'][1]['history'], [[0,0],[1,0]])
                 self.assertEqual(result['root_searches'][1]['error'], 'deadline')
+                self.assertEqual(result['stop_reason'], 'deadline')
                 self.assertNotIn('completed', result['root_searches'][1])
                 self.assertEqual(result['completed'], 2)
                 # A real immediate pair is committed before the first winning
