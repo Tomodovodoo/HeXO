@@ -2377,11 +2377,24 @@ class NativeProofs(unittest.TestCase):
         history=[[0,0],[4,0],[7,0],[-1,0],[-2,0]]
         endpoint=history+[[5,0],[6,0],[2,0],[8,0]]
         graph=self.graph(history)
-        pool=self.pool([graph],quantum=16,views=8,depth=1,work=1024)
-        proofs=pool.enable_proofs(slice_ms=8,table_mb=1,workers=1,queue=1,endpoints=8)
+        winner=self.graph(self.opening)
+        pool=self.pool([graph,winner],quantum=16,views=8,depth=1,work=1024)
+        proofs=pool.enable_proofs(slice_ms=8,table_mb=1,workers=1,queue=2,endpoints=8)
         pool.step();self.answer(pool);proofs.step()
-        self.wait(lambda:proofs.stats()['finished']>0);proofs.step()
+        submitted=proofs.stats()['submitted']
+        self.assertGreaterEqual(submitted,2)
+        self.wait(lambda:proofs.stats()['finished']==submitted)
+        credits=pool.games[0].stats()['root_completed']
+        pool.step(neural=False)
+        frontier=proofs.stats()['neural_frontier']
+        self.assertGreater(frontier['queue']['pending'],0)
+        self.assertEqual(frontier['candidates'],0)
+        self.assertEqual(pool.games[0].stats()['root_completed'],credits)
+        # Pausing neural admission defers estimates, never a verified proof.
+        self.assertEqual(native.hxg_exact(winner.ptr),0)
+        pool.step()
         self.assertGreater(proofs.stats()['neural_frontier']['candidates'],0)
+        self.assertEqual(proofs.stats()['neural_frontier']['queue']['admitted'],1)
         self.assertEqual(native.hxg_exact(graph.ptr),-1)
         seen=set()
         for _ in range(300):
@@ -2394,6 +2407,7 @@ class NativeProofs(unittest.TestCase):
         self.assertTrue(all(r['result']['status']=='UNKNOWN' for r in proofs.frontier_records()))
         self.assertEqual(native.hxg_exact(graph.ptr),-1)
         pool.cancel();proofs.drain();pool.abandon_fenced()
+        self.assertEqual(proofs.stats()['neural_frontier']['queue']['pending'],0)
         self.assertEqual(pool.games[0].stats()['pending'],0)
         self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()),pool.games[0].stats()['root_completed'])
 
@@ -2869,6 +2883,23 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(sum(r['missing_fresh'] for r in effort.values()), proofs.stats()['missing_fresh'])
         self.assertEqual(sum(r['queries'] for r in effort.values()), proofs.stats()['finished'])
         self.assertEqual(effort[1]['queries'], stats['finished'])
+
+        # A completed UNKNOWN continuation can wait without a graph pin. A new
+        # root discards that old-generation estimate before it reaches the GPU.
+        history=[[0,0],[4,0],[7,0],[-1,0],[-2,0]]
+        pending_pool=self.pool([self.graph(history)],quantum=16,views=8,depth=1,work=1024)
+        pending=pending_pool.enable_proofs(slice_ms=8,table_mb=1,workers=1,queue=1,endpoints=8)
+        pending_pool.step();self.answer(pending_pool);pending.step()
+        self.wait(lambda:pending.stats()['finished']>0)
+        pending_pool.step(neural=False)
+        self.assertGreater(pending.stats()['neural_frontier']['queue']['pending'],0)
+        self.assertEqual(pending.stats()['neural_frontier']['candidates'],0)
+        pending_pool.retarget(0,[[0,0],[1,2],[3,-1]],work=1024)
+        self.assertEqual(pending.stats()['neural_frontier']['queue']['pending'],0)
+        self.assertGreater(pending.stats()['neural_frontier']['queue']['obsolete'],0)
+        self.assertEqual(native.hxg_exact(native.hxgo_root(pending_pool.games[0].ptr)),-1)
+        pending_pool.cancel();pending.drain();pending_pool.abandon_fenced()
+        self.assertEqual(pending_pool.games[0].stats()['pending'],0)
 
     def shared(self, **options):
         from native_scheduler import ProofWorkers
