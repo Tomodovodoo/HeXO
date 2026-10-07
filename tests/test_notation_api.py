@@ -269,6 +269,29 @@ class OfficialAPI(unittest.TestCase):
 
 
 class TimedClocks(unittest.TestCase):
+    def test_native_controller_releases_precise_timer_on_close_or_startup_failure(self):
+        from timed_engine import TimedEngine
+        from unittest.mock import Mock
+        for ready in (True, False):
+            with self.subTest(ready=ready), patch('timed_engine.mp.get_context') as context_type, \
+                    patch('timed_engine.precise_timer') as request_timer:
+                context = context_type.return_value
+                connection = Mock()
+                connection.poll.return_value = ready
+                connection.recv.return_value = ('ready', dict(checkpoint='test'))
+                context.Pipe.return_value = connection, Mock()
+                context.Process.return_value.is_alive.return_value = False
+                config = dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(enabled=False))
+                if ready:
+                    engine = TimedEngine(config)
+                    engine.close()
+                    engine.close()
+                else:
+                    with self.assertRaises(TimeoutError):
+                        TimedEngine(config)
+                request_timer.assert_called_once_with()
+                request_timer.return_value.timeEndPeriod.assert_called_once_with(1)
+
     def test_native_clocked_reply_does_not_wait_for_resource_drain(self):
         from timed_engine import TimedEngine
         from types import SimpleNamespace

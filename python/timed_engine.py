@@ -16,6 +16,18 @@ PROOF_WORKERS = 2   # native timed turns: proof workers of the turn's private lo
 PROOF_BUDGET = 1.   # share of the graph owner's time proof steps may take (solver.budget, ProofLoop owner_budget)
 
 
+def precise_timer():
+    """Request precise Windows waits in this process; the owner must release it."""
+    import sys
+    if sys.platform != 'win32':
+        return None
+    import ctypes
+    timer = ctypes.WinDLL('winmm')
+    if timer.timeBeginPeriod(1):
+        raise RuntimeError('Could not request 1 ms native search timers')
+    return timer
+
+
 def proof_settings(solver):
     """The checked proof workers and owner budget of a native timed Bubble's `solver` settings."""
     workers, budget = solver.get('workers', PROOF_WORKERS), solver.get('budget', PROOF_BUDGET)
@@ -501,13 +513,7 @@ def _worker(connection, cancellation, config):
         if kind == 'bubble':
             if (config.get('search', {}).get('native_scheduler')
                     and config.get('search', {}).get('enabled', True)):
-                import sys
-                if sys.platform == 'win32':
-                    import ctypes
-                    winmm = ctypes.WinDLL('winmm')
-                    if winmm.timeBeginPeriod(1):
-                        raise RuntimeError('Could not request 1 ms native search timers')
-                    timer = winmm
+                timer = precise_timer()
             import torch
             from dense_player import DensePlayer
             torch.set_num_threads(2)
@@ -673,10 +679,13 @@ class TimedEngine:
         self.lock = threading.Lock()
         self.generation = 0
         self.busy = False
+        self.timer = None
         self.process = context.Process(target=_worker, args=(child, self.cancellation, self.config), daemon=True)
         self.process.start()
         child.close()
         try:
+            if config.get('kind', 'bubble') == 'bubble' and search.get('native_scheduler') and search.get('enabled', True):
+                self.timer = precise_timer()
             if not self.connection.poll(startup_timeout):
                 raise TimeoutError('Engine initialization timed out')
             status, identity = self.connection.recv()
@@ -838,17 +847,22 @@ class TimedEngine:
             self.lock.release()
 
     def close(self):
-        self.cancellation.set()
-        if self.process.is_alive():
-            try:
-                self.connection.send(None)
-            except (BrokenPipeError, OSError):
-                pass
-            self.process.join(.2)
+        try:
+            self.cancellation.set()
             if self.process.is_alive():
-                self.process.terminate()
-                self.process.join(2)
-        self.connection.close()
+                try:
+                    self.connection.send(None)
+                except (BrokenPipeError, OSError):
+                    pass
+                self.process.join(.2)
+                if self.process.is_alive():
+                    self.process.terminate()
+                    self.process.join(2)
+            self.connection.close()
+        finally:
+            if self.timer is not None:
+                self.timer.timeEndPeriod(1)
+                self.timer = None
 
     def __enter__(self):
         return self
