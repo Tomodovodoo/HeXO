@@ -122,6 +122,10 @@ struct Edge {
 // Legal lists are large and live together. Pool their buffers within one game,
 // recycling evicted nodes' blocks instead of making one heap allocation per node.
 // A node retains the resource because it can outlive the GameStore's indices.
+// libc++ (the browser build) pools a block only up to a quarter of largest_required_pool_block and keeps larger ones
+// on a list it scans on every deallocation, which made freeing a browser graph quadratic in its edge states. Asking
+// for four times the largest block keeps every block pooled there; libstdc++ pools them either way.
+constexpr std::pmr::pool_options pooled(size_t blocks,size_t largest){return {blocks,4*largest};}
 struct EdgeMemory {
 #ifdef HEXO_RECLAIM_PROFILE
  struct Upstream : std::pmr::memory_resource {
@@ -130,15 +134,15 @@ struct EdgeMemory {
   void do_deallocate(void* p,size_t n,size_t alignment)override {bytes-=n;std::pmr::new_delete_resource()->deallocate(p,n,alignment);}
   bool do_is_equal(const std::pmr::memory_resource& other)const noexcept override {return this==&other;}
  } upstream;
- std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144},&upstream};
- std::pmr::unsynchronized_pool_resource states{std::pmr::pool_options{1024,sizeof(EdgeState)},&upstream};
+ std::pmr::unsynchronized_pool_resource pool{pooled(8,262144),&upstream};
+ std::pmr::unsynchronized_pool_resource states{pooled(1024,sizeof(EdgeState)),&upstream};
  ~EdgeMemory(){auto start=std::chrono::steady_clock::now();states.release();pool.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
   std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"edge_memory\",\"peak_bytes\":%llu,\"allocations\":%llu,\"remaining_bytes\":%llu,\"release_ns\":%llu}\n",
    (unsigned long long)upstream.peak,(unsigned long long)upstream.allocations,(unsigned long long)upstream.bytes,(unsigned long long)ns);
  }
 #else
- std::pmr::unsynchronized_pool_resource pool{std::pmr::pool_options{8,262144}};
- std::pmr::unsynchronized_pool_resource states{std::pmr::pool_options{1024,sizeof(EdgeState)}};
+ std::pmr::unsynchronized_pool_resource pool{pooled(8,262144)};
+ std::pmr::unsynchronized_pool_resource states{pooled(1024,sizeof(EdgeState))};
 #endif
 };
 // Cold actions share the unknown completed Q. Each small block retains its

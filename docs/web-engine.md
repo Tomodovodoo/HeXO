@@ -218,9 +218,9 @@ WebGPU with `shader-f16` loads both graphs, times a batch of 16 at crop 24 under
 1.25 times faster; fp32 reproduces the server's evaluations, fp16 does not. A limited adapter (see Loading) loads
 fp16 alone. Without WebGPU it runs the WebAssembly
 build with SIMD, and threads when the page is cross-origin isolated (`play.py` sends COOP/COEP; static hosts use
-`isolate()`). The owner sends at most 16 rows per network batch. A larger batch raises WebGPU throughput (64
-leaves in 63 ms against 16 in 26 ms); `BubbleEngine.turn` takes `batch_size` in its budget for that. WebAssembly time
-grows linearly with the batch.
+`isolate()`). The owner sends at most 64 rows per network batch on WebGPU and 16 on WebAssembly: a WebGPU forward
+costs little more at 64 rows than at 16 (63 ms against 26 ms), while WebAssembly time grows linearly with the batch,
+so a cancel there still lands within a short batch. `BubbleEngine.turn` takes `batch_size` in its budget to change it.
 
 The ONNX Runtime binary (27 MB WebGPU, 14 MB WebAssembly) and the model (4.6 MB fp32, 2.3 MB fp16) are fetched
 once and kept in the Cache API under their version and SHA-256. GitHub release downloads send no CORS headers, so
@@ -267,6 +267,21 @@ makes the WebGPU and CUDA columns noisy (WebGPU deep took 11 to 18 s across runs
 a one-operator graph already takes 6 ms, so a batch costs mostly dispatch and time slicing, not arithmetic. Graph
 capture saved 15% at batch 16 and is not used. WebAssembly with one thread is what a page without cross-origin
 isolation gets.
+
+Hybrid search from the same 9-stone position on main/185000, WebGPU fp32, 16,384 simulations, no solver, with the
+training run on the GPU (2026-10-08):
+
+| Build | Batch | Simulations/s | Longest owner step | Freeing the graph |
+|---|---|---|---|---|
+| gumbel.wasm before the pool fix | 16 | 28 | 45 s | 55 s |
+| after | 16 | 206 | 30 ms | 40 ms |
+| after | 64 | 560 | 12 ms | 12 ms |
+
+Before the fix, libc++'s `unsynchronized_pool_resource` (the browser build's standard library) served the game
+graph's edge states from a list it scans on every deallocation, because it pools only blocks up to a quarter of the
+largest size it is given. Every eviction inside a step and every freed graph paid a scan over all live edge states,
+so steps grew to seconds once a search had a few thousand simulations, and the cancel grace restarted the engine.
+The native library (libstdc++) was never affected. `EdgeMemory` now asks for four times its largest block.
 
 ## Drip (browser)
 

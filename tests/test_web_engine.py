@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
 NODE = shutil.which('node')
 BUILT = NODE is not None and (ENGINE/'gumbel.wasm').exists()
+NINE_STONES = [[0, 0], [1, 0], [0, 1], [2, -1], [-1, 2], [3, -2], [1, 1], [-2, 3], [2, 0]]
 spec = importlib.util.spec_from_file_location('build_web', ROOT/'tools'/'build_web.py')
 build_web = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build_web)
@@ -948,6 +949,23 @@ class Bundle(unittest.TestCase):
         answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, warm=True))
         self.assertEqual((answer['warmed'], answer['after']), (2, 2))
         self.assertEqual(len(answer['moves']), 2)
+
+    def test_a_long_search_on_a_peaked_network_answers_a_cancel_at_once(self):
+        # A network that keeps meeting the same stones makes the game graph store and evict many edge states. Freeing
+        # them must stay cheap, or the search sends nothing for seconds and the page restarts the engine (2 s grace).
+        answer = node(dict(kind='worker-turn', history=NINE_STONES, simulations=65536, peaked=True, cancelAfter=3000))
+        self.assertEqual(answer['replies'], ['cancelled'])
+        self.assertLess(answer['ms'], 3000 + 1000)
+        self.assertLess(answer['gap'], 1500)
+        values = [live['value'] for live in answer['live']]
+        self.assertGreater(len(values), 10)
+        self.assertGreater(len(set(values)), len(values) // 4)
+
+    def test_a_timed_search_on_a_peaked_network_answers_within_its_clock(self):
+        result = node(dict(kind='worker-turn', history=NINE_STONES, simulations=65536, nodes=0, peaked=True, ms=1000))
+        self.assertEqual(len(result['moves']), 2)
+        self.assertLess(result['ms'], 1000 + 500)
+        self.assertGreater(result['actual_completed'], 256)
 
     def test_a_refresh_budget_below_one_quantum_still_searches(self):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))

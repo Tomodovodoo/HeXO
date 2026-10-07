@@ -75,7 +75,7 @@ export class BubbleEngine extends EngineWorker {
       simulations: budget.simulations, solverNodes: budget.solver_nodes, solverWorkers: budget.solver_workers ?? PROOF_WORKERS,
       solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4, proveMs: budget.solver_ms ?? 0,
       proofStamps: options.proofStamps ?? true,
-      batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
+      batchSize: budget.batch_size, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
       ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
