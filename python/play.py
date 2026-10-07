@@ -1384,6 +1384,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         facts = sorted(merged.values(), key=lambda f: len(f['history']))[:2048]
     if solved is None and solver_ms and prover is not None:
         solved = prove(bubble, prover, package, history, solver_ms, watch, live, facts)
+        if solved.get('proofs'):
+            # The frontier's verified positions settle the follow-up search's edges.
+            known = known if known is not None else Proofs()
+            known.add(history, dict(proofs=solved['proofs']))
     turn = TurnSearch(bubble, network, history, simulations,
                       solved or solve(prover, history, solver_nodes, watch, facts), trees, q_range_floor, known, proofs)
     try:
@@ -2283,7 +2287,7 @@ class Session:
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'refuted')}
+                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'refuted', 'solver')}
                     if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')

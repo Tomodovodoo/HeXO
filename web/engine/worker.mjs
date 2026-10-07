@@ -315,9 +315,11 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
       check();
       solverUsed += found.used; solverStats = found.solver; failure ||= found.error;
       frontierProofs(found.records, table, leafProofs);
+      // A root win joins the proof table, so the Standard search below still runs and the table gives the turn.
       if (found.mine) {
-        ({moves, pv, proof} = winningLine(native, history, found.mine, facts.filter(f => f.history.length !== history.length || f.winner !== player)));
-        top = [[...moves[0], 1, 1, 1]];
+        const record = winningLine(native, history, found.mine, facts.filter(f => f.history.length !== history.length || f.winner !== player));
+        table.add(history, record);
+        ({pv, proof} = record);
       } else if (found.proof) proof = found.proof;
     } else if (solverNodes && !nativeProof) {
       postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
