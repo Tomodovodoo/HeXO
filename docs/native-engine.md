@@ -29,7 +29,8 @@ After each completed iteration the same prover asks whether the opponent has a
 forced win after the chosen turn; a strategy it finds removes every root turn it
 also beats. Iterative deepening stops with a quarter of the allowance left, or
 earlier when the next iteration would likely not finish. Until then, a root that
-beats the earlier scores of an unfinished iteration replaces the choice. The turn
+beats the earlier scores of an unfinished iteration, and is not a proven loss,
+replaces the choice. The turn
 Native is about to play is then probed if no iteration probed it, and any time
 left continues the search without replacing the choice from an unfinished
 iteration.

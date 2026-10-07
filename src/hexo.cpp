@@ -1495,8 +1495,9 @@ struct Search {
                     }
                 };
                 // Deepen until the last quarter of the allowance, keeping a root
-                // that beats an unfinished iteration's earlier scores. Stop early
-                // when the next iteration is unlikely to finish in time.
+                // that beats an unfinished iteration's earlier scores and is not
+                // a proven loss. Stop early when the next iteration is unlikely
+                // to finish in time.
                 int depth=1;
                 auto deepen=[&](bool reserve) {
                     for(;depth<=max_depth;++depth) {
@@ -1514,7 +1515,7 @@ struct Search {
                                 score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
                             }
                             t.score=score;
-                            if(score>best) {best=score;iteration=t;if(reserve) chosen=t;}
+                            if(score>best) {best=score;iteration=t;if(reserve && score>-mate) chosen=t;}
                             if(best>=mate) break;
                         }
                         chosen=iteration;chosen.score=best;output.depth=depth;
@@ -1532,7 +1533,7 @@ struct Search {
                 deadline=end-allowance/4;
                 try {deepen(true);} catch(const Timeout&) {}
                 deadline=end;refutation_left=end-Clock::now();
-                if(chosen.score<mate && chosen.score>-mate) refute();
+                if(chosen.score<mate) refute();
                 if(depth<=max_depth) deepen(false);
             } catch(const Timeout&) {}
         }
