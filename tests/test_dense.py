@@ -21,6 +21,7 @@ from collections import Counter
 from types import SimpleNamespace
 import unittest
 import unittest.mock
+import zlib
 
 import numpy as np
 import torch
@@ -2906,6 +2907,23 @@ class CheapRowTests(unittest.TestCase):
             kept = set(half.index)
             self.assertEqual(held.total_rows, len(held.index)+sum(key in kept for key in held.validation))
 
+    def test_surveyed_counts_pace_like_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 10, 30, proven=True)
+            survey = dense_data.survey(tmp, 4, .5, processes=1)
+            primed = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4,
+                                             survey=survey)
+            plain = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4)
+            self.assertEqual(primed.total_rows, plain.total_rows)
+            self.assertEqual(primed.total_rows, len(primed.index))
+            before = primed.total_rows
+            self.label(tmp, '000001', list(range(30)))    # the dropped cheap rows of game 0 become exact
+            for window in (primed, plain):
+                window.refresh()
+            self.assertGreater(primed.total_rows, before)
+            self.assertEqual(primed.total_rows, plain.total_rows)
+            self.assertEqual(primed.total_rows, len(primed.index))
+
     def test_retention_is_stable_across_rebuilds(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic_run(tmp, 3, 8, 30)
@@ -3278,6 +3296,69 @@ class ValidationSourceTests(unittest.TestCase):
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
+
+    def test_subsets_follow_the_documented_walk_with_a_cold_or_surveyed_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in (1, 2):
+                source_shard(run/'shards'/f'{k:06d}', k, 'old', 'converted', games=10, policy_every=1)
+            for k in range(6):
+                source_shard(run/'shards'/f'10000000000{k:02d}', 10+k, 'x', checkpoint='main/000010', games=10, policy_every=1)
+            limit, quota, seed, fraction = 25, 6, 5, .4
+            expected = {}
+            for source, origin in (('converted', 'converted'), ('fresh', 'actor')):
+                for split in ('held', 'train'):
+                    chosen = []
+                    for path in dense_data.shard_dirs(run):
+                        if dense_data.origin(dense_data.manifest(path)) != origin or len(chosen) >= limit:
+                            continue
+                        episodes, rows = dense_data.read_shard(path)
+                        full = [i for i, r in enumerate(rows) if len(r['policy'])]
+                        order = np.random.default_rng([seed, zlib.crc32(path.name.encode())]).permutation(len(full))
+                        picked = [full[k] for k in order if dense_data.holdout(episodes[rows[full[k]]['game']], fraction) == (split == 'held')]
+                        chosen += [(path.name, i) for i in picked[:min(quota, limit-len(chosen))]]
+                    expected[source, split] = chosen
+            cold = dense_data.ValidationSets(run, fraction, seed, limit, quota)
+            cold.refresh()
+            with unittest.mock.patch.object(dense_data, 'SURVEY_CHUNK', 2):
+                survey = dense_data.survey(run, seed, .5, processes=2)    # two spawned workers over the cached index
+            self.assertEqual({n: v.actors for n, v in survey.items()}, cold.actors)
+            self.assertEqual({n: v.manifest for n, v in survey.items()}, cold.manifests)
+            primed = dense_data.ValidationSets(run, fraction, seed, limit, quota, survey)
+            primed.refresh()
+            for sets in (cold, primed):
+                subsets = {k: [(r.shard, r.index) for r in refs] for k, refs in sets.subsets.items()}
+                for key, chosen in expected.items():
+                    self.assertEqual(subsets[key], chosen, key)
+                self.assertEqual(subsets['newest', 'held'], subsets['fresh', 'held'])
+                self.assertEqual(sets.newest_checkpoint, 'main/000010')
+
+    def test_shard_index_follows_replaced_and_tampered_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', games=4)
+            source_shard(run/'shards'/'1000000000002', 2, 'x', games=4)
+            first = dense_data.ReplayWindow(run, 10**6, 10**6)
+            built = []
+            index_shard = dense_data.index_shard
+            with unittest.mock.patch.object(dense_data, 'index_shard', lambda path: built.append(path.name) or index_shard(path)):
+                again = dense_data.ReplayWindow(run, 10**6, 10**6)
+                self.assertEqual(built, [])    # unchanged shards are read from their index
+                self.assertEqual(list(again.index), list(first.index))
+                shutil.rmtree(run/'shards'/'1000000000002')
+                time.sleep(.01)
+                source_shard(run/'shards'/'1000000000002', 7, 'x', games=9)
+                replaced = dense_data.ReplayWindow(run, 10**6, 10**6)
+                self.assertEqual(built, ['1000000000002'])
+            episodes, rows = dense_data.read_shard(run/'shards'/'1000000000002', policies=False)
+            refs = [replaced.ref(n, i) for n, i in replaced.index if n == '1000000000002']
+            self.assertEqual(len(refs), sum(dense_data.trained(episodes[r['game']], r['ply']) for r in rows))
+            for ref in refs:
+                self.assertEqual(ref.episode['moves'], episodes[ref.row['game']]['moves'])
+            path = run/'shards'/'1000000000001'/'rows.json'
+            path.write_text(path.read_text().replace('"ply": 0', '"ply": 1', 1))
+            with self.assertRaisesRegex(ValueError, 'Shard changed'):
+                dense_data.ReplayWindow(run, 10**6, 10**6)
 
     def test_learner_settings_size_the_subsets(self):
         with tempfile.TemporaryDirectory() as tmp:
