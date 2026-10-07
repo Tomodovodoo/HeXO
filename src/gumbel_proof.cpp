@@ -164,10 +164,10 @@ struct Loop {
  enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Owner,Reasons};
  enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,OwnerExits,Counts};
  using Census=std::array<uint64_t,Counts>;
- std::array<double,Reasons> idle_ms{};Idle stop=Empty;
+ std::array<double,Reasons> idle_ms{};Idle stop=Empty;Clock::time_point refilled{};
  std::array<uint64_t,3> excluded{};Census census{};
  void publish(const Census& refill,Idle reason,int exit){
-  service.account(Clock::now());stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
+  refilled=Clock::now();service.account(refilled);stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
   if(reason==Empty)std::copy_n(refill.begin()+Excluded,3,excluded.begin());
  }
  void charge(double ms){
@@ -329,6 +329,7 @@ struct Loop {
     if(ms<1)mark(*job);
     if(job->cancelled){job->info[4]=1;completed(job);++finished;continue;}
     job->worker=index;job->started=Clock::now();job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
+    service.account(job->started);--service.idle_workers;
     job->request=request(*job,ms);worker.active=job;++started;return job->id;
    }return 0;
   }
@@ -338,7 +339,8 @@ struct Loop {
    if(!job || job->id!=id || !info || count<0 || count>2 || (count && !moves))throw std::runtime_error("Unknown external proof completion");
    std::copy_n(info,13,job->info.begin());job->move_count=count;if(count)std::copy_n(moves,2*count,job->moves.begin());
    if(result)job->result=result;if(error)job->error=error;
-   job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();worker.service+=job->elapsed;service_ms+=job->elapsed;
+   auto now=Clock::now();job->elapsed=std::chrono::duration<double,std::milli>(now-job->started).count();worker.service+=job->elapsed;service_ms+=job->elapsed;
+   service.account(now);++service.idle_workers;
    worker.active.reset();completed(job);++finished;
   }
  void publish(Tree& view,const Board& board,const gumbel::Outcome& outcome){
@@ -449,6 +451,8 @@ struct Loop {
 };
 Service::Service(const uint64_t* functions,int count,int queue):api(functions),capacity(queue),external(!functions){
  if(count<1 || count>16 || queue<count || queue>128)throw std::runtime_error("Invalid native proof worker limits");
+ // External workers are idle until their caller takes a job; threads count themselves.
+ if(external)idle_workers=size_t(count);
  try {
   for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();if(!external){worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");}workers.push_back(std::move(worker));}
 #ifndef __EMSCRIPTEN__
@@ -475,10 +479,12 @@ void Service::account(Clock::time_point now){
  idle_mark=now;
 }
 // Free slots for `loop`: the service bound, and an equal share among loops
-// that hold jobs or whose last refill found work within their owner's budget.
+// that hold jobs or whose refill in the last 50 ms wanted more within their
+// owner's budget. A loop whose owner stopped stepping gives its share back.
 size_t Service::room(const Loop& loop)const{
- size_t held=0,wanting=0,own=loop.live.size()+loop.reserved;
- for(auto* l:loops){size_t h=l->live.size()+l->reserved;held+=h;wanting+=l==&loop || h || (l->enabled && l->stop!=Loop::Empty && l->stop!=Loop::Owner);}
+ size_t held=0,wanting=0,own=loop.live.size()+loop.reserved;auto recent=Clock::now()-std::chrono::milliseconds(50);
+ for(auto* l:loops){size_t h=l->live.size()+l->reserved;held+=h;
+  wanting+=l==&loop || h || (l->enabled && l->stop!=Loop::Empty && l->stop!=Loop::Owner && l->refilled>recent);}
  size_t share=std::max<size_t>(1,capacity/wanting);
  return held>=capacity || own>=share?0:std::min(capacity-held,share-own);
 }

@@ -2989,6 +2989,49 @@ class NativeProofs(unittest.TestCase):
         last = max(i for i, h in enumerate(order) if h[1][1] == 1)
         self.assertEqual(sum(h[1][1] == -1 for h in order[:last]), 1)
 
+    def test_a_producer_that_stops_refilling_gives_back_its_queue_share(self):
+        import time
+        from neural_search import checked
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        service, join, entered, release, order = self.held_workers(4)
+        loops = [join(pool) for pool in pools]
+        stats, times = np.empty(16, np.uint64), np.empty(5, np.float64)
+        def submitted(loop):
+            native.hxp_stats(loop, stats.ctypes.data, times.ctypes.data)
+            return int(stats[1])
+        for i, loop in enumerate(loops):
+            for k in range(1, 9):
+                cells = np.asarray([[0,0],[k,-1-i],[k,1+i]], np.int64)
+                checked(native.hxp_offer(loop, 0, cells.ctypes.data, len(cells), 1.))
+            checked(native.hxp_step(loop))
+        # The first producer holds the whole queue; the second found it full and then stops stepping.
+        self.assertEqual([submitted(loop) for loop in loops], [4, 0])
+        release.set()
+        def answered():
+            native.hxp_stats(loops[0], stats.ctypes.data, times.ctypes.data)
+            return int(stats[3]) == 4
+        self.wait(answered)
+        time.sleep(.1)
+        checked(native.hxp_step(loops[0]))
+        self.assertEqual(submitted(loops[0]), 8)
+
+    def test_external_workers_report_their_idle_time(self):
+        import ctypes as C
+        import time
+        from neural_search import bind, checked, ptr
+        bind('hxpe_new', ptr, ptr, *([C.c_int]*7))
+        pool = self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096)
+        loop = native.hxpe_new(pool.ptr, 2, 4, 10, 1, 64, 0, 64)
+        self.assertTrue(loop)
+        try:
+            checked(native.hxp_step(loop))
+            time.sleep(.05)
+            stats, times = np.empty(16, np.uint64), np.empty(5, np.float64)
+            native.hxp_stats(loop, stats.ctypes.data, times.ctypes.data)
+            self.assertGreaterEqual(times[1], 2*45)
+        finally:
+            native.hxp_cancel(loop);checked(native.hxp_drain(loop));checked(native.hxp_free(loop))
+
     def test_concurrent_producer_refills_never_exceed_the_shared_bound(self):
         import threading
         from neural_search import checked
