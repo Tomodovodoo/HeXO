@@ -60,7 +60,7 @@ its source, binary, checkpoint, configuration and workload identities.
 | Endpoint export, October 6 | Midgame checked proofs 3/3 to 10/11 and completed-view depth 5/5 to 7/7, while rows/s fell slightly | Useful proof/depth work can improve while neural throughput declines. This small study establishes no general strength gain. |
 | Round versus visit-layer barriers, endpoints enabled | Four trials per condition: quiet 3,142 to 4,493 rows/s; four midgames 4,008 to 4,944 | Higher unique NN admission rate under the same one-second clock, about 43% and 23%. Depth and credits were separately recorded. |
 | Same-clock Six protocol play | Four sustained starts: HeXO proof-on about 4.0-4.7k versus Six 3.7-4.4k neural rows/s, two repeats | A local end-to-end comparison is competitive. Six's PUCT protocol player is not its Gumbel self-play pipeline; CPU use differed and no learning/strength conclusion follows. |
-| Current IPC Play versus Six, October 7 | Three two-stone starts, two alternating repeats, HeXO solver-off/on: all 24 engine replies legal and complete. HeXO terminal neural rows per reply-plus-drain second are 3.52-4.50k solver-off and 3.05-3.87k solver-on; Six protocol neural rows per reply second are 3.23-4.84k. | Actual current caller and pinned binaries, not the older manual-pump harness. Terminal work can include work after reply. Only two repeats per condition; new canvas captures, external CPU activity and different search/proof algorithms limit the comparison. No general speedup or strength result. |
+| Current IPC Play versus Six, October 7 | Three two-stone starts, two alternating repeats, HeXO solver-off/on: all 24 engine replies legal and complete. HeXO terminal leased rows per reply-plus-drain second are 3.52-4.50k solver-off and 3.05-3.81k solver-on; Six protocol neural rows per reply second are 3.23-4.84k. | Actual current caller and pinned binaries, not the older manual-pump harness. Terminal work can include work after reply. Only two repeats per condition; new canvas captures, external CPU activity and different search/proof algorithms limit the comparison. No general speedup or strength result. |
 | PR404 balanced allocation study | 48 one-second trials across baseline, lookup control and pressure admission. Midgame owner-step wall per NN row falls about 16%; root comparison credits rise. Overall rows/s is approximately flat. | Admission improves a measured host/allocation cost, not a massive speedup. Neural-only continuation depths fell; proof-enabled depth/proof delivery was comparable. |
 | Actor pipeline, October 6 | Four trials per arm, full-length frozen-main/200000 games, no proof workers: combined experimental changes raise placements/s from 180.8 to 204.2 at 128 slots and 160.4 to 187.0 at 64; unique NN rows/s 4,048 to 4,540 and 3,578 to 4,158 | Real data-generation gain of 13.0% and 16.5%. Includes pending PR433 and graph limit 1024; published rows were replayed through the learner. Not a proof-enabled or learning-strength comparison. |
 | PR404 complete games | 8 neural-only and 8 concurrent-proof uncapped games, all terminal; 1,780 saved rows, 96 independently checked CPU certificates, no missing raw predictions | Legal play, proof/data/lifetime behavior and complete drainage. Not a strength or learner comparison. |
@@ -389,6 +389,13 @@ The current comparison keeps reply snapshots, terminal totals and their wall
 boundaries separate. Its receipts are `current-caller-six-turns-20261007.json`,
 `current-caller-six-summary-20261007.json` and
 `clocked-causal-delivery-runtime-20261007.json`.
+
+The broker's `unique_rows` counts newly queued tasks, including work withdrawn
+before leasing. The origin proof-on repeats created 7,858 tasks but leased 7,736
+rows. `current-caller-six-counter-audit-20261007.json` corrects that distinction
+without changing the raw receipts. Leased rows still exclude physical padding
+and capture warmup. All twelve HeXO trials had scheduling profiling disabled,
+so their zero queue-age and owner-phase counters mean those costs were unmeasured.
 
 ### Queueing and transfers
 
