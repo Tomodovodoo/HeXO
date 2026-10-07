@@ -294,7 +294,7 @@ console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal
     def test_saves_under_older_engine_ids_read_back_as_drip(self):
         source = """import {PlayStorage} from './web/engine/storage.mjs';
 const storage=new PlayStorage(null),key='browser:native|null|abc|';
-await storage.put('sessions',{id:'live',seats:[{engine:'human'},{engine:'browser:native',preset:'quick'}],
+await storage.put('sessions',{id:'live',seats:[{engine:'browser:bubble',preset:'custom',budget:{simulations:64,native_owner:true,native_proof:true,native_capture:false}},{engine:'browser:native',preset:'quick'}],
  match:{players:[{engine:'browser:native',name:'Native (browser)',version:key},{engine:'browser:six',name:'Six (browser)'}]}});
 await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine_key:key,note:'native'});
 await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
@@ -310,6 +310,8 @@ console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluat
                               capture_output=True, text=True, check=True)
         result = json.loads(done.stdout)
         self.assertEqual(result['session']['seats'][1], dict(engine='browser:drip', preset='quick'))
+        self.assertEqual(result['session']['seats'][0]['budget'],
+                         dict(simulations=64, hybrid_scheduler=True, hybrid_proof=True, hybrid_capture=False))
         self.assertEqual(result['session']['match']['players'],
                          [dict(engine='browser:drip', name='Drip (browser)', version='browser:drip|null|abc|'),
                           dict(engine='browser:six', name='Six (browser)')])
