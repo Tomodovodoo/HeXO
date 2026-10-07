@@ -139,7 +139,7 @@ note:`${c.checkpoint}${c.rows!=null?` · ${c.rows.toLocaleString()} source rows`
 function draw(p,hover){if(p.surface)return drawSurface(p,hover);const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
 const rawSeries=(p.history?historySeries(p):panelSeries(p)).map(s=>({...s,raw:(s.raw||cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep))}));
-const xs=rawSeries.flatMap(s=>s.raw.map(q=>q[0])),unit=xs.length?(Math.max(...xs)-Math.min(...xs))/1000:0;
+let lo=Infinity,hi=-Infinity;for(const s of rawSeries)for(const q of s.raw){if(q[0]<lo)lo=q[0];if(q[0]>hi)hi=q[0]}const unit=hi>lo?(hi-lo)/1000:0;
 const series=rawSeries.map(s=>({...s,points:p.smooth&&state.smooth>0?ema(s.raw,state.smooth,unit):s.raw}));
 const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.title=s.note||'';if(s.color)e.style.color=s.color;e.append(swatch(s.index,s.dash,s.color),s.label,(s.metric==='seal_elo'||s.metric.startsWith('anchor_elo:')||s.metric.startsWith('external_elo:'))&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
 if(p.external)el.querySelector('.note').textContent=[p.note,...series.filter(s=>s.note).map(s=>s.note)].join(' ');
