@@ -2310,7 +2310,7 @@ class Session:
                                   opening=self.opening),
                         evaluations=evaluations, stale=stale,
                         review=review(history, lambda h: self.proven(h, self.review_lookup(h, target)), board['winner']),
-                        review_preset=self.analysis['preset'] if self.analysis else None,
+                        review_preset=('standard' if self.analysis['preset'] == 'solver' else self.analysis['preset']) if self.analysis else None,
                         jobs=self.job_list())
 
     def job_list(self):
