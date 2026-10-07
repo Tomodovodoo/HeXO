@@ -614,14 +614,21 @@ inline void Producer::run()noexcept{
    // another proof/selection pass for each available snapshot slot.
    while(neural && int(outstanding.size())<broker.pending && !pool.stopped && !broker.cancelled && !this->retiring){
     neural=broker.admission(pause_token);if(!neural)break;
+    bool proof_changed=false;
+    if(pool.proof_collect && pool.proof_ready && pool.proof_ready(pool.proof_owner)){
+     auto start=broker.profile_enabled?Clock::now():Clock::time_point{};
+     auto proofs=pool.proof_collect(pool.proof_owner);broker.collected(start,proofs);proof_changed=proofs!=0;
+    }
     bool any_active=false;
     for(size_t i=0;i<pool.games.size();++i){
      auto& game=pool.games[i];
-     if(!game->stopped && game->expired()){
-      game->deadline=true;game->stop();
-      if(broker.continuous && active[i]){
-       auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
-      }
+     if(!game->stopped && proof_changed){
+      auto& root=*game->views[0].tree;root.proof_root();
+      if(root.board.winner>=0 || (root.root->expanded && root.root->exact_winner>=0))game->stop();
+     }
+     if(!game->stopped && game->expired()){game->deadline=true;game->stop();}
+     if(game->stopped && broker.continuous && active[i]){
+      auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
      }
      any_active|=!game->stopped;
     }
