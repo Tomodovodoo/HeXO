@@ -51,7 +51,7 @@ class RelationalPlayer:
             from neural_search import EvaluationCache, NeuralSearch
             self.cache = EvaluationCache()
             self.tree = NeuralSearch(self.evaluator, self.model_sha256, self.history, self.seed, self.cache,
-                                     tactics=True)
+                                     tactics=True, proof_solver=self.prover, proof_ms=self.proof_ms)
 
     def _sync(self, game):
         current = [tuple(cell[:2]) for cell in game.cells]

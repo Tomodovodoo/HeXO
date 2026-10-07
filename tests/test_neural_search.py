@@ -208,6 +208,29 @@ class NeuralTree(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'Invalid evaluation'):
                 invalid.fulfill(invalid.request(), prediction)
 
+    def test_unknown_proofs_reserve_inference_across_large_batches(self):
+        from unittest.mock import patch
+        clock, spent = [0.], [0.]
+        class Unknown:
+            def history(self, history, ms, **kwargs):
+                spent[0] += ms
+                clock[0] += ms/1000
+                return {'status': 'UNKNOWN'}
+        class Timed(Uniform):
+            def evaluate(self, histories):
+                clock[0] += .005
+                return super().evaluate(histories)
+        search = NeuralSearch(Timed(), 'proof-reserve', [(0,0)],
+                              proof_solver=Unknown(), proof_ms=1000)
+        self.addCleanup(search.close)
+        with patch('neural_search.time.perf_counter', side_effect=lambda: clock[0]):
+            result = search.search(32, root_samples=16, batch_size=16, milliseconds=100)
+        self.assertLessEqual(spent[0], 25)
+        self.assertGreater(result['evaluated'], 0)
+        ref = Reference()
+        ref.play(0,0)
+        ref.play(*result['action'])
+
     def test_verified_pending_turn_and_rejected_certificate(self):
         from tactical_proof import NativeTactics
         try:
@@ -217,33 +240,27 @@ class NeuralTree(unittest.TestCase):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         cert = dict(version=1, width='wide', root=0,
                     nodes=[dict(kind='immediate_win', action=[[-1,0],[4,0]])])
-        search = NeuralSearch(Uniform(), 'verified-turn', history)
+        search = NeuralSearch(Uniform(), 'verified-turn', history, proof_solver=solver, proof_ms=1000)
         self.addCleanup(search.close)
         self.assertTrue(native.hxg_begin(search.ptr, 8, 4))
         request, pending_history = search.request()
-
-        def install(history, verified):
-            """A verified leaf win installed as dense_selfplay's leaf solver installs it."""
-            game = Game(history)
-            try:
-                cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
-                moves = np.ascontiguousarray(verified['moves'], np.int64)
-                return native.hxg_prove(search.ptr, request, cells, len(cells), game.player, game.remaining,
-                                        moves, len(moves), int(verified['proof_turns']))
-            finally:
-                game.close()
         bad = dict(version=1, width='wide', root=0,
                    nodes=[dict(kind='immediate_win', action=[[8,0],[9,0]])])
-        self.assertNotEqual(solver.history(pending_history, ms=1000, certificate=bad)['status'], 'PROVEN_WIN')
+        self.assertFalse(search.fulfill_proof(request, pending_history, bad))
+        self.assertEqual(native.hxg_exact(search.ptr), -1)
         verified = solver.history(pending_history, ms=1000, certificate=cert)
         self.assertEqual(verified['status'], 'PROVEN_WIN')
+        for attacker in ('opponent', None):
+            self.assertFalse(search._install_verified_proof(request, pending_history, dict(verified, attacker=attacker)))
+            self.assertEqual(native.hxg_exact(search.ptr), -1)
         changed = [list(p) for p in pending_history]
         changed[8] = [8,4]
-        self.assertFalse(install(changed, verified))
-        self.assertIn(b'Proof history mismatch', native.hxg_error())
-        self.assertEqual(native.hxg_exact(search.ptr), -1)
-        self.assertTrue(install(pending_history, verified))
-        # The second certified placement survives tree advancement.
+        with self.assertRaisesRegex(ValueError, 'Proof history mismatch'):
+            search.fulfill_proof(request, changed, cert)
+        self.assertTrue(search.fulfill_proof(request, pending_history, cert))
+        # The second certified placement survives tree advancement even if
+        # later proof work is unavailable.
+        search.proof_solver = None
         result = search.search(8)
         self.assertEqual(result['action'], [-1,0])
         self.assertEqual(result['exact_winner'], 0)
@@ -484,11 +501,14 @@ class NeuralTree(unittest.TestCase):
             result = search.search(8)
             self.assertEqual((result['exact_winner'], result['completed']), (winner, 0))
 
-    def test_an_immediate_win_settles_the_root_without_network_work(self):
+    def test_immediate_win_does_not_query_a_slower_certificate(self):
         # Player 0 completes six with one stone. Existing exact evidence must
-        # settle this root before the network receives work.
+        # settle this root before a solver or the network receives work.
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
-        search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True)
+        class Slow:
+            def history(self, history, ms, certificate=None, **kwargs):
+                raise AssertionError('An immediate win does not need a solver query')
+        search = NeuralSearch(Uniform(), 'longer-certificate', history, tactics=True, proof_solver=Slow())
         self.addCleanup(search.close)
         result = search.search(8)
         self.assertEqual((result['proven'], result['proof_plies']), (1, 1))
