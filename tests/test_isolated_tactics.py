@@ -83,6 +83,33 @@ class Isolation(unittest.TestCase):
         self.assertEqual(results[0]['status'], 'UNKNOWN')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
+    def test_abort_without_a_running_query_keeps_the_child(self):
+        self.tactics.abort()
+        first = self.tactics.history([[0, 0]], ms=10000)
+        self.tactics.abort()
+        self.assertIn('hard deadline', self.tactics.history([[1, 1]], ms=200)['reason'])
+        self.tactics.replacement.join()
+        self.tactics.abort()
+        after = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual((first['reason'], after['reason']), ('scripted', 'scripted'))
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], after['pid'])
+        self.assertEqual(self.tactics.stats['spawns'], 2)
+
+    def test_abort_landing_after_the_answer_replaces_the_child_before_the_next_query(self):
+        line = self.tactics._line
+
+        def answered_then_aborted(deadline):
+            value = line(deadline)
+            if isinstance(value, dict) and 'reason' in value:  # the answer, not the ready line
+                self.tactics.abort()
+            return value
+
+        with patch.object(self.tactics, '_line', answered_then_aborted):
+            first = self.tactics.history([[0, 0]], ms=10000)
+        after = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual((first['reason'], after['reason']), ('scripted', 'scripted'))
+        self.assertNotEqual(after['pid'], first['pid'])
+
     def test_abandoned_native_work_replaces_child(self):
         pid = self.tactics.history([[2, 2]], ms=10000)['pid']
         self.assertEqual(self.tactics.stats['kills'], 1)
@@ -183,6 +210,34 @@ class Isolation(unittest.TestCase):
             time.sleep(0.25)
             self.assertIn('replaced', stuck.history([[0, 0]], ms=1000)['reason'])
             self.assertEqual(stuck.stats['kills'], 1)
+        finally:
+            stuck.close()
+
+    def test_cancellation_reaches_a_call_still_waiting_for_its_turn(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        results, stop = [], threading.Event()
+        with self.tactics.lock:  # an earlier query still holds the worker
+            query = threading.Thread(target=lambda: results.append(
+                self.tactics.history([[0, 0]], ms=20000, cancel_event=stop)))
+            query.start()
+            stop.set()
+            self.tactics.abort()
+        query.join(5)
+        self.assertEqual(results[0]['reason'], 'cancelled')
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
+    def test_abort_while_the_child_starts_reports_the_cancellation(self):
+        stuck = IsolatedTactics('slow-start', engine=ENGINE)
+        try:
+            results, stop = [], threading.Event()
+            query = threading.Thread(target=lambda: results.append(stuck.history([[0, 0]], ms=20000, cancel_event=stop)))
+            query.start()
+            time.sleep(.3)
+            stop.set()
+            stuck.abort()
+            query.join(5)
+            self.assertEqual(results[0]['reason'], 'cancelled')
+            self.assertEqual((stuck.stats['kills'], stuck.stats['exits']), (1, 0))
         finally:
             stuck.close()
 
