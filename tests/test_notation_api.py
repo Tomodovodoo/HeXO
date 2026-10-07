@@ -269,6 +269,108 @@ class OfficialAPI(unittest.TestCase):
 
 
 class TimedClocks(unittest.TestCase):
+    def test_clocked_opponent_reply_after_search_cutoff_is_kept(self):
+        from timed_engine import TimedEngine
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        for kind in ('native', 'seal'):
+            with self.subTest(kind=kind):
+                clock = [0.]
+                engine = TimedEngine.__new__(TimedEngine)
+                engine.config = dict(kind=kind)
+                engine.external, engine.checkpoint, engine.model_sha256 = False, kind, ''
+                engine.lock, engine.cancellation = threading.Lock(), threading.Event()
+                engine.generation, engine.busy = 0, False
+                engine.process = SimpleNamespace(is_alive=lambda: True)
+                def advance(seconds):
+                    clock[0] += seconds
+                def poll(timeout=0):
+                    advance(timeout)
+                    return engine.busy and clock[0] >= .092
+                engine.connection = Mock(poll=poll)
+                engine.connection.recv.return_value = (1, 'done', dict(moves=[[1, 0], [2, 0]], nodes=123))
+                game = Game([[0, 0]])
+                try:
+                    with patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]), \
+                            patch('timed_engine.time.sleep', side_effect=advance):
+                        result = engine.turn(game, 100)
+                finally:
+                    game.close()
+                self.assertEqual(result['nodes'], 123)
+                self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                self.assertLess(result['elapsed_ms'], 100)
+                self.assertFalse(engine.busy)
+
+    def test_native_controller_releases_precise_timer_on_close_or_startup_failure(self):
+        from timed_engine import TimedEngine
+        from unittest.mock import Mock
+        for ready in (True, False):
+            with self.subTest(ready=ready), patch('timed_engine.mp.get_context') as context_type, \
+                    patch('timed_engine.precise_timer') as request_timer:
+                context = context_type.return_value
+                connection = Mock()
+                connection.poll.return_value = ready
+                connection.recv.return_value = ('ready', dict(checkpoint='test'))
+                context.Pipe.return_value = connection, Mock()
+                context.Process.return_value.is_alive.return_value = False
+                config = dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(enabled=False))
+                if ready:
+                    engine = TimedEngine(config)
+                    engine.close()
+                    engine.close()
+                else:
+                    with self.assertRaises(TimeoutError):
+                        TimedEngine(config)
+                request_timer.assert_called_once_with()
+                request_timer.return_value.timeEndPeriod.assert_called_once_with(1)
+
+    def test_native_clocked_reply_does_not_wait_for_resource_drain(self):
+        from timed_engine import TimedEngine
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        clock = [0.]
+        chosen = dict(moves=[[1, 0], [2, 0]], turn_complete=True, completed=8, stop_reason='deadline')
+        for complete in (False, True):
+            with self.subTest(turn_complete=complete):
+                clock[0] = 0.
+                engine = TimedEngine.__new__(TimedEngine)
+                engine.config = dict(kind='bubble', search=dict(native_scheduler=True))
+                engine.external, engine.checkpoint, engine.model_sha256 = False, 'test', 'test'
+                engine.lock, engine.cancellation = threading.Lock(), threading.Event()
+                engine.generation, engine.busy = 0, False
+                engine.process = SimpleNamespace(is_alive=lambda: True)
+                delivered = [False]
+                def poll(timeout=0):
+                    if not engine.busy:
+                        return False
+                    if not delivered[0]:
+                        clock[0] = .09
+                        return True
+                    clock[0] = .097
+                    return True
+                def receive():
+                    if not delivered[0]:
+                        delivered[0] = True
+                        return (1, 'progress', dict(chosen, turn_complete=complete))
+                    return (1, 'done', dict(chosen, moves=[[1, 0], [3, 0]]))
+                engine.connection = Mock(poll=poll, recv=Mock(side_effect=receive))
+                game = Game([[0, 0]])
+                try:
+                    with patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                        result = engine.turn(game, 100)
+                finally:
+                    game.close()
+                self.assertEqual(result['moves'], [[1, 0], [2, 0] if complete else [3, 0]])
+                self.assertEqual(engine.connection.recv.call_count, 1 if complete else 2)
+                self.assertEqual(engine.busy, complete)
+                self.assertEqual(engine.cancellation.is_set(), complete)
+                self.assertLess(result['elapsed_ms'], 100)
+                self.assertEqual(result['stop_reason'], 'deadline')
+                limits = engine.connection.send.call_args.args[0][2]
+                self.assertAlmostEqual(limits['search_deadline'], .08)
+                self.assertAlmostEqual(limits['hard_deadline'], .1)
+                self.assertLess(limits['response_deadline'], .1)
+
     def test_clocked_comparison_book_settings_and_paired_scores(self):
         from timed_match import side_settings, paired_openings, comparison_summary
         from dense_openings import canonical
