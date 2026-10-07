@@ -3326,8 +3326,6 @@ class Session:
         if not keeps_clock(entry):
             raise ValueError(f"{entry['name']} plays a fixed budget; its adapter cannot keep a clock")
         if kind == 'bubble':
-            if budget.get('leaf_nodes'):
-                raise ValueError('The timed Bubble adapter does not support a separate leaf-proof allowance')
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,

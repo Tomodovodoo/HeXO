@@ -14,8 +14,8 @@ of that question.
 ## Implementation status
 
 The hybrid scheduler runs search in native graph owners, proofs on CPU workers and network batches on the GPU.
-Self-play runs it by default (`ActorSettings.hybrid_scheduler`), and so does every searching timed Bubble turn
-(`timed_engine.hybrid_turn`). With the actor setting off, the Python-coordinated search of `python/neural_search.py`
+Self-play runs it by default (`ActorSettings.hybrid_scheduler`), and so do every searching timed Bubble turn
+(`timed_engine.hybrid_turn`) and every Bubble search of the Play page (`play.search`, docs/play.md). With the actor setting off, the Python-coordinated search of `python/neural_search.py`
 and `python/dense_selfplay.py` runs instead; the evaluator's games (`dense_eval.MatchGame`) always run on that search.
 
 | Area | Current implementation | Delivery |
@@ -148,8 +148,8 @@ proofs while placements rise 4% and machine CPU falls 8 points; below it the pro
 grow. The actor default is 0.1. Hybrid timed play keeps 2 proof workers and budget 1 (`timed_engine.PROOF_BUDGET`);
 with two workers the owner stays far below any cap. The analysis solver preset (docs/play.md) gives the proof
 workers the whole budget, since there the proof is the answer. Out of the box, the Play page's Standard analysis
-proved 46 of the 66 puzzles in Tom's set, all within 2.2 s, and the other 20 never; a 4-million-node root query
-proved one more.
+proves 46 of the 66 puzzles in Tom's set on main/185000 within about 2.3 s, on the hybrid search as on the older
+one, and the other 20 never; a 4-million-node root query proved one more.
 
 A general 5x improvement has not been established. Neither an assumed
 100 microseconds/row host cost nor four halving rounds supplies a speed forecast.

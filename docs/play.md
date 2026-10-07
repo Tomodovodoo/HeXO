@@ -57,7 +57,8 @@ The clock belongs to the match and applies to both seats:
 | Game | `--tc 180+2` | 180 seconds per player, plus two seconds after a complete turn |
 
 Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
-across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
+across the whole turn, and its solver nodes only switch its proof work on or off, since a timed turn's proofs run
+in time slices inside the allowance; Six receives nodes plus movetime or
 both clocks and increments; Drip and Seal receive the smaller of their ms ceiling and the allocated time.
 Strix/Pulsatrix and Six-protocol drivers of other bots (Shrimp) are refused under a clock: their adapters play a
 fixed budget and cannot return an interrupted search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing

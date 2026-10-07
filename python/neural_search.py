@@ -105,7 +105,7 @@ class NeuralSearch:
     leave it false when retaining analysis for undo. `round_barrier` keeps sampled root candidates fixed
     within each halving round while permitting concurrent work across visit layers; default false."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
-                 tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
+                 tactics=False, graph=False, q_range_floor=0., root_noise=0.,
                  limit=None, archive_bytes=0, archive_forward=False, round_barrier=False):
         if not model_version:
             raise ValueError('A model version is required')
@@ -115,7 +115,6 @@ class NeuralSearch:
         if not self.ptr:
             raise MemoryError('Native tree allocation failed')
         self.history = []
-        self.proof_solver, self.proof_ms = proof_solver, proof_ms
         checked(native.hxg_tactics(self.ptr, int(tactics)))
         checked(native.hxg_graph(self.ptr, int(graph)))
         try:
@@ -175,32 +174,6 @@ class NeuralSearch:
         return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds,
                                        stop=stop, choice=choice, q_range_floor=q_range_floor,
                                        root_noise=root_noise)[0]
-
-    def fulfill_proof(self, request, history, certificate, milliseconds=None):
-        """Verify a certificate against this pending state before exact backup."""
-        if self.proof_solver is None:
-            raise ValueError('A native certificate verifier is required')
-        result = self.proof_solver.history(history, ms=self.proof_ms if milliseconds is None else milliseconds,
-                                          certificate=certificate)
-        return self._install_verified_proof(request, history, result)
-
-    def _install_verified_proof(self, request, history, result):
-        """Install this leaf's already verified solver verdict; native checks its history, phase and turn."""
-        if (result.get('status') != 'PROVEN_WIN' or not result.get('native_verified')
-                or result.get('attacker') != 'mover'):
-            return False
-        moves = result.get('moves', [])
-        if not moves:
-            return False
-        game = Game(history)
-        try:
-            h = np.ascontiguousarray(history, dtype=np.int64).reshape(-1, 2)
-            checked(native.hxg_prove(self.ptr, request, h, len(h), game.player,
-                                    game.remaining, np.ascontiguousarray(moves, dtype=np.int64), len(moves),
-                                    int(result['proof_turns'])))
-        finally:
-            game.close()
-        return True
 
     def expand(self):
         """Evaluate the root (through the cache) when it has no edges yet and the game goes on, so `mark` can
@@ -349,9 +322,9 @@ class GameGraph(NeuralSearch):
     searches at most `limit` expanded nodes are kept (0: no bound), the least recently used leaves leaving first.
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 
-    def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
-                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0, archive_forward=False, round_barrier=False):
-        super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
+    def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, q_range_floor=0.,
+                 root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0, archive_forward=False, round_barrier=False):
+        super().__init__(evaluator, model_version, history, seed, cache, tactics,
                          q_range_floor=q_range_floor, root_noise=root_noise, limit=limit, archive_bytes=archive_bytes,
                          archive_forward=archive_forward, round_barrier=round_barrier)
 
@@ -377,7 +350,6 @@ class GameGraph(NeuralSearch):
         view = object.__new__(GameGraph)
         view.ptr, view.history = address, list(cells)
         view.evaluator, view.model_version, view.cache = self.evaluator, self.model_version, self.cache
-        view.proof_solver, view.proof_ms = self.proof_solver, self.proof_ms
         return view
 
     def counters(self):
@@ -484,7 +456,7 @@ class SearchCoordinator:
         `q_range_floor` and `root_noise`, when given, become every tree's floor and root noise (NeuralSearch) from
         this search on; None keeps each tree's own.
 
-        Play chooses the highest improved policy by default; choice='gumbel' uses the
+        The default choice is the highest improved policy; choice='gumbel' uses the
         final Gumbel score. Actors call result() directly and retain Gumbel exploration.
         """
         if choice not in ('policy', 'gumbel'):
@@ -507,7 +479,6 @@ class SearchCoordinator:
             raise ValueError('Positive search budgets required')
         starts, finishes = [], [None]*len(searches)
         evaluated, hits = [0]*len(searches), [0]*len(searches)
-        proof_spent = [0.]*len(searches)
         active = set()
         cursor = 0
         try:
@@ -556,25 +527,6 @@ class SearchCoordinator:
                             idle += 1
                         else:
                             idle = 0
-                            search = searches[i]
-                            if search.proof_solver is not None:
-                                def proof_budget():
-                                    return search.proof_ms if limits[i] is None else min(search.proof_ms,
-                                        max(0, int(min(limits[i]/4-proof_spent[i],
-                                            (limits[i]-(time.perf_counter()-starts[i])*1000)/4))))
-                                allowance = proof_budget()
-                                if allowance:
-                                    proof_start = time.perf_counter()
-                                    proof = search.proof_solver.history(history, ms=allowance)
-                                    proof_spent[i] += (time.perf_counter()-proof_start)*1000
-                                    if finished(i):
-                                        continue
-                                    if proof.get('status') == 'PROVEN_WIN' and proof.get('native_verified'):
-                                        proof_start = time.perf_counter()
-                                        fulfilled = search._install_verified_proof(request, history, proof)
-                                        proof_spent[i] += (time.perf_counter()-proof_start)*1000
-                                        if fulfilled:
-                                            continue
                             key = self.cache.key(history, self.model_version)
                             cached = self.cache.get(key)
                             if cached is None:
