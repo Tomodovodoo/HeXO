@@ -310,9 +310,10 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                     with suppress(Exception):
                         await pending
             finally:
-                # Server shutdown can cancel this handler while it waits for its last answer; the engine still closes.
+                # Server shutdown can cancel this handler, also while the close waits for a worker thread; the shield
+                # keeps that close from being dropped.
                 if engine:
-                    await asyncio.to_thread(engine.close)
+                    await asyncio.shield(asyncio.to_thread(engine.close))
         return ws
 
     async def create(request):
