@@ -310,7 +310,7 @@ class TimedClocks(unittest.TestCase):
                 self.assertEqual(engine.cancellation.is_set(), complete)
                 self.assertLess(result['elapsed_ms'], 100)
                 limits = engine.connection.send.call_args.args[0][2]
-                self.assertAlmostEqual(limits['search_deadline'], .09)
+                self.assertAlmostEqual(limits['search_deadline'], .08)
                 self.assertLess(limits['response_deadline'], .1)
 
     def test_clocked_comparison_book_settings_and_paired_scores(self):

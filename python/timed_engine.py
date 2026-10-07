@@ -728,15 +728,17 @@ class TimedEngine:
     def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
         history = [list(cell[:2]) for cell in game.cells]
         started = time.monotonic()
-        limits = allowance(clock, game.player, milliseconds)
+        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
+                          self.config.get('search', {}).get('native_scheduler') and
+                          self.config.get('search', {}).get('enabled', True))
+        # Leave time to finalize a graph root and transfer its immutable result,
+        # in addition to delivering the turn through the controller.
+        limits = allowance(clock, game.player, milliseconds, reserve_ms=20 if native_clocked else 10)
         if clock and self.config.get('kind') == 'six':
             # A clock-aware external engine owns its allocation, bounded by the host's remaining clock.
             remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
             limits['hard_ms'] = remaining if milliseconds is None else min(remaining, milliseconds)
             limits['clock'] = dict(clock)
-        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
-                          self.config.get('search', {}).get('native_scheduler') and
-                          self.config.get('search', {}).get('enabled', True))
         # Native search stops before the reserve. Leave three milliseconds of
         # that reserve for validating and delivering the selected turn.
         response_ms = limits['hard_ms']-min(3., limits['reserve_ms']) if native_clocked else limits['hard_ms']-limits['reserve_ms']
