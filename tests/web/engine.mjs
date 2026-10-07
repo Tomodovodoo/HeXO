@@ -142,7 +142,7 @@ if (job.kind === 'encode') {
       channel.port1.onmessage = () => {messageCancelled = true;channel.port1.close();channel.port2.close();};
       channel.port2.postMessage('cancel');
     }
-    if (job.delay) {
+    if (job.delay && forwardCalls <= (job.delayedForwards ?? Infinity)) {
       await new Promise(resolve => setTimeout(resolve, job.delay));
       readyBeforeResult = Math.max(readyBeforeResult, Number(owner.m._hxgf_queued(owner.feed)));
     }
