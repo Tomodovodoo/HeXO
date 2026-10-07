@@ -294,13 +294,12 @@ console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal
     def test_saves_under_older_engine_ids_read_back_as_drip(self):
         source = """import {PlayStorage} from './web/engine/storage.mjs';
 const storage=new PlayStorage(null),key='browser:native|null|abc|';
-await storage.put('sessions',{id:'live',seats:[{engine:'browser:bubble',preset:'custom',budget:{simulations:64,native_owner:true,native_proof:true,native_capture:false,leaf_nodes:2048,leaf_ms:10}},{engine:'browser:native',preset:'quick'}],
+await storage.put('sessions',{id:'live',seats:[{engine:'browser:bubble',preset:'custom',budget:{simulations:64,native_owner:true,native_proof:true,native_capture:false}},{engine:'browser:native',preset:'quick'}],
  match:{players:[{engine:'browser:native',name:'Native (browser)',version:key},{engine:'browser:six',name:'Six (browser)'}]}});
 await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine_key:key,note:'native'});
 await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
 await storage.put('evaluations',{id:'browser:drip|null|abc||{}|0,1',engine:'browser:drip',note:'newer'});
 await storage.put('evaluations',{id:'other',engine:'browser:six',name:'Native (browser)',kind:'six'});
-await storage.put('evaluations',{id:'bubble',engine:'browser:bubble',budget:{simulations:8,solver_nodes:0,hybrid_scheduler:true,hybrid_proof:false,hybrid_capture:false,leafNodes:1},hybrid_scheduler:[{completed:8}],moves:[[1,0]]});
 const target=new PlayStorage(null);
 await target.put('evaluations',{id:'browser:drip|x',engine:'browser:drip',note:'present'});
 await target.restore({format:'hexo-browser-save',version:1,sessions:[],games:[],matches:[],coverage:[],
@@ -311,14 +310,14 @@ console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluat
                               capture_output=True, text=True, check=True)
         result = json.loads(done.stdout)
         self.assertEqual(result['session']['seats'][1], dict(engine='browser:drip', preset='quick'))
-        self.assertEqual(result['session']['seats'][0]['budget'], dict(simulations=64))
+        self.assertEqual(result['session']['seats'][0]['budget'],
+                         dict(simulations=64, hybrid_scheduler=True, hybrid_proof=True, hybrid_capture=False))
         self.assertEqual(result['session']['match']['players'],
                          [dict(engine='browser:drip', name='Drip (browser)', version='browser:drip|null|abc|'),
                           dict(engine='browser:six', name='Six (browser)')])
         self.assertEqual(sorted(result['evaluations'], key=lambda r: r['id']),
                          [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip', engine_key='browser:drip|null|abc|',
                                note='native'), dict(id='browser:drip|null|abc||{}|0,1', engine='browser:drip', note='newer'),
-                          dict(id='bubble', engine='browser:bubble', budget=dict(simulations=8, solver_nodes=0), moves=[[1, 0]]),
                           dict(id='other', engine='browser:six', name='Native (browser)', kind='six')])
         self.assertEqual(result['restored'], [dict(id='browser:drip|x', engine='browser:drip', note='backup')])
 
@@ -407,14 +406,14 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(browser[1]['top'][0][:2], [6,-4])
         self.assertEqual([r['proof']['plies'] for r in browser], [52]*3)
 
-    def test_frontier_certificate_is_visible_before_the_first_stone_and_after_reload(self):
+    def test_leaf_certificate_is_visible_before_the_first_stone_and_after_reload(self):
         from tests.test_tactical_proof import LATE_WIN
         history = [list(p) for p in LATE_WIN] + [[-1, -11]]
-        # One root node leaves the proof to the owner's frontier, whose records the turn returns.
-        found = node(dict(kind='worker-turn', adapter=True, history=history, simulations=512, nodes=1))
+        found = node(dict(kind='worker-turn', adapter=True, history=history, simulations=8, nodes=0,
+                          leafNodes=2048, leafQueryMs=1000))
         self.assertEqual(found['proof']['winner'], 0)
         self.assertGreater(len(found['pv']), 5)
-        self.assertIn(dict(history=history, winner=0, plies=found['proof']['plies'], pv=found['pv']), found['proofs'])
+        self.assertEqual(found['pv'], found['proofs'][0]['pv'])
         line = [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in found['pv']]
         for record in (found, dict(found, proof=None, pv=[])):
             answer = node(dict(kind='proofs', history=history, ply=len(history), found=record))
@@ -809,12 +808,12 @@ class Bundle(unittest.TestCase):
 
     def test_browser_worker_native_proofs_return_checked_evidence(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
-        answer = node(dict(kind='worker-turn',history=history,simulations=4096,nodes=1,ms=2000,solverSlice=128,proofStamps=False))
+        answer = node(dict(kind='worker-turn',history=history,simulations=4096,nodes=32768,ms=2000,hybridScheduler=True,hybridProof=True,solverSlice=128,proofStamps=False))
         self.assertTrue(answer['proofs'])
         self.assertTrue(answer['proof'])
         self.assertTrue(answer['solved'])
         self.assertGreater(answer['actual_solver_nodes'], 0)
-        self.assertGreater(answer['scheduler'][0]['proof']['installed'], 0)
+        self.assertGreater(answer['hybrid_scheduler'][0]['proof']['installed'], 0)
 
     def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
         import re
@@ -912,47 +911,17 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(answer['result']['node_value'], -1.)
 
     def test_native_browser_owner_turn_uses_shared_graph_and_releases_views(self):
-        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0))
+        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0, hybridScheduler=True))
         self.assertEqual(len(result['moves']), 2)
-        self.assertEqual(len(result['scheduler']), 2)
-        self.assertEqual(result['actual_completed'], sum(stats['completed'] for stats in result['scheduler']))
+        self.assertEqual(len(result['hybrid_scheduler']), 2)
         game = play.Game([[0,0]])
         try:
             for move in result['moves']:
                 self.assertTrue(game.legal(*move))
                 game.play(*move)
         finally: game.close()
-        for stats in result['scheduler']:
+        for stats in result['hybrid_scheduler']:
             self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
-            self.assertGreaterEqual(stats['completed'], 256)
-            self.assertNotIn('proof', stats)
-
-    def test_a_cancel_ends_a_turn_whose_proof_workers_are_still_starting(self):
-        answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, stallPrepare=True))
-        self.assertEqual(answer['replies'], ['cancelled'])
-        self.assertLess(answer['ms'], 2000)
-
-    def test_a_browser_without_nested_workers_still_searches(self):
-        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, noWorkers=True))
-        self.assertEqual(len(result['moves']), 2)
-        self.assertIn('nested workers are not allowed', result['solver_error'])
-        self.assertTrue(all(stats['completed'] >= 32 for stats in result['scheduler']))
-        solver = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, proveMs=2000, noWorkers=True))
-        self.assertIn('nested workers are not allowed', solver['solver_error'])
-        self.assertGreater(solver['solver_frames'], 1)   # the owner reports while the root prover is out
-        answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, warm=True, noWorkers=True))
-        self.assertEqual((answer['tried'], answer['retried']), (1, 0))
-        self.assertEqual(len(answer['moves']), 2)
-
-    def test_proof_workers_start_before_the_clock_and_serve_the_turn(self):
-        answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, warm=True))
-        self.assertEqual((answer['warmed'], answer['after']), (2, 2))
-        self.assertEqual(len(answer['moves']), 2)
-
-    def test_a_refresh_budget_below_one_quantum_still_searches(self):
-        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))
-        self.assertEqual(len(result['moves']), 2)
-        self.assertTrue(all(stats['completed'] >= 2 for stats in result['scheduler']))
 
     def test_native_browser_owner_stops_split_forwards_at_cancellation_or_proof(self):
         for control in (dict(cancel=True, cancelAfter=3), dict(stopAfter=3), dict(prove=True, proveAfter=3)):
@@ -1000,11 +969,12 @@ class Bundle(unittest.TestCase):
         result = answer['result']
         self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])
 
-    def test_every_preset_sends_its_work_and_proof_workers(self):
-        for request in node(dict(kind='owner-adapter')):
-            self.assertGreater(request['simulations'], 0)
-            self.assertGreater(request['solverNodes'], 0)
-            self.assertTrue(1 <= request['solverWorkers'] <= 8)
+    def test_browser_adapter_keeps_the_hybrid_scheduler_opt_in(self):
+        ordinary, compiled = node(dict(kind='owner-adapter'))
+        self.assertFalse(ordinary['hybridScheduler'])
+        self.assertTrue(compiled['hybridScheduler'])
+        self.assertFalse(ordinary['hybridCapture'])
+        self.assertTrue(compiled['hybridCapture'])
 
     def test_worker_does_not_admit_models_while_cached_session_cleanup_fails(self):
         answer = node(dict(kind='worker-model-cache'))
@@ -1016,6 +986,33 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['recovered']['live'], ['G','H'])
         self.assertEqual(answer['recovered']['largest'], 2)
         self.assertEqual(answer['remaining'], 0)
+
+    def test_captured_inputs_change_and_buffers_drain_before_eviction_or_close(self):
+        answer = node(dict(kind='capture-runtime'))
+        self.assertEqual(answer['values'], [3,6,9,12,9])
+        self.assertEqual(answer['shapes'], [3*24*24,3,3])
+        self.assertEqual({k:answer['rectangular'][k] for k in ('policy','far','value','physical')},
+                         dict(policy=3*24*72,far=3,value=3,physical=4))
+        self.assertEqual((answer['physical'], answer['reused']), (4,1))
+        self.assertLessEqual(answer['bounds']['actual_cells'], 65536)
+        self.assertGreater(answer['bounds']['stats']['evictions'], 0)
+        self.assertTrue(answer['stopped'])
+        self.assertEqual(answer['fence_error'], 'Device fence failed')
+        self.assertEqual(answer['dispose_error'], 'Output release failed')
+        self.assertEqual(answer['outputs_retained'], 1)
+        self.assertTrue(answer['other_outputs_drained'])
+        self.assertEqual((answer['recovered'], answer['last']), (5,7))
+        self.assertEqual(answer['closed_error'], 'Native captures are closed')
+        self.assertEqual(answer['release_error'], 'Session release failed')
+        self.assertEqual(answer['release_failure'], dict(entries=1,sessions=1,base_releases=1,buffers=0))
+        self.assertEqual(answer['base_releases'], 1)
+        self.assertEqual(answer['eviction_error'], 'Session release failed')
+        self.assertTrue(answer['poisoned_model'])
+        self.assertEqual(answer['eviction_base_releases'], 1)
+        self.assertEqual(answer['reloaded_value'], 15)
+        self.assertEqual(answer['final']['stats']['unreleased_outputs'], 0)
+        self.assertEqual([answer['final'][key] for key in ('active','freedBusy','mapped','buffers','sessions')], [0]*5)
+        self.assertEqual(answer['final']['created'], answer['final']['released'])
 
     def test_stored_turn_reconnects_proofs_in_either_stone_order(self):
         from tests.test_neural_search import Uniform
@@ -1165,20 +1162,20 @@ class Bundle(unittest.TestCase):
         self.assertEqual(found['proof']['plies'],22)
         self.assertEqual((found['actual_completed'],found['actual_solver_nodes']),(0,0))
 
-    def test_live_values_stay_at_the_requested_root(self):
+    def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
         history = [[0, 0], [1, 0], [1, 1], [-1, 0]]
         for length in (1, 2, 3, 4):
             root = history[:length]
             for repeat, turn in enumerate(node(dict(kind='glimpse', history=root, simulations=32, nodes=0))):
                 with self.subTest(length=length, repeat=repeat):
+                    self.assertTrue(turn['checked'], 'The principal-variation check must run')
                     self.assertTrue(turn['live'])
                     fractions = [p['fraction'] for p in turn['progress']]
                     self.assertEqual(fractions, sorted(fractions))
-                    self.assertTrue(0 <= turn['result']['value'] <= 1)
+                    self.assertAlmostEqual(turn['result']['value'], .93, places=4)
                     for glimpse in turn['live']:
+                        self.assertAlmostEqual(glimpse['value'], turn['result']['value'], places=4)
                         self.assertEqual(glimpse['root'], root)
-                        self.assertTrue(0 <= glimpse['value'] <= 1)
-                        self.assertTrue(glimpse['top'])
 
     def test_root_candidates_are_published_before_the_solver_runs(self):
         root = [[0, 0], [1, 0]]
@@ -1190,6 +1187,15 @@ class Bundle(unittest.TestCase):
                 fractions = [p['fraction'] for p in turn['progress']]
                 self.assertEqual(fractions, sorted(fractions))
                 self.assertEqual(turn['evaluations'].count(root), 1)
+
+    def test_cached_search_receives_cancellation_messages(self):
+        result = node(dict(kind='cached-cancel'))
+        self.assertTrue(result['received'])
+        self.assertTrue(result['stopped'])
+        self.assertLess(result['completed'], 128)
+        self.assertGreater(result['hits'], 0)
+        self.assertEqual(result['forwards'], 0)
+        self.assertEqual(result['retry'], dict(completed=128, unchanged=True))
 
     def test_analysis_failure_stays_visible_and_can_be_retried(self):
         result = node(dict(kind='analysis-failure'))
@@ -1215,15 +1221,21 @@ class Bundle(unittest.TestCase):
         for bar in node(dict(kind='analysis-bar', cases=cases)):
             self.assertEqual((bar['x'], bar['o']), ('>99', '<1'))
 
-    def test_the_proof_frontier_proves_a_losing_half_turn(self):
+    @slow
+    def test_solver_leaves_prove_a_losing_half_turn(self):
         history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],
                    [-3, 1], [-1, 1], [-2, -1], [-4, 0], [-3, 0], [0, -1], [-2, -3], [-2, -2],
                    [-2, 1], [-2, -5], [-3, -1], [-1, -3], [-5, 1], [0, -4], [-4, 1], [-4, -1], [-5, -1]]
-        # One root node leaves the proof to the owner's frontier.
-        turn = node(dict(kind='worker-turn', history=history, simulations=2048, nodes=1, solverSlice=64))
+        found = node(dict(kind='proof-search', history=history, simulations=2048, nodes=524288))
+        self.assertEqual((found['exact_winner'], found['proven']), (0, -1))
+        self.assertGreater(found['proof_plies'], 0)
+        self.assertLess(found['completed'], 2048)
+        self.assertTrue(all(v == -1. for v in found['values']))
+        self.assertLessEqual(found['nodes_used'], 524288)
+        self.assertGreater(found['queries'], 0)
+        turn = node(dict(kind='worker-turn', history=history, simulations=2048, nodes=0, leafNodes=524288, leafQueryMs=100))
         self.assertEqual((turn['proof']['winner'], turn['value']), (0, 0.))
         self.assertLess(turn['actual_completed'], 2048)
-        self.assertGreater(turn['scheduler'][0]['proof']['installed'], 0)
         self.assertTrue(all(row[3:] == [0., -1] for row in turn['top']))
 
     def test_artefacts_match_their_sources(self):
@@ -1531,11 +1543,11 @@ class Bundle(unittest.TestCase):
             self.assertEqual(case['after']['discarded']-case['before']['discarded'], 2 if case['forward'] else 0)
             self.assertEqual(case['counters']['pending'], 0)
             self.assertEqual(case['counters']['views'], 1)
-        growth = found['proofGrowth']
-        self.assertGreaterEqual(growth['before']['nodes'], 2)
-        self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])
-        self.assertLessEqual(growth['after']['bytes'], growth['after']['limit'])
-        self.assertEqual(growth['returnedWinner'], growth['winner'])
+        for growth in (found['proofGrowth'], found['leafProofGrowth']):
+            self.assertGreaterEqual(growth['before']['nodes'], 2)
+            self.assertGreater(growth['after']['discarded'], growth['before']['discarded'])
+            self.assertLessEqual(growth['after']['bytes'], growth['after']['limit'])
+            self.assertEqual(growth['returnedWinner'], growth['winner'])
 
     def test_a_root_reads_and_resumes_its_deeper_branch(self):
         """A -> B -> A in the browser's GameGraph: after B is searched as a root and found lost for A's mover, A's

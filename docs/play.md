@@ -391,9 +391,8 @@ neural search reaches, with the whole owner budget. The panel shows that work in
 queued and running proof jobs, busy workers, then the winner and distance, or the nodes and certificates spent
 without a proof. The turn and candidates are searched afterwards at the Standard simulations, from the proven turn
 when there is one. Solver evaluations are saved under their own key (`~solver120000`) and their proofs join the
-game's proof table like any other; engine seats cannot use the preset. The static page has the same switch. Its
-proof workers are Web Workers, half the browser's threads less one, from one to eight (`PROOF_WORKERS`, see
-[web-engine.md](web-engine.md)).
+game's proof table like any other; engine seats cannot use the preset. The static page has the same switch, with up
+to eight proof workers in Web Workers.
 
 Each cell has fixed places for its marks, so none hides another. A candidate is a ring with its rank and, below,
 the mover's win chance after it: rank 1 green, the others blue to red by how far they fall behind it. A proven line
@@ -471,11 +470,6 @@ The official client (`board-renderer/src/themes/darkColors.ts`) draws player 0, 
 order. Bubble had it the other way round.
 
 ## Bubble in the browser
-
-On the static page every Bubble search runs the hybrid scheduler on the game's graph, as the served page does: a
-preset's simulations are the owner's work per stone, and its solver nodes the root queries' budget, with the
-owner's proof frontier on the page's proof workers whenever that budget is above 0. A refresh searches with a quarter
-of the saved evaluation's simulations and no proof work. [web-engine.md](web-engine.md) has the settings.
 
 On an isolated page ONNX Runtime runs on the cores but one WebAssembly threads, at most 8. On hosts where the
 runtime's thread workers never come up (the Claude desktop browser pane is one), the engine notices the stalled

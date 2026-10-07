@@ -26,7 +26,7 @@ import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 import {runInNewContext} from 'node:vm';
 import {encode, features} from '../../web/engine/encode.mjs';
-import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, NativeOwner, NativeProofs} from '../../web/engine/search.mjs';
+import {Native, NeuralSearch, EvaluationCache, GameGraph, GameGraphs, NativeOwner, NativeProofs, PV_CHECK} from '../../web/engine/search.mjs';
 import {principalVariation, topRows, Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven} from '../../web/engine/proof.mjs';
 import createModule from '../../web/engine/gumbel.mjs';
 import {OfflineSession} from '../../web/engine/offline.mjs';
@@ -40,43 +40,6 @@ import {loadTactical, proofAnswer} from '../../web/engine/tactical.mjs';
 
 const job = JSON.parse(readFileSync(0, 'utf8'));
 const native = new Native(await createModule());
-
-/** One search of `tree` (a NeuralSearch, a GameGraph or one of its views) through the per-leaf hxg_* ABI, batched as
- * python/neural_search.py NeuralSearch.search batches it, so the wasm build can be checked against the native library.
- * `evaluate([{history, actions}])` resolves to [{logits, q}]; cached leaves are answered from `cache`. Resolves to
- * the tree's result(choice). */
-async function drive(tree, {simulations = 128, rootSamples = null, batchSize = 16, evaluate, cache = new EvaluationCache(),
-  version = 'web', choice = 'policy'}) {
-  const m = tree.m;
-  native.checked(m._hxg_begin(tree.ptr, simulations, rootSamples ?? Math.max(2, Math.floor(Math.sqrt(simulations)))));
-  try {
-    for (let active = native.game(tree.history).winner < 0; active;) {
-      const pending = [];
-      let idle = false;
-      while (pending.length < batchSize && !idle) {
-        if (m._hxg_done(tree.ptr)) { active = false; break; }
-        const [id, leaf] = tree.request();
-        if (id === 0) idle = true;
-        else if (id > 0) {
-          const key = cache.key(leaf.history, version), cached = cache.get(key);
-          if (cached === undefined) pending.push({id, leaf, key});
-          else tree.fulfill(id, leaf.actions, cached);
-        }
-      }
-      if (m._hxg_done(tree.ptr)) active = false;
-      if (!active) break;
-      if (!pending.length) throw new Error('Native scheduler stalled without pending evaluations');
-      const groups = new Map();
-      for (const item of pending) groups.set(item.key, [...groups.get(item.key) ?? [], item]);
-      const unique = [...groups.values()], predictions = await evaluate(unique.map(items => items[0].leaf));
-      unique.forEach((items, i) => {
-        for (const item of items) tree.fulfill(item.id, item.leaf.actions, predictions[i]);
-        cache.put(items[0].key, {logits: Float64Array.from(predictions[i].logits), q: Float64Array.from(predictions[i].q)});
-      });
-    }
-  } finally { m._hxg_cancel(tree.ptr); }
-  return tree.result(choice);
-}
 
 async function search(item) {
   const options = {seed: item.seed, tactics: item.tactics, qRangeFloor: item.q_range_floor ?? 0, rootNoise: item.root_noise ?? 0,
@@ -97,7 +60,7 @@ async function search(item) {
       if (step.at) tree.at(step.at);
       const marks = new Map((step.marks || []).map(([q, r, winner, distance]) => [`${q},${r}`, {action: [q, r], winner, distance}]));
       const unmarked = await tree.settle(marks, {cache, evaluate});
-      const result = await drive(tree, {simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
+      const result = await tree.search({simulations: step.simulations, rootSamples: step.root_samples, batchSize: step.batch_size, cache,
         ...(step.choice ? {choice: step.choice} : {}), evaluate});
       out.push({action: result.action, policy: result.policy, visits: result.visits, completed: result.completed, proven: result.proven,
         proof_plies: result.proof_plies, native_distance: tree.m._hxg_distance(tree.ptr), unmarked: unmarked.size});
@@ -122,7 +85,7 @@ async function searched(history, table) {
     const tree = new NeuralSearch(native, {seed: 1740, tactics: true, history: current});
     try {
       if ((await tree.settle(table.edges(current), {evaluate})).size) throw new Error('The tree did not take a proven stone');
-      const result = await drive(tree, {simulations: 8, rootSamples: 16, evaluate});
+      const result = await tree.search({simulations: 8, rootSamples: 16, evaluate});
       first ??= result;
       moves.push(result.action);
       current.push(result.action);
@@ -229,8 +192,8 @@ if (job.kind === 'encode') {
     let middle = null, peer = null;
     if (job.offer || job.cancelBeforeDispatch || job.cooldown) {
       const evaluate = async leaves => leaves.map(({history,actions}) => ({logits:actions.map(()=>0),q:actions.map(()=>job.cooldown && history.length>job.history.length ? .8 : 0)}));
-      await drive(graph,{simulations:4,rootSamples:4,evaluate});
-      if(job.offer){middle=graph.view(job.offer.history.slice(0,-1));await drive(middle,{simulations:4,rootSamples:4,evaluate});
+      await graph.search({simulations:4,rootSamples:4,evaluate});
+      if(job.offer){middle=graph.view(job.offer.history.slice(0,-1));await middle.search({simulations:4,rootSamples:4,evaluate});
         peer=graph.view(job.offer.peer || job.offer.history);}
     }
     const owner = new NativeOwner(graph,{work:job.ms?0:4096,ms:job.ms??0,views:job.views??4,depth:job.depth??6});
@@ -307,10 +270,11 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'owner-adapter') {
   const fetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({networks: []}));
-  const {BubbleEngine, PRESETS} = await import('../../web/engine/bubble.mjs');
+  const {BubbleEngine} = await import('../../web/engine/bubble.mjs');
   globalThis.fetch = fetch;
   const engine = new BubbleEngine({model:'test'});engine.call = async request => request;
-  answer = await Promise.all(Object.values(PRESETS).map(budget => engine.turn([[0,0]], budget)));
+  answer = [await engine.turn([[0,0]], {simulations:128,solver_nodes:0}),
+    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,hybrid_scheduler:true,hybrid_capture:true})];
 } else if (job.kind === 'worker-model-cache') {
   const messages=[],created=[],live=new Set(),attempts=[],workerUrl=new URL('../../web/engine/worker.mjs',import.meta.url);
   let fail=true,largest=0;
@@ -332,6 +296,135 @@ if (job.kind === 'encode') {
     answer.recovered={created:[...created],live:[...live],largest,attempts:[...attempts]};
   }finally{fail=false;await runInNewContext('Promise.all([...held.values()].map(n=>n.close()))',context);}
   answer.remaining=live.size;
+} else if (job.kind === 'capture-runtime') {
+  globalThis.GPUBufferUsage = {STORAGE:1,COPY_DST:2,COPY_SRC:4,MAP_READ:8};globalThis.GPUMapMode = {READ:1};
+  let active = 0, freedBusy = 0, created = 0, released = 0, mapped = 0, stop = false, failFence = false, failDispose = false, failRelease = null;
+  const buffers = new Set(), sessions = new Set();
+  const device = {limits:{maxBufferSize:2**28},queue:{
+    writeBuffer(buffer,offset,data){new Uint8Array(buffer.bytes).set(new Uint8Array(data.buffer,data.byteOffset,data.byteLength),offset);},
+    submit(commands){for(const command of commands)for(const copy of command)copy();},
+    async onSubmittedWorkDone(){if(failFence){failFence=false;throw Error('Device fence failed');}},
+  },createBuffer({size}){
+    const buffer={size,bytes:new ArrayBuffer(size),destroyed:false,mapped:false,
+      async mapAsync(){if(this.destroyed||this.mapped)throw Error('Invalid mapped buffer');this.mapped=true;mapped++;},
+      getMappedRange(){return this.bytes;},unmap(){if(!this.mapped)throw Error('Not mapped');this.mapped=false;mapped--;},
+      destroy(){if(active)freedBusy++;this.destroyed=true;buffers.delete(this);}};
+    buffers.add(buffer);return buffer;
+  },createCommandEncoder(){const copies=[];return {
+    copyBufferToBuffer(source,start,target,offset,length){copies.push(()=>new Uint8Array(target.bytes,offset,length).set(new Uint8Array(source.bytes,start,length)));},finish(){return copies;}};}};
+  const ort={env:{webgpu:{device}},Tensor:{fromGpuBuffer(gpuBuffer,{dims}){return {gpuBuffer,dims,dispose(){}};}},InferenceSession:{
+    async create(graph,options){
+      created++;await new Promise(resolve=>setTimeout(resolve,1));
+      const {batch:rows,size,height=size,width=size}=options.freeDimensionOverrides;
+      const session={rows,size,height,width,async run({features}){
+        active++;let output;
+        try{
+          await new Promise(resolve=>setTimeout(resolve,1));
+          if(features.gpuBuffer.destroyed)throw Error('Input freed during inference');
+          if(features.dims.join()!==[rows,20,height,width].join())throw Error('Wrong captured input shape');
+          const values=new Float32Array(features.gpuBuffer.bytes),stride=20*height*width;output={};
+          for(const name of ['policy','far','value']){
+            const columns=name==='policy'?height*width:1,buffer=device.createBuffer({size:16*Math.ceil(rows*columns/4)}),data=new Float32Array(buffer.bytes);
+            for(let row=0;row<rows;row++)for(let cell=0;cell<columns;cell++)data[row*columns+cell]=values[row*stride]+graph[0]+cell/100;
+            output[name]={type:'float32',gpuBuffer:buffer,dispose(){if(failDispose){failDispose=false;throw Error('Output release failed');}buffer.destroy();}};
+          }
+          return output;
+        }finally{active--;}
+      },async release(){
+        if(active)freedBusy++;
+        if(failRelease===this){failRelease=null;throw Error('Session release failed');}
+        released++;sessions.delete(this);
+      }};
+      sessions.add(session);return session;
+    }
+  }};
+  const network = new Network(ort,{async release(){}},'fp32',{model_version:'A'},1,{provider:'webgpu',graph:new Uint8Array([1])});
+  const input = (rows,size,value) => {const area=Array.isArray(size)?size[0]*size[1]:size*size;const data=new Float32Array(rows*20*area);for(let row=0;row<rows;row++)data[row*20*area]=value+row;return data;};
+  const other = new Network(ort,{async release(){}},'fp32',{model_version:'B'},1,{provider:'webgpu',graph:new Uint8Array([7])});
+  let baseReleases = 0;
+  const faulty = new Network(ort,{async release(){baseReleases++;}},'fp32',{model_version:'C'},1,{provider:'webgpu',graph:new Uint8Array([9])});
+  let evictionBaseReleases=0;
+  const evicting = new Network(ort,{async release(){evictionBaseReleases++;}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+  let replacement, rectangular;
+  try{
+    const first=await network.forwardCaptured(input(3,24,2),3,24),second=await network.forwardCaptured(input(3,24,5),3,24);
+    const concurrent=await Promise.all([network.forwardCaptured(input(3,24,8),3,24),network.forwardCaptured(input(3,24,11),3,24)]);
+    const different=await other.forwardCaptured(input(3,24,2),3,24);await other.close();
+    answer={values:[first.value[0],second.value[0],...concurrent.map(x=>x.value[0]),different.value[0]],
+      shapes:[first.policy.length,first.far.length,first.value.length],physical:first.physical_rows,reused:network.captureStats().creates};
+    await network.forwardCaptured(input(64,24,1),64,24);await network.forwardCaptured(input(32,32,1),32,32);
+    answer.bounds={stats:network.captureStats(),actual_cells:[...sessions].reduce((sum,s)=>sum+s.rows*s.size*s.size,0)};
+    stop=false;const stopping=network.forwardCaptured(input(1,40,1),1,40,()=>stop);setTimeout(()=>{stop=true;},0);
+    answer.stopped=await stopping===null;stop=false;
+    failFence=true;try{await network.forwardCaptured(input(1,40,1),1,40);}catch(error){answer.fence_error=error.message;}
+    answer.recovered=(await network.forwardCaptured(input(1,40,4),1,40)).value[0];
+    failDispose=true;try{await network.forwardCaptured(input(1,40,4),1,40);}catch(error){answer.dispose_error=error.message;}
+    answer.outputs_retained=network.captureStats().unreleased_outputs;
+    answer.other_outputs_drained=buffers.size===2*network.captureStats().entries+1;
+    const pending=network.forwardCaptured(input(1,40,6),1,40);await new Promise(resolve=>setTimeout(resolve,0));const closing=network.close();
+    answer.last=(await pending).value[0];await closing;
+    try{await network.forwardCaptured(input(1,40,1),1,40);}catch(error){answer.closed_error=error.message;}
+    await faulty.forwardCaptured(input(1,24,1),1,24);await faulty.forwardCaptured(input(1,32,1),1,32);
+    failRelease=[...sessions][0];
+    try{await faulty.close();}catch(error){answer.release_error=error.message;}
+    answer.release_failure={entries:faulty.captureStats().entries,sessions:sessions.size,base_releases:baseReleases,buffers:buffers.size};
+    await faulty.close();await faulty.close();answer.base_releases=baseReleases;
+    await evicting.forwardCaptured(input(1,24,1),1,24);await evicting.forwardCaptured(input(64,24,1),64,24);
+    failRelease=[...sessions].find(s=>s.rows===64);
+    try{await evicting.forwardCaptured(input(32,32,1),32,32);}catch(error){answer.eviction_error=error.message;}
+    answer.poisoned_model=evicting.closed;
+    await evicting.close();answer.eviction_base_releases=evictionBaseReleases;
+    replacement=new Network(ort,{async release(){}},'fp32',{model_version:'D'},1,{provider:'webgpu',graph:new Uint8Array([13])});
+    answer.reloaded_value=(await replacement.forwardCaptured(input(1,24,2),1,24)).value[0];await replacement.close();
+    rectangular=new Network(ort,{async release(){}},'fp32',{model_version:'R',spatial_axes:['height','width']},1,{provider:'webgpu',graph:new Uint8Array([1])});
+    const r=await rectangular.forwardCaptured(input(3,[24,72],2),3,[24,72]);
+    answer.rectangular={policy:r.policy.length,far:r.far.length,value:r.value[0],physical:r.physical_rows};
+    await rectangular.close();
+    answer.final={active,freedBusy,mapped,buffers:buffers.size,sessions:sessions.size,created,released,stats:network.captureStats()};
+  }finally{await network.close();await other.close();await faulty.close();await evicting.close();await replacement?.close();await rectangular?.close();}
+} else if (job.kind === 'owner-profile') {
+  // Runtime measurements, not old/new search-row or playing-strength checks.
+  answer = {features: [], searches: []};
+  for (const history of job.histories) {
+    const graph = new GameGraph(native, {history}), owner = new NativeOwner(graph, {work: 1, ms: 0, views: 1});
+    let batch;
+    try {
+      owner.step(); batch = owner.take();
+      if (!batch) {answer.features.push({history, exact: true});continue;}
+      const sample = encode(history, native.legal(history)), count = job.repeats ?? 40, trials = [];
+      for (let i = 0; i < 5; i++) { features(sample); batch.features(0,0,1); }
+      for (const compiled of [false,true,true,false]) {
+        const begin = performance.now();
+        for (let i = 0; i < count; i++) compiled ? batch.features(0,0,1) : features(sample);
+        trials.push({compiled, ms: performance.now()-begin, rows: count});
+      }
+      answer.features.push({history, size: sample.size, trials});
+    } finally {batch?.close();owner.close();graph.close();}
+  }
+  if (job.model) {
+    const ort = await import(pathToFileURL(job.ort).href);
+    ort.env.wasm.numThreads = 1;
+    const session = await ort.InferenceSession.create(new Uint8Array(readFileSync(job.model)), {executionProviders: ['wasm']});
+    const network = new Network(ort, session, 'fp32', {model_version: job.version}, 1);
+    try {
+      for (const history of job.searchHistories ?? job.histories) {
+        await network.evaluate([{history, actions: native.legal(history)}]);
+        for (const compiled of [false,true,true,false]) {
+          const graph = new GameGraph(native, {history, roundBarrier: compiled, seed: 1740});
+          let owner;
+          try {
+            const begin = performance.now(); let result;
+            if (compiled) {
+              owner = new NativeOwner(graph, {ms: job.ms ?? 1000, work: 0, views: job.views ?? 8});
+              result = await owner.search({network, batchSize: 64});
+            } else result = await graph.search({simulations: 1024, rootSamples: 16, batchSize: 64,
+              evaluate: leaves => network.evaluate(leaves), stop: () => performance.now()-begin >= (job.ms ?? 1000)});
+            answer.searches.push({history, compiled, ms: performance.now()-begin, result});
+          } finally {owner?.close();graph.close();}
+        }
+      }
+    } finally {await session.release();}
+  }
 } else if (job.kind === 'search') {
   answer = [];
   for (const item of job.cases) answer.push(await search(item));
@@ -348,7 +441,7 @@ if (job.kind === 'encode') {
     const replacement = tree.request();install(first[1]);
     native.m._hxg_cancel(tree.ptr);
     const retired = tree.counters();
-    const result = await drive(tree, {simulations:32,rootSamples:8,batchSize:128,evaluate:async leaves => leaves.map(predict)});
+    const result = await tree.search({simulations:32,rootSamples:8,batchSize:128,evaluate:async leaves => leaves.map(predict)});
     answer = {blocked,extra:extra[0]>0,replacement:replacement[0]>0,retired,
       completed:result.completed,mass:result.policy.reduce((a,b) => a+b,0),action:result.action};
   } finally { tree.close(); }
@@ -360,12 +453,12 @@ if (job.kind === 'encode') {
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
   const cache = new EvaluationCache(0);
   try {
-    const first = await drive(graph, {simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    const first = await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
     graph.at(current);
-    await drive(graph, {simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
-    await drive(graph, {simulations:4, rootSamples:4, batchSize:16, evaluate, cache});
+    await graph.search({simulations:128, rootSamples:16, batchSize:16, evaluate, cache});
+    await graph.search({simulations:4, rootSamples:4, batchSize:16, evaluate, cache});
     graph.at(returned);const reused = graph.result();
-    const after = await drive(graph, {simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
+    const after = await graph.search({simulations:8, rootSamples:8, batchSize:16, evaluate, cache});
     answer = {first:first.visits, reused:reused.visits, after:after.visits, credits:graph.credits(), archive:graph.archive(), counters:graph.counters()};
   } finally {graph.close();}
   answer.conflicts = [];
@@ -400,29 +493,38 @@ if (job.kind === 'encode') {
   const second = original.map(c => [...c]), third = original.map(c => [...c]);
   [second[5],second[9]] = [second[9],second[5]];[second[6],second[10]] = [second[10],second[6]];
   [third[1],third[9]] = [third[9],third[1]];[third[2],third[10]] = [third[10],third[2]];
-  const bounded = new GameGraph(native, {history: original, seed: 7, limit: 1, archiveBytes: 65536});
-  try {
+  for (const leafProof of [false,true]) {
+   const bounded = new GameGraph(native, {history: original, seed: 7, limit: 1, archiveBytes: 65536});
+   try {
     for (const history of [original,second,third]) {
-      bounded.at(history);await drive(bounded, {simulations:1,rootSamples:1,batchSize:1,evaluate,cache});
+      bounded.at(history);await bounded.search({simulations:1,rootSamples:1,batchSize:1,evaluate,cache});
     }
-    bounded.at(third);const before = bounded.archive(), winner = 1-native.game(third).player;
-    bounded.proveLoss(winner,7);
+    const target = leafProof ? original.map(c => [...c]) : third;
+    if (leafProof) [target[5],target[9]] = [target[9],target[5]];
+    bounded.at(target);const before = bounded.archive();
+    const winner = leafProof ? native.game(target).player : 1-native.game(target).player;
+    if (leafProof) {
+      native.checked(bounded.m._hxg_begin(bounded.ptr,1,1));
+      const [id,leaf] = bounded.request();
+      bounded.fulfillProof(id,leaf,{attacker:'mover',moves:leaf.actions.slice(0,2),proof_turns:2});
+    } else bounded.proveLoss(winner,7);
     const after = bounded.archive();
     bounded.at(original);
-    answer.proofGrowth = {before,after,winner,returnedWinner:bounded.m._hxg_exact(bounded.ptr)};
-  } finally {bounded.close();}
+    answer[leafProof ? 'leafProofGrowth' : 'proofGrowth'] = {before,after,winner,returnedWinner:bounded.m._hxg_exact(bounded.ptr)};
+   } finally {bounded.close();}
+  }
 } else if (job.kind === 'views') {
   const parent = new GameGraph(native, {history: job.history, seed: 3});
   const evaluate = async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}));
   let view, proof;
   try {
-    await drive(parent, {simulations: 16, rootSamples: 4, batchSize: 4, evaluate});
+    await parent.search({simulations: 16, rootSamples: 4, batchSize: 4, evaluate});
     const before = parent.counters(), beforeCredits = parent.credits();
     view = parent.view(job.history, 19);
-    await drive(view, {simulations: 32, rootSamples: 8, batchSize: 8, evaluate});
+    await view.search({simulations: 32, rootSamples: 8, batchSize: 8, evaluate});
     answer = {before, after: parent.counters(), beforeCredits, afterCredits: parent.credits(), viewCredits: view.credits()};
     parent.close();
-    await drive(view, {simulations: 8, rootSamples: 4, batchSize: 4, evaluate});
+    await view.search({simulations: 8, rootSamples: 4, batchSize: 4, evaluate});
     answer.survived = view.counters();
     native.checked(native.m._hxg_begin(view.ptr, 8, 4));
     const [id, leaf] = view.request();
@@ -441,7 +543,7 @@ if (job.kind === 'encode') {
     while (native.game(current).player === player && native.game(current).winner < 0) {
       const tree = trees.graph(line, current, options);
       carried.push(tree.result().visits.reduce((a, b) => a + b, 0));
-      current.push((await drive(tree, {simulations: job.simulations, rootSamples: 16, cache, evaluate})).action);
+      current.push((await tree.search({simulations: job.simulations, rootSamples: 16, cache, evaluate})).action);
     }
     return {history: current, carried, tree: trees.graphs.get(line).graph};
   };
@@ -464,13 +566,13 @@ if (job.kind === 'encode') {
   const graph = new GameGraph(native, {seed: 5, tactics: true, history: a}), cache = new EvaluationCache();
   const pick = ({action, visits, policy, completed_q}) => ({action, visits, policy, completed_q});
   try {
-    const first = await drive(graph, {simulations: 64, rootSamples: 8, batchSize: 8, cache, evaluate});
+    const first = await graph.search({simulations: 64, rootSamples: 8, batchSize: 8, cache, evaluate});
     refuted = [...a, first.action];
     graph.at(refuted);
-    await drive(graph, {simulations: 1024, rootSamples: 16, batchSize: 32, cache: new EvaluationCache(), evaluate});
+    await graph.search({simulations: 1024, rootSamples: 16, batchSize: 32, cache: new EvaluationCache(), evaluate});
     graph.at(a);
     const back = graph.result('policy');
-    const again = await drive(graph, {simulations: 32, rootSamples: 8, batchSize: 8, cache: new EvaluationCache(), evaluate});
+    const again = await graph.search({simulations: 32, rootSamples: 8, batchSize: 8, cache: new EvaluationCache(), evaluate});
     answer = {first: pick(first), back: pick(back), again: pick(again)};
   } finally { graph.close(); }
 } else if (job.kind === 'proof-answer') {
@@ -478,13 +580,28 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'tactical') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   answer = job.queries.map(({history, options}) => solver.history(history, options));
+} else if (job.kind === 'proof-search') {
+  const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
+  const tree = new NeuralSearch(native, {tactics: true, graph: true, history: job.history});
+  let nodes = job.nodes, queries = 0;
+  try {
+    const found = await tree.search({simulations: job.simulations, rootSamples: 16,
+      prove: async history => {
+        if (!nodes) return null;
+        queries++;
+        const proof = solver.history(history, {nodes: Math.min(2048, nodes), ms: 100});
+        nodes = Math.max(0, nodes - proof.nodes_used);
+        return proof;
+      },
+      evaluate: async leaves => leaves.map(({actions}) => ({logits: actions.map(() => 0), q: actions.map(() => 0)}))});
+    answer = {...found, queries, nodes_used: job.nodes - nodes};
+  } finally { tree.close(); }
 } else if (job.kind === 'worker-turn' || job.kind === 'glimpse') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const messages = [], queries = [], evaluations = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
   const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
-  let prepares = 0, constructed = 0;
   let graph = null;
-  const context = {Native, EvaluationCache, GameGraph, NativeOwner, createModule, principalVariation, topRows,
+  const context = {Native, NeuralSearch, EvaluationCache, GameGraph, NativeOwner, PV_CHECK, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
     Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
@@ -500,14 +617,12 @@ if (job.kind === 'encode') {
         return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
       })})},
     Worker: class {
-      constructor() { constructed++; if (job.noWorkers) throw new Error('nested workers are not allowed'); }
       postMessage({id, history, options, prepare, request, cancel}) {
-        if (prepare) { prepares++; if (!job.stallPrepare) queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
+        if (prepare) { queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
         if (request) {
           const {history,...options} = request;
-          // A worker's answer arrives as a task, so the owner's turn can run between proof slices.
           const found = solver.history(history,{...options,cancel});
-          setTimeout(() => this.onmessage({data:{id,answer:proofAnswer(found,request)}})); return;
+          queueMicrotask(() => this.onmessage({data:{id,answer:proofAnswer(found,request)}})); return;
         }
         queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
         const result = job.replayMiss && options.replay?.length
@@ -545,7 +660,7 @@ if (job.kind === 'encode') {
     }
     const configured = await session.request('/analysis', job.preset ? {engine: 'test', preset: job.preset, auto: false}
       : {engine: 'test', preset: 'custom', auto: false, custom: {
-      simulations: job.simulations, solver_nodes: job.nodes}}, 'POST');
+      simulations: job.simulations, solver_nodes: job.nodes, leaf_nodes: job.leafNodes || 0, leaf_ms: job.leafQueryMs ?? 10}}, 'POST');
     if (configured[0] !== 200) throw Error(JSON.stringify(configured));
     const requested = await session.request('/analyse', {ply: job.history.length}, 'POST');
     if (requested[0] !== 200) throw Error(JSON.stringify(requested));
@@ -553,33 +668,41 @@ if (job.kind === 'encode') {
     answer = session.lookup(job.history);
     if (job.preset && answer) answer = {...answer, analysis: session.state().analysis, solver_frames: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
     if (!answer) throw Error(JSON.stringify(session.state().jobs));
-  } else if (job.warm) {
-    // The page's prepare call starts the proof workers before any clock runs; the turn then reuses them.
-    await context.onmessage({data: {type: 'use', id: 1, model: 'test', proofWorkers: 2}});
-    const warmed = prepares, tried = constructed;
-    // A browser that could not start them is not asked again.
-    await context.onmessage({data: {type: 'use', id: 3, model: 'test', proofWorkers: 2}});
-    const retried = constructed - tried;
-    await context.onmessage({data: {type: 'turn', id: 2, history: job.history, simulations: job.simulations, solverNodes: job.nodes, solverWorkers: 2}});
-    answer = {warmed, after: prepares, tried, retried, moves: messages.find(m => m.id === 2 && m.type === 'result')?.result.moves};
-  } else if (job.stallPrepare) {
-    // The proof workers never answer their preparation; a cancel 50 ms in must still end the turn.
-    const started = performance.now();
-    setTimeout(() => context.onmessage({data: {type: 'cancel', id: 1}}), 50);
-    await context.onmessage({data: {type: 'turn', id: 1, history: job.history, simulations: job.simulations, solverNodes: job.nodes}});
-    answer = {replies: messages.filter(m => m.id === 1 && m.type !== 'progress').map(m => m.type), ms: performance.now() - started};
-    runInNewContext('frontierWorkers.close()', context);
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
-      simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null, proveMs: job.proveMs ?? 0,
+      simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
+      hybridScheduler: job.hybridScheduler ?? false,
+      hybridProof: job.hybridProof ?? false, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,
       known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
     progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
-    live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root}))}))
-    : {...messages.find(m => m.type === 'result').result, solver_frames: messages.filter(m => m.live?.solver).length};
+    live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root})),
+    checked: messages.some(m => m.id === id && m.root && native.game(m.root).player !== mover)}))
+    : messages.find(m => m.type === 'result').result;
+} else if (job.kind === 'cached-cancel') {
+  const cache = new EvaluationCache(), options = {history:[[0,0]],seed:1740}, budget = {simulations:128,rootSamples:16};
+  const evaluate = async leaves => leaves.map(({actions})=>({logits:actions.map(()=>0),q:actions.map(()=>0)}));
+  const first = new NeuralSearch(native,options);
+  const expected = await first.search({...budget,cache,evaluate}); first.close();
+  const tree = new NeuralSearch(native,options), clock = globalThis.performance, get = cache.get.bind(cache);
+  const channel = new MessageChannel();
+  let ticks=0,received=false,forwards=0;
+  channel.port1.onmessage=()=>{received=true;};
+  cache.get=key=>{const value=get(key);if(++ticks===1)channel.port2.postMessage('cancel');return value;};
+  // Advance a clock at each cache read so message delivery is independent of the test machine's speed.
+  globalThis.performance={now:()=>ticks*1000};
+  try {
+    const stopped=await tree.search({...budget,cache,evaluate:async leaves=>{forwards++;return evaluate(leaves);},stop:()=>received});
+    answer={received,stopped:stopped.stopped,completed:stopped.completed,forwards,hits:stopped.cache_hits};
+  } finally {
+    globalThis.performance=clock;cache.get=get;channel.port1.close();channel.port2.close();tree.close();
+  }
+  const retry = new NeuralSearch(native,options);
+  const found = await retry.search({...budget,cache,evaluate}); retry.close();
+  answer.retry={completed:found.completed,unchanged:JSON.stringify([found.action,found.policy])===JSON.stringify([expected.action,expected.policy])};
 } else if (job.kind === 'analysis-failure') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
   let calls = 0;
