@@ -1,5 +1,4 @@
 """Native neural tree checks independent of trained model quality."""
-import importlib.util
 from pathlib import Path
 import unittest
 import numpy as np
@@ -124,20 +123,13 @@ class NeuralTree(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'choice must be'):
             search.search(32, choice='invalid')
 
-    def test_explicit_gumbel_and_timed_fallback_keep_the_selected_mode(self):
-        from unittest.mock import patch
+    def test_explicit_gumbel_keeps_the_selected_mode(self):
         for choice in ('policy', 'gumbel'):
             search = NeuralSearch(Uniform(), 'timed-choice', [(0, 0)], seed=0)
             self.addCleanup(search.close)
             result = search.search(32, root_samples=4, batch_size=4, choice=choice)
             ranking = result['policy'] if choice == 'policy' else result['scores']
             self.assertEqual(result['action'], result['actions'][ranking.argmax()].tolist())
-            with patch.object(search, 'result', wraps=search.result) as snapshot:
-                result = search.search(32, root_samples=4, batch_size=1, anytime=True,
-                                       stop=lambda: snapshot.call_count > 0, choice=choice)
-            ranking = result['policy'] if choice == 'policy' else result['scores']
-            self.assertEqual(result['action'], result['actions'][ranking.argmax()].tolist())
-            self.assertLess(result['completed'], 32)
 
     def test_puct_initial_value_uses_policy_weighted_action_values(self):
         from puct_search import PUCTSearch
@@ -215,39 +207,6 @@ class NeuralTree(unittest.TestCase):
             invalid.begin(8)
             with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'Invalid evaluation'):
                 invalid.fulfill(invalid.request(), prediction)
-
-    @unittest.skipUnless(importlib.util.find_spec('torch'), 'Timed Bubble turns require torch')
-    def test_timed_turn_reserves_simulations_for_both_stones(self):
-        import threading
-        from types import SimpleNamespace
-        from timed_engine import dense_turn, legal_turn
-        player = SimpleNamespace(evaluator=Uniform(), model_sha256='turn-cap', checkpoint='test',
-                                 cache=EvaluationCache(64), prover=None, options=dict(search=True, solver=False))
-        progress = []
-        result = dense_turn(player, [(0, 0)], dict(normal_ms=1000, hard_ms=1500, reserve_ms=10, simulations=8),
-                            threading.Event(), publish=lambda r: progress.append(dict(r)))
-        self.addCleanup(player._timed_tree.close)
-        counts = [r['completed'] for r in progress if r['completed']]
-        self.assertGreaterEqual(len(counts), 2)
-        self.assertLess(counts[0], counts[-1])
-        self.assertLessEqual(result['completed'], 8)
-        self.assertEqual(legal_turn([(0, 0)], result['moves']), result['moves'])
-
-    def test_timed_interruption_does_not_select_from_a_partial_comparison(self):
-        class Interrupted(Uniform):
-            calls = 0
-            def evaluate(self, histories):
-                self.calls += 1
-                return super().evaluate(histories)
-        evaluator = Interrupted()
-        search = NeuralSearch(evaluator, 'timed-comparison', [(0, 0)])
-        self.addCleanup(search.close)
-        result = search.search(128, root_samples=16, batch_size=1, anytime=True,
-                               stop=lambda: evaluator.calls >= 2)
-        self.assertIsNone(result['action'])
-        self.assertGreater(result['completed'], 0)
-        result = search.search(8, root_samples=4, batch_size=1, anytime=True)
-        self.assertIn(tuple(result['action']), map(tuple, result['actions']))
 
     def test_unknown_proofs_reserve_inference_across_large_batches(self):
         from unittest.mock import patch

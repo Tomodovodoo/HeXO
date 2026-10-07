@@ -704,7 +704,7 @@ class SelfPlayGame:
 
     def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, hybrid=False):
         self.hybrid = hybrid
-        if hybrid and (settings.game_graph <= 0 or settings.pv_check or settings.proven_line_rows):
+        if hybrid and (settings.graph_nodes <= 0 or settings.pv_check or settings.proven_line_rows):
             raise ValueError('Hybrid self-play requires game_graph, uses native depth views, and has no certificate line rows')
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
@@ -721,8 +721,9 @@ class SelfPlayGame:
         self.forced_plies = len(forced)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
             if settings.opening_random_plies > 0 and restart is None and book is None else 0
+        graph = settings.graph_nodes if hybrid else settings.game_graph
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
-                                        settings.q_range_floor, settings.game_graph)
+                                        settings.q_range_floor, graph)
                       for k, model in enumerate(dict.fromkeys(sides))}
         if settings.hybrid_round_barrier:
             for tree in self.trees.values():

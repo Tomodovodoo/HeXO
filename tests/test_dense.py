@@ -1490,7 +1490,7 @@ class DenseConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'requires native_feed'):
             dense_config.ActorSettings(native_packing=True)
         with self.assertRaisesRegex(ValueError, 'per-leaf'):
-            dense_config.ActorSettings(native_feed=True, solver_leaf_nodes=32)
+            dense_config.ActorSettings(hybrid_scheduler=False, native_feed=True, solver_leaf_nodes=32)
 
     def test_hybrid_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
         parser = argparse.ArgumentParser()
@@ -1842,17 +1842,22 @@ class DenseConfigTests(unittest.TestCase):
                 dense_config.ActorSettings(root_noise=bad)
         graph_args = parser.parse_args(['--game-graph', '512', '--pv-check', '0.25'])
         self.assertEqual(dense_selfplay.actor_flags(graph_args), ['--game-graph', '512', '--pv-check', '0.25'])
-        got = dense_config.override(base, graph_args)
+        legacy = dense_config.ActorSettings(hybrid_scheduler=False)
+        got = dense_config.override(legacy, graph_args)
         self.assertEqual((got.game_graph, got.pv_check), (512, .25))
-        self.assertEqual((base.game_graph, base.pv_check), (0, 0.))
+        self.assertEqual((legacy.graph_nodes, legacy.pv_check), (0, 0.))
         for bad in (dict(pv_check=.25), dict(game_graph=512, pv_check=.5), dict(game_graph=-1)):
             with self.assertRaisesRegex(ValueError, 'game_graph must be nonnegative'):
-                dense_config.ActorSettings(**bad)
-        # Hybrid actors bound each game's graph by default; legacy actors keep one tree per model.
-        hybrid = dense_config.ActorSettings(hybrid_scheduler=True)
-        self.assertEqual(hybrid.game_graph, dense_config.HYBRID_GAME_GRAPH)
-        self.assertEqual(dense_config.ActorSettings(hybrid_scheduler=True, game_graph=4096).game_graph, 4096)
-        self.assertEqual(dataclasses.replace(hybrid).game_graph, dense_config.HYBRID_GAME_GRAPH)
+                dense_config.ActorSettings(hybrid_scheduler=False, **bad)
+        with self.assertRaisesRegex(ValueError, 'frontier slices'):
+            dense_config.override(base, graph_args)
+        # Hybrid actors (the default) bound each game's graph; legacy actors keep one tree per model,
+        # also when a hybrid configuration is switched off.
+        self.assertTrue(base.hybrid_scheduler)
+        self.assertEqual(base.graph_nodes, dense_config.HYBRID_GAME_GRAPH)
+        self.assertEqual(dense_config.ActorSettings(game_graph=4096).graph_nodes, 4096)
+        self.assertEqual(dataclasses.replace(base).graph_nodes, dense_config.HYBRID_GAME_GRAPH)
+        self.assertEqual(dense_config.override(base, parser.parse_args(['--no-hybrid-scheduler'])).graph_nodes, 0)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -6000,7 +6005,7 @@ class EngineTests(unittest.TestCase):
         for planned, compiled in ((False, False), (False, True), (True, False), (True, True)):
             with self.subTest(planned=planned, compiled=compiled):
                 model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-                settings = replace(dense_config.ActorSettings(), full_sims=65536, full_fraction=1.,
+                settings = replace(dense_config.ActorSettings(hybrid_scheduler=False), full_sims=65536, full_fraction=1.,
                                    root_samples=16, opening_random_plies=0., adjudicate_proven=True,
                                    proven_line_rows=False, solver_root_nodes=1 if planned else 0)
                 slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
@@ -6036,7 +6041,7 @@ class EngineTests(unittest.TestCase):
             with self.subTest(compiled=compiled, packed=packed):
                 torch.manual_seed(1839)
                 model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-                settings = replace(dense_config.ActorSettings(), full_sims=32, full_fraction=1., root_samples=8,
+                settings = replace(dense_config.ActorSettings(hybrid_scheduler=False), full_sims=32, full_fraction=1., root_samples=8,
                                    opening_random_plies=0., game_graph=512, pv_check=.25)
                 history = [[0,0],[0,3],[1,3]]
                 slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
@@ -6202,7 +6207,7 @@ class EngineTests(unittest.TestCase):
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2,
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, full_fraction=0., tactics=False, max_plies=len(history)+2,
                                              adjudicate_proven=True, proven_line_rows=True)
         slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
         try:
@@ -6261,7 +6266,7 @@ class EngineTests(unittest.TestCase):
                 history = base if winning else base+[[-1,3]]
                 action = [4,0] if winning else [7,6]
                 model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-                settings = dense_config.ActorSettings(full_fraction=0., tactics=False, solver_follow=True,
+                settings = dense_config.ActorSettings(hybrid_scheduler=False, full_fraction=0., tactics=False, solver_follow=True,
                     max_plies=len(history)+(2 if winning else 1), adjudicate_proven=winning, proven_line_rows=True)
                 slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
                 try:
@@ -6437,7 +6442,7 @@ class EngineTests(unittest.TestCase):
         from dense_solver import Schedule
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
-        settings = dense_config.ActorSettings(full_fraction=0., tactics=False, max_plies=len(history)+2,
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, full_fraction=0., tactics=False, max_plies=len(history)+2,
                                              solver_threat_nodes=1, solver_follow=True,
                                              adjudicate_proven=True, proven_line_rows=True)
         slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, restart=({}, history))
@@ -6741,7 +6746,7 @@ class YieldTests(unittest.TestCase):
         self.wall[0] = time.time()
         self.heartbeat(4., stage='phase-idle', phase_rows=100)
         (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/old')))
-        settings = dense_config.ActorSettings(games_in_flight=2, shard_games=10, phase_follow=True,
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, games_in_flight=2, shard_games=10, phase_follow=True,
                                                yield_below=0., yield_check_seconds=0.)
         config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
         order, admitted, acks = [], [], []
@@ -6859,7 +6864,7 @@ class YieldTests(unittest.TestCase):
         self.assertFalse(due('playing', 'playing', 1.))
 
     def test_historical_games_can_restart_when_book_fraction_is_zero(self):
-        settings = dense_config.ActorSettings(games_in_flight=2, shard_games=2,
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, games_in_flight=2, shard_games=2,
                                                historical_fraction=1., restart_fraction=1.)
         config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
         model = SimpleNamespace(checkpoint='main/test', sha='a'*64, config=TINY)
@@ -10135,7 +10140,7 @@ class DenseTimedWorker(unittest.TestCase):
                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
                 clock = [0.]
                 pool = unittest.mock.Mock(proofs=None)
-                player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
+                player = SimpleNamespace(options=dict(solver=False),
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
                     _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
                 service = service_type.return_value
@@ -10188,6 +10193,49 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['stones'][1]['source'], 'verified_proof')
                 self.assertNotIn('error', result['root_searches'][1])
 
+    def test_raw_policy_turn_plays_both_stones_or_a_verified_proof(self):
+        from types import SimpleNamespace
+        from timed_engine import dense_turn, legal_turn
+        from time_control import allowance
+        import threading
+        class Policy:
+            def evaluate(self, histories):
+                out = []
+                for history in histories:
+                    game = Game(history)
+                    try:
+                        actions = np.asarray(game.legal_moves(), np.int64)
+                    finally:
+                        game.close()
+                    out.append(dict(actions=actions, logits=-np.abs(actions).sum(1).astype(float),
+                                    q=np.zeros(len(actions))))
+                return out
+        win = [[0,0],[0,5],[1,5],[1,0],[2,0],[3,5],[4,5],[3,0],[-1,1],[6,6],[7,7]]
+        prover = unittest.mock.Mock()
+        prover.history.return_value = dict(status='PROVEN_WIN', native_verified=True, moves=[[4,0],[5,0]], nodes_used=9)
+        for history, solver in (([[0,0]], False), (win, True)):
+            with self.subTest(solver=solver):
+                player = SimpleNamespace(options=dict(search=False, solver=solver), prover=prover,
+                                         evaluator=Policy(), checkpoint='fixed', model_sha256='fixed')
+                published = []
+                result = dense_turn(player, history, allowance(movetime=1000), threading.Event(), published.append)
+                self.assertTrue(all(legal_turn(history, event['moves']) == event['moves'] for event in published))
+                self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+                self.assertEqual(result['moves'], published[-1]['moves'])
+                if solver:
+                    self.assertEqual((result['moves'], result['proof_status'], result['evaluated']),
+                                     ([[4,0],[5,0]], 'PROVEN_WIN', 0))
+                    self.assertLessEqual(prover.history.call_args.kwargs['ms'], 250)
+                else:
+                    self.assertEqual((len(result['moves']), result['evaluated']), (2, 2))
+                    self.assertEqual(len(result['suggestions']), 5)
+                    self.assertEqual(result['stop_reason'], 'budget')
+        cancelled = threading.Event()
+        cancelled.set()
+        result = dense_turn(player, [[0,0]], allowance(movetime=1000), cancelled)
+        self.assertEqual((result['stop_reason'], result['evaluated']), ('stop', 0))
+        self.assertEqual(legal_turn([[0,0]], result['moves']), result['moves'])
+
     @slow
     def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
         from timed_engine import TimedEngine, legal_turn
@@ -10196,10 +10244,10 @@ class DenseTimedWorker(unittest.TestCase):
             model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
-            for hybrid, solver in ((False, False), (True, False), (True, True)):
+            for searched, solver in ((False, False), (True, False), (True, True)):
                 # The simulation cap ends each turn; the 30 s clock only bounds a broken search, however loaded the machine.
-                search = dict(hybrid_scheduler=hybrid, max_simulations=64)
-                with self.subTest(hybrid_scheduler=hybrid, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                search = dict(enabled=searched, max_simulations=64)
+                with self.subTest(search=searched, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
                         search=search, solver=dict(enabled=solver))) as engine:
                     game = Game([[0, 0]])
                     try:
@@ -10212,8 +10260,7 @@ class DenseTimedWorker(unittest.TestCase):
                             self.assertEqual(result['backend'], 'dense')
                             self.assertEqual(result['model_sha256'], engine.model_sha256)
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
-                            if hybrid:
-                                self.assertTrue(result['settings']['hybrid_scheduler'])
+                            if searched:
                                 self.assertEqual(len(result['stones']), 2, result)
                                 self.assertEqual([s['move'] for s in result['stones']], result['moves'])
                                 self.assertEqual(result['stones'][0]['history'], history)
@@ -10240,7 +10287,7 @@ class DenseTimedWorker(unittest.TestCase):
                         engine.wait_idle()
                     finally:
                         game.close()
-                    if hybrid and solver:
+                    if searched and solver:
                         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
                                    (3, 0), (-1, 1), (6, 6), (7, 7)]
                         engine.reset(history)
@@ -10257,14 +10304,17 @@ class DenseTimedWorker(unittest.TestCase):
 
 
             from dense_player import DensePlayer
-            player = DensePlayer(Path(folder), 'cpu', model=path, hybrid_scheduler=True, net_kernels='reference')
+            from timed_engine import dense_turn
+            from time_control import allowance
+            import threading
+            player = DensePlayer(Path(folder), 'cpu', model=path, net_kernels='reference')
+            def turn(game):
+                return dense_turn(player, [cell[:2] for cell in game.cells],
+                                  allowance(movetime=1000) | dict(simulations=16), threading.Event())
             game = Game([[0, 0]])
             try:
-                player.configure(dict(solver=True, solver_nodes=512))
-                with self.assertRaisesRegex(ValueError, 'time slices'):
-                    player.turn(game, 1000)
-                player.configure(dict(solver=False, simulations=16))
-                result = player.turn(game, 1000)
+                player.configure(dict(solver=False))
+                result = turn(game)
                 self.assertEqual(result['model_sha256'], player.model_sha256)
                 self.assertEqual(result['settings']['simulations'], 16)
                 self.assertLessEqual(result['scheduler_completed'], 16)
@@ -10282,7 +10332,7 @@ class DenseTimedWorker(unittest.TestCase):
                             dict(producer=0, game=0, model=0, token=2, history=[[0, 0], [1, 0]], context='second',
                                  action=[2, 0], exact_winner=winner, root_completed=1, completed=1,
                                   edges=np.array([[2, 0, 0, 0, 0, 1, 1, 1, 1]], float))]
-                        result = player.turn(game, 1000)
+                        result = turn(game)
                     self.assertEqual(result['proof_status'], status)
                     self.assertEqual(result['win_probability'], value)
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
@@ -10301,7 +10351,7 @@ class DenseTimedWorker(unittest.TestCase):
                         dict(producer=0, game=0, model=0, token=2, history=[[0,0],[0,1]], context='second',
                              action=[0,2], exact_winner=-1, root_completed=3, completed=4,
                              edges=np.array([[0,2,0,0,.6,1,3,3,1]], float))]
-                    result = player.turn(game, 1000)
+                    result = turn(game)
                     self.assertEqual(service.retarget.call_args_list[1].args[2], [[0,0],[0,1]])
                 self.assertEqual(result['moves'], [[0,1],[0,2]])
                 self.assertEqual(result['stones'][1]['history'], [[0,0],[0,1]])
@@ -10328,7 +10378,7 @@ class DenseTimedWorker(unittest.TestCase):
                         return None
                     service.event.side_effect = completion
                     service.close.side_effect = lambda **kw: [frames[1]] if kw.get('completions') else None
-                    result = player.turn(game, 1000)
+                    result = turn(game)
                     service.launch.assert_called_once()
                     service.cancel.assert_called_once()
                     service.pump.assert_not_called()
@@ -10346,8 +10396,6 @@ class DenseTimedWorker(unittest.TestCase):
                                   action=[2,1], edges=np.array([[2,1,0,0,.8,1,7,7,1]], float))]
                 published = []
                 from timed_engine import hybrid_turn
-                from time_control import allowance
-                import threading
                 with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
                      unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
                     service = service_type.return_value
@@ -10380,7 +10428,7 @@ class DenseTimedWorker(unittest.TestCase):
                     service.event.side_effect = [frames[0],
                         dict(producer=0, game=0, model=0, token=2,
                              history=[[0,0],[1,0]], error='deadline')]
-                    result = player.turn(game, 1000)
+                    result = turn(game)
                 self.assertEqual(len(result['stones']), 1)
                 self.assertEqual(result['root_searches'][1]['history'], [[0,0],[1,0]])
                 self.assertEqual(result['root_searches'][1]['error'], 'deadline')
@@ -10389,10 +10437,9 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['completed'], 2)
                 # Completion delivery is not itself a budget stop. Preserve the
                 # worker's deadline/cancellation reason at the controller too.
-                import threading
                 for reason in ('deadline','stop','budget'):
                     controller = TimedEngine.__new__(TimedEngine)
-                    controller.config = dict(kind='bubble',search=dict(hybrid_scheduler=True))
+                    controller.config = dict(kind='bubble')
                     controller.external = controller.busy = False
                     controller.checkpoint, controller.model_sha256 = player.checkpoint, player.model_sha256
                     controller.lock, controller.cancellation = threading.Lock(), threading.Event()
@@ -10405,9 +10452,6 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(controller.turn(game,1000)['stop_reason'],reason)
                 # A real immediate pair is committed before the first winning
                 # publication can cancel the worker. No second inference is needed.
-                from timed_engine import dense_turn
-                from time_control import allowance
-                import threading
                 history = [[0,0],[0,5],[1,5],[1,0],[2,0],[3,5],[4,5],[3,0],[-1,1],[6,6],[7,7]]
                 player.set_history(history)
                 cancelled, published = threading.Event(), []
@@ -10443,7 +10487,7 @@ class DenseTimedWorker(unittest.TestCase):
                             history=history, context='witnessed', action=[4,0], winning_turn=[[4,0],[5,0]],
                             exact_winner=0, root_completed=1, completed=1,
                             edges=np.array([[4,0,0,0,1,.1,0,2,1], [2,5,0,0,.5,.9,-1,-1,1]], float))
-                        result = player.turn(finished, 1000)
+                        result = turn(finished)
                     self.assertEqual(result['moves'], [[4,0],[5,0]])
                     self.assertEqual(result['winning_turn'], result['moves'])
                     for action in result['moves']:
@@ -10461,7 +10505,7 @@ class DenseTimedWorker(unittest.TestCase):
                         history=[[0,0]], context='unwitnessed', action=[1,0], exact_winner=1,
                         root_completed=1, completed=1, edges=np.array([[1,0,0,0,1,1,0,0,1]], float))
                     with self.assertRaisesRegex(ValueError, 'complete turn witness'):
-                        player.turn(game, 1000)
+                        turn(game)
                 # Release retained search and captures before replacement allocations.
                 old_pool = player._timed_hybrid[1]
                 old_graph = unittest.mock.Mock()
@@ -10524,28 +10568,6 @@ class DenseBrowser(unittest.TestCase):
         result = evaluate(self.bubble, None, history, 16, 0)
         self.assertEqual((result['proof'] or {}).get('winner'), 0)
         self.assertTrue(self.complete(history, result['moves']))
-
-    def test_dense_player_keeps_the_proven_second_stone_without_reevaluation(self):
-        from dense_player import DensePlayer
-        history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
-                   (3, 0), (-1, 1), (6, 6), (7, 7)]
-        player = DensePlayer(Path(self.temp.name), 'cpu', model=Path(self.temp.name)/'ema.pt',
-                             tactical_package=Path(self.temp.name)/'missing', net_kernels='reference')
-        player.configure(dict(search=True, simulations=16, solver=False))
-        game = Game(history)
-        try:
-            with unittest.mock.patch.object(player.evaluator, 'evaluate', wraps=player.evaluator.evaluate) as evaluate:
-                result = player.turn(game)
-            # An immediate win may be settled exactly with no network call; the second stone never needs one.
-            self.assertLessEqual(evaluate.call_count, 1)
-            self.assertEqual([tuple(cell[:2]) for cell in game.cells], history)
-            self.assertEqual(len(result['moves']), 2)
-            for move in result['moves']:
-                game.play(*move)
-            self.assertEqual(game.winner, 0)
-        finally:
-            game.close()
-            player.close()
 
     def test_engines_reload_changed_weights_and_record_the_budget_they_ran(self):
         from play import Engines

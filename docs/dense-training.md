@@ -54,6 +54,10 @@ The replay window follows KataGo: at least `window_min_rows` full-search rows, t
 
 `--book-fraction` starts that share of new games from the opening book's off-policy pool, with a random hex symmetry, and `--restart-fraction` from the proof pass's restart buffer. Preset stones produce no rows; search and training start after them. A tactical opening from `openings/tactical/` fixes the value target of the first position after its prefix, so a later blunder cannot contradict the opening's known result.
 
+## Actor search
+
+Actors search on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)) unless `--no-hybrid-scheduler` is given: native game graphs that keep up to `HYBRID_GAME_GRAPH` (1024) expanded nodes per game, one model-keyed inference queue, and `hybrid_proof_workers` (12) CPU proof workers that may take `hybrid_proof_budget` (0.1) of each graph owner's time. The older per-query solver budgets (`solver_*_nodes`), `pv_check` and `proven_line_rows` belong to the Python-coordinated search of `python/neural_search.py` and are refused unless `hybrid_scheduler` is off. Without the tactical solver build, `bubble.py train` starts the actors with no proof workers.
+
 ## Kernels
 
 `--net-kernels fused` on the learner, actors and evaluator selects the Triton kernels described in [gpu-kernels.md](gpu-kernels.md). Checkpoints load in either mode.

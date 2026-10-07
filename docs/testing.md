@@ -101,7 +101,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_forcing_material.ForcingMaterial` | 4 | Live-window counts and the gate level the solver budget follows | 0.0 | 0.0 | - | - | keep |
 | `test_isolated_tactics.Isolation` | 19 | Solver child process: reuse, hard kill at the deadline, abort, cancel, memory cap, size limits | 6.0 | 0.0 | a Python child per test, 0.1 to 0.3 s sleeps, 512 MB allocations | tactical_proof isolated cancel | keep |
 | `test_leaf_tactics.LeafTactics` | 5 | Depth-1 search finds forced wins and avoids forced losses on development positions, checked by the reference | 3.0 | 0.0 | 1 s searches | tt_injection.cpp development positions | keep |
-| `test_neural_search.NeuralTree` | 40 | Native Gumbel tree: noise, Q floor, choice, exact wins and losses, proof install, reuse, cache keys, batching, deadlines, input checks | 1.4 | 0.0 | 8 to 128 uniform-evaluator simulations | gumbel.cpp (shared turn node, shortest win, round barrier) | keep; legal-count pins rewritten (#458) |
+| `test_neural_search.NeuralTree` | 38 | Native Gumbel tree: noise, Q floor, choice, exact wins and losses, proof install, reuse, cache keys, batching, deadlines, input checks | 1.4 | 0.0 | 8 to 128 uniform-evaluator simulations | gumbel.cpp (shared turn node, shortest win, round barrier) | keep; legal-count pins rewritten (#458) |
 | `test_neural_search.SharedGraph` | 25 | Shared game graph across views: archive, reconvergence, credits, eviction, proofs reaching earlier roots, PV recheck | 6.7 | 0.0 | one 2048-simulation search | gumbel.cpp archive and eviction blocks | keep |
 | `test_neural_search.HybridScheduler` | 42 | SearchPool and InferenceService: batching, coalescing, retargeting, cancellation, watermarks, fenced teardown, GPU launcher overlap | 6.1 | 0.0 | service threads with condition waits | - | keep |
 | `test_neural_search.NativeProofs` | 36 (1 slow) | Proof loop over the real solver: admission, scope closing, facts, shared workers, owner budget, cancellation, verified certificates | 7.1 | 3.1 | real solver, condition waits | Rust token tests | keep; the 1.5 s owner-budget load comparison is slow; slice pin rewritten (#458) |
@@ -139,8 +139,8 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_dense.OpponentSchedulerTests` | 8 | Report reload, payoff matrix, panel and veto, PFSP weights, opponent plies masked from training | 0.6 | 0.0 | one 4-game engine run | - | keep |
 | `test_dense.EvaluatorLoopTests` | 96 | League evaluator: SPRT and posterior trials, anchors, variants, panels, fills, rematches, supersession, restarts, reports | 20.0 | 0.0 | tiny-model games (Seal ones need the library) | openings EvaluatorBookTests | keep |
 | `test_dense.SlowDenseTests` | 2 (slow) | Window memory per row stays under budget; the learner CLI heartbeat reports its target | 0.0 | 26.9 | a 50,000-row window; two subprocesses | - | slow |
-| `test_dense.DenseTimedWorker` | 2 (1 slow) | Timed hybrid turns are legal and complete, report proofs, honour deadlines and swap models | 0.0 | 7.6 | 64-simulation turns with 30 s clocks | - | keep; the clocked CPU turn is slow |
-| `test_dense.DenseBrowser` | 8 | play.evaluate returns complete legal turns, keeps proven second stones, reloads changed weights, cancels promptly | 0.7 | 0.0 | tiny model, one solve | - | keep |
+| `test_dense.DenseTimedWorker` | 3 (1 slow) | Timed hybrid and raw-policy turns are legal and complete, report proofs, honour deadlines and swap models | 0.0 | 7.6 | 64-simulation turns with 30 s clocks | - | keep; the clocked CPU turn is slow |
+| `test_dense.DenseBrowser` | 7 | play.evaluate returns complete legal turns, keeps proven second stones, reloads changed weights, cancels promptly | 0.7 | 0.0 | tiny model, one solve | - | keep |
 | `test_dense_solve.PassTests` | 10 (1 slow) | Offline proof pass: windows, lookback, buffer entries, gate, verification events | 13.8 | 4.7 | real solves; worker processes | - | keep; worker processes slow |
 | `test_dense_solve.WorkerCountTests` | 3 | Book prefixes are excluded; worker count follows the learner phase | 0.1 | 0.0 | - | - | keep |
 | `test_dense_solve.RestartBufferTests` | 6 | The priority restart buffer | 0.0 | 0.0 | - | - | keep |
@@ -152,7 +152,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 
 | Class | Tests | What it protects | Fast s | Slow s | What costs time | Overlaps | Decision |
 | --- | ---: | --- | ---: | ---: | --- | --- | --- |
-| `test_bubble.CommandTests` | 4 | The match command and services target the run; flags reach GPU services | 0.1 | 0.0 | - | - | keep |
+| `test_bubble.CommandTests` | 4 | The match command and services target the run; flags reach GPU services; actors drop proof workers without the solver | 0.1 | 0.0 | - | - | keep |
 | `test_bubble.ModelTests` | 3 | Install and download place the weights and champion | 0.0 | 0.0 | - | - | keep |
 | `test_bubble.MembersTests` | 2 | Process-tree membership | 0.0 | 0.0 | - | - | keep |
 | `test_bubble.MatchTests` | 1 | A match process is a member of the tree | 0.0 | 0.0 | - | - | keep |
@@ -168,7 +168,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_evaluation.PairedEvaluation` | 1 | Paired match statistics rate only complete colour pairs | 0.0 | 0.0 | - | - | keep; the legacy evaluate checks were deleted (#457) |
 | `test_notation_api.OfficialNotation` | 3 | htttx parse and dump round trip, strict turns, bounds, first-stone terminal | 0.0 | 0.0 | - | - | keep |
 | `test_notation_api.OfficialAPI` | 7 | Stateless HTTP API: board reconstruction, 400/408/409/503, request deadlines | 1.9 | 0.0 | HTTP server, 1 ms searches | - | keep |
-| `test_notation_api.TimedClocks` | 15 | Side settings, paired openings, clock arithmetic, the hybrid controller's allowance, HTTP opponent failures | 2.4 | 0.0 | hybrid timed turn; a handler that sleeps 1 s | six_engine opponent failure | keep |
+| `test_notation_api.TimedClocks` | 15 | Side settings refused or accepted, older saved specs, paired openings, clock arithmetic, the hybrid controller's allowance, HTTP opponent failures | 2.4 | 0.0 | hybrid timed turn; a handler that sleeps 1 s | six_engine opponent failure | keep |
 | `test_notation_api.TimedAPI` | 8 | Match REST and websocket: clock stream, interrupt, shutdown, engine release, resume | 1.8 | 0.0 | aiohttp server | - | keep; the shutdown test found a session engine left open, fixed in #460 and #462 |
 | `test_notation_api.ArenaDrip` | 6 | Arena bot: gateway retries, cleanup, socket redial, replay without duplicate moves | 4.7 | 0.0 | real searches, a 1.2 s retry | - | keep |
 | `test_openings.CanonicalTests` | 5 | Canonical keys over symmetries and turn orders; parents; tempered weights; reach | 0.1 | 0.0 | - | - | keep |

@@ -166,7 +166,7 @@ class HybridGames:
         placeholders = {}
         for index,game in enumerate(self.games):
             s = game.settings
-            source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
+            source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.graph_nodes)
             if s.hybrid_round_barrier:
                 checked(native.hxg_round_barrier(source.ptr, 1))
             placeholders[index] = source

@@ -14,8 +14,9 @@ of that question.
 ## Implementation status
 
 The hybrid scheduler runs search in native graph owners, proofs on CPU workers and network batches on the GPU.
-`ActorSettings.hybrid_scheduler` turns it on for self-play and `search.hybrid_scheduler` for timed play; with it
-off, the Python-coordinated search of `python/neural_search.py` and `python/dense_selfplay.py` runs instead.
+Self-play runs it by default (`ActorSettings.hybrid_scheduler`), and so does every searching timed Bubble turn
+(`timed_engine.hybrid_turn`). With the actor setting off, the Python-coordinated search of `python/neural_search.py`
+and `python/dense_selfplay.py` runs instead; the evaluator's games (`dense_eval.MatchGame`) always run on that search.
 
 | Area | Current implementation | Delivery |
 | --- | --- | --- |

@@ -63,6 +63,9 @@ class CommandTests(unittest.TestCase):
         plan = bubble.commands(Path('runs/x'), proof=False)
         self.assertNotIn('proof', plan)
         self.assertEqual(set(plan) | {'proof'}, set(bubble.SERVICES))
+        actors = plan['actors']
+        self.assertEqual(actors[actors.index('--hybrid-proof-workers') + 1], '0')
+        self.assertNotIn('--hybrid-proof-workers', bubble.commands(Path('runs/x'))['actors'])
 
     def test_kernels_reach_gpu_services_only_when_given(self):
         plan = bubble.commands(Path('runs/x'), kernels='fused')
