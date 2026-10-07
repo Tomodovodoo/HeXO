@@ -1766,6 +1766,11 @@ class DenseConfigTests(unittest.TestCase):
         for bad in (dict(pv_check=.25), dict(game_graph=512, pv_check=.5), dict(game_graph=-1)):
             with self.assertRaisesRegex(ValueError, 'game_graph must be nonnegative'):
                 dense_config.ActorSettings(**bad)
+        # Native actors bound each game's graph by default; legacy actors keep one tree per model.
+        native = dense_config.ActorSettings(native_scheduler=True)
+        self.assertEqual(native.game_graph, dense_config.NATIVE_GAME_GRAPH)
+        self.assertEqual(dense_config.ActorSettings(native_scheduler=True, game_graph=4096).game_graph, 4096)
+        self.assertEqual(dataclasses.replace(native).game_graph, dense_config.NATIVE_GAME_GRAPH)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
