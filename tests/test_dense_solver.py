@@ -1204,6 +1204,32 @@ class Scheduler(unittest.TestCase):
         pool.close()
         self.assertLess(time.perf_counter()-start, 5.)
 
+    def test_closing_a_pool_reaches_a_query_that_has_not_started_its_child(self):
+        started = threading.Event()
+
+        class NotYetRunning:
+            """A query between leaving the heap and taking its child, where abort has nothing to kill."""
+            def __init__(self, priority=None):
+                pass
+
+            def history(self, history, cancel_event, **request):
+                started.set()
+                cancel_event.wait(60)
+                return dict(status='UNKNOWN', reason='cancelled', nodes_used=0)
+
+            def abort(self):
+                pass
+
+            def close(self):
+                pass
+        with mock.patch.object(dense_solver, 'IsolatedTactics', NotYetRunning):
+            pool = dense_solver.Pool(1, None)
+        pool.submit(0., 5., [[0, 0]], dict(nodes=10**9, ms=60000))
+        self.assertTrue(started.wait(10))
+        start = time.perf_counter()
+        pool.close()
+        self.assertLess(time.perf_counter()-start, 5.)
+
     def test_a_late_verdict_defers_its_game_once_then_finishes_in_the_background(self):
         try:
             solver = dense_solver.Solver(Schedule(fixed_budgets=False))
