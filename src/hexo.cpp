@@ -1472,7 +1472,12 @@ struct Search {
                             proof_deadline=std::min(deadline,probe_start+std::min(refutation_left,allowance/4));
                             try {if(b.winner<0 && forcing_material(b,b.player)) enemy=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
                         }
-                        if(enemy<0) {proof.resize(mark);refutation_left-=Clock::now()-probe_start;break;}
+                        if(enemy<0) {
+                            // A probe cut short by the deepening deadline is retried
+                            // with the reserved time.
+                            if(Clock::now()>=deadline) probed.pop_back();
+                            proof.resize(mark);refutation_left-=Clock::now()-probe_start;break;
+                        }
                         proof_deadline=std::min(deadline,probe_start+refutation_left);
                         std::vector<bool> refuted(roots.size());
                         for(size_t i=0;i<roots.size();++i) {
