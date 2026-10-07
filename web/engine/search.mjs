@@ -742,8 +742,11 @@ export class NativeProofs {
       const values = Array.from(this.n.view(BigUint64Array, out, 16), Number), elapsed = Array.from(this.n.view(Float64Array, times, 5));
       this.m._hxp_neural_stats(this.ptr, out);
       const neural = Array.from(this.n.view(BigUint64Array, out, 6), Number);
+      this.m._hxp_endpoint_queue_stats(this.ptr, out);
+      const queue = Array.from(this.n.view(BigUint64Array, out, 9), Number);
       return {...Object.fromEntries(['ticks','submitted','started','finished','installed','cancelled','pruned','unknown','fresh_nodes','missing_fresh','queued','active','ready','tasks','facts','records'].map((name, i) => [name, values[i]])),
-        neural_frontier: Object.fromEntries(['paths','candidates','rejected','bytes','install_ns','records'].map((name, i) => [name, neural[i]])),
+        neural_frontier: {...Object.fromEntries(['paths','candidates','rejected','bytes','install_ns','records'].map((name, i) => [name, neural[i]])),
+          queue: Object.fromEntries(['pending','bytes','high_water','admitted','dropped','obsolete','blocked','admission_ns','oldest_age_ns'].map((name, i) => [name, queue[i]]))},
         ...Object.fromEntries(['worker_service_ms','worker_idle_ms','snapshot_ms','install_ms','owner_step_ms'].map((name, i) => [name, elapsed[i]]))};
     } finally { this.m._free(out); this.m._free(times); }
   }
