@@ -1,9 +1,9 @@
 # HeXO search scheduler
 
-Updated 2026-10-06. Source baseline: main `b61c362`, through PR404. PR404 was
-reviewed on `73f1eeb` and merged after its native/browser checks passed. This
-replaces the October 3 proposal. Implemented mechanisms, measurements, and
-remaining design decisions are separated below.
+Updated 2026-10-07. Merged source baseline: main `13d01f8`, including PR433,
+PR439, PR441, PR442, PR443 and PR444. PR438 integrates that baseline privately. Draft work
+is identified below; its presence on this branch does not make it deployed.
+This replaces the October 3 proposal.
 
 The objective is useful search and faster model improvement per machine-hour.
 Keep useful GPU and CPU work ready, retain evidence across turns, discover
@@ -29,6 +29,14 @@ of that question.
 | Browser | Native owner in WASM, bounded GPU captures/readback, external solver workers and endpoint handoff | PR400, PR401, PR402, PR403 |
 | CPU-to-GPU paths | Actual quiet/unfinished forcing paths admitted as connecting prefixes and endpoint candidates | PR403 |
 | Queue-pressure admission | Active-candidate lookup and existing-view-first gathering before allocating extra views | PR404 |
+| Rectangular inference | Full-board rectangular encoding, packing, fused inference and browser paths with existing weights | PR413 |
+| Retarget and actor records | Avoid redundant eviction scans; retain the raw root prediction; incremental prefix keys | PR425, PR428, PR429 |
+| Proof supply | Wake one worker, close unsupported quiet sides, retry only after fresh work and count supply exclusions | PR415, PR427; PR440 sets opt-in proof defaults |
+| Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 merged, including the queued-shard naming fix |
+| Actor graph allowance | Retain up to 1024 nodes per native actor game by default | PR444 merged; this changes the configured allowance, not proof of a loaded production binary |
+| Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; the pre-PR443 IPC comparison returned two searched stones in all 12 HeXO turns; strict deadline checks remain open |
+| Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 merged after actual two-model CUDA validation |
+| Shared proof workers | Optional globally bounded service lends workers across producer loops; originating graph owners install results | PR443 merged; private native and browser builds completed. Earlier caller timings used separate loop-owned workers |
 
 These are source deliveries. Native actor/continuous-proof modes remain opt-in.
 They do not establish that production has loaded these binaries, that training
@@ -52,7 +60,9 @@ its source, binary, checkpoint, configuration and workload identities.
 | Endpoint export, October 6 | Midgame checked proofs 3/3 to 10/11 and completed-view depth 5/5 to 7/7, while rows/s fell slightly | Useful proof/depth work can improve while neural throughput declines. This small study establishes no general strength gain. |
 | Round versus visit-layer barriers, endpoints enabled | Four trials per condition: quiet 3,142 to 4,493 rows/s; four midgames 4,008 to 4,944 | Higher unique NN admission rate under the same one-second clock, about 43% and 23%. Depth and credits were separately recorded. |
 | Same-clock Six protocol play | Four sustained starts: HeXO proof-on about 4.0-4.7k versus Six 3.7-4.4k neural rows/s, two repeats | A local end-to-end comparison is competitive. Six's PUCT protocol player is not its Gumbel self-play pipeline; CPU use differed and no learning/strength conclusion follows. |
+| Current IPC Play versus Six, October 7 | Three two-stone starts, two alternating repeats, HeXO solver-off/on: all 24 engine replies legal and complete. HeXO terminal leased rows per reply-plus-drain second are 3.52-4.50k solver-off and 3.05-3.81k solver-on; Six protocol neural rows per reply second are 3.23-4.84k. | Actual current caller and pinned binaries, not the older manual-pump harness. Terminal work can include work after reply. Only two repeats per condition; new canvas captures, external CPU activity and different search/proof algorithms limit the comparison. No general speedup or strength result. |
 | PR404 balanced allocation study | 48 one-second trials across baseline, lookup control and pressure admission. Midgame owner-step wall per NN row falls about 16%; root comparison credits rise. Overall rows/s is approximately flat. | Admission improves a measured host/allocation cost, not a massive speedup. Neural-only continuation depths fell; proof-enabled depth/proof delivery was comparable. |
+| Actor pipeline, October 6 | Four trials per arm, full-length frozen-main/200000 games, no proof workers: combined experimental changes raise placements/s from 180.8 to 204.2 at 128 slots and 160.4 to 187.0 at 64; unique NN rows/s 4,048 to 4,540 and 3,578 to 4,158 | Real data-generation gain of 13.0% and 16.5%. Includes pending PR433 and graph limit 1024; published rows were replayed through the learner. Not a proof-enabled or learning-strength comparison. |
 | PR404 complete games | 8 neural-only and 8 concurrent-proof uncapped games, all terminal; 1,780 saved rows, 96 independently checked CPU certificates, no missing raw predictions | Legal play, proof/data/lifetime behavior and complete drainage. Not a strength or learner comparison. |
 | Proof worker wakeups, October 6 | 12 proof workers, queue 48, whole machine, four A/B/B/A trials per arm: book-32 solver-on NN rows/s 7,025 to 10,283, proof queries 10.2k to 18.5k, checked certificates 0 to 8; saved-selfplay-8 3,909 to 4,205. Unchanged within noise at 4 workers | Waking every idle worker for each job made them queue on the proof mutex ahead of the graph owner. More workers now add coverage instead of starving the GPU feed. |
 | Proof supply and worker split, October 6 | 12 proof workers, 4 s clocks, four A/B/B/A trials per arm (#427): worker idle on book-32 55% to 12%, fresh solver nodes +7 to +48% across cohorts, book-32 checked certificates 11.5 to 42, NN rows/s within 2% on the multi-game cohorts and -4 to -6% on quiet-handoff and saved-selfplay-8. Queue 8 per worker against 4: fresh nodes +9 to +24%, midgame certificates 100 to 147, NN rows/s -1 to -2%. 16 workers against 12 cost quiet-handoff 15% of NN rows/s | Most quiet dispatches were no-ops that never closed their side. Defaults: 12 proof workers per producer pool (one pool per model), queue 8 per worker |
@@ -97,6 +107,23 @@ The spans establish an opportunity; they do not isolate its cause. A new trace
 must exercise the actual two-flight launcher and distinguish queue/packing,
 host preparation, installation, transfer and dependency waits. Open nodes that
 are ready must not wait merely because view admission is busy elsewhere.
+
+The best measured actor configuration above sampled about 95% device activity
+at 128 slots, with machine CPU about 18.5% and the actor process averaging
+1.62 logical cores. These are solver-off figures. Four-second solver-on cohort
+trials separately sampled machine CPU about 70-77%, or 34% when seven of eight
+roots were proven. Worker service-wall share is not CPU instruction occupancy;
+`nvidia-smi dmon` activity is not achieved SM occupancy. The October 7 current
+single-game comparison separately sampled HeXO device busy-time at 60-63%
+solver-off and 53-56% solver-on, against Six at 57-72%. These ranges are means
+of two trial means for each fixture. HeXO process CPU averaged 0.56-0.82 logical
+cores without proofs and 1.18-2.54 with proofs; Six averaged 0.91-1.01. NVML's
+averaging period can cross the reply boundary. External CPU services and 33
+unowned monitor processes were present; their interference was not isolated.
+These observations do not measure achieved SM occupancy or establish that all
+remaining device time can be filled with useful search. Historical batch-32 backend
+rates, single-game rates and sustained actor rates have different shapes and
+supply conditions and cannot be substituted for each other.
 
 A general 5x improvement has not been established. Neither an assumed
 100 microseconds/row host cost nor four halving rounds supplies a speed forecast.
@@ -252,6 +279,20 @@ added 0.8-5.8 seconds in sampled turns with little proof evidence. Keep existing
 cheap immediate classification. Deeper checks earn CPU slices through utility
 and cost; whether another inline tactical check pays is a measurement question.
 
+PR443 adds an optional shared proof-worker service with bounded admission,
+producer fairness, client-specific cancellation/drain, immutable job identities,
+and retained callback, library and worker-thread lifetimes. Only originating
+owners install results. Native actor producers can join that service instead of
+each reserving a separate pool. Clocked NativePlay still owns its two workers;
+the earlier caller measurements predate PR443 and do not measure shared-worker
+throughput. A successful private rebuild does not establish production adoption.
+
+Known-premise and stamp queries currently clear the worker's raw resident table
+and frontier. This isolates proof scope but can destroy retained raw work. Sharing
+a queue or remembering a preferred worker does not resolve that. Conditional
+sessions require explicit isolation or a measured, disclosed reset policy;
+continuation counters must distinguish preserved work from fresh rebuilding.
+
 ## Useful breadth, depth and batching
 
 Keep the full legal action set. The implemented compact store separates legal
@@ -288,6 +329,73 @@ and useful extra views. A higher rows/s configuration can support more useful
 work under an unchanged clock. Rejecting it only because it explores less depth
 at the same simulation count uses the wrong resource comparison. Conversely,
 rows added solely to fill hardware do not earn policy-target credit.
+
+### Clocked candidate delivery
+
+A final completion can arrive after the caller's deadline even when a useful
+candidate already exists. PR438 exposes one owned latest-progress frame per game
+after completed primary-root comparisons. Observing it does not acknowledge the
+command, advance its epoch or permit retargeting. Actor progress publication is
+off by default.
+
+Play validates producer, game, model, token, history and context. A new second-root
+observation replaces its provisional row and cumulative counts. It adds no new
+comparison credits. Final completion supersedes progress, and exact witnesses
+remain authoritative. Reading deeper evidence about the same position does not
+fabricate current-root sampling work. The first stone still needs final completion
+before its second root can be requested. If no usable prediction arrives in time,
+this mailbox cannot manufacture a searched turn.
+
+Native ownership/backpressure, CPU Play, browser behavior and exact-head review
+passed on implementation `6195d27`. Actual one-second GPU/controller delivery
+failed in the eighteenth saved trial. The forcing-position second root had zero
+completed comparisons, despite 80 issued requests; the fenced turn took 1.898
+seconds against a one-second allowance. A new 32x40 capture and a competing CI
+CUDA context were present, but neither is established as the cause. The caller
+now keeps that attempt in the clock record with zero fresh root comparisons. A
+matching final graph choice remains useful even without fresh comparison credits.
+Each stone distinguishes current-root comparisons, accumulated position-edge
+visits, an uncredited estimate and verified proof. Edge visits are neither unique
+neural evaluations nor an age measurement. An uncredited estimate can already
+include proof exclusions and the improved-policy transform, so it is not labelled
+as a raw network prediction. A matching completed progress candidate remains
+preferred to a later uncredited final estimate. Exact evidence remains usable
+without neural comparison credits. The changed existing caller behavior passed
+on private `0b9ce02` using immutable mocked frames, without model or CUDA work.
+It checks inherited and uncredited choices, zero fresh credits and exact
+precedence. It does not verify actual GPU timing. This reporting correction does not resolve
+the missed work. Earlier one-searched-stone
+timing failures are also retained. Measure caller return separately from
+post-return neural/proof drainage and trace capture, installation and publication
+boundaries before attributing the delay.
+
+On private `b4d05171`, nine new direct causal traces and the actual IPC/Six
+comparison were saved on October 7. The first unprewarmed direct turn spent
+1,125 ms in the initial capture call, including its warmup, and returned no
+searched stones. This does not establish a missing Play warmup: the actual
+TimedEngine worker evaluates the center position before sending `ready`, outside
+the move clock. All 12 actual IPC HeXO replies contained two aligned,
+positive-credit position records. Eight reply times nevertheless exceeded
+exactly 1,000 ms, with a maximum of 1,011.36 ms; Six also exceeded nominal
+movetime in its protocol replies. Functional delivery is therefore verified on
+these fixtures, while strict deadline success is not. The original failed
+receipt remains unchanged; no cause for its competing-context delay is inferred
+from the new cold-capture observation.
+
+The published `evaluated` counter is launched neural rows and can include
+in-flight work. Final service counters follow mandatory drainage. Neither
+counter says how many predictions affected the move delivered by the controller.
+The current comparison keeps reply snapshots, terminal totals and their wall
+boundaries separate. Its receipts are `current-caller-six-turns-20261007.json`,
+`current-caller-six-summary-20261007.json` and
+`clocked-causal-delivery-runtime-20261007.json`.
+
+The broker's `unique_rows` counts newly queued tasks, including work withdrawn
+before leasing. The origin proof-on repeats created 7,858 tasks but leased 7,736
+rows. `current-caller-six-counter-audit-20261007.json` corrects that distinction
+without changing the raw receipts. Leased rows still exclude physical padding
+and capture warmup. All twelve HeXO trials had scheduling profiling disabled,
+so their zero queue-age and owner-phase counters mean those costs were unmeasured.
 
 ### Queueing and transfers
 
