@@ -1,4 +1,4 @@
-"""Opt-in Triton line features, inference LineConv, and masked normalization.
+"""Opt-in Triton line features, LineConv, masked pooling and masked normalization.
 
 Keep the reference bf16 rounding points, including the centred variance and
 the products used for the affine gradients. Reductions accumulate in fp32.
@@ -91,16 +91,13 @@ def line_features(own,opp,mask):
     return out
 
 
-@tr.jit(do_not_specialize=['B', 'H', 'W', 'S'])
-def _line_add(X,Weight,Y,B,C:tl.constexpr,H,W,
-              S,L:tl.constexpr,K:tl.constexpr,NHWC:tl.constexpr):
-    i=tl.program_id(0)*K+tl.arange(0,K)
-    if NHWC:
-        c,x,y,b=i % C,i//C % W,i//(C*W) % H,i//(C*H*W)
-    else:
-        x,y=i % W,i//W % H
-        c,b=i//(H*W) % C,i//(C*H*W)
-    valid=i<B*C*H*W
+@tr.jit(do_not_specialize=['H', 'W', 'S'])
+def _line_add(X,Weight,Y,C:tl.constexpr,H,W,S,L:tl.constexpr,K:tl.constexpr):
+    plane=tl.program_id(0)
+    b,c=plane//C,plane % C
+    i=tl.program_id(1)*K+tl.arange(0,K)
+    x,y=i % W,i//W
+    valid=i<H*W
     at=b*S[0]+c*S[1]+y*S[2]+x*S[3]
     horizontal=tl.full((K,),0.,tl.float32)
     vertical=tl.full((K,),0.,tl.float32)
@@ -108,9 +105,9 @@ def _line_add(X,Weight,Y,B,C:tl.constexpr,H,W,
     for tap in tl.static_range(L):
         d=tap-L//2
         dd=tap-(L-1-L//2)  # centre after the reference diagonal's tap reversal
-        wh=tl.load(Weight+(c*3)*L+tap,valid,0).to(X.dtype.element_ty).to(tl.float32)
-        wv=tl.load(Weight+(c*3+1)*L+tap,valid,0).to(X.dtype.element_ty).to(tl.float32)
-        wd=tl.load(Weight+(c*3+2)*L+tap,valid,0).to(X.dtype.element_ty).to(tl.float32)
+        wh=tl.load(Weight+(c*3)*L+tap).to(X.dtype.element_ty).to(tl.float32)
+        wv=tl.load(Weight+(c*3+1)*L+tap).to(X.dtype.element_ty).to(tl.float32)
+        wd=tl.load(Weight+(c*3+2)*L+tap).to(X.dtype.element_ty).to(tl.float32)
         h=tl.load(X+at+d*S[3],valid&(x+d>=0)&(x+d<W),0).to(tl.float32)
         v=tl.load(X+at+d*S[2],valid&(y+d>=0)&(y+d<H),0).to(tl.float32)
         a=tl.load(X+at-dd*S[2]+dd*S[3],valid&(x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H),0).to(tl.float32)
@@ -120,7 +117,7 @@ def _line_add(X,Weight,Y,B,C:tl.constexpr,H,W,
     hv=(horizontal.to(X.dtype.element_ty).to(tl.float32)+vertical).to(X.dtype.element_ty).to(tl.float32)
     line=(hv+diagonal.to(X.dtype.element_ty).to(tl.float32)).to(X.dtype.element_ty).to(tl.float32)
     value=line+tl.load(X+at,valid,0).to(tl.float32)
-    tl.store(Y+i,value,valid)
+    tl.store(Y+plane*H*W+i,value,valid)
 
 
 @tr.jit(do_not_specialize=['N', 'H', 'W'])
@@ -151,13 +148,96 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
     tl.store(Y+at,line+tl.load(X+at,valid,0).to(tl.float32),valid)
 
 
+# Masked pooling: the mean and max of act(x) per sample and channel, read once forward and twice backward, with
+# the reference rounding of the bf16 sum, of the mean and max gradients and of their sum. Ties for the max share
+# its gradient equally, as amax's does.
+@tr.jit(do_not_specialize=['N', 'CS'])
+def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
+    p=tl.program_id(0)
+    b,c=p//C,p % C
+    i=tl.arange(0,K)
+    total=tl.full((K,),0.,tl.float32)
+    best=tl.full((K,),float('-inf'),tl.float32)
+    for start in range(0,N,K):
+        j=start+i
+        valid=j<N
+        v=tl.load(X+p*N+j,valid,0).to(tl.float32)
+        if ACT:
+            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32))
+        total+=tl.where(valid,v,0.)
+        best=tl.maximum(best,tl.where(valid,v,float('-inf')))
+    top=tl.max(best,0)
+    tl.store(Out+b*2*C+c,tl.sum(total,0).to(X.dtype.element_ty).to(tl.float32)/tl.load(Count+b))
+    tl.store(Out+b*2*C+C+c,top)
+    tl.store(Top+p,top)
+
+
+@tr.jit(do_not_specialize=['N', 'CS'])
+def _pool_grad(X,Ceiling,Count,Top,G,DX,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
+    p=tl.program_id(0)
+    b,c=p//C,p % C
+    i=tl.arange(0,K)
+    top=tl.load(Top+p)
+    ties=tl.full((K,),0.,tl.float32)
+    for start in range(0,N,K):
+        j=start+i
+        valid=j<N
+        v=tl.load(X+p*N+j,valid,0).to(tl.float32)
+        if ACT:
+            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32))
+        ties+=tl.where(valid&(v==top),1.,0.)
+    mean=(tl.load(G+b*2*C+c)/tl.load(Count+b)).to(DX.dtype.element_ty).to(tl.float32)
+    peak=tl.load(G+b*2*C+C+c).to(DX.dtype.element_ty).to(tl.float32)
+    peak=(peak/tl.sum(ties,0)).to(DX.dtype.element_ty).to(tl.float32)
+    for start in range(0,N,K):
+        j=start+i
+        valid=j<N
+        x=tl.load(X+p*N+j,valid,0).to(tl.float32)
+        v=x
+        if ACT:
+            ceiling=tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32)
+            v=tl.minimum(tl.maximum(x,0.),ceiling)
+        g=(mean+tl.where(v==top,peak,0.)).to(DX.dtype.element_ty).to(tl.float32)
+        if ACT:
+            g=tl.where((x>=0.)&(x<=ceiling),g,0.)
+        tl.store(DX+p*N+j,g,valid)
+
+
+class _MaskedPool(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,x,count,ceiling):
+        b,c,h,w=x.shape
+        out=torch.empty((b,2*c),device=x.device,dtype=torch.float32)
+        top=torch.empty(b*c,device=x.device,dtype=torch.float32)
+        act=ceiling is not None
+        source=ceiling if act else x
+        _pool[(b*c,)](x,source,count,out,top,h*w,source.stride(0),c,act,1024)
+        ctx.save_for_backward(x,count,top,source)
+        ctx.act=act
+        return out
+
+    @staticmethod
+    def backward(ctx,grad):
+        x,count,top,source=ctx.saved_tensors
+        b,c,h,w=x.shape
+        dx=torch.empty_like(x)
+        _pool_grad[(b*c,)](x,source,count,top,grad.contiguous(),dx,h*w,source.stride(0),c,ctx.act,1024)
+        return dx,None,None
+
+
+def masked_pool(x,count,ceiling=None):
+    """hexnet.pool for contiguous NCHW CUDA x, count [B, 1] fp32 and an optional ceiling [B, 1, H, W] whose planes are
+    contiguous: [B, 2C] fp32."""
+    return _MaskedPool.apply(x,count,ceiling)
+
+
 def line_add(x,weight):
     out=torch.empty_like(x)
     b,c,h,w=x.shape
     if x.is_contiguous(memory_format=torch.channels_last):
         _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32)
     else:
-        _line_add[(tr.cdiv(x.numel(),256),)](x,weight,out,*x.shape,x.stride(),weight.shape[-1],256,False)
+        _line_add[(b*c,tr.cdiv(h*w,256))](x,weight,out,c,h,w,x.stride(),weight.shape[-1],256)
     return out
 
 
@@ -370,160 +450,87 @@ class MaskedBatchNorm(torch.autograd.Function):
         return (dx,None,dw.to(weight.dtype),db.to(weight.dtype),None,None,None)[:len(ctx.needs_input_grad)]
 
 
-# Training LineConv keeps the reference Toeplitz bmm operations and BF16
-# rounding. Only their NCHW staging, output gather, and tap gradients differ.
-@tr.jit(do_not_specialize=['B', 'H', 'W'])
-def _train_line_skew(X, Skew, B, H, W, C:tl.constexpr, K:tl.constexpr):
-    wide=H+W-1
-    i=tl.program_id(0)*K+tl.arange(0,K)
-    j,b=i%wide,i//wide%B
-    y,c=i//(wide*B)%H,i//(wide*B*H)
-    x=j-y
-    valid=i<C*H*B*wide
-    value=tl.load(X+((b*C+c)*H+y)*W+x,valid&(x>=0)&(x<W),0)
-    tl.store(Skew+i,value,valid)
+# Training LineConv: the forward pass is _line_add. The backward pass runs the transposed taps over the gradient
+# with the reference bf16 rounding of each axis sum, and reduces the tap gradients in fp32.
+@tr.jit(do_not_specialize=['H', 'W'])
+def _line_grad(G,Weight,DX,C:tl.constexpr,H,W,L:tl.constexpr,K:tl.constexpr):
+    plane,c=tl.program_id(0),tl.program_id(0) % C
+    i=tl.program_id(1)*K+tl.arange(0,K)
+    x,y=i % W,i//W
+    valid=i<H*W
+    g=G+plane*H*W+i
+    horizontal=tl.full((K,),0.,tl.float32)
+    vertical=tl.full((K,),0.,tl.float32)
+    diagonal=tl.full((K,),0.,tl.float32)
+    for tap in tl.static_range(L):
+        d=tap-L//2
+        dd=tap-(L-1-L//2)
+        wh=tl.load(Weight+(c*3)*L+tap).to(G.dtype.element_ty).to(tl.float32)
+        wv=tl.load(Weight+(c*3+1)*L+tap).to(G.dtype.element_ty).to(tl.float32)
+        wd=tl.load(Weight+(c*3+2)*L+tap).to(G.dtype.element_ty).to(tl.float32)
+        h=tl.load(g-d,valid&(x-d>=0)&(x-d<W),0).to(tl.float32)
+        v=tl.load(g-d*W,valid&(y-d>=0)&(y-d<H),0).to(tl.float32)
+        a=tl.load(g-dd+dd*W,valid&(x-dd>=0)&(x-dd<W)&(y+dd>=0)&(y+dd<H),0).to(tl.float32)
+        horizontal=tl.fma(h,wh,horizontal)
+        vertical=tl.fma(v,wv,vertical)
+        diagonal=tl.fma(a,wd,diagonal)
+    hv=(horizontal.to(G.dtype.element_ty).to(tl.float32)+vertical.to(G.dtype.element_ty).to(tl.float32))
+    hv=hv.to(G.dtype.element_ty).to(tl.float32)
+    residual=(hv+tl.load(g,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
+    tl.store(DX+plane*H*W+i,residual+diagonal.to(G.dtype.element_ty).to(tl.float32),valid)
 
 
-@tr.jit(do_not_specialize=['B', 'H', 'W'])
-def _train_line_planar(X, Planar, B, H, W, C:tl.constexpr, K:tl.constexpr):
-    i=tl.program_id(0)*K+tl.arange(0,K)
-    x,b=i%W,i//W%B
-    y,c=i//(W*B)%H,i//(W*B*H)
-    valid=i<C*H*B*W
-    tl.store(Planar+i,tl.load(X+((b*C+c)*H+y)*W+x,valid,0),valid)
-
-
-@tr.jit(do_not_specialize=['B', 'H', 'W'])
-def _train_line_gather(HV,Diagonal,X,Y,B,H,W,C:tl.constexpr,K:tl.constexpr):
-    i=tl.program_id(0)*K+tl.arange(0,K)
-    x,y=i%W,i//W%H
-    c,b=i//(W*H)%C,i//(W*H*C)
-    valid=i<B*C*H*W
-    wide=H+W-1
-    planar=((c*H+y)*B+b)*W+x
-    skew=((c*H+y)*B+b)*wide+x+y
-    hv=tl.load(HV+planar,valid,0).to(tl.float32)
-    dd=tl.load(Diagonal+skew,valid,0).to(tl.float32)
-    line=(hv+dd).to(Y.dtype.element_ty).to(tl.float32)
-    tl.store(Y+i,line+tl.load(X+i,valid,0).to(tl.float32),valid)
-
-
-@tr.jit(do_not_specialize=['B', 'H', 'W'])
-def _train_line_gather_dx(DH,DV,DD,G,DX,B,H,W,C:tl.constexpr,K:tl.constexpr):
-    i=tl.program_id(0)*K+tl.arange(0,K)
-    x,y=i%W,i//W%H
-    c,b=i//(H*W)%C,i//(C*H*W)
-    valid=i<B*C*H*W
-    wide=H+W-1
-    planar=((c*H+y)*B+b)*W+x
-    skew=((c*H+y)*B+b)*wide+x+y
-    h=tl.load(DH+planar,valid,0).to(tl.float32)
-    v=tl.load(DV+planar,valid,0).to(tl.float32)
-    d=tl.load(DD+skew,valid,0).to(tl.float32)
-    hv=(h+v).to(G.dtype.element_ty).to(tl.float32)
-    residual=(hv+tl.load(G+i,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
-    tl.store(DX+i,residual+d,valid)
-
-
-@tr.jit
-def _train_line_tap_diagonals(DH,DV,DD,DW,S:tl.constexpr,L:tl.constexpr,
-                              I:tl.constexpr,T:tl.constexpr):
-    c,axis=tl.program_id(0),tl.program_id(1)
-    tap=tl.arange(0,T)
-    i=tl.arange(0,I)
-    centre=L//2
-    if axis==0:
-        matrix=DH
-        j=i[None,:]+centre-tap[:,None]
-    elif axis==1:
-        matrix=DV
-        j=i[None,:]+tap[:,None]-centre
-    else:
-        matrix=DD
-        j=i[None,:]+L-1-centre-tap[:,None]
-    valid=(tap[:,None]<L)&(i[None,:]<S)&(j>=0)&(j<S)
-    values=tl.load(matrix+c*S*S+i[None,:]*S+j,valid,0).to(tl.float32)
-    tl.store(DW+(c*3+axis)*L+tap,tl.sum(values,1),tap<L)
-
-
-@tr.jit(do_not_specialize=['side'])
-def _train_line_three_toeplitz(Weight,Matrices,side,C:tl.constexpr,L:tl.constexpr,K:tl.constexpr):
-    group=tl.program_id(0)
-    axis,c=group//C,group%C
-    position=tl.program_id(1)*K+tl.arange(0,K)
-    row,column=position//side,position%side
-    difference=row-column
-    centre=L//2
-    tap=tl.where(axis==2,L-1-centre-difference,difference+centre)
-    value=tl.load(Weight+(c*3+axis)*L+tap,
-                  (position<side*side)&(tap>=0)&(tap<L),0)
-    tl.store(Matrices+group*side*side+position,value,position<side*side)
-
-
-def _train_line_matrices(weight,side):
-    c,_,length=weight.shape
-    matrices=torch.empty((3,c,side,side),dtype=weight.dtype,device=weight.device)
-    _train_line_three_toeplitz[(3*c,tr.cdiv(side*side,256))](
-        weight,matrices,side,c,length,256)
-    return matrices[0],matrices[1].transpose(1,2),matrices[2].transpose(1,2)
+@tr.jit(do_not_specialize=['B', 'H', 'W', 'T', 'P'])
+def _line_taps(X,G,Partial,B,C:tl.constexpr,H,W,T,P,L:tl.constexpr,LP:tl.constexpr,K:tl.constexpr):
+    c,t=tl.program_id(0),tl.program_id(1)
+    tap=tl.arange(0,LP)
+    d=(tap-L//2)[:,None]
+    dd=(tap-(L-1-L//2))[:,None]
+    horizontal=tl.full((LP,K),0.,tl.float32)
+    vertical=tl.full((LP,K),0.,tl.float32)
+    diagonal=tl.full((LP,K),0.,tl.float32)
+    for start in range(t*P,tl.minimum((t+1)*P,B*H*W),K):
+        j=start+tl.arange(0,K)
+        x,y,b=j % W,j//W % H,j//(H*W)
+        at=(((b*C+c)*H+y)*W+x)[None,:]
+        valid=j<B*H*W
+        g=tl.load(G+at,valid[None,:],0).to(tl.float32)
+        used=(tap<L)[:,None]&valid[None,:]
+        x,y=x[None,:],y[None,:]
+        horizontal+=g*tl.load(X+at+d,used&(x+d>=0)&(x+d<W),0).to(tl.float32)
+        vertical+=g*tl.load(X+at+d*W,used&(y+d>=0)&(y+d<H),0).to(tl.float32)
+        diagonal+=g*tl.load(X+at+dd-dd*W,used&(x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H),0).to(tl.float32)
+    out=Partial+(c*3*L+tap)*T+t
+    tl.store(out,tl.sum(horizontal,1),tap<L)
+    tl.store(out+L*T,tl.sum(vertical,1),tap<L)
+    tl.store(out+2*L*T,tl.sum(diagonal,1),tap<L)
 
 
 class _TrainLineAdd(torch.autograd.Function):
     @staticmethod
     def forward(ctx,x,weight):
-        b,c,h,w=x.shape
-        weight_bf16=weight.to(x.dtype)
-        horizontal,vertical,diagonal=_train_line_matrices(weight_bf16,h)
-        wide=h+w-1
-        skew=torch.empty((c,h,b,wide),dtype=x.dtype,device=x.device)
-        _train_line_skew[(tr.cdiv(skew.numel(),256),)](x,skew,b,h,w,c,256)
-        dd=torch.bmm(diagonal,skew.view(c,h,b*wide)).view(c,h,b,wide)
-        planar=torch.empty((c,h,b,w),dtype=x.dtype,device=x.device)
-        _train_line_planar[(tr.cdiv(planar.numel(),256),)](x,planar,b,h,w,c,256)
-        hv=torch.bmm(planar.view(c,h*b,w),horizontal).view(c,h,b*w)
-        hv.baddbmm_(vertical.to(hv.dtype),planar.view(c,h,b*w).to(hv.dtype))
-        out=torch.empty_like(x,memory_format=torch.contiguous_format)
-        _train_line_gather[(tr.cdiv(x.numel(),256),)](hv,dd,x,out,b,h,w,c,256)
-        ctx.save_for_backward(planar,skew,weight_bf16)
-        ctx.shape=b,c,h,w
-        return out
+        ctx.save_for_backward(x,weight)
+        return line_add(x,weight)
 
     @staticmethod
     def backward(ctx,grad):
-        planar_x,skew_x,weight=ctx.saved_tensors
-        b,c,h,w=ctx.shape
-        line_grad=grad.to(weight.dtype).contiguous()
+        x,weight=ctx.saved_tensors
+        b,c,h,w=x.shape
+        length=weight.shape[-1]
+        grad=grad.to(x.dtype).contiguous()
         dx=dw=None
-        wide=h+w-1
-        planar_g=torch.empty_like(planar_x)
-        _train_line_planar[(tr.cdiv(planar_g.numel(),256),)](
-            line_grad,planar_g,b,h,w,c,256)
-        skew_g=torch.empty_like(skew_x)
-        _train_line_skew[(tr.cdiv(skew_g.numel(),256),)](
-            line_grad,skew_g,b,h,w,c,256)
-        if ctx.needs_input_grad[1]:
-            dh=torch.bmm(planar_x.view(c,h*b,w).transpose(1,2),
-                         planar_g.view(c,h*b,w))
-            dv=torch.bmm(planar_g.view(c,h,b*w),
-                         planar_x.view(c,h,b*w).transpose(1,2))
-            dd=torch.bmm(skew_g.view(c,h,b*wide),
-                         skew_x.view(c,h,b*wide).transpose(1,2))
-            l=weight.shape[-1]
-            dw=torch.empty((c,3,l),dtype=torch.float32,device=grad.device)
-            _train_line_tap_diagonals[(c,3)](
-                dh,dv,dd,dw,h,l,tr.next_power_of_2(h),tr.next_power_of_2(l))
-            del dh,dv,dd
         if ctx.needs_input_grad[0]:
-            horizontal,vertical,diagonal=_train_line_matrices(weight,h)
-            dh=torch.bmm(planar_g.view(c,h*b,w),horizontal.transpose(1,2)).view(c,h,b,w)
-            dv=torch.bmm(vertical.transpose(1,2),planar_g.view(c,h,b*w)).view(c,h,b,w)
-            dd=torch.bmm(diagonal.transpose(1,2),skew_g.view(c,h,b*wide)).view(c,h,b,wide)
-            dx=torch.empty((b,c,h,w),device=grad.device,dtype=line_grad.dtype)
-            _train_line_gather_dx[(tr.cdiv(dx.numel(),256),)](
-                dh,dv,dd,line_grad,dx,b,h,w,c,256)
+            dx=torch.empty_like(grad)
+            _line_grad[(b*c,tr.cdiv(h*w,256))](grad,weight,dx,c,h,w,length,256)
+        if ctx.needs_input_grad[1]:
+            k,p=64,4096
+            t=tr.cdiv(b*h*w,p)
+            partial=torch.empty((c,3,length,t),dtype=torch.float32,device=grad.device)
+            _line_taps[(c,t)](x,grad,partial,b,c,h,w,t,p,length,tr.next_power_of_2(length),k)
+            dw=partial.sum(-1)
         return dx,dw
 
 
 def line_train_add(x,weight):
-    """Residual LineConv for contiguous NCHW CUDA bf16 activations and fp32 taps."""
+    """Residual LineConv x + LineConv(x) for contiguous NCHW CUDA bf16 activations and fp32 taps, with gradients."""
     return _TrainLineAdd.apply(x,weight)

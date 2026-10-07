@@ -55,6 +55,7 @@ its source, binary, checkpoint, configuration and workload identities.
 | PR404 balanced allocation study | 48 one-second trials across baseline, lookup control and pressure admission. Midgame owner-step wall per NN row falls about 16%; root comparison credits rise. Overall rows/s is approximately flat. | Admission improves a measured host/allocation cost, not a massive speedup. Neural-only continuation depths fell; proof-enabled depth/proof delivery was comparable. |
 | PR404 complete games | 8 neural-only and 8 concurrent-proof uncapped games, all terminal; 1,780 saved rows, 96 independently checked CPU certificates, no missing raw predictions | Legal play, proof/data/lifetime behavior and complete drainage. Not a strength or learner comparison. |
 | Proof worker wakeups, October 6 | 12 proof workers, queue 48, whole machine, four A/B/B/A trials per arm: book-32 solver-on NN rows/s 7,025 to 10,283, proof queries 10.2k to 18.5k, checked certificates 0 to 8; saved-selfplay-8 3,909 to 4,205. Unchanged within noise at 4 workers | Waking every idle worker for each job made them queue on the proof mutex ahead of the graph owner. More workers now add coverage instead of starving the GPU feed. |
+| Proof supply and worker split, October 6 | 12 proof workers, 4 s clocks, four A/B/B/A trials per arm (#427): worker idle on book-32 55% to 12%, fresh solver nodes +7 to +48% across cohorts, book-32 checked certificates 11.5 to 42, NN rows/s within 2% on the multi-game cohorts and -4 to -6% on quiet-handoff and saved-selfplay-8. Queue 8 per worker against 4: fresh nodes +9 to +24%, midgame certificates 100 to 147, NN rows/s -1 to -2%. 16 workers against 12 cost quiet-handoff 15% of NN rows/s | Most quiet dispatches were no-ops that never closed their side. Defaults: 12 proof workers per producer pool (one pool per model), queue 8 per worker |
 
 An October 6 reverse-order queue study adds 96 one-second trials. With endpoints
 and proofs enabled, producer outstanding depth 2 to 4 at chunk 64 raises median
@@ -215,9 +216,18 @@ reservation exactly once even when its result becomes obsolete.
 Current task priority uses root/view impact, value movement, measured recent
 query cost and aging, with deliberate exploration. It excludes exact/dormant
 nodes and nodes whose rule peers have neural work pending. It alternates mover
-and defender work subject to scope status. The desktop pool uses native worker
-instances, continuation affinity and work stealing rather than leaving a worker
-idle because its preferred continuation is unavailable.
+and defender work subject to scope status. A side closes for the same premises
+when its search is disproved. Without stamps the defender side is closed from
+the start when the solver cannot begin there (the mover completes now, or the
+defender's attacker has no two-stone completion); premise changes reopen only
+the mover. A task inside its retry delay ranks behind every other eligible task,
+and only a worker idle at the refill continues it with the doubled slice, so
+retries never queue ahead of fresh positions. A full frontier drops exact
+entries and entries closed under the current facts before open ones. The
+desktop pool uses native worker instances, continuation affinity and work
+stealing rather than leaving a worker idle because its preferred continuation
+is unavailable. `hxp_supply_stats` counts why each refill stopped and charges
+idle worker time to that reason.
 
 Queries use time slices under the root clock. Retries can increase the slice;
 new relevant premises or material value change can reopen work. Fresh nodes,

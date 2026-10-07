@@ -16,6 +16,15 @@ int main(){
    auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);
   }
  }
+ // One pass over a history gives every prefix the keys of its replayed board.
+ {Board board;std::vector<Cell> history;std::mt19937_64 rng(37);
+  for(int stones=0;stones<80 && board.winner<0;++stones){auto legal=board.legal_moves();auto action=legal[rng()%legal.size()];board.make(action);history.push_back(action);}
+  auto all=gumbel::prefix_keys(history);assert(all.size()==history.size()+1);Board replay;
+  for(size_t k=0;k<=history.size();++k){
+   assert(all[k]==gumbel::keys(replay) && all[k]==gumbel::keys(std::vector<Cell>(history.begin(),history.begin()+k)));
+   if(k<history.size())replay.make(history[k]);
+  }
+ }
  // Discarding a child graph must not discard the second stone of a retained
  // winning turn. Orphan proof records do not keep their own descendants alive.
  {gumbel::Tree t(29);assert(hxg_share(&t,1));t.tactics=true;

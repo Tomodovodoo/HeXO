@@ -61,7 +61,7 @@ for name, result, args in (
     ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
     ('drain', C.c_int, [ptr]), ('free', C.c_int, [ptr]),
     ('offer', C.c_int, [ptr, C.c_int, ptr, C.c_int, C.c_double]),
-    ('stats', None, [ptr, ptr, ptr]), ('scope_stats', None, [ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
+    ('stats', None, [ptr, ptr, ptr]), ('scope_stats', None, [ptr, ptr]), ('supply_stats', None, [ptr, ptr, ptr]), ('record', C.c_char_p, [ptr, C.c_int]),
     ('generation', C.c_uint64, [ptr, C.c_int]), ('effort', C.c_int, [ptr, C.c_int, ptr]),
 ):
     bind('hxp_'+name, result, *args)
@@ -73,9 +73,12 @@ class ProofLoop:
     A slice is a CPU scheduling quantum. UNKNOWN remains unknown. Resident tables
     and bounded best-first frontiers survive compatible slices and retargets.
     Recursive level-1 frames and kernel memos are still rebuilt per query.
+    `queue` bounds queued plus running jobs; by default eight per worker, so
+    workers keep work between the graph owner's refills.
     """
-    def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
+    def __init__(self, pool, package=None, *, workers=2, queue=None, slice_ms=8, table_mb=4,
                  tasks=256, stamps=False, endpoints=8, direct=False):
+        queue = 8*workers if queue is None else queue
         if not isinstance(endpoints,int) or not 0<=endpoints<=8:
             raise ValueError('Neural frontier limit must be an integer from 0 to 8')
         from tactical_proof import NativeTactics, PACKAGE
@@ -142,6 +145,13 @@ class ProofLoop:
         frontier=np.empty(6, np.uint64)
         native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
         result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
+        counts, idle = np.empty(12, np.uint64), np.empty(6, np.float64)
+        native.hxp_supply_stats(self.ptr, counts.ctypes.data, idle.ctypes.data)
+        result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_deferred', 'supply_pending',
+                           'supply_closed', 'supply_dormant', 'supply_full_exits', 'supply_held_exits',
+                           'supply_empty_exits', 'supply_first_queries', 'supply_deferred_dispatched'), map(int, counts)))
+        result.update(zip(('idle_capacity_ms', 'idle_held_ms', 'idle_pending_ms', 'idle_closed_ms',
+                           'idle_dormant_ms', 'idle_empty_ms'), map(float, idle)))
         return result
 
     def records(self):

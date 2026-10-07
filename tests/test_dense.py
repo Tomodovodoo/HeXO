@@ -1300,25 +1300,48 @@ class FusedCudaTests(unittest.TestCase):
                     tol = .02 if dtype == torch.bfloat16 else 2e-5
                     torch.testing.assert_close(a, b, atol=tol, rtol=tol)
 
+    def test_masked_pool_matches_reference(self):
+        torch.manual_seed(3070)
+        x = torch.randn(3, 8, 24, 24, device='cuda', dtype=torch.bfloat16)
+        x[0, :2] = -x[0, :2].abs()    # all-zero activations: every cell ties for the max
+        mask = (torch.rand(3, 1, 24, 24, device='cuda') > .3).bfloat16()
+        ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
+        count = mask.sum((2, 3), dtype=torch.float32)
+        grad = torch.randn(3, 16, device='cuda')
+        for limit in (ceiling, None):
+            source = x if limit is not None else hexnet.act(x, ceiling)
+            outputs, gradients = [], []
+            for fused in (False, True):
+                y = source.detach().clone().requires_grad_()
+                out = hexnet.pool(y, count, limit, fused)
+                outputs.append(out)
+                gradients.append(torch.autograd.grad(out, y, grad)[0])
+            with self.subTest(ceiling=limit is not None):
+                self.assertEqual(outputs[1].dtype, outputs[0].dtype)
+                self.assert_bf16_close(*outputs)
+                self.assert_bf16_close(*gradients)
+
     def test_training_line_residual_gradients(self):
         from hexnet_kernels import line_train_add
 
         torch.manual_seed(3070)
-        line = hexnet.LineConv(8, 11).cuda()
-        with torch.no_grad():
-            line.weight.normal_(0, .2)
-        fused = copy.deepcopy(line)
-        x = torch.randn(3, 8, 24, 24, device='cuda', dtype=torch.bfloat16).requires_grad_()
-        x_fused = x.detach().clone().requires_grad_()
-        grad = torch.randn_like(x)
-        with torch.autocast('cuda', torch.bfloat16):
-            expected = x+line(x)
-            actual = line_train_add(x_fused, fused.weight)
-        expected_grads = torch.autograd.grad(expected, (x, line.weight), grad)
-        actual_grads = torch.autograd.grad(actual, (x_fused, fused.weight), grad)
-        self.assert_bf16_close(expected, actual)
-        for reference, candidate in zip(expected_grads, actual_grads):
-            self.assert_bf16_close(reference, candidate)
+        for length, size in ((11, 24), (5, 32), (6, 40)):
+            line = hexnet.LineConv(8, length).cuda()
+            with torch.no_grad():
+                line.weight.normal_(0, .2)
+            fused = copy.deepcopy(line)
+            x = torch.randn(3, 8, size, size, device='cuda', dtype=torch.bfloat16).requires_grad_()
+            x_fused = x.detach().clone().requires_grad_()
+            grad = torch.randn_like(x)
+            with torch.autocast('cuda', torch.bfloat16):
+                expected = x+line(x)
+                actual = line_train_add(x_fused, fused.weight)
+            expected_grads = torch.autograd.grad(expected, (x, line.weight), grad)
+            actual_grads = torch.autograd.grad(actual, (x_fused, fused.weight), grad)
+            with self.subTest(length=length, size=size):
+                self.assert_bf16_close(expected, actual)
+                for reference, candidate in zip(expected_grads, actual_grads):
+                    self.assert_bf16_close(reference, candidate)
 
     def test_model_random_and_real_forward_backward(self):
         torch.manual_seed(3070)
