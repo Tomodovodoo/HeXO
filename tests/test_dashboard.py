@@ -511,10 +511,6 @@ class OpeningBookPages(unittest.TestCase):
         self.assertAlmostEqual(row['mean_plies'], 130/6)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ProjectSmoothing(unittest.TestCase):
     """The comparison page's smoothing spans the same share of the x-axis for every series, however densely it was
     logged: a variant logged every 20 steps and one downsampled to every 220 steps smooth to the same curve."""
@@ -546,3 +542,7 @@ console.log(JSON.stringify({gap, gapPerPoint, first: d[0][1], firstSignal: dense
         self.assertLess(out['gap'], 0.05)
         self.assertGreater(out['gapPerPoint'], out['gap'] * 2)
         self.assertAlmostEqual(out['first'], out['firstSignal'], places=9)
+
+
+if __name__ == '__main__':
+    unittest.main()
