@@ -1232,8 +1232,13 @@ def unsearched(rows):
     return sum(bool(r.get('line')) for r in rows)
 
 
-def shard_name():
-    return f'{time.time_ns()//1_000_000:013d}{os.getpid() % 1000:03d}'
+def shard_name(after=''):
+    """Millisecond and process name of a new shard, later than `after` (this process's previous shard) so
+    shards queued for the writer within one millisecond never share a directory."""
+    ms = time.time_ns()//1_000_000
+    if after:
+        ms = max(ms, int(after[:13])+1)
+    return f'{ms:013d}{os.getpid() % 1000:03d}'
 
 
 def worker(args):
@@ -1332,7 +1337,7 @@ def worker(args):
 
     def publish():
         now = time.perf_counter()
-        name = shard_name()
+        name = state['last_shard'] = shard_name(state.get('last_shard', ''))
         actors = sorted({e['actor'] for e in episodes})
         opponents = {}
         for e in episodes:
