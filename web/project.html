@@ -14,7 +14,7 @@ canvas{display:block;width:100%;height:260px;touch-action:pan-y}.tip{position:ab
 @media(max-width:760px){main{padding:16px}header{padding:14px 16px}.grid{grid-template-columns:1fr}canvas{height:220px}}
 .panel.history .legend{max-height:none}
 </style>
-<header><h1>Bubble</h1><span>Dense run comparison</span><label class="smooth">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
+<header><h1>Bubble</h1><span>Dense run comparison</span><label class="smooth" title="Exponential smoothing over the x-axis of the full logged series: the value is the weight kept per thousandth of the visible span, so every series smooths over the same span however densely it was logged">Smoothing <input id="smooth" type="range" min="0" max="0.99" step="0.01"> <output id="smooth-value"></output></label><label class="smooth">from step <input id="from-step" type="number" min="0" step="500"></label><div id="status" role="status">Connecting...</div></header>
 <main>
 <section class="runs"><div class="bar"><h2>Runs</h2><small id="showing"></small><button id="first">First 10</button><button id="none">None</button></div>
 <div class="table-scroll"><table><thead><tr><th></th><th></th><th>Run</th><th>Variant</th><th>Step</th><th>Elo (95%)</th><th>Champion</th><th>Learner</th><th>Actors</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table></div></section>
@@ -59,7 +59,7 @@ const save=()=>{try{localStorage.setItem('hexo-project',JSON.stringify(state))}c
 const selected=()=>state.selected?rows.filter(r=>state.selected.includes(r.key)):rows.slice(0,10);
 const style=(i,dash)=>({color:COLORS[i%COLORS.length],dash:dash||(i>=COLORS.length?[6,4]:[])});
 const fmt=v=>{if(!Number.isFinite(v))return'-';const a=Math.abs(v);return a>=1e4?Math.round(v).toLocaleString():a>=100?v.toFixed(0):a>=10?v.toFixed(1):a>=.01||a===0?v.toPrecision(4):v.toExponential(2)};
-const ema=(pts,w)=>{let m=0,n=0;return pts.map(q=>{m=m*w+(1-w)*q[1];n++;return [q[0],m/(1-w**n),...q.slice(2)]})};
+const ema=(pts,w,unit)=>{let m=0,n=0,prev=null;return pts.map(q=>{const k=unit>0&&prev!=null?(q[0]-prev)/unit:1,a=w**k;m=m*a+(1-a)*q[1];n+=k;prev=q[0];return [q[0],m/(1-w**n),...q.slice(2)]})};
 const XLABEL={step:'Step',hours:'Time (hours)',remaining:'Plies remaining',ply:'Ply'},xfmt=(x,v)=>x==='hours'?v.toFixed(2)+' h':x==='remaining'?`${Math.round(v)} plies`:x==='ply'?`ply ${Math.round(v)}`:`${Math.round(v)}`;
 const tick=v=>Math.abs(v)>=1e-3||v===0?v.toLocaleString(undefined,{maximumFractionDigits:6}):v.toExponential(1);
 const age=s=>s==null?'-':s<90?`${Math.round(s)} s`:s<5400?`${Math.round(s/60)} min`:s<172800?`${(s/3600).toFixed(1)} h`:`${Math.round(s/86400)} d`;
@@ -86,7 +86,7 @@ const xOf=p=>p.xs.includes(state.x[p.id])?state.x[p.id]:p.xs[0];
 const fromOf=p=>xOf(p)==='step'?state.fromStep:0;
 const cacheKey=(s,p)=>`${s.run.name}|${s.variant}|${s.metric}|${xOf(p)}`;
 async function fetchSeries(){const jobs=[];for(const p of PANELS)for(const s of panelSeries(p)){const k=cacheKey(s,p),hit=cache.get(k),from=fromOf(p),x=xOf(p),now=project.now;if(hit&&hit.from===from&&(hit.poll===now||(!s.run.live&&now-hit.poll<60)))continue;
-jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x,max_points:1000,from_step:from});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);const points=(await res.json()).points,cur=cache.get(k);if(from===fromOf(p)&&!(cur?.from===from&&cur.poll>now))cache.set(k,{poll:now,from,points})})}
+jobs.push(async()=>{const q=new URLSearchParams({run:s.run.name,variant:s.variant,metric:s.metric,x,max_points:p.smooth?20000:1000,from_step:from});const res=await fetch('/api/series?'+q);if(!res.ok)throw Error(`${s.metric} of ${s.label}: HTTP ${res.status}`);const points=(await res.json()).points,cur=cache.get(k);if(from===fromOf(p)&&!(cur?.from===from&&cur.poll>now))cache.set(k,{poll:now,from,points})})}
 for(const p of PANELS){if(!p.surface&&!p.history)continue;const s=surfOf(p),hit=s.r&&cache.get(s.k);if(!s.r||hit&&(hit.poll===project.now||(!s.r.run.live&&project.now-hit.poll<60)))continue;
 jobs.push(async()=>{const q=new URLSearchParams({run:s.r.run.name,variant:s.r.variant,metric:`${s.src}_${p.surface||p.history}`});if(p.history){q.set('history','1');q.set('x',xOf(p))}const res=await fetch((p.history?'/api/series?':'/api/surface?')+q);if(!res.ok)throw Error(`${p.title} of ${s.r.key}: HTTP ${res.status}`);cache.set(s.k,{poll:project.now,grid:await res.json()})})}
 let failure=null;const worker=async()=>{while(jobs.length){try{await jobs.shift()()}catch(e){failure=e}}};await Promise.all(Array.from({length:6},worker));if(failure)throw failure}
@@ -138,7 +138,9 @@ return {key:c.checkpoint,metric:p.history,label:`${c.step.toLocaleString()}${las
 note:`${c.checkpoint}${c.rows!=null?` · ${c.rows.toLocaleString()} source rows`:''}${c.source_checkpoint?` · games from ${c.source_checkpoint}`:''}`}})}
 function draw(p,hover){if(p.surface)return drawSurface(p,hover);const el=p.el,c=el.querySelector('canvas'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight,x=xOf(p),log=p.log&&state.log[p.id];
 c.width=w*ratio;c.height=h*ratio;ctx.setTransform(ratio,0,0,ratio,0,0);el.querySelectorAll('.tools button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.x?b.dataset.x===x:!!log));
-const series=(p.history?historySeries(p):panelSeries(p)).map(s=>{const raw=(s.raw||cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep));return {...s,raw,points:p.smooth&&state.smooth>0?ema(raw,state.smooth):raw}});
+const rawSeries=(p.history?historySeries(p):panelSeries(p)).map(s=>({...s,raw:(s.raw||cache.get(cacheKey(s,p))?.points||[]).map(q=>q.map((v,i)=>i&&p.scale&&v!=null?v*p.scale:v)).filter(q=>(q[1]==null||!log||q[1]>0)&&(x!=='step'||q[0]>=state.fromStep))}));
+let lo=Infinity,hi=-Infinity;for(const s of rawSeries)for(const q of s.raw){if(q[0]<lo)lo=q[0];if(q[0]>hi)hi=q[0]}const unit=hi>lo?(hi-lo)/1000:0;
+const series=rawSeries.map(s=>({...s,points:p.smooth&&state.smooth>0?ema(s.raw,state.smooth,unit):s.raw}));
 const legend=el.querySelector('.legend');legend.replaceChildren(...series.map(s=>{const e=document.createElement('span');e.title=s.note||'';if(s.color)e.style.color=s.color;e.append(swatch(s.index,s.dash,s.color),s.label,(s.metric==='seal_elo'||s.metric.startsWith('anchor_elo:')||s.metric.startsWith('external_elo:'))&&s.raw.length?' '+fmt(s.raw[0][1]):'');return e}));
 if(p.external)el.querySelector('.note').textContent=[p.note,...series.filter(s=>s.note).map(s=>s.note)].join(' ');
 const total=p.perRun?new Set(rows.map(r=>r.run.name)).size:rows.length,shown=new Set(selected().map(r=>p.perRun?r.run.name:r.key)).size;el.querySelector('.showing').textContent=p.history?(surfOf(p).r?`${surfOf(p).r.key} · held-out ${surfOf(p).src} · older → newer`:''):shown<total?`Showing first ${shown} of ${total} runs`:`Showing ${shown} runs`;
