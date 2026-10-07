@@ -500,7 +500,7 @@ if (job.kind === 'encode') {
       })})},
     Worker: class {
       postMessage({id, history, options, prepare, request, cancel}) {
-        if (prepare) { queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
+        if (prepare) { if (!job.stallPrepare) queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
         if (request) {
           const {history,...options} = request;
           // A worker's answer arrives as a task, so the owner's turn can run between proof slices.
@@ -551,6 +551,13 @@ if (job.kind === 'encode') {
     answer = session.lookup(job.history);
     if (job.preset && answer) answer = {...answer, analysis: session.state().analysis, solver_frames: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
     if (!answer) throw Error(JSON.stringify(session.state().jobs));
+  } else if (job.stallPrepare) {
+    // The proof workers never answer their preparation; a cancel 50 ms in must still end the turn.
+    const started = performance.now();
+    setTimeout(() => context.onmessage({data: {type: 'cancel', id: 1}}), 50);
+    await context.onmessage({data: {type: 'turn', id: 1, history: job.history, simulations: job.simulations, solverNodes: job.nodes}});
+    answer = {replies: messages.filter(m => m.id === 1 && m.type !== 'progress').map(m => m.type), ms: performance.now() - started};
+    runInNewContext('frontierWorkers.close()', context);
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,

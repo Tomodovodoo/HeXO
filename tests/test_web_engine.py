@@ -926,6 +926,11 @@ class Bundle(unittest.TestCase):
             self.assertGreaterEqual(stats['completed'], 256)
             self.assertNotIn('proof', stats)
 
+    def test_a_cancel_ends_a_turn_whose_proof_workers_are_still_starting(self):
+        answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, stallPrepare=True))
+        self.assertEqual(answer['replies'], ['cancelled'])
+        self.assertLess(answer['ms'], 2000)
+
     def test_a_refresh_budget_below_one_quantum_still_searches(self):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))
         self.assertEqual(len(result['moves']), 2)

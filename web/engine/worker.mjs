@@ -21,9 +21,18 @@ let frontierWorkers = null;
 let gameTurn = Promise.resolve();
 let modelUse = Promise.resolve();
 const held = new Map();
-const cancelled = new Set(), solverWaits = new Map();
+const cancelled = new Set(), solverWaits = new Map(), cancelWaits = new Map();
 
 class Cancelled extends Error {}
+
+/** `promise`, or a Cancelled rejection as soon as job `id` is cancelled; the promise itself runs on. */
+function unlessCancelled(id, promise) {
+  return new Promise((resolve, reject) => {
+    if (cancelled.has(id)) { reject(new Cancelled()); return; }
+    cancelWaits.set(id, () => reject(new Cancelled()));
+    promise.then(resolve, reject).finally(() => cancelWaits.delete(id));
+  });
+}
 
 const GRACE_MS = 500;
 const unknown = reason => ({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason});
@@ -252,7 +261,9 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
   await use(model, new Stages(postMessage, id));
   let failure = null, proofPool = null;
   // A browser that cannot start the proof workers still searches; the turn reports why it has no frontier proofs.
-  if (solverNodes || proveMs) proofPool = await proofWorkers(solverWorkers).catch(error => { failure = error.message; return null; });
+  if (solverNodes || proveMs) {
+    proofPool = await unlessCancelled(id, proofWorkers(solverWorkers).catch(error => { failure = error.message; return null; }));
+  }
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
   const state = native.game(history), player = state.player;
@@ -534,6 +545,7 @@ async function load(options = {}) {
 onmessage = async ({data}) => {
   if (data.type === 'cancel') {
     cancelled.add(data.id);
+    cancelWaits.get(data.id)?.();
     stopSolver(data.id);
     return;
   }
