@@ -1505,7 +1505,8 @@ class DenseConfigTests(unittest.TestCase):
         config = dense_config.RunConfig(actor=hybrid)
         saved = dataclasses.asdict(config)
         self.assertEqual(dense_config.from_dict(json.loads(json.dumps(saved))), config)
-        saved['actor'] = {key.replace('hybrid_', 'native_'): value for key, value in saved['actor'].items()}
+        older = {new: old for old, new in dense_config.RENAMED['actor'].items()}
+        saved['actor'] = {older.get(key, key): value for key, value in saved['actor'].items()}
         self.assertEqual(dense_config.from_dict(saved), config)
 
     def test_hybrid_actors_drop_proof_workers_without_the_solver_build(self):
@@ -5194,9 +5195,24 @@ class EngineTests(unittest.TestCase):
                                              max_plies=128, tactics=False, adjudicate_proven=True,
                                              opening_random_plies=0.)
         history = NativeProofs.opening
-        games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, hybrid=True,
-                    book=(dict(suite='test', key=str(i), ply=len(history)), history)) for i in range(2)]
-        episodes, rows, receipt = play_cohort(games, producers=2, proof_workers=1, slice_ms=25, views=4)
+        from hybrid_scheduler import SearchPool
+        for stamps in (False, True):
+            with self.subTest(stamps=stamps):
+                games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, hybrid=True,
+                            book=(dict(suite='test', key=str(i), ply=len(history)), history)) for i in range(2)]
+                loops, enable = [], SearchPool.enable_proofs
+                def recorded(pool, package=None, **options):
+                    loops.append(options['stamps'])
+                    return enable(pool, package, **options)
+                with unittest.mock.patch.object(SearchPool, 'enable_proofs', recorded):
+                    episodes, rows, receipt = play_cohort(games, producers=2, proof_workers=1, slice_ms=25, views=4,
+                                                          proof_stamps=stamps)
+                self.assertEqual(set(loops), {stamps})
+                self.proven_cohort(episodes, rows, receipt)
+
+    def proven_cohort(self, episodes, rows, receipt):
+        """Every game ends proven, every played row carries its proof and fresh effort, every proof verifies."""
+        from tactical_proof import independent_verify
         self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
         self.assertTrue(all(r['proven']==1 and r['proof_plies']>0 for r in rows))
         self.assertTrue(all(r['search']['missing_fresh']==0 for r in rows))
