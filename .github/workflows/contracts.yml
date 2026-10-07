@@ -28,6 +28,7 @@ on:
       - 'python/legacy/**'
       - 'src/**'
       - 'CMakeLists.txt'
+      - 'tools/build_tactical.py'
       - 'tools/compare_search_modes.py'
       - 'tools/proof_stamps.py'
       - 'tools/tactical/**'

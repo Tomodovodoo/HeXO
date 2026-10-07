@@ -4673,6 +4673,10 @@ class EngineTests(unittest.TestCase):
         for index, history in enumerate(histories):
             service.retarget(0,index,history,work=8,views=1)
         service.resume()
+        # With no batch in flight the broker sends whatever is ready, so let a full batch queue up first.
+        end = time.monotonic()+PATIENCE
+        while service.stats()['pending_rows']<8 and time.monotonic()<end:
+            time.sleep(.001)
         token, _, rows = ready(service)
         self.assertEqual(rows.count,8)
         service.pending.append((token,native_dense.submit(evaluator,rows)))
