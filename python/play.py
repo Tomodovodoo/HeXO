@@ -507,7 +507,7 @@ class Bubble:
         self.native = None
 
     def scheduler(self):
-        """The same weights for the native scheduler's packed batches (see `prove`), made on first use."""
+        """The same weights for the hybrid scheduler's packed batches (see `prove`), made on first use."""
         import hexnet
         if self.native is None:
             self.native = hexnet.DenseEvaluator(self.evaluator.model, self.evaluator.device, self.sha256, max_batch=128)
@@ -759,7 +759,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
     `native_nodes` and `certificates` of the native frontier."""
     from neural_search import GameGraph
     import tactical_proof
-    from native_scheduler import SearchPool, InferenceService, ProofWorkers
+    from hybrid_scheduler import SearchPool, InferenceService, ProofWorkers
     history = [tuple(map(int, p)) for p in history]
     game = replay(history)
     player, remaining = game.player, game.remaining

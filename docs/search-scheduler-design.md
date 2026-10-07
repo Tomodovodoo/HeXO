@@ -13,6 +13,10 @@ of that question.
 
 ## Implementation status
 
+The hybrid scheduler runs search in native graph owners, proofs on CPU workers and network batches on the GPU.
+`ActorSettings.hybrid_scheduler` turns it on for self-play and `search.hybrid_scheduler` for timed play; with it
+off, the Python-coordinated search of `python/neural_search.py` and `python/dense_selfplay.py` runs instead.
+
 | Area | Current implementation | Delivery |
 | --- | --- | --- |
 | Shared game graph | Context nodes, rule-position outcomes, shared child evidence, edge-local visits, re-rooting | PR328 and subsequent graph changes are on main |
@@ -20,7 +24,7 @@ of that question.
 | Native owner | Independent same-game views, leased work, root completion records, bounded continuation discovery | PR354 |
 | CPU proving | In-process native worker instances, immutable jobs, arbitrary retained-position proof installation, scoped facts, retries and cancellation | PR350, PR357, PR358, PR388 |
 | Shared inference service | Native producers supply one model-keyed queue; Python launches and collects packed immutable batches | PR367, PR377 |
-| Continuous games and actors | Slot release/refill, pause fences, native actor worker, bulk legal root records | PR368, PR370, PR371, PR373, PR380 |
+| Continuous games and actors | Slot release/refill, pause fences, hybrid actor worker, bulk legal root records | PR368, PR370, PR371, PR373, PR380 |
 | Lean graph work | Sparse graph update indices, complete legal lists with lazy mutable edge state, grouped untouched-action selection, stored-continuation index | PR379, PR382, PR384, PR397 |
 | Graph retention | Bounded dormant archive and forward-game removal of colour-conflicting variations | PR389, PR395 |
 | Inference capacity and packing | Larger small-canvas captures, measured crop planner, reduced tail padding | PR338, PR385, PR393 |
@@ -33,12 +37,12 @@ of that question.
 | Retarget and actor records | Avoid redundant eviction scans; retain the raw root prediction; incremental prefix keys | PR425, PR428, PR429 |
 | Proof supply | Wake one worker, close unsupported quiet sides, retry only after fresh work and count supply exclusions | PR415, PR427; PR440 sets opt-in proof defaults |
 | Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 merged, including the queued-shard naming fix |
-| Actor graph allowance | Retain up to 1024 nodes per native actor game by default | PR444 merged; this changes the configured allowance, not proof of a loaded production binary |
+| Actor graph allowance | Retain up to 1024 nodes per hybrid actor game by default | PR444 merged; this changes the configured allowance, not proof of a loaded production binary |
 | Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; the pre-PR443 IPC comparison returned two searched stones in all 12 HeXO turns; strict deadline checks remain open |
 | Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 merged after actual two-model CUDA validation |
 | Shared proof workers | Optional globally bounded service lends workers across producer loops; originating graph owners install results | PR443 merged; private native and browser builds completed. Earlier caller timings used separate loop-owned workers |
 
-These are source deliveries. Native actor/continuous-proof modes remain opt-in.
+These are source deliveries. The hybrid actor and continuous-proof modes remain opt-in.
 They do not establish that production has loaded these binaries, that training
 is using every mechanism, or that learning has improved. The fixed-work
 evaluator remains a separate reproducible configuration.
@@ -125,7 +129,7 @@ remaining device time can be filled with useful search. Historical batch-32 back
 rates, single-game rates and sustained actor rates have different shapes and
 supply conditions and cannot be substituted for each other.
 
-The proof owner budget (`native_proof_budget`, `ProofLoop` `owner_budget`) was swept on October 7 with the real
+The proof owner budget (`hybrid_proof_budget`, `ProofLoop` `owner_budget`) was swept on October 7 with the real
 actor: 128 slots, 384 games, 48-ply cap, 12 shared proof workers, frozen main/200000, logical CPUs 0-15, medians
 of four trials per arm in rotating order (receipts `proof-budget-actor-*-20261007.json`).
 
@@ -140,7 +144,7 @@ of four trials per arm in rotating order (receipts `proof-budget-actor-*-2026100
 
 At 0.2 and above the cap never binds. At 0.1 the actor keeps 96% of its proven rows and 84% of its installed
 proofs while placements rise 4% and machine CPU falls 8 points; below it the proof work collapses faster than rows
-grow. The actor default is 0.1. Native timed play keeps 2 proof workers and budget 1 (`timed_engine.PROOF_BUDGET`);
+grow. The actor default is 0.1. Hybrid timed play keeps 2 proof workers and budget 1 (`timed_engine.PROOF_BUDGET`);
 with two workers the owner stays far below any cap. The analysis solver preset (docs/play.md) gives the proof
 workers the whole budget, since there the proof is the answer. Out of the box, the Play page's Standard analysis
 proved 46 of the 66 puzzles in Tom's set, all within 2.2 s, and the other 20 never; a 4-million-node root query
@@ -303,8 +307,8 @@ and cost; whether another inline tactical check pays is a measurement question.
 PR443 adds an optional shared proof-worker service with bounded admission,
 producer fairness, client-specific cancellation/drain, immutable job identities,
 and retained callback, library and worker-thread lifetimes. Only originating
-owners install results. Native actor producers can join that service instead of
-each reserving a separate pool. Clocked NativePlay still owns its two workers;
+owners install results. Hybrid actor producers can join that service instead of
+each reserving a separate pool. Clocked hybrid play still owns its two workers;
 the earlier caller measurements predate PR443 and do not measure shared-worker
 throughput. A successful private rebuild does not establish production adoption.
 
@@ -488,7 +492,7 @@ search/evidence. Prefetch and unfinished exploration do not become full policy
 targets merely because the GPU evaluated them.
 
 New row kinds need explicit retention, masks, weights and learner-window
-accounting. Native actor integration exists, but proof/depth rows and inherited
+accounting. Hybrid actor integration exists, but proof/depth rows and inherited
 root estimates still need a controlled learning comparison. A solver auxiliary
 head is an optional parallel experiment. It does not delay scheduling or create
 proofs from predicted success.
@@ -563,8 +567,8 @@ repeatable proof/neural cooperation, then better learning from that evidence.
 | Bulk native feeding, deduplication, encoding, cache, packed results | `src/gumbel_feed.cpp`, `src/gumbel_batch.cpp` |
 | Independent producers, broker queue, completion ownership, retirement | `src/gumbel_broker.hpp`, `src/gumbel_parallel.hpp` |
 | CPU frontier, immutable jobs, scoped facts, native/external workers, endpoint replay | `src/gumbel_proof.cpp` |
-| Search pools, proof and inference adapters | `python/native_scheduler.py`, `python/native_dense.py` |
-| Native actor data/lifecycle | `python/native_selfplay.py`, `python/dense_selfplay.py` |
+| Search pools, proof and inference adapters | `python/hybrid_scheduler.py`, `python/native_dense.py` |
+| Hybrid actor data/lifecycle | `python/hybrid_selfplay.py`, `python/dense_selfplay.py` |
 | CUDA capacities and tail packing | `python/hexnet_graphs.py` |
 | Solver query/cancel/answer/frontier contracts | `tools/tactical/src/lib.rs`, `tools/tactical/src/native_answer.rs`, vendored prover sources |
 | Browser owner/GPU/solver adapters | `web/engine/search.mjs`, `web/engine/tactical.mjs`, `web/engine/network.mjs` |

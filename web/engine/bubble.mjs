@@ -61,10 +61,10 @@ export class BubbleEngine extends EngineWorker {
 
   /**
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
-   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Optional native_owner
-    * selects the compiled multi-view feeding path. Optional native_proof runs
-    * resident CPU solver slices through that owner's native graph frontier.
-   * Optional native_capture uses bounded static WebGPU sessions and combined readback with that owner.
+   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Optional hybrid_scheduler
+   * selects the hybrid scheduler: the native graph owner's compiled multi-view feeding. Optional hybrid_proof runs
+   * resident CPU solver slices through that owner's native graph frontier.
+   * Optional hybrid_capture uses bounded static WebGPU sessions and combined readback with that owner.
    * Optional solver_ms (the SOLVER preset) spends up to that long on proof work alone before the turn (worker.mjs proveRoot).
    * Optional leaf_nodes adds
    * a per-turn leaf-proof allowance, capped at 2048 nodes and leaf_ms (default 10) per query. Under a clock
@@ -76,9 +76,9 @@ export class BubbleEngine extends EngineWorker {
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
       simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      nativeOwner: budget.native_owner ?? false,
-      nativeCapture: budget.native_capture ?? false,
-      nativeProof: budget.native_proof ?? false,
+      hybridScheduler: budget.hybrid_scheduler ?? false,
+      hybridCapture: budget.hybrid_capture ?? false,
+      hybridProof: budget.hybrid_proof ?? false,
       solverWorkers: budget.solver_workers ?? (budget.solver_ms ? SOLVER_WORKERS : 1), solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4,
       proveMs: budget.solver_ms ?? 0,
       leafNodes: budget.leaf_nodes ?? 0, leafQueryMs: budget.leaf_ms ?? 10,

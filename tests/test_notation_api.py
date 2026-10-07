@@ -301,7 +301,7 @@ class TimedClocks(unittest.TestCase):
                 self.assertLess(result['elapsed_ms'], 100)
                 self.assertFalse(engine.busy)
 
-    def test_native_controller_releases_precise_timer_on_close_or_startup_failure(self):
+    def test_hybrid_controller_releases_precise_timer_on_close_or_startup_failure(self):
         from timed_engine import TimedEngine
         from unittest.mock import Mock
         for ready in (True, False):
@@ -313,7 +313,7 @@ class TimedClocks(unittest.TestCase):
                 connection.recv.return_value = ('ready', dict(checkpoint='test'))
                 context.Pipe.return_value = connection, Mock()
                 context.Process.return_value.is_alive.return_value = False
-                config = dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(enabled=False))
+                config = dict(kind='bubble', search=dict(hybrid_scheduler=True), solver=dict(enabled=False))
                 if ready:
                     engine = TimedEngine(config)
                     engine.close()
@@ -324,7 +324,7 @@ class TimedClocks(unittest.TestCase):
                 request_timer.assert_called_once_with()
                 request_timer.return_value.timeEndPeriod.assert_called_once_with(1)
 
-    def test_native_clocked_reply_does_not_wait_for_resource_drain(self):
+    def test_hybrid_clocked_reply_does_not_wait_for_resource_drain(self):
         from timed_engine import TimedEngine
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -334,7 +334,7 @@ class TimedClocks(unittest.TestCase):
             with self.subTest(turn_complete=complete):
                 clock[0] = 0.
                 engine = TimedEngine.__new__(TimedEngine)
-                engine.config = dict(kind='bubble', search=dict(native_scheduler=True))
+                engine.config = dict(kind='bubble', search=dict(hybrid_scheduler=True))
                 engine.external, engine.checkpoint, engine.model_sha256 = False, 'test', 'test'
                 engine.lock, engine.cancellation = threading.Lock(), threading.Event()
                 engine.generation, engine.busy = 0, False
@@ -376,32 +376,32 @@ class TimedClocks(unittest.TestCase):
         from dense_openings import canonical
         with TemporaryDirectory() as directory:
             path = Path(directory)/'settings.json'
-            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None, native_scheduler=True),
+            path.write_text(json.dumps(dict(search=dict(root_samples=32, max_simulations=None, hybrid_scheduler=True),
                                             solver=dict(enabled=False))), encoding='utf-8')
             self.assertIsNone(side_settings(path)['search']['max_simulations'])
-            self.assertTrue(side_settings(path)['search']['native_scheduler'])
-            path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=dict(nodes=512))), encoding='utf-8')
+            self.assertTrue(side_settings(path)['search']['hybrid_scheduler'])
+            path.write_text(json.dumps(dict(search=dict(hybrid_scheduler=True), solver=dict(nodes=512))), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'time slices'):
                 side_settings(path)
             from timed_engine import TimedEngine
             with self.assertRaisesRegex(ValueError, 'time slices'):
-                TimedEngine(dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(nodes=512)))
+                TimedEngine(dict(kind='bubble', search=dict(hybrid_scheduler=True), solver=dict(nodes=512)))
             with self.assertRaisesRegex(ValueError, 'proof frontier'):
-                TimedEngine(dict(kind='bubble', search=dict(native_scheduler=True), solver=dict(leaf=True)))
-            path.write_text(json.dumps(dict(search=dict(native_scheduler=False), solver=dict(nodes=512))), encoding='utf-8')
+                TimedEngine(dict(kind='bubble', search=dict(hybrid_scheduler=True), solver=dict(leaf=True)))
+            path.write_text(json.dumps(dict(search=dict(hybrid_scheduler=False), solver=dict(nodes=512))), encoding='utf-8')
             self.assertEqual(side_settings(path)['solver']['nodes'], 512)
-            path.write_text(json.dumps(dict(search=dict(native_scheduler=True, enabled=False), solver=dict(nodes=512))), encoding='utf-8')
+            path.write_text(json.dumps(dict(search=dict(hybrid_scheduler=True, enabled=False), solver=dict(nodes=512))), encoding='utf-8')
             self.assertEqual(side_settings(path)['solver']['nodes'], 512)
-            path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=dict(workers=12, budget=.1))), encoding='utf-8')
+            path.write_text(json.dumps(dict(search=dict(hybrid_scheduler=True), solver=dict(workers=12, budget=.1))), encoding='utf-8')
             self.assertEqual(side_settings(path)['solver'], dict(workers=12, budget=.1))
             for solver in (dict(budget=0), dict(budget=1.5), dict(workers=0)):
-                path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=solver)), encoding='utf-8')
+                path.write_text(json.dumps(dict(search=dict(hybrid_scheduler=True), solver=solver)), encoding='utf-8')
                 with self.assertRaisesRegex(ValueError, 'solver'):
                     side_settings(path)
             path.write_text(json.dumps(dict(solver=dict(budget=.1))), encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'native timed solving only'):
+            with self.assertRaisesRegex(ValueError, 'hybrid timed solving only'):
                 side_settings(path)
-            with self.assertRaisesRegex(ValueError, 'native timed solving only'):
+            with self.assertRaisesRegex(ValueError, 'hybrid timed solving only'):
                 TimedEngine(dict(kind='bubble', solver=dict(workers=4)))
             path.write_text(json.dumps(dict(search=dict(native_feed=True))), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'Unsupported search'):

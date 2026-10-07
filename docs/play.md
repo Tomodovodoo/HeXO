@@ -358,7 +358,7 @@ Changing the analysis engine, checkpoint or strength evaluates the shown positio
 The Solver switch beside Auto analysis sets the analysis to the solver preset, for puzzles and positions where a
 forced win is the answer you want. Each analysis then spends up to two minutes on proof work alone and stops as soon
 as a verified proof for either side arrives. Two provers run side by side: the tactical solver asks the root for a
-win of the side to move with 32,768 nodes and four times as many each round, and a native scheduler search of the
+win of the side to move with 32,768 nodes and four times as many each round, and a hybrid scheduler search of the
 position feeds the proof workers (up to 12, four fewer than the machine's threads) the positions its neural search
 reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar: time, root nodes,
 queued and running proof jobs, busy workers, then the winner and distance, or the nodes and certificates spent

@@ -1492,14 +1492,18 @@ class DenseConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'per-leaf'):
             dense_config.ActorSettings(native_feed=True, solver_leaf_nodes=32)
 
-    def test_native_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
+    def test_hybrid_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.3']))
-        self.assertEqual(actor.native_proof_budget, .3)
+        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--hybrid-proof-budget', '0.3']))
+        self.assertEqual(actor.hybrid_proof_budget, .3)
         for budget in (0., 1.5):
-            with self.assertRaisesRegex(ValueError, 'native proof'):
-                dense_config.ActorSettings(native_proof_budget=budget)
+            with self.assertRaisesRegex(ValueError, 'hybrid proof'):
+                dense_config.ActorSettings(hybrid_proof_budget=budget)
+        hybrid = dense_config.ActorSettings(hybrid_scheduler=True, hybrid_producers=6, hybrid_model_producers=2,
+                                            hybrid_proof_workers=4, hybrid_proof_budget=.25, hybrid_views=4)
+        config = dense_config.RunConfig(actor=hybrid)
+        self.assertEqual(dense_config.from_dict(json.loads(json.dumps(dataclasses.asdict(config)))), config)
 
     def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1841,11 +1845,11 @@ class DenseConfigTests(unittest.TestCase):
         for bad in (dict(pv_check=.25), dict(game_graph=512, pv_check=.5), dict(game_graph=-1)):
             with self.assertRaisesRegex(ValueError, 'game_graph must be nonnegative'):
                 dense_config.ActorSettings(**bad)
-        # Native actors bound each game's graph by default; legacy actors keep one tree per model.
-        native = dense_config.ActorSettings(native_scheduler=True)
-        self.assertEqual(native.game_graph, dense_config.NATIVE_GAME_GRAPH)
-        self.assertEqual(dense_config.ActorSettings(native_scheduler=True, game_graph=4096).game_graph, 4096)
-        self.assertEqual(dataclasses.replace(native).game_graph, dense_config.NATIVE_GAME_GRAPH)
+        # Hybrid actors bound each game's graph by default; legacy actors keep one tree per model.
+        hybrid = dense_config.ActorSettings(hybrid_scheduler=True)
+        self.assertEqual(hybrid.game_graph, dense_config.HYBRID_GAME_GRAPH)
+        self.assertEqual(dense_config.ActorSettings(hybrid_scheduler=True, game_graph=4096).game_graph, 4096)
+        self.assertEqual(dataclasses.replace(hybrid).game_graph, dense_config.HYBRID_GAME_GRAPH)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -4391,18 +4395,18 @@ class EvaluatorSearchTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
-    def test_native_startup_queues_historical_models_within_the_host_allocation(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_startup_queues_historical_models_within_the_host_allocation(self):
+        from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'startup-{k}','fixed','cpu',64,128) for k in range(3)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,game_graph=192,
-            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,game_graph=192,
+            hybrid_quantum=8,hybrid_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
             opening_random_plies=0.)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         for i,pair in enumerate(([models[0]]*2,[models[0],models[1]],[models[0],models[2]])):
             engine.add(dense_selfplay.SelfPlayGame(pair,settings,30+i,
-                       opponent=None if i==0 else f'fixed-{i}',native_owner=True))
+                       opponent=None if i==0 else f'fixed-{i}',hybrid=True))
         episodes,parked = [],False
         end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
@@ -4418,29 +4422,29 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(episode['moves']),3)
             self.assertTrue(all(r['search']['model']==episode['actors'][str(r['player'])] for r in rows))
 
-    def test_native_rejected_model_pair_does_not_consume_the_retired_slot(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_rejected_model_pair_does_not_consume_the_retired_slot(self):
+        from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'one-host-{k}','fixed','cpu',64,128) for k in range(2)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=1,game_graph=192,
-            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=2,
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=1,game_graph=192,
+            hybrid_quantum=8,hybrid_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=2,
             opening_random_plies=0.)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
-        engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30,native_owner=True))
+        engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30,hybrid=True))
         end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
         self.assertFalse(engine.slots)
-        pair = dense_selfplay.SelfPlayGame(models,settings,40,opponent='other',native_owner=True)
+        pair = dense_selfplay.SelfPlayGame(models,settings,40,opponent='other',hybrid=True)
         self.addCleanup(pair.game.close)
         for tree in pair.trees.values():
             self.addCleanup(tree.close)
         with self.assertRaisesRegex(ValueError,'model set exceeds'):
             engine.add(pair)
         self.assertEqual(len(engine.free),1)
-        engine.add(dense_selfplay.SelfPlayGame([models[1]]*2,settings,41,native_owner=True))
+        engine.add(dense_selfplay.SelfPlayGame([models[1]]*2,settings,41,hybrid=True))
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
@@ -4448,17 +4452,17 @@ class EngineTests(unittest.TestCase):
         engine.drain()
         self.assertEqual(engine.summary()['host_workers'],0)
 
-    def test_native_model_admission_waits_without_deadlocking_disjoint_historical_pairs(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_model_admission_waits_without_deadlocking_disjoint_historical_pairs(self):
+        from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'admit-{k}','fixed','cpu',64,128) for k in range(4)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_producers=2,game_graph=192,
-            native_quantum=8,native_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,game_graph=192,
+            hybrid_quantum=8,hybrid_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
             opening_random_plies=0.)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         for i in range(2):
-            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30+i,native_owner=True))
+            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30+i,hybrid=True))
         count,end = 0,time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
@@ -4466,23 +4470,23 @@ class EngineTests(unittest.TestCase):
                 count += 1
                 if count==1:
                     engine.add(dense_selfplay.SelfPlayGame([models[1],models[2]],settings,40,
-                                                         opponent='fixed-2',native_owner=True))
+                                                         opponent='fixed-2',hybrid=True))
                 elif count==2:
                     engine.add(dense_selfplay.SelfPlayGame([models[0],models[3]],settings,41,
-                                                         opponent='fixed-3',native_owner=True))
+                                                         opponent='fixed-3',hybrid=True))
             self.assertLessEqual(engine.summary()['host_workers'],2)
         self.assertFalse(engine.slots)
         self.assertEqual(count,4)
 
-    def test_native_actor_startup_pause_releases_unregistered_evaluator_captures(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_actor_startup_pause_releases_unregistered_evaluator_captures(self):
+        from hybrid_selfplay import ActorEngine
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'idle-{k}','fixed','cpu',64,128) for k in range(2)]
         graphs = [unittest.mock.Mock(max_incremental_bytes=123,max_batch=128) for _ in models]
         for model,graph in zip(models,graphs):
             model.evaluator.graph = graph
             model.evaluator.free.append({})
             model.evaluator.staging['buffer'] = object()
-        engine = ActorEngine(dense_config.ActorSettings(native_scheduler=True,game_graph=192))
+        engine = ActorEngine(dense_config.ActorSettings(hybrid_scheduler=True,game_graph=192))
         self.addCleanup(engine.close)
         engine.synchronize_inflight(models)
         self.assertTrue(engine.paused)
@@ -4498,12 +4502,12 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(c.kwargs==dict(max_incremental_bytes=123,max_batch=128) for c in capture.call_args_list))
 
     def test_hot_producer_retirement_keeps_old_device_snapshot_and_new_model_separate(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         torch.set_num_threads(2)
-        old = NativeScheduler.graph(self)
-        pool = NativeScheduler.pool(self,[old],views=4,work=32,quantum=8)
+        old = HybridScheduler.graph(self)
+        pool = HybridScheduler.pool(self,[old],views=4,work=32,quantum=8)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
@@ -4534,8 +4538,8 @@ class EngineTests(unittest.TestCase):
         service.reclaim(pool)
         self.assertFalse(pool._ptr)
         self.assertTrue(service.model_pending(0))
-        fresh = NativeScheduler.graph(self,version='next-model')
-        other = NativeScheduler.pool(self,[fresh],views=1,work=16)
+        fresh = HybridScheduler.graph(self,version='next-model')
+        other = HybridScheduler.pool(self,[fresh],views=1,work=16)
         next_eval = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='next-model',max_batch=128)
         producer,model = service.attach(other,next_eval)
         self.assertEqual((producer,model),(0,1))
@@ -4554,17 +4558,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(service.stats()['reclaimed_pools'],1)
         self.assertEqual((service.stats()['reclaim_queued'],service.stats()['reclaim_active']),(0,0))
 
-    def test_native_actor_attaches_new_checkpoint_while_old_game_keeps_its_model(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_actor_attaches_new_checkpoint_while_old_game_keeps_its_model(self):
+        from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'rotate-{k}',f'fixed-{k}','cpu',64,128) for k in range(3)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_round_barrier=True,native_producers=2,native_views=4,
-            native_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,full_fraction=.5,
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_round_barrier=True,hybrid_producers=2,hybrid_views=4,
+            hybrid_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,full_fraction=.5,
             max_plies=9,leaf_batch=64,opening_random_plies=0.)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
-        games = [dense_selfplay.SelfPlayGame([models[0]]*2,replace(settings,max_plies=2),20,native_owner=True),
-                 dense_selfplay.SelfPlayGame([models[0]]*2,settings,21,native_owner=True)]
+        games = [dense_selfplay.SelfPlayGame([models[0]]*2,replace(settings,max_plies=2),20,hybrid=True),
+                 dense_selfplay.SelfPlayGame([models[0]]*2,settings,21,hybrid=True)]
         for game in games:
             engine.add(game)
         episodes,overlap = [],False
@@ -4580,13 +4584,13 @@ class EngineTests(unittest.TestCase):
                     time.sleep(.02)
                     self.assertTrue(engine.engine.service.paused())
                     self.assertEqual(engine.engine.service.stats()['launched_rows'],engine.accounted[0])
-                    new = dense_selfplay.SelfPlayGame([models[1]]*2,settings,22,native_owner=True)
+                    new = dense_selfplay.SelfPlayGame([models[1]]*2,settings,22,hybrid=True)
                     engine.add(new)
                     engine.resume()
                     self.assertEqual(engine.evals,count)
                 elif len(episodes)==2:
-                    engine.add(dense_selfplay.SelfPlayGame([models[2]]*2,settings,23,native_owner=True))
-            self.assertLessEqual(engine.summary()['host_workers'],settings.native_producers)
+                    engine.add(dense_selfplay.SelfPlayGame([models[2]]*2,settings,23,hybrid=True))
+            self.assertLessEqual(engine.summary()['host_workers'],settings.hybrid_producers)
         self.assertFalse(engine.slots)
         self.assertTrue(overlap)
         self.assertEqual(len(episodes),4)
@@ -4600,17 +4604,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.engine.receipt['inference']['pending_rows'],0)
         self.assertGreater(engine.evals,0)
 
-    def test_native_actor_splits_model_slots_over_producers_within_the_host_allocation(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_actor_splits_model_slots_over_producers_within_the_host_allocation(self):
+        from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'split-{k}',f'fixed-{k}','cpu',64,128) for k in range(3)]
-        settings = dense_config.ActorSettings(native_scheduler=True,native_round_barrier=True,native_producers=4,
-            native_model_producers=2,native_views=4,native_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_round_barrier=True,hybrid_producers=4,
+            hybrid_model_producers=2,hybrid_views=4,hybrid_quantum=8,game_graph=192,full_sims=16,cheap_sims=4,
             full_fraction=.5,max_plies=5,leaf_batch=64,opening_random_plies=0.)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         for i in range(4):
-            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,50+i,native_owner=True))
+            engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,50+i,hybrid=True))
         episodes,producers,parked = [],set(),False
         end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
@@ -4619,12 +4623,12 @@ class EngineTests(unittest.TestCase):
                 if len(episodes)==1:
                     # Two more models need four producers while the first still holds two.
                     engine.add(dense_selfplay.SelfPlayGame([models[1],models[2]],settings,60,
-                                                         opponent='fixed-2',native_owner=True))
+                                                         opponent='fixed-2',hybrid=True))
             summary = engine.summary()
             producers.add(summary['producers'])
             parked |= bool(engine.engine.waiting)
-            self.assertLessEqual(summary['host_workers'],settings.native_producers)
-            self.assertLessEqual(summary['producers'],settings.native_producers)
+            self.assertLessEqual(summary['host_workers'],settings.hybrid_producers)
+            self.assertLessEqual(summary['producers'],settings.hybrid_producers)
         self.assertFalse(engine.slots)
         self.assertTrue(parked)
         self.assertIn(2,producers)
@@ -4638,20 +4642,20 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((inference['active_producers'],inference['pending_rows'],inference['inflight_batches']),(0,0,0))
 
     def test_model_producer_setting_stays_within_the_host_allocation(self):
-        with self.assertRaisesRegex(ValueError,'native_model_producers'):
-            dense_config.ActorSettings(native_producers=2,native_model_producers=3)
+        with self.assertRaisesRegex(ValueError,'hybrid_model_producers'):
+            dense_config.ActorSettings(hybrid_producers=2,hybrid_model_producers=3)
         with self.assertRaisesRegex(ValueError,'two models of producers'):
-            dense_config.ActorSettings(native_scheduler=True,game_graph=192,native_producers=3,
-                                       native_model_producers=2,historical_fraction=.5)
-        settings = dense_config.ActorSettings(native_scheduler=True,game_graph=192,native_producers=4,
-                                              native_model_producers=2,historical_fraction=.5)
-        self.assertEqual(settings.native_model_producers,2)
+            dense_config.ActorSettings(hybrid_scheduler=True,game_graph=192,hybrid_producers=3,
+                                       hybrid_model_producers=2,historical_fraction=.5)
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,game_graph=192,hybrid_producers=4,
+                                              hybrid_model_producers=2,historical_fraction=.5)
+        self.assertEqual(settings.hybrid_model_producers,2)
 
     def test_native_pause_waits_for_acknowledgement_unless_caller_sets_timeout(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=16)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=16)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start(continuous=True)
@@ -4669,13 +4673,13 @@ class EngineTests(unittest.TestCase):
         service.close()
 
     def test_continuous_slot_replacement_survives_an_old_device_snapshot(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         torch.set_num_threads(2)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        old = NativeScheduler.graph(self)
-        pool = NativeScheduler.pool(self,[old],views=4,work=32,quantum=8)
+        old = HybridScheduler.graph(self)
+        pool = HybridScheduler.pool(self,[old],views=4,work=32,quantum=8)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start(continuous=True)
@@ -4690,7 +4694,7 @@ class EngineTests(unittest.TestCase):
             time.sleep(.001)
         self.assertIsNotNone(event)
         saved = copy.deepcopy(event)
-        fresh = NativeScheduler.graph(self)
+        fresh = HybridScheduler.graph(self)
         with self.assertRaisesRegex(ValueError,'Release the previous game'):
             service.replace(0,0,fresh,expected=1,work=16,views=1)
         service.release(0,0,expected=1)
@@ -4705,7 +4709,7 @@ class EngineTests(unittest.TestCase):
             service.replace(0,0,fresh,expected=2,work=16,views=1)
         self.assertIsNotNone(fresh.ptr)  # Rejection leaves the new graph caller-owned.
         old.close()  # Close only after retirement acknowledgement, before old-owner destruction.
-        other = NativeScheduler.graph(self,version='other-model')
+        other = HybridScheduler.graph(self,version='other-model')
         with self.assertRaisesRegex(ValueError,'frozen model'):
             service.replace(0,0,other,expected=2,work=16,views=1)
         service.replace(0,0,fresh,expected=2,work=16,samples=4,views=1)
@@ -4731,16 +4735,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
                           service.stats()['active_producers']),(0,0,0))
 
-    def test_native_stream_refills_slots_and_preserves_mixed_model_targets(self):
-        from native_selfplay import play_stream
+    def test_hybrid_stream_refills_slots_and_preserves_mixed_model_targets(self):
+        from hybrid_selfplay import play_stream
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'stream-{k}',f'fixed-{k}','cpu',32,64) for k in range(2)]
         settings = dense_config.ActorSettings(full_fraction=.5,full_sims=32,cheap_sims=8,root_samples=8,
                                              cheap_root_samples=4,game_graph=192,max_plies=7,tactics=False,
                                              opening_random_plies=0.,root_noise=.2)
         games = [dense_selfplay.SelfPlayGame(models,replace(settings,max_plies=3),10,learner=1,
-                    opponent='fixed-0',native_owner=True),
-                 dense_selfplay.SelfPlayGame(models,settings,20,learner=1,opponent='fixed-0',native_owner=True)]
+                    opponent='fixed-0',hybrid=True),
+                 dense_selfplay.SelfPlayGame(models,settings,20,learner=1,opponent='fixed-0',hybrid=True)]
         counts, overlap = [1,1], []
         def refill(slot, finished):
             if slot==0:
@@ -4749,7 +4753,7 @@ class EngineTests(unittest.TestCase):
                 return None
             counts[slot] += 1
             return dense_selfplay.SelfPlayGame(models,settings,30+slot*10+counts[slot],learner=1,
-                                               opponent='fixed-0',native_owner=True)
+                                               opponent='fixed-0',hybrid=True)
         episodes,rows,receipt = play_stream(games,refill,producers=2,quantum=8,views=4,cache=128)
         self.assertEqual(len(episodes),6)
         self.assertTrue(overlap[0])  # A replacement starts while another original game is still live.
@@ -4778,8 +4782,8 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(all(np.isfinite(t['value']) for t in targets))
             self.assertTrue(all(r.row['search']['source']=='native-root' for r in refs))
 
-    def test_native_stream_closes_each_solver_ledger_before_refilling(self):
-        from native_selfplay import play_stream
+    def test_hybrid_stream_closes_each_solver_ledger_before_refilling(self):
+        from hybrid_selfplay import play_stream
         from tests.test_neural_search import NativeProofs
         from tactical_proof import library, independent_verify
         if not library().is_file():
@@ -4790,14 +4794,14 @@ class EngineTests(unittest.TestCase):
                                              max_plies=128,tactics=False,adjudicate_proven=True,
                                              opening_random_plies=0.)
         history = NativeProofs.opening
-        games = [dense_selfplay.SelfPlayGame([model,model],settings,230+i,native_owner=True,
+        games = [dense_selfplay.SelfPlayGame([model,model],settings,230+i,hybrid=True,
                  book=(dict(suite='test',key=str(i),ply=len(history)),history)) for i in range(2)]
         counts = [1,1]
         def refill(slot, finished):
             if counts[slot]==2:
                 return None
             counts[slot] += 1
-            return dense_selfplay.SelfPlayGame([model,model],settings,240+slot,native_owner=True,
+            return dense_selfplay.SelfPlayGame([model,model],settings,240+slot,hybrid=True,
                     book=(dict(suite='test',key=f'new-{slot}',ply=len(history)),history))
         episodes,rows,receipt = play_stream(games,refill,producers=1,proof_workers=1,slice_ms=25,views=4)
         self.assertEqual(len(episodes),4)
@@ -4815,12 +4819,12 @@ class EngineTests(unittest.TestCase):
                             and s['facts']==0 for s in receipt['proof_stats']))
 
     def test_continuous_pause_installs_a_partial_native_job_without_launching_the_rest(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         torch.set_num_threads(2)
         histories = [[[0,0],[1,r],[2,s]] for r in range(-2,2) for s in range(-4,4)]
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,h) for h in histories],views=1,work=8)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self,h) for h in histories],views=1,work=8)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=16)
         service = InferenceService([pool],[evaluator],batch_size=8,quantum=64)
         self.addCleanup(service.close)
@@ -4855,12 +4859,12 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
 
     def test_launcher_thread_feeds_forwards_until_pause_and_raises_its_failure(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         torch.set_num_threads(2)
         histories = [[[0,0],[1,r]] for r in range(-2,2)]
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,h) for h in histories],views=1,work=8)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self,h) for h in histories],views=1,work=8)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=16)
         service = InferenceService([pool],[evaluator],batch_size=8,quantum=64)
         self.addCleanup(service.close)
@@ -4907,13 +4911,13 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']),(0,0))
 
     def test_continuous_pause_fences_forwards_then_resumes_every_game(self):
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         from neural_search import native
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         torch.set_num_threads(2)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pools = [NativeScheduler.pool(self,[NativeScheduler.graph(self,h)],views=4,work=128)
+        pools = [HybridScheduler.pool(self,[HybridScheduler.graph(self,h)],views=4,work=128)
                  for h in ([[0,0]],[[0,0],[1,0],[2,0]])]
         service = InferenceService(pools,[evaluator])
         self.addCleanup(service.close)
@@ -4967,11 +4971,11 @@ class EngineTests(unittest.TestCase):
                           service.stats()['active_producers']),(0,0,0))
 
     def test_continuous_pause_preserves_a_failed_forward_until_retry(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=32)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start(continuous=True)
@@ -4998,7 +5002,7 @@ class EngineTests(unittest.TestCase):
                           service.stats()['active_producers']),(0,0,0))
 
     def test_continuous_cpu_proofs_progress_with_neural_inference_paused(self):
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         from tests.test_neural_search import NativeProofs
         from tactical_proof import library, independent_verify
         if not library().is_file():
@@ -5032,10 +5036,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((proofs.stats()['active'],proofs.stats()['queued'],proofs.stats()['ready']),(0,0,0))
 
     def test_continuous_cold_deadline_does_not_cancel_other_game(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
-        graphs = [NativeScheduler.graph(self) for _ in range(2)]
-        pool = NativeScheduler.pool(self,graphs,views=1,work=16)
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
+        graphs = [HybridScheduler.graph(self) for _ in range(2)]
+        pool = HybridScheduler.pool(self,graphs,views=1,work=16)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
@@ -5064,12 +5068,12 @@ class EngineTests(unittest.TestCase):
                           service.stats()['active_producers']),(0,0,0))
 
     def test_continuous_tighter_prefix_proof_changes_the_learner_witness(self):
-        from native_selfplay import play_cohort, label_prefixes
+        from hybrid_selfplay import play_cohort, label_prefixes
         torch.set_num_threads(2)
         model = dense_selfplay.Model(hexnet.HexNet(TINY),'native-witness','fixed','cpu',32,64)
         settings = dense_config.ActorSettings(full_fraction=1.,full_sims=16,root_samples=4,
                                              game_graph=128,max_plies=6,tactics=False,opening_random_plies=0.)
-        game = dense_selfplay.SelfPlayGame([model,model],settings,23,native_owner=True)
+        game = dense_selfplay.SelfPlayGame([model,model],settings,23,hybrid=True)
         episodes,rows,_ = play_cohort([game],producers=1,views=1)
         actions = legal(game.moves[:1])
         old,new = actions[:2].tolist()
@@ -5109,16 +5113,16 @@ class EngineTests(unittest.TestCase):
             self.assertAlmostEqual(float(targets[0]['policy'].sum()),1.,places=6)
 
     def test_continuous_prefix_labels_keep_only_shortest_graph_witnesses(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
-        graph = NativeScheduler.graph(self)
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
+        graph = HybridScheduler.graph(self)
         graph.expand()
         actions = graph.result(0,0,0,0)['actions']
         # Trusted proof inputs can have different upper bounds. A later row
         # must receive only the shortest retained witnesses of its prefix.
         graph.mark(actions[0],1,42)
         graph.mark(actions[1],1,34)
-        pool = NativeScheduler.pool(self,[graph],views=1,work=8)
+        pool = HybridScheduler.pool(self,[graph],views=1,work=8)
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
@@ -5134,21 +5138,21 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(prefix[1:], [1,34,[actions[1].tolist()]])
         service.close()
 
-    def test_continuous_native_span_stops_only_its_game_and_rejects_legacy_budgets(self):
-        from native_selfplay import play_cohort
+    def test_continuous_hybrid_span_stops_only_its_game_and_rejects_legacy_budgets(self):
+        from hybrid_selfplay import play_cohort
         torch.set_num_threads(2)
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-span', 'fixed', 'cpu', 32, 64)
         settings = dense_config.ActorSettings(full_fraction=1., full_sims=16, root_samples=4,
                                              game_graph=128, max_plies=6, tactics=False,
                                              opening_random_plies=0.)
         with self.assertRaisesRegex(ValueError,'frontier slice'):
-            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_root_nodes=32),1,native_owner=True)
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_root_nodes=32),1,hybrid=True)
         with self.assertRaisesRegex(ValueError,'frontier slice'):
-            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_leaf_nodes=32),1,native_owner=True)
+            dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_leaf_nodes=32),1,hybrid=True)
         wide = line_history(34)
-        games = [dense_selfplay.SelfPlayGame([model,model],settings,1,native_owner=True,
+        games = [dense_selfplay.SelfPlayGame([model,model],settings,1,hybrid=True,
                     book=(dict(suite='test',key='wide',ply=len(wide)),wide)),
-                 dense_selfplay.SelfPlayGame([model,model],settings,2,native_owner=True)]
+                 dense_selfplay.SelfPlayGame([model,model],settings,2,hybrid=True)]
         events = []
         episodes, rows, receipt = play_cohort(games, producers=1, views=1,
                                               progress=lambda index,event:events.append((index,event)))
@@ -5161,8 +5165,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((receipt['inference']['pending_rows'],receipt['inference']['inflight_batches'],
                           receipt['inference']['active_producers']), (0,0,0))
 
-    def test_continuous_native_proofs_reach_played_rows_with_fresh_effort(self):
-        from native_selfplay import play_cohort
+    def test_continuous_hybrid_proofs_reach_played_rows_with_fresh_effort(self):
+        from hybrid_selfplay import play_cohort
         from tests.test_neural_search import NativeProofs
         from tactical_proof import library, independent_verify
         if not library().is_file():
@@ -5173,7 +5177,7 @@ class EngineTests(unittest.TestCase):
                                              max_plies=128, tactics=False, adjudicate_proven=True,
                                              opening_random_plies=0.)
         history = NativeProofs.opening
-        games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, native_owner=True,
+        games = [dense_selfplay.SelfPlayGame([model,model], settings, 230+i, hybrid=True,
                     book=(dict(suite='test', key=str(i), ply=len(history)), history)) for i in range(2)]
         episodes, rows, receipt = play_cohort(games, producers=2, proof_workers=1, slice_ms=25, views=4)
         self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
@@ -5188,11 +5192,11 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(s['active']==0 and s['queued']==0 and s['ready']==0 for s in receipt['proof_stats']))
 
     def test_continuous_service_can_retarget_while_expired_batch_remains_in_flight(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         import native_dense
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=4,work=32,quantum=8)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=4,work=32,quantum=8)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start(continuous=True)
@@ -5233,15 +5237,15 @@ class EngineTests(unittest.TestCase):
         service.close()
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],service.stats()['active_producers']),(0,0,0))
 
-    def test_continuous_native_selfplay_records_only_played_roots_and_replays_targets(self):
-        from native_selfplay import play_cohort
+    def test_continuous_hybrid_selfplay_records_only_played_roots_and_replays_targets(self):
+        from hybrid_selfplay import play_cohort
         torch.set_num_threads(2)
         models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'native-{k}', f'model-{k}', 'cpu', 32, 64) for k in range(2)]
         settings = dense_config.ActorSettings(full_fraction=.5, full_sims=32, cheap_sims=8, root_samples=8,
                                              cheap_root_samples=4, game_graph=192, max_plies=7, tactics=False,
                                              opening_random_plies=0., root_noise=.2)
-        games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, native_owner=True) for i in range(2)]
-        games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', native_owner=True))
+        games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, hybrid=True) for i in range(2)]
+        games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', hybrid=True))
         events = []
         with unittest.mock.patch.object(games[0], 'searched', wraps=games[0].searched) as searched:
             episodes, rows, receipt = play_cohort(games, producers=2, quantum=8, views=4, cache=128,
@@ -5292,12 +5296,12 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(all(np.isfinite(t['value']) for t in targets))
 
     def test_played_roots_keep_their_network_value_without_a_prediction_cache(self):
-        from native_selfplay import play_cohort
+        from hybrid_selfplay import play_cohort
         torch.set_num_threads(2)
         model = dense_selfplay.Model(hexnet.HexNet(TINY), 'native-raw', 'model-raw', 'cpu', 32, 64)
         settings = dense_config.ActorSettings(full_fraction=1., full_sims=16, root_samples=4, game_graph=192,
                                              max_plies=6, tactics=False, opening_random_plies=0.)
-        games = [dense_selfplay.SelfPlayGame([model, model], settings, 140+i, native_owner=True) for i in range(2)]
+        games = [dense_selfplay.SelfPlayGame([model, model], settings, 140+i, hybrid=True) for i in range(2)]
         events = []
         # No feed cache: a root expanded earlier as a child still reports the
         # prediction its graph node installed, never a missing value.
@@ -5313,14 +5317,14 @@ class EngineTests(unittest.TestCase):
 
     def test_inference_service_batch_capacity_is_separate_from_producer_snapshots(self):
         import native_dense
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         from neural_search import checked, native
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
         for limit in (1,2,4):
             with self.subTest(limit=limit):
-                graphs = [NativeScheduler.graph(self,[(0,0),(i,0),(i,1)]) for i in range(1,8)]
-                pool = NativeScheduler.pool(self,graphs,views=1,work=16,quantum=16)
+                graphs = [HybridScheduler.graph(self,[(0,0),(i,0),(i,1)]) for i in range(1,8)]
+                pool = HybridScheduler.pool(self,graphs,views=1,work=16,quantum=16)
                 service = InferenceService([pool],[evaluator],batch_size=1,pending=4,flights=limit)
                 self.addCleanup(service.close)
                 service.start()
@@ -5352,10 +5356,10 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
 
     def test_inference_service_rejects_invalid_batch_capacity_without_owning_pools(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=16)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=16)
         for limit in (0,9):
             with self.subTest(limit=limit), self.assertRaisesRegex(ValueError,'1 to 8'):
                 InferenceService([pool],[evaluator],flights=limit)
@@ -5366,13 +5370,13 @@ class EngineTests(unittest.TestCase):
         service.run()
 
     def test_inference_service_profile_counts_delivery_and_remains_opt_in(self):
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         from neural_search import native, checked
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
         for enabled, feedback in ((False,False),(True,False),(True,True)):
             with self.subTest(profile=enabled, feedback=feedback):
-                pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,[(0,0),(i,0),(i,1)])
+                pool = HybridScheduler.pool(self,[HybridScheduler.graph(self,[(0,0),(i,0),(i,1)])
                                                  for i in range(1,5)],views=1,work=16,quantum=16)
                 service = InferenceService([pool],[evaluator],batch_size=2,profile=enabled,interleave_feedback=feedback)
                 self.addCleanup(service.close)
@@ -5405,10 +5409,10 @@ class EngineTests(unittest.TestCase):
 
     def test_inference_service_rejected_manual_prediction_can_be_fenced_and_abandoned(self):
         import ctypes
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=32)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start()
@@ -5432,10 +5436,10 @@ class EngineTests(unittest.TestCase):
 
     def test_inference_service_snapshot_adoption_failure_releases_native_flight(self):
         import native_dense
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=32)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         with unittest.mock.patch.object(native_dense.PackedRows,'from_native',side_effect=RuntimeError('adoption failed')):
@@ -5446,10 +5450,10 @@ class EngineTests(unittest.TestCase):
 
     def test_inference_service_failed_forward_retains_lease_until_fence_recovery(self):
         import native_dense
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self)],views=1,work=32)
+        pool = HybridScheduler.pool(self,[HybridScheduler.graph(self)],views=1,work=32)
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         with unittest.mock.patch.object(native_dense.Forward,'collect',side_effect=RuntimeError('collect failed')), \
@@ -5465,10 +5469,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']),(0,0))
 
     def test_inference_service_owns_producers_and_drains_real_packed_forwards(self):
-        from native_scheduler import InferenceService
-        from tests.test_neural_search import NativeScheduler
+        from hybrid_scheduler import InferenceService
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=128)
-        pools = [NativeScheduler.pool(self,[NativeScheduler.graph(self,history)],views=1,work=32)
+        pools = [HybridScheduler.pool(self,[HybridScheduler.graph(self,history)],views=1,work=32)
                  for history in ([(0,0)],[(0,0)],[(0,0),(1,0),(2,0)])]
         service = InferenceService(pools,[evaluator])
         self.addCleanup(service.close)
@@ -5501,13 +5505,13 @@ class EngineTests(unittest.TestCase):
     def test_ready_inference_can_run_before_prior_results_install(self):
         import unittest.mock as mock
         import native_dense
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
         for overlap in (False, True):
             with self.subTest(overlap=overlap):
-                graphs = [NativeScheduler.graph(self), NativeScheduler.graph(self, [(0,0),(1,0),(2,0)]),
-                          NativeScheduler.graph(self, [(0,0),(0,1),(1,1)])]
-                pool = NativeScheduler.pool(self, graphs, views=1, work=32)
+                graphs = [HybridScheduler.graph(self), HybridScheduler.graph(self, [(0,0),(1,0),(2,0)]),
+                          HybridScheduler.graph(self, [(0,0),(0,1),(1,1)])]
+                pool = HybridScheduler.pool(self, graphs, views=1, work=32)
                 events = mock.Mock()
                 with mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
                      mock.patch.object(pool.feed, 'install_packed', wraps=pool.feed.install_packed) as install, \
@@ -5524,10 +5528,10 @@ class EngineTests(unittest.TestCase):
     def test_failed_install_closes_prior_results_and_new_inference(self):
         import unittest.mock as mock
         import native_dense
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
-        pool = NativeScheduler.pool(self, [NativeScheduler.graph(self),
-                                          NativeScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
+        pool = HybridScheduler.pool(self, [HybridScheduler.graph(self),
+                                          HybridScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
         with mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
              mock.patch.object(pool.feed, 'install_packed', side_effect=RuntimeError('install failed')), \
              mock.patch.object(pool, 'admit', side_effect=[True,True,True,True]):
@@ -5539,10 +5543,10 @@ class EngineTests(unittest.TestCase):
 
     def test_failed_fence_does_not_abandon_a_submitted_batch(self):
         import native_dense
-        from tests.test_neural_search import NativeScheduler
+        from tests.test_neural_search import HybridScheduler
         evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY), 'cpu', model_version='scheduler', max_batch=1)
-        pool = NativeScheduler.pool(self, [NativeScheduler.graph(self),
-                                          NativeScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
+        pool = HybridScheduler.pool(self, [HybridScheduler.graph(self),
+                                          HybridScheduler.graph(self, [(0,0),(1,0),(2,0)])], views=1, work=32)
         with unittest.mock.patch.object(native_dense, 'submit', wraps=native_dense.submit) as submit, \
              unittest.mock.patch.object(pool.feed, 'install_packed', side_effect=RuntimeError('install failed')), \
              unittest.mock.patch.object(native_dense.Forward, 'close', side_effect=RuntimeError('fence failed')), \
@@ -7371,13 +7375,13 @@ class ActorModelTests(unittest.TestCase):
         self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
                          [('main/000010', 'main/000020')])
 
-    def test_native_worker_publishes_rotating_checkpoint_rows_that_learner_can_read(self):
+    def test_hybrid_worker_publishes_rotating_checkpoint_rows_that_learner_can_read(self):
         self.export('main/000010',1.)
         self.export('main/000020',2.)
         config = dense_config.RunConfig(device='cpu',model=dense_config.ModelSettings(**{k:getattr(TINY,k)
             for k in ('blocks','channels','pool_every','line_length','value_hidden','head_channels')}),
-            actor=dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_quantum=8,
-                native_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
+            actor=dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,hybrid_quantum=8,
+                hybrid_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
                 root_samples=8,full_fraction=1.,game_graph=192,max_plies=6,cache_positions=128,shard_games=1,
                 opening_random_plies=0.))
         dense_config.save(self.run,config)
@@ -7391,8 +7395,8 @@ class ActorModelTests(unittest.TestCase):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=6,initial_model=None))
         status = json.loads((self.run/'actor-status.json').read_text())
         self.assertEqual((status['stage'],status['games_completed']),('finished',6))
-        self.assertEqual(status['native_scheduler']['inference']['active_producers'],0)
-        self.assertEqual(status['native_scheduler']['inference']['pending_rows'],0)
+        self.assertEqual(status['hybrid_scheduler']['inference']['active_producers'],0)
+        self.assertEqual(status['hybrid_scheduler']['inference']['pending_rows'],0)
         self.assertGreater(status['mean_batch'],0)
         window = dense_data.ReplayWindow(self.run,capacity_rows=1000,validation_fraction=0.)
         refs = [window.ref(name,index) for name,index in window.index]
@@ -7406,13 +7410,13 @@ class ActorModelTests(unittest.TestCase):
         self.assertEqual(len(samples),36)
         self.assertTrue(all(np.isfinite(t['value']) for t in targets))
 
-    def test_native_worker_acknowledges_learner_only_after_neural_fence_then_resumes(self):
-        from native_selfplay import ActorEngine
+    def test_hybrid_worker_acknowledges_learner_only_after_neural_fence_then_resumes(self):
+        from hybrid_selfplay import ActorEngine
         self.export('main/000010',1.)
         config = dense_config.RunConfig(device='cpu',model=dense_config.ModelSettings(**{k:getattr(TINY,k)
             for k in ('blocks','channels','pool_every','line_length','value_hidden','head_channels')}),
-            actor=dense_config.ActorSettings(native_scheduler=True,native_producers=2,native_quantum=8,
-                native_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
+            actor=dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,hybrid_quantum=8,
+                hybrid_views=4,games_in_flight=2,leaf_batch=64,full_sims=16,cheap_sims=4,
                 root_samples=8,full_fraction=1.,game_graph=192,max_plies=6,cache_positions=128,shard_games=1,
                 opening_random_plies=0.,phase_follow=True,yield_below=0.,yield_check_seconds=0.))
         dense_config.save(self.run,config)
@@ -10113,7 +10117,7 @@ class SlowDenseTests(unittest.TestCase):
 class DenseTimedWorker(unittest.TestCase):
     def test_unsearched_completion_preserves_candidate_and_exact_evidence(self):
         from types import SimpleNamespace
-        from timed_engine import native_turn, legal_turn
+        from timed_engine import hybrid_turn, legal_turn
         from time_control import allowance
         import threading
         history = [[0, 0]]
@@ -10123,13 +10127,13 @@ class DenseTimedWorker(unittest.TestCase):
                      edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
         for winner, visits in ((-1, 200), (-1, 0), (1, 0)):
             with self.subTest(exact_winner=winner, position_edge_visits=visits), \
-                    unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                    unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
                 clock = [0.]
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
-                    _timed_native=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+                    _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None
@@ -10152,7 +10156,7 @@ class DenseTimedWorker(unittest.TestCase):
                         cancelled.set()
                 limits = allowance(movetime=100, reserve_ms=20) | dict(
                     hard_deadline=.1, response_deadline=.097, search_deadline=.08)
-                result = native_turn(player, history, limits, cancelled, publish)
+                result = hybrid_turn(player, history, limits, cancelled, publish)
                 self.assertAlmostEqual(service.retarget.call_args.kwargs['ms'], 32.)
             self.assertFalse(published[0]['turn_complete'])
             self.assertFalse(published[1]['turn_complete'])
@@ -10188,10 +10192,10 @@ class DenseTimedWorker(unittest.TestCase):
             model = hexnet.HexNet(hexnet.HexNetConfig(blocks=1, channels=8, pool_every=1,
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
-            for native, solver in ((False, False), (True, False), (True, True)):
+            for hybrid, solver in ((False, False), (True, False), (True, True)):
                 # The simulation cap ends each turn; the 30 s clock only bounds a broken search, however loaded the machine.
-                search = dict(native_scheduler=native, max_simulations=64)
-                with self.subTest(native_scheduler=native, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
+                search = dict(hybrid_scheduler=hybrid, max_simulations=64)
+                with self.subTest(hybrid_scheduler=hybrid, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
                         search=search, solver=dict(enabled=solver))) as engine:
                     game = Game([[0, 0]])
                     try:
@@ -10204,8 +10208,8 @@ class DenseTimedWorker(unittest.TestCase):
                             self.assertEqual(result['backend'], 'dense')
                             self.assertEqual(result['model_sha256'], engine.model_sha256)
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
-                            if native:
-                                self.assertTrue(result['settings']['native_scheduler'])
+                            if hybrid:
+                                self.assertTrue(result['settings']['hybrid_scheduler'])
                                 self.assertEqual(len(result['stones']), 2, result)
                                 self.assertEqual([s['move'] for s in result['stones']], result['moves'])
                                 self.assertEqual(result['stones'][0]['history'], history)
@@ -10232,7 +10236,7 @@ class DenseTimedWorker(unittest.TestCase):
                         engine.wait_idle()
                     finally:
                         game.close()
-                    if native and solver:
+                    if hybrid and solver:
                         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (3, 5), (4, 5),
                                    (3, 0), (-1, 1), (6, 6), (7, 7)]
                         engine.reset(history)
@@ -10249,7 +10253,7 @@ class DenseTimedWorker(unittest.TestCase):
 
 
             from dense_player import DensePlayer
-            player = DensePlayer(Path(folder), 'cpu', model=path, native_scheduler=True, net_kernels='reference')
+            player = DensePlayer(Path(folder), 'cpu', model=path, hybrid_scheduler=True, net_kernels='reference')
             game = Game([[0, 0]])
             try:
                 player.configure(dict(solver=True, solver_nodes=512))
@@ -10263,7 +10267,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(legal_turn([[0, 0]], result['moves']), result['moves'])
                 # Exact backend verdicts are position-scoped; both stones here belong to P2.
                 for winner, status, value in ((1, 'PROVEN_WIN', 1.), (0, 'UNKNOWN', .5)):
-                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type:
                         service = service_type.return_value
                         service.progress.return_value = None
                         service.stats.return_value = dict(launched_rows=2)
@@ -10282,7 +10286,7 @@ class DenseTimedWorker(unittest.TestCase):
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
                 # Play follows the full improved policy, including a move outside
                 # the owner's last halving finalists, and retargets that position.
-                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
                     service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=2)
@@ -10308,7 +10312,7 @@ class DenseTimedWorker(unittest.TestCase):
                           dict(producer=0, game=0, model=0, token=2, history=[[0,0],[1,0]],
                                context='second', action=[2,0], exact_winner=-1, root_completed=3, completed=3,
                                edges=np.array([[2,0,0,0,.6,1,3,3,1]], float))]
-                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
                      unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
                     service = service_type.return_value
                     service.progress.return_value = None
@@ -10337,10 +10341,10 @@ class DenseTimedWorker(unittest.TestCase):
                                   root_completed=7, completed=9,
                                   action=[2,1], edges=np.array([[2,1,0,0,.8,1,7,7,1]], float))]
                 published = []
-                from timed_engine import native_turn
+                from timed_engine import hybrid_turn
                 from time_control import allowance
                 import threading
-                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
                      unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
                     service = service_type.return_value
                     service.stats.return_value = dict(launched_rows=5)
@@ -10352,7 +10356,7 @@ class DenseTimedWorker(unittest.TestCase):
                         return snapshots[1]
                     service.progress.side_effect = progress
                     service.close.side_effect = lambda **kw: [] if kw.get('completions') else None
-                    result = native_turn(player, [[0,0]], allowance(movetime=1000),
+                    result = hybrid_turn(player, [[0,0]], allowance(movetime=1000),
                                          threading.Event(), published.append)
                     self.assertEqual(service.retarget.call_count, 2)
                     self.assertEqual(service.progress.call_args.kwargs, dict(token=2, after=1))
@@ -10365,7 +10369,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(published[-2]['completed'], 5)
                 # A cold continuation can miss its deadline. Record that
                 # attempted position without counting legal filler as search.
-                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
                     service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=1)
@@ -10384,7 +10388,7 @@ class DenseTimedWorker(unittest.TestCase):
                 import threading
                 for reason in ('deadline','stop','budget'):
                     controller = TimedEngine.__new__(TimedEngine)
-                    controller.config = dict(kind='bubble',search=dict(native_scheduler=True))
+                    controller.config = dict(kind='bubble',search=dict(hybrid_scheduler=True))
                     controller.external = controller.busy = False
                     controller.checkpoint, controller.model_sha256 = player.checkpoint, player.model_sha256
                     controller.lock, controller.cancellation = threading.Lock(), threading.Event()
@@ -10427,7 +10431,7 @@ class DenseTimedWorker(unittest.TestCase):
                 # estimated policy assigns more mass to a different legal stone.
                 finished = Game(history)
                 try:
-                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type:
                         service = service_type.return_value
                         service.progress.return_value = None
                         service.stats.return_value = dict(launched_rows=0)
@@ -10445,7 +10449,7 @@ class DenseTimedWorker(unittest.TestCase):
                 finally:
                     finished.close()
                 # A bare exact value cannot certify an arbitrary second stone.
-                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                with unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
                     service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=0)
@@ -10455,7 +10459,7 @@ class DenseTimedWorker(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'complete turn witness'):
                         player.turn(game, 1000)
                 # Release retained search and captures before replacement allocations.
-                old_pool = player._timed_native[1]
+                old_pool = player._timed_hybrid[1]
                 old_graph = unittest.mock.Mock()
                 player.evaluator.graph = old_graph
                 player.model_path = None

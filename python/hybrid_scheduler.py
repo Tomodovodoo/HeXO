@@ -1,4 +1,4 @@
-"""Native adaptive views and one frozen-model neural queue, called by one coordinator.
+"""The hybrid scheduler: native adaptive views and one frozen-model neural queue, called by one coordinator.
 
 This is an explicit search API. Actors keep their existing target construction.
 Graph evidence and comparison credits are exported separately.

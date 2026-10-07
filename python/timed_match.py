@@ -295,21 +295,21 @@ def side_settings(path):
     if path is None:
         return {}
     settings = json.loads(path.read_text(encoding='utf-8'))
-    allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'native_scheduler'},
+    allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'hybrid_scheduler'},
                    solver={'enabled', 'nodes', 'leaf', 'workers', 'budget'})
     if not isinstance(settings, dict) or settings.keys()-allowed.keys():
         raise ValueError('Side settings contain only search and solver objects')
     for group, options in settings.items():
         if not isinstance(options, dict) or options.keys()-allowed[group]:
             raise ValueError(f'Unsupported {group} settings: {options}')
-    if settings.get('search', {}).get('native_scheduler') and settings.get('search', {}).get('enabled', True) and settings.get('solver', {}).get('enabled', True):
+    if settings.get('search', {}).get('hybrid_scheduler') and settings.get('search', {}).get('enabled', True) and settings.get('solver', {}).get('enabled', True):
         if 'nodes' in settings.get('solver', {}):
-            raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
+            raise ValueError('Hybrid timed solving uses time slices; omit solver.nodes or disable hybrid_scheduler')
         if settings.get('solver', {}).get('leaf'):
-            raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+            raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
         proof_settings(settings.get('solver', {}))
     elif {'workers', 'budget'} & settings.get('solver', {}).keys():
-        raise ValueError('Proof workers and budget apply to native timed solving only')
+        raise ValueError('Proof workers and budget apply to hybrid timed solving only')
     return settings
 
 
