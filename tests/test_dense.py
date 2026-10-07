@@ -10018,6 +10018,22 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['stop_reason'], 'deadline')
                 self.assertNotIn('completed', result['root_searches'][1])
                 self.assertEqual(result['completed'], 2)
+                # Completion delivery is not itself a budget stop. Preserve the
+                # worker's deadline/cancellation reason at the controller too.
+                import threading
+                for reason in ('deadline','stop','budget'):
+                    controller = TimedEngine.__new__(TimedEngine)
+                    controller.config = dict(kind='bubble',search=dict(native_scheduler=True))
+                    controller.external = controller.busy = False
+                    controller.checkpoint, controller.model_sha256 = player.checkpoint, player.model_sha256
+                    controller.lock, controller.cancellation = threading.Lock(), threading.Event()
+                    controller.generation = 0
+                    controller.process = unittest.mock.Mock()
+                    controller.process.is_alive.return_value = True
+                    controller.connection = unittest.mock.Mock()
+                    controller.connection.poll.side_effect = [False,True]
+                    controller.connection.recv.return_value = (1,'done',dict(moves=[[1,0],[2,0]],stop_reason=reason))
+                    self.assertEqual(controller.turn(game,1000)['stop_reason'],reason)
                 # A real immediate pair is committed before the first winning
                 # publication can cancel the worker. No second inference is needed.
                 from timed_engine import dense_turn

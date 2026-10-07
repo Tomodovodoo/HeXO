@@ -743,7 +743,7 @@ class TimedEngine:
                         publish(dict(best))
                     if status == 'done':
                         complete = True
-                        best['stop_reason'] = 'budget'
+                        best['stop_reason'] = result.get('stop_reason', 'budget')
                         break
             finally:
                 if self.busy:
