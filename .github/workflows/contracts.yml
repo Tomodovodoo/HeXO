@@ -2,7 +2,7 @@ name: Contracts
 on:
   pull_request:
     paths:
-      # Everything the three suites import or read, directly or through each other, and the native code they load.
+      # Everything the three suites import or read (modules, native code, openings, served pages), directly or not.
       - 'python/bot_api.py'
       - 'python/dashboard.py'
       - 'python/dense_*.py'
@@ -27,7 +27,12 @@ on:
       - 'python/timed_engine.py'
       - 'python/legacy/**'
       - 'src/**'
+      - 'openings/**'
+      - 'web/*.html'
+      - 'web/coi-sw.js'
+      - 'web/engine/**'
       - 'CMakeLists.txt'
+      - 'tools/bench_dense_data.py'
       - 'tools/build_tactical.py'
       - 'tools/compare_search_modes.py'
       - 'tools/proof_stamps.py'
