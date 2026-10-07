@@ -390,6 +390,11 @@ class IsolatedTactics:
                                                        gate_score=None, **({'proof_numbers': None} if bounds else {}))
         if not self.lock.acquire(timeout=ms/1000):
             return unknown('lock deadline')
+        def cancelled():
+            # An abort racing the cancellation may have killed the idle child; replace it now.
+            if self.aborted is self.process and not self.replacement:
+                self._retire(killed=True)
+            return unknown('cancelled')
         try:
             self.stats['queries'] += 1
             # From here an abort kills the child; a cancellation set before that is seen below.
@@ -406,7 +411,7 @@ class IsolatedTactics:
                     return unknown('tactical worker restarting')
                 self.replacement = None
             if stopped():
-                return unknown('cancelled')
+                return cancelled()
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
                 if stopped():
@@ -444,8 +449,8 @@ class IsolatedTactics:
             if resume:
                 request['resume'] = True
             with self.control_lock:
-                cancelled = stopped()
-                if not cancelled:
+                stop = stopped()
+                if not stop:
                     self.query_id += 1
                     request['query_id'] = self.query_id
                     payload = json.dumps(request, separators=(',', ':'))
@@ -455,10 +460,8 @@ class IsolatedTactics:
                     dispatched = True
                     self.process.stdin.write(payload+'\n')
                     self.process.stdin.flush()
-            if cancelled:
-                if self.aborted is self.process:
-                    self._retire(killed=True)
-                return unknown('cancelled')
+            if stop:
+                return cancelled()
             result = self._line(hard)
             with self.control_lock:
                 self.busy = False
