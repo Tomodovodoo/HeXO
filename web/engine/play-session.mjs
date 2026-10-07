@@ -12,7 +12,7 @@ export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000}
 
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
-const REFRESH_SHARE = .25;  // the share of a saved evaluation's simulations that a refresh searches again
+const REFRESH_SHARE = .25;  // the share of a saved evaluation's simulations a refresh searches again (python/play.py)
 /** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
 const moved = (found, before) => JSON.stringify((found.moves || []).map(p => p.join(',')).sort()) !== JSON.stringify((before.moves || []).map(p => p.join(',')).sort()) || Math.abs(found.value - before.value) > REFRESH_MOVE;
 
