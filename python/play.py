@@ -757,6 +757,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
     frontier, busy, workers, proof}} about twice a second. `found['solver']` reports the totals, among them
     `native_nodes` and `certificates` of the native frontier."""
     from neural_search import GameGraph
+    import tactical_proof
     from native_scheduler import SearchPool, InferenceService, ProofWorkers
     history = [tuple(map(int, p)) for p in history]
     game = replay(history)
@@ -773,7 +774,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
         nodes = 32768
         while not stop.is_set() and time.monotonic() < end:
             left = int((end - time.monotonic()) * 1000)
-            result = prover.history(history, attacker='mover', nodes=nodes, ms=max(1, min(left, max(10_000, nodes // 8))),
+            result = prover.history(history, attacker='mover', nodes=nodes, ms=max(1, min(left, 60_000, max(10_000, nodes // 8))),
                                     shortest=True, cancel_event=stop, **(dict(known=premises) if premises else {}))
             root['nodes'] += result.get('nodes_used', 0)
             if verified(result) and result['moves']:
@@ -781,7 +782,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
                 return
             if result.get('nodes_used', 0) < nodes:   # the solver ruled the root out before spending its nodes
                 return
-            nodes *= 4
+            nodes = min(4 * nodes, tactical_proof.MAX_NODES)
     asking = threading.Thread(target=ask, daemon=True)
     shared = ProofWorkers(package, workers=workers)
     evaluator = bubble.scheduler()
