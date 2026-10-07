@@ -305,11 +305,14 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
             sockets.discard(ws)
             generation += 1
             cancellation.set()
-            if pending:
-                with suppress(Exception):
-                    await pending
-            if engine:
-                await asyncio.to_thread(engine.close)
+            try:
+                if pending:
+                    with suppress(Exception):
+                        await pending
+            finally:
+                # Server shutdown can cancel this handler while it waits for its last answer; the engine still closes.
+                if engine:
+                    await asyncio.to_thread(engine.close)
         return ws
 
     async def create(request):
