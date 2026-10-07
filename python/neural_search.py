@@ -484,7 +484,7 @@ class SearchCoordinator:
         `q_range_floor` and `root_noise`, when given, become every tree's floor and root noise (NeuralSearch) from
         this search on; None keeps each tree's own.
 
-        Play chooses the highest improved policy by default; choice='gumbel' uses the
+        The default choice is the highest improved policy; choice='gumbel' uses the
         final Gumbel score. Actors call result() directly and retain Gumbel exploration.
         """
         if choice not in ('policy', 'gumbel'):

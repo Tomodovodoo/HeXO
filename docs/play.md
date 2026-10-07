@@ -57,7 +57,8 @@ The clock belongs to the match and applies to both seats:
 | Game | `--tc 180+2` | 180 seconds per player, plus two seconds after a complete turn |
 
 Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
-across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
+across the whole turn, and its solver nodes only switch its proof work on or off, since a timed turn's proofs run
+in time slices inside the allowance; Six receives nodes plus movetime or
 both clocks and increments; Drip and Seal receive the smaller of their ms ceiling and the allocated time.
 Strix/Pulsatrix and Six-protocol drivers of other bots (Shrimp) are refused under a clock: their adapters play a
 fixed budget and cannot return an interrupted search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
@@ -226,7 +227,7 @@ the seats: off when both are Human, on otherwise (a seat a browser engine plays 
 Six's ladder is 30 positions per Bubble simulation, the ratio of the 170-game Bubble-versus-Six tournament, where the
 two sides took about the same time per turn at every tier.
 
-On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds per turn at Quick to Deep;
+On a Ryzen 9 5900X with two threads, main/185000 takes about 1, 8, 36 and 125 seconds per turn at Quick to Deep;
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
 (simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,

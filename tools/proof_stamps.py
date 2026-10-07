@@ -148,7 +148,7 @@ def puzzle_benchmark(source, target, nodes, ms, stamps):
 
 
 def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps, case_ids=()):
-    """The player's complete CPU analysis: root queries, graph search and reply checks.
+    """The player's complete CPU analysis: root queries and the hybrid graph search with its proof frontier.
 
     One resident engine reads the archive in order. Each puzzle has its own game
     graph; the network cache and bounded stamp library survive between puzzles.
