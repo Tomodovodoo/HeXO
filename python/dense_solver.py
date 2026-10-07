@@ -234,6 +234,7 @@ class Pool:
     def __init__(self, workers, priority):
         self.engines = [IsolatedTactics(priority=priority) for _ in range(workers)]
         self.heap, self.sequence, self.reserved, self.stopped = [], 0, 0., False
+        self.halt = threading.Event()  # reaches a query that has left the heap but not yet reached its child
         self.rates, self.rate, self.busy_ms = deque(maxlen=256), RATE, 0.
         self.condition = threading.Condition()
         self.threads = [threading.Thread(target=self.serve, args=(e,), daemon=True) for e in self.engines]
@@ -259,7 +260,7 @@ class Pool:
                 _, _, reserved, history, request, future = heapq.heappop(self.heap)
             start = time.perf_counter()
             try:
-                result = decode(engine.history(history, **request))
+                result = decode(engine.history(history, cancel_event=self.halt, **request))
             except Exception as error:
                 with self.condition:
                     self.reserved -= reserved
@@ -278,6 +279,7 @@ class Pool:
         with self.condition:
             self.stopped = True
             self.condition.notify_all()
+        self.halt.set()
         for engine in self.engines:
             engine.abort()
         for thread in self.threads:

@@ -586,12 +586,13 @@ def proof_turns(plies, remaining, mover_wins):
 
 
 def interruptible(call, watch, abort):
-    """`call()` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, `abort()` ends the call and
-    the exception propagates."""
-    result = {}
+    """`call(stop)` on its own thread, polling `watch(0)` meanwhile; when `watch` raises, the event `stop` is set
+    before `abort()` ends the call, so a call that has not started its work yet returns at once too, and the
+    exception propagates."""
+    result, stop = {}, threading.Event()
     def run():
         try:
-            result['value'] = call()
+            result['value'] = call(stop)
         except Exception as error:
             result['error'] = error
     thread = threading.Thread(target=run, daemon=True)
@@ -601,6 +602,7 @@ def interruptible(call, watch, abort):
         try:
             watch(0)
         except Cancelled:
+            stop.set()
             abort()
             raise
     if 'error' in result:
@@ -701,14 +703,15 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     # witness, while still reusing every interior fact.
     mine_known = [f for f in known if len(f['history']) != len(history) or f['winner'] != player]
     mine_options = dict(known=[{k: f[k] for k in ('history', 'winner', 'plies')} for f in mine_known]) if mine_known else {}
-    mine = interruptible(lambda: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
-                                                shortest=True, **mine_options), watch, prover.abort)
+    mine = interruptible(lambda stop: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
+                                                     shortest=True, cancel_event=stop, **mine_options),
+                         watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine) and mine['moves']:
         found.update(winning_line(history, mine, mine_known))
         return found
-    theirs = interruptible(lambda: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline, **options),
-                           watch, prover.abort)
+    theirs = interruptible(lambda stop: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline,
+                                                       cancel_event=stop, **options), watch, prover.abort)
     found.update(solved=found['solved'] and searched(theirs), used=found['used'] + theirs.get('nodes_used', 0))
     if verified(theirs):
         found['threat'] = [list(m) for m in theirs['moves']]
@@ -716,8 +719,8 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
         return found
     # The real defender root can use graph facts even when the flipped-turn
     # proposal search did not find a threat within its budget.
-    defended = interruptible(lambda: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline,
-                                                   **options), watch, prover.abort)
+    defended = interruptible(lambda stop: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline,
+                                                        cancel_event=stop, **options), watch, prover.abort)
     found.update(solved=found['solved'] and searched(defended), used=found['used'] + defended.get('nodes_used', 0))
     if defended.get('status') == 'PROVEN_LOSS' and defended.get('native_verified'):
         cert = defended.get('certificate') or json.loads(defended['certificate_json'])
