@@ -1480,13 +1480,11 @@ struct Search {
                         }
                         proof_deadline=std::min(deadline,probe_start+refutation_left);
                         std::vector<bool> refuted(roots.size());
-                        for(size_t i=0;i<roots.size();++i) {
-                            if(roots[i].count==query.count && roots[i].cells==query.cells) refuted[i]=true;
-                            else try {
-                                Restore restore(b);apply(b,roots[i]);
-                                if(b.winner<0) refuted[i]=replay(b,enemy);
-                            } catch(const Timeout&) {break;}
-                        }
+                        for(size_t i=0;i<roots.size();++i) refuted[i]=roots[i].count==query.count && roots[i].cells==query.cells;
+                        for(size_t i=0;i<roots.size();++i) if(!refuted[i]) try {
+                            Restore restore(b);apply(b,roots[i]);
+                            if(b.winner<0) refuted[i]=replay(b,enemy);
+                        } catch(const Timeout&) {break;}
                         refutation_left-=Clock::now()-probe_start;
                         if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=-mate;break;}
                         size_t j=0;
@@ -1534,7 +1532,7 @@ struct Search {
                 try {deepen(true);} catch(const Timeout&) {}
                 deadline=end;refutation_left=end-Clock::now();
                 if(chosen.score<mate) refute();
-                if(depth<=max_depth) deepen(false);
+                if(depth<=max_depth && chosen.score>-mate) deepen(false);
             } catch(const Timeout&) {}
         }
         output.q1=chosen.cells[0].q;output.r1=chosen.cells[0].r;
