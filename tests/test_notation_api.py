@@ -269,6 +269,38 @@ class OfficialAPI(unittest.TestCase):
 
 
 class TimedClocks(unittest.TestCase):
+    def test_clocked_opponent_reply_after_search_cutoff_is_kept(self):
+        from timed_engine import TimedEngine
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        for kind in ('native', 'seal'):
+            with self.subTest(kind=kind):
+                clock = [0.]
+                engine = TimedEngine.__new__(TimedEngine)
+                engine.config = dict(kind=kind)
+                engine.external, engine.checkpoint, engine.model_sha256 = False, kind, ''
+                engine.lock, engine.cancellation = threading.Lock(), threading.Event()
+                engine.generation, engine.busy = 0, False
+                engine.process = SimpleNamespace(is_alive=lambda: True)
+                def advance(seconds):
+                    clock[0] += seconds
+                def poll(timeout=0):
+                    advance(timeout)
+                    return engine.busy and clock[0] >= .092
+                engine.connection = Mock(poll=poll)
+                engine.connection.recv.return_value = (1, 'done', dict(moves=[[1, 0], [2, 0]], nodes=123))
+                game = Game([[0, 0]])
+                try:
+                    with patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]), \
+                            patch('timed_engine.time.sleep', side_effect=advance):
+                        result = engine.turn(game, 100)
+                finally:
+                    game.close()
+                self.assertEqual(result['nodes'], 123)
+                self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                self.assertLess(result['elapsed_ms'], 100)
+                self.assertFalse(engine.busy)
+
     def test_native_controller_releases_precise_timer_on_close_or_startup_failure(self):
         from timed_engine import TimedEngine
         from unittest.mock import Mock

@@ -684,8 +684,7 @@ class TimedEngine:
         self.process.start()
         child.close()
         try:
-            if config.get('kind', 'bubble') == 'bubble' and search.get('native_scheduler') and search.get('enabled', True):
-                self.timer = precise_timer()
+            self.timer = precise_timer()
             if not self.connection.poll(startup_timeout):
                 raise TimeoutError('Engine initialization timed out')
             status, identity = self.connection.recv()
@@ -752,9 +751,9 @@ class TimedEngine:
             remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
             limits['hard_ms'] = remaining if milliseconds is None else min(remaining, milliseconds)
             limits['clock'] = dict(clock)
-        # Native search stops before the reserve. Leave three milliseconds of
-        # that reserve for validating and delivering the selected turn.
-        response_ms = limits['hard_ms']-min(3., limits['reserve_ms']) if native_clocked else limits['hard_ms']-limits['reserve_ms']
+        # Search stops before the reserve. Listen during finalization, leaving
+        # three milliseconds to validate and deliver the selected turn.
+        response_ms = limits['hard_ms']-min(3., limits['reserve_ms'])
         deadline = started + max(0, response_ms)/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
@@ -809,12 +808,10 @@ class TimedEngine:
                         break
                     # Windows pipe waits can round a short timeout to a much
                     # coarser timer tick. Python's sleep uses a precise timer.
-                    wait = 0 if native_clocked else min(.005, max(0, deadline-time.monotonic()))
-                    if not self.connection.poll(wait):
+                    if not self.connection.poll():
                         if not self.process.is_alive():
                             raise RuntimeError('Engine worker exited')
-                        if native_clocked:
-                            time.sleep(min(.001, max(0, deadline-time.monotonic())))
+                        time.sleep(min(.001, max(0, deadline-time.monotonic())))
                         continue
                     ident, status, result = self.connection.recv()
                     if ident != generation:
