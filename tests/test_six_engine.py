@@ -176,7 +176,14 @@ class SixProtocolTests(unittest.TestCase):
         player = FakePlayer([[(5, 0), (6, 0)]])
         flat = ' '.join(f'{q} {r}' for q, r in opening)
         out = io.StringIO()
-        serve(player, io.StringIO(f'position radius 8 moves {flat}\ngo\nquit\n'), out)
+        def commands():
+            yield f'position radius 8 moves {flat}\n'
+            yield 'go\n'
+            end = time.monotonic()+PATIENCE
+            while 'bestmove' not in out.getvalue() and time.monotonic() < end:
+                time.sleep(.01)
+            yield 'quit\n'
+        serve(player, commands(), out)
         self.assertEqual(out.getvalue().strip(), 'bestmove 5 0')
 
     def test_client_restart_after_timeout(self):
