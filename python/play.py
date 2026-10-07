@@ -3583,6 +3583,8 @@ class Session:
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
             spent.update({k: refresh[k] for k in ('leaf_nodes', 'leaf_ms', 'solver_ms') if k in refresh})
+            if refresh.get('solver'):
+                found['solver'] = refresh['solver']   # a refresh rereads the graph; the proof work it replaces stays reported
         saved = self.save(history, weights, spent, found, model)
         if job.kind == 'analyse' and game is not None:
             if refresh is None:

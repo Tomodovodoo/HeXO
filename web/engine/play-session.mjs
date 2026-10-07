@@ -614,7 +614,7 @@ export class BrowserSession extends OfflineSession {
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
-      if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
+      if (job.refresh) result = {...result, threat: job.refresh.threat ?? [], ...(job.refresh.solver ? {solver: job.refresh.solver} : {})};
       const {graph_id: graph, ...answer} = result;
       result = answer;
       if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph, history.length, !job.refresh)}; job.counted = true; }
