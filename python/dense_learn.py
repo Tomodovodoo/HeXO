@@ -557,6 +557,16 @@ def make_optimizer(model, s):
     return torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
 
 
+def match_layout(optimizer):
+    """Give each optimizer state tensor its parameter's memory layout: a checkpoint written by a learner running the
+    other layout loads with the saved strides, and the fused AdamW step needs matching ones."""
+    for inner in getattr(optimizer, 'optimizers', (optimizer,)):
+        for p, state in inner.state.items():
+            for key, value in state.items():
+                if torch.is_tensor(value) and value.shape == p.shape and value.stride() != p.stride():
+                    state[key] = torch.empty_like(p, dtype=value.dtype).copy_(value)
+
+
 def load_future_optimizer(optimizer, model, source, settings, state):
     """Restore shared parameter states when adding/removing the masked future head; new parameters start fresh."""
     previous = make_optimizer(source, settings)
@@ -619,7 +629,7 @@ class Learner:
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.net_kernels = net_kernels
         self.device = torch.device(config.device)
-        self.memory_format = hexnet.memory_format(config.model)
+        self.memory_format = hexnet.memory_format(config.model, self.device.type == 'cuda' and net_kernels == 'fused')
         saved = checkpoints(run, settings.variant)
         manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
         if saved:
@@ -699,6 +709,7 @@ class Learner:
                 load_future_optimizer(self.optimizer, self.model, source, self.settings, state['optimizer'])
             else:
                 self.optimizer.load_state_dict(state['optimizer'])
+            match_layout(self.optimizer)
         adamw = self.optimizer.adamw if self.settings.optimizer == 'muon' else self.optimizer
         for group, decay in zip(adamw.param_groups, (self.settings.weight_decay, 0.)):
             group['weight_decay'] = decay

@@ -276,7 +276,7 @@ def measure(args):
         learner.device = device
         learner.net_kernels = 'reference' if mode == 'reference' else 'fused'
         raw = hexnet.load_model(checkpoint/'model.pt')
-        learner.memory_format = hexnet.memory_format(raw.config)
+        learner.memory_format = hexnet.memory_format(raw.config, mode == 'fused')
         learner.model = learner.place(raw).train()
         learner.ema = learner.place(hexnet.load_model(checkpoint/'ema.pt'))
         if mode == 'shipped':
@@ -286,6 +286,7 @@ def measure(args):
         state = torch.load(checkpoint/'optimizer.pt', map_location=device, weights_only=True)
         learner.optimizer = dense_learn.make_optimizer(learner.model, settings)
         learner.optimizer.load_state_dict(state['optimizer'])
+        dense_learn.match_layout(learner.optimizer)
         learner.step, learner.samples_seen = manifest['step'], manifest['samples_seen']
         learner.optimizer_started = state['optimizer_started']
         learner.ema_updates = state['ema_updates']
@@ -537,7 +538,7 @@ def live(args):
         learner = dense_learn.Learner.__new__(dense_learn.Learner)
         learner.settings, learner.device = settings, device
         learner.net_kernels = 'reference' if mode == 'reference' else 'fused'
-        learner.memory_format = hexnet.memory_format(raw.config)
+        learner.memory_format = hexnet.memory_format(raw.config, mode == 'fused')
         learner.model = learner.place(raw).train()
         learner.ema = learner.place(raw_ema)
         if mode == 'shipped':
@@ -546,6 +547,7 @@ def live(args):
                     module.net_kernels = 'reference'
         learner.optimizer = dense_learn.make_optimizer(learner.model, settings)
         learner.optimizer.load_state_dict(state['optimizer'])
+        dense_learn.match_layout(learner.optimizer)
         learner.step, learner.samples_seen = manifest['step'], manifest['samples_seen']
         learner.optimizer_started, learner.ema_updates = state['optimizer_started'], state['ema_updates']
 

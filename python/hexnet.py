@@ -284,8 +284,10 @@ def act(x, ceiling):
 
 def pool(x, count, ceiling=None, fused=False):
     """Masked mean and max of act(x, ceiling), or of x without a ceiling (then non-negative and zero off the crop):
-    [B, 2C]. `fused` runs hexnet_kernels.masked_pool on contiguous NCHW CUDA inputs."""
-    if (fused and x.is_cuda and x.is_contiguous() and x.dtype in (torch.float32, torch.bfloat16)
+    [B, 2C]. `fused` runs hexnet_kernels.masked_pool on channels-last CUDA inputs while autograd records (training);
+    inference keeps these operations."""
+    if (fused and x.is_cuda and torch.is_grad_enabled() and x.is_contiguous(memory_format=torch.channels_last)
+            and x.dtype in (torch.float32, torch.bfloat16)
             and (ceiling is None or ceiling.stride()[2:] == (x.shape[3], 1))):
         from hexnet_kernels import masked_pool
         return masked_pool(x, count, ceiling)
@@ -312,8 +314,8 @@ class Block(nn.Module):
             y = y*mask
             train_line = (getattr(self.line, 'net_kernels', 'reference') == 'fused' and
                           self.training and torch.is_grad_enabled() and y.is_cuda and
-                          y.dtype == torch.bfloat16 and y.is_contiguous() and
-                          y.stride(1) != 1 and self.line.weight.dtype == torch.float32)
+                          y.dtype == torch.bfloat16 and y.is_contiguous(memory_format=torch.channels_last) and
+                          self.line.weight.dtype == torch.float32)
             if train_line:
                 from hexnet_kernels import line_train_add
                 y = line_train_add(y, self.line.weight)
@@ -390,12 +392,18 @@ class HexNet(nn.Module):
         out = dict(policy=self.policy(hidden).flatten(1).float(), far=self.far(pooled)[:, 0].float(),
                    value_logit=self.value(value)[:, 0].float())
         if aux and self.config.aux_heads:
-            spatial = self.aux_spatial(hidden).float()
+            spatial = pointwise(self.aux_spatial, hidden).float()
             out.update(short_value_logit=self.short_value(value)[:, 0].float(), future=spatial[:, 1:],
                        opponent_policy=spatial[:, 0].flatten(1))
             if self.future_target == 'masked':
-                out['future_masked'] = self.future_masked(hidden).float()
+                out['future_masked'] = pointwise(self.future_masked, hidden).float()
         return out
+
+
+def pointwise(conv, x):
+    """The 1x1 Conv2d `conv` of x, run NCHW with NCHW weight strides: channels-last strides on either operand select
+    cuDNN's NHWC kernels, whose weight gradient for three output channels is several times slower."""
+    return F.conv2d(x.contiguous(), conv.weight.flatten(1)[:, :, None, None], conv.bias)
 
 
 def action_logits(policy, far, cells, counts):
@@ -476,9 +484,10 @@ def masked_future_loss(future, target, planes, weight=None):
     return _weighted_mean(per, None if weight is None else weight.reshape(-1))
 
 
-def memory_format(config):
-    """The line convolutions are matmuls that prefer NCHW; the plain trunk is faster channels_last."""
-    return torch.contiguous_format if config.line_length else torch.channels_last
+def memory_format(config, fused_cuda=False):
+    """Activation layout: channels-last for the fused CUDA kernels (`fused_cuda`) and for a plain trunk; the reference
+    line convolutions are matmuls that prefer NCHW."""
+    return torch.contiguous_format if config.line_length and not fused_cuda else torch.channels_last
 
 
 def model_digest(model):
@@ -558,7 +567,7 @@ class DenseEvaluator:
         self.model_version = model_version or model_digest(model)
         self.device = torch.device(device)
         self.cuda = self.device.type == 'cuda'
-        self.memory_format = torch.channels_last if self.cuda and model.net_kernels == 'fused' else memory_format(model.config)
+        self.memory_format = memory_format(model.config, self.cuda and model.net_kernels == 'fused')
         self.model = model.to(self.device, memory_format=self.memory_format).eval()
         self.max_batch = max_batch
         self.staging = {}
