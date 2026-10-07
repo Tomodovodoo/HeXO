@@ -50,11 +50,13 @@ struct Broker;
 // Completed roots own their numeric records. Consumers never borrow a graph,
 // and the large legal-action table need not pass through an ASCII formatter.
 struct RootEvent {
- std::string text;std::vector<double> edges;bool has_edges=false;
- RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
+  std::string text;std::vector<double> edges;bool has_edges=false;
+  Clock::time_point built{},published{};
+  RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
+  void timing(const char* name,double ms){text.pop_back();text+=",\""+std::string(name)+"\":"+std::to_string(ms)+'}';}
 };
 struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;
- int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;};
+ int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;Clock::time_point queued{};};
 struct Producer:std::enable_shared_from_this<Producer> {
  Broker& broker;owner::Pool& pool;int model,index,worker_request=0;
  std::atomic<bool> retiring=false;
@@ -62,9 +64,11 @@ struct Producer:std::enable_shared_from_this<Producer> {
  std::vector<std::shared_ptr<Job>> outstanding;bool done=false;uint64_t pause_ack=0;
  std::deque<Command> commands;std::vector<uint64_t> epochs;size_t retirement_reserved=0;
  std::vector<bool> requested,reported,released;
- Producer(Broker& b,owner::Pool& p,int m,int i):broker(b),pool(p),model(m),index(i),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()){}
+ std::vector<RootEvent> progress;std::vector<uint64_t> progress_sequence;
+ Producer(Broker& b,owner::Pool& p,int m,int i):broker(b),pool(p),model(m),index(i),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()),progress(p.games.size()),progress_sequence(p.games.size()){}
  void run()noexcept;
- RootEvent result(int index,uint64_t token);
+ RootEvent result(int index,uint64_t token,uint64_t sequence=0);
+ RootEvent unsearched(const Command& command);
 };
 // The service owns only immutable snapshots and prediction messages. Producers
 // exclusively mutate their pools. No GPU callback dereferences a graph node.
@@ -80,9 +84,10 @@ struct Broker {
  int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
  uint64_t flight_high_water=0;
  // Optional repeated admission observations and owner wall spans, not occupancy.
- bool profile_enabled=false,interleave_feedback=false;std::array<uint64_t,38> schedule{};
+ bool profile_enabled=false,interleave_feedback=false,progress_enabled=false;std::array<uint64_t,38> schedule{};
  std::vector<std::pair<int,int>> model_rows;
- std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
+ std::atomic<bool> cancelled=false;Clock::time_point cancelled_at{};
+ bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
  struct Retired {std::unique_ptr<owner::Pool> pool;std::unique_ptr<owner::Owner> game;};
@@ -91,7 +96,7 @@ struct Broker {
  bool reclaiming_owner=false;size_t retirement_reserved=0;
  uint64_t reclaimed_owners=0,owner_reclaim_ns=0,retirement_deferred=0;
  struct Event {Producer* producer;int game;RootEvent data;};
- std::deque<Event> events;RootEvent last_data;std::string last_event;
+ std::deque<Event> events;RootEvent last_data,last_progress;std::string last_event;
  Broker(int q,int p,int merge,double latency):quantum(q),pending(p),merge_cells(merge),latency_ms(latency){
   if(q<1 || q>128 || p<1 || p>4 || merge<0 || !std::isfinite(latency) || latency<0 || latency>20)
    throw std::runtime_error("Invalid native inference service limits");
@@ -109,6 +114,10 @@ struct Broker {
  void configure_feedback(bool enabled){
   std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure interleaved solver feedback before starting");
   interleave_feedback=enabled;
+ }
+ void configure_progress(bool enabled){
+  std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure root progress before starting");
+  progress_enabled=enabled;
  }
  void collected(Clock::time_point start,uint64_t proofs){
   if(!profile_enabled)return;
@@ -262,10 +271,14 @@ struct Broker {
   {std::lock_guard lock(mutex);if(error.empty())error=message;}cancel();
  }
  void cancel(){
-  cancelled=true;
-  {std::lock_guard lock(mutex);for(auto& p:producers)if(p && p->pool.proof_owner)hxp_cancel(p->pool.proof_owner);}
+  auto when=Clock::now();
+  {std::lock_guard lock(mutex);
+   if(!cancelled){cancelled_at=when;cancelled=true;}
+   for(auto& p:producers)if(p && p->pool.proof_owner)hxp_cancel(p->pool.proof_owner);
+  }
   wake.notify_all();
  }
+ Clock::time_point stop_time(){std::lock_guard lock(mutex);return cancelled?cancelled_at:Clock::now();}
  void start(double ms){
   std::unique_lock lock(mutex);
   if(started || std::none_of(producers.begin(),producers.end(),[](const auto& p){return bool(p);}) || !std::isfinite(ms) || ms<0)throw std::runtime_error("Invalid inference service start");
@@ -280,6 +293,7 @@ struct Broker {
   }catch(...){lock.unlock();cancel();for(auto& p:producers)if(p && p->thread.joinable())p->thread.join();throw;}
  }
  void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0){
+  auto queued=Clock::now();
   if(!continuous || !started || cancelled || producer<0 || producer>=int(producers.size()) || count<0 || (count && !cells) ||
      (!work && !(ms>0) && !source) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1)
    throw std::runtime_error("Invalid continuous search command");
@@ -287,7 +301,7 @@ struct Broker {
   if(game<0 || game>=int(p.epochs.size()) || p.done || p.retiring || p.requested[game] || expected!=p.epochs[game] || !p.reported[game])
    throw std::runtime_error("Consume the matching game completion before retargeting");
   if(p.released[game]!=(source!=nullptr))throw std::runtime_error("Release the previous game before replacing its slot");
-  Command command{game,samples,views,expected+1,work,ms,noise,{}};if(count)command.cells.assign(cells,cells+2*count);
+  Command command{game,samples,views,expected+1,work,ms,noise,{}};command.queued=queued;if(count)command.cells.assign(cells,cells+2*count);
   if(source){
    auto& old=*p.pool.games[game];
    if(std::any_of(old.game->pins.begin(),old.game->pins.end(),[&](const auto& pin){
@@ -299,7 +313,7 @@ struct Broker {
    for(int i=0;i<count;++i)if(source->board.history[i].c!=Cell{cells[2*i],cells[2*i+1]})throw std::runtime_error("Replacement history mismatch");
    command.kind=2;command.replacement=source->state;command.tactics=source->tactics;command.range=source->range_floor;command.seed=seed;
   }
-  p.commands.push_back(std::move(command));p.requested[game]=true;
+  p.commands.push_back(std::move(command));p.requested[game]=true;p.progress[game]={};
   // A successful replacement transfers the source Tree. Destroy its caller
   // pin before the producer can mutate the retained store; shared ownership
   // alone would not prevent concurrent unordered_map mutation on close().
@@ -344,7 +358,24 @@ struct Broker {
   return out;
  }
  void publish(Producer& p,int game,uint64_t token,RootEvent event,bool released=false){
-  std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
+  std::lock_guard lock(mutex);stamp(event);p.progress[game]={};p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
+ }
+ void publish_progress(Producer& p,int game,uint64_t sequence,RootEvent event){
+  std::lock_guard lock(mutex);stamp(event);p.progress_sequence[game]=sequence;p.progress[game]=std::move(event);wake.notify_all();
+ }
+ void stamp(RootEvent& event){
+  if(event.built==Clock::time_point{})return;
+  event.published=Clock::now();event.timing("publish_delay_ms",std::chrono::duration<double,std::milli>(event.published-event.built).count());
+ }
+ bool progress_rows(int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){
+  std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);
+  if(producer<0 || producer>=int(producers.size()) || !producers[producer])throw std::runtime_error("Unknown progress producer");
+  auto& p=*producers[producer];if(game<0 || game>=int(p.epochs.size()))throw std::runtime_error("Unknown progress game");
+  if(!p.requested[game] || token!=p.epochs[game]+1 || p.progress_sequence[game]<=after || p.progress[game].text.empty())return false;
+  // Observation cannot acknowledge a completion or permit another command.
+  // Own the copy separately from the final event's borrowed ABI records.
+  last_progress=p.progress[game];if(last_progress.published!=Clock::time_point{})last_progress.timing("observation_age_ms",std::chrono::duration<double,std::milli>(Clock::now()-last_progress.published).count());
+  *text=last_progress.text.c_str();*edges=last_progress.edges.data();*count=int(last_progress.edges.size()/9);return true;
  }
  // Block a consumer until a root event, a failure or the end of all producers.
  bool wait_event(double ms){
@@ -354,7 +385,8 @@ struct Broker {
  }
  bool next_event(){
   std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return false;
-  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);return true;
+  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);
+  if(last_data.published!=Clock::time_point{})last_data.timing("event_queue_ms",std::chrono::duration<double,std::milli>(Clock::now()-last_data.published).count());return true;
  }
  bool event_rows(const char** text,const double** edges,int* count){
   if(!next_event())return false;
@@ -492,8 +524,9 @@ struct Broker {
  }
 };
 inline void Producer::run()noexcept{
+ std::vector<uint64_t> active;
  try{
-  std::vector<uint64_t> active(pool.games.size()),retiring(pool.games.size());
+  active.resize(pool.games.size());std::vector<uint64_t> retiring(pool.games.size()),progress_passes(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
    if(int count=broker.worker_request(*this)){
     // The preceding graph/feed phase has joined. Caller threads never resize
@@ -524,7 +557,13 @@ inline void Producer::run()noexcept{
     if(completion.finished)std::erase(outstanding,job);
    }
    broker.installed_burst(completions.size(),burst_start,burst_proof);
-   for(auto& command:broker.commands(*this)){
+    for(auto& command:broker.commands(*this)){
+     progress_passes[command.game]=0;
+    if(broker.cancelled){
+     if(command.kind!=1 && (command.work || command.ms))
+      broker.publish(*this,command.game,command.token,unsearched(command));
+     continue;
+    }
     if(command.kind==1){
      pool.games[command.game]->stop();
      if(pool.proof_retarget)pool.proof_retarget(pool.proof_owner,command.game);
@@ -536,6 +575,8 @@ inline void Producer::run()noexcept{
      std::vector<Cell> history;for(size_t i=0;i<command.cells.size();i+=2)history.push_back({command.cells[i],command.cells[i+1]});source.root_at(history);
      auto retired=pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.seed);
      broker.reclaim_owner(*this,std::move(retired));
+     auto& o=*pool.games[command.game];
+     if(command.ms){o.started=command.queued;if(o.expired()){o.deadline=true;o.stop();}}
      if(!command.work && !command.ms){
       int producer=index;
       broker.publish(*this,command.game,command.token,"{\"kind\":\"replaced\",\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(command.game)+",\"token\":"+std::to_string(command.token)+'}');
@@ -545,8 +586,12 @@ inline void Producer::run()noexcept{
     auto& o=*pool.games[command.game];o.sample_limit=command.samples;o.max_views=command.views;
     o.views[0].tree->root_noise=command.noise;
     pool.retarget(command.game,command.cells.data(),int(command.cells.size()/2),command.work,command.ms);
+    // Queueing and root preparation consume this command's clock. An expired
+    // prepared root is stopped before either proof or neural frontier admission.
+    if(command.ms){o.started=command.queued;if(o.expired()){o.deadline=true;o.stop();}}
     active[command.game]=command.token;
    }
+   if(broker.cancelled)break;
    uint64_t pause_token=0;bool neural=broker.admission(pause_token);
    int progress=pool.step(neural);
    for(auto& job:outstanding)for(size_t row=0;row<job->ids.size();++row){
@@ -578,20 +623,51 @@ inline void Producer::run()noexcept{
      outstanding.push_back(job);broker.enqueue(job);progress=1;
     }
    }
+   if(broker.progress_enabled)for(size_t i=0;i<active.size();++i)if(active[i]){
+    auto& root=pool.games[i]->views[0];
+    if(root.passes && uint64_t(root.passes)!=progress_passes[i]){
+     uint64_t sequence;
+     {std::lock_guard lock(broker.mutex);sequence=progress_sequence[i]+1;}
+     auto event=result(int(i),active[i],sequence);
+     progress_passes[i]=root.passes;broker.publish_progress(*this,int(i),sequence,std::move(event));
+    }
+   }
    broker.acknowledge(*this,pause_token);
    if(this->retiring && outstanding.empty())break;
    if(!progress)broker.wait(*this);
   }
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native inference producer failed");}
  try{
-  pool.stop();if(pool.proof_owner){hxp_cancel(pool.proof_owner);if(!hxp_drain(pool.proof_owner))throw std::runtime_error(gumbel::error);}
+  pool.stop();
+  // Joined owner phases are the only graph writers. Publish their final choice
+  // before slow proof drainage or device snapshot cleanup, exactly once.
+  if(broker.continuous){
+    for(size_t i=0;i<active.size();++i)if(active[i]){
+     auto token=active[i];auto event=result(int(i),token);
+     active[i]=0;broker.publish(*this,int(i),token,std::move(event));
+    }
+    std::deque<Command> waiting;
+    {std::lock_guard lock(broker.mutex);waiting.swap(commands);}
+    for(auto& c:waiting)if(c.kind!=1 && (c.work || c.ms))
+     broker.publish(*this,c.game,c.token,unsearched(c));
+  }
+  if(pool.proof_owner){hxp_cancel(pool.proof_owner);if(!hxp_drain(pool.proof_owner))throw std::runtime_error(gumbel::error);}
   for(auto& job:outstanding)for(size_t row=0;row<job->ids.size();++row)broker.withdraw(job,int(row));
   // GPU readers own copied snapshots, never this feed's trees or request table.
   if(!hxgf_abandon_all(pool.feed))throw std::runtime_error(gumbel::error);
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native producer teardown failed");}
- {std::lock_guard lock(broker.mutex);completed.clear();outstanding.clear();
+  {std::lock_guard lock(broker.mutex);completed.clear();outstanding.clear();for(auto& frame:progress)frame={};
   broker.retirement_reserved-=retirement_reserved;retirement_reserved=0;done=true;
  }broker.wake.notify_all();
+}
+inline RootEvent Producer::unsearched(const Command& command){
+ // This command never became a root. Its completion must carry its own history,
+ // not statistics or actions borrowed from the previous generation.
+ std::ostringstream out;
+ bool expired=command.ms>0 && std::chrono::duration<double,std::milli>(broker.stop_time()-command.queued).count()>=command.ms;
+ out<<"{\"producer\":"<<index<<",\"model\":"<<model<<",\"game\":"<<command.game<<",\"token\":"<<command.token<<",\"error\":\""<<(expired?"deadline":"cancelled")<<"\",\"history\":[";
+ for(size_t i=0;i<command.cells.size();i+=2){if(i)out<<',';out<<'['<<command.cells[i]<<','<<command.cells[i+1]<<']';}
+ out<<"]}";return out.str();
 }
 // Copy a complete winning turn while the producer owns the graph. No consumer
 // needs to re-root mutable search or ask the network for a certified second stone.
@@ -610,13 +686,22 @@ inline std::vector<Cell> winning_turn(owner::Owner& owner,Cell first){
  for(auto& e:found->second.edges)if(e.winner==side && after.legal(e.action) && (!second || e.distance<second->distance))second=&e;
  return second?std::vector<Cell>{first,second->action}:std::vector<Cell>{};
 }
-inline RootEvent Producer::result(int index,uint64_t token){
+inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
+ auto build_start=broker.progress_enabled?Clock::now():Clock::time_point{};
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
- if(pool.failed[index] || (!n.expanded && o.deadline)){
+ // Only the owner reads root clocks. Late owner work or teardown must not turn
+ // an explicit stop into a deadline, including when cancellation is repeated.
+ if(!sequence && o.stopped && broker.cancelled)
+  o.deadline=o.time_limit_ms>0 && std::chrono::duration<double,std::milli>(broker.stop_time()-o.started).count()>=o.time_limit_ms;
+ auto finish=[&](RootEvent result){
+  if(broker.progress_enabled){result.built=Clock::now();result.timing("result_build_ms",std::chrono::duration<double,std::milli>(result.built-build_start).count());result.timing("result_ready_elapsed_ms",o.elapsed());}
+  return result;
+ };
+ if(pool.failed[index] || (!n.expanded && o.stopped)){
   int producer=this->index;
-  std::string reason=pool.failed[index]?"span":"deadline";
+  std::string reason=pool.failed[index]?"span":o.deadline?"deadline":"cancelled";
   std::string out="{\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(index)+",\"token\":"+std::to_string(token)+",\"error\":\""+reason+"\",\"history\":[";
-  for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return out+"]}";
+   for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return finish(out+"]}");
  }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");
  t.current(n);int ignored=0;auto q=t.completed_q(n,ignored);
@@ -632,7 +717,8 @@ inline RootEvent Producer::result(int index,uint64_t token){
  int producer=this->index;
  std::ostringstream out;out<<std::setprecision(17);
  auto cells=[&](const std::vector<Cell>& h){out<<'[';for(size_t j=0;j<h.size();++j){if(j)out<<',';out<<'['<<h[j].q<<','<<h[j].r<<']';}out<<']';};
- out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
+  out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
+ if(sequence)out<<",\"kind\":\"progress\",\"snapshot_sequence\":"<<sequence<<",\"comparison_passes\":"<<o.views[0].passes<<",\"credit_source\":\"completed_comparisons\"";
  out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.q<<",\"network_value\":";
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
@@ -642,7 +728,8 @@ inline RootEvent Producer::result(int index,uint64_t token){
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(prefixes[ply].first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;
   for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}}
- out<<"]}";result.text=out.str();return result;
+ out<<"]}";result.text=out.str();
+ return finish(std::move(result));
 }
 }
 extern "C" {
@@ -652,6 +739,8 @@ HX_API void hxb_flight_stats(void* p,uint64_t* out){auto& b=*static_cast<inferen
  std::array<uint64_t,3> values{uint64_t(b.flight_limit),b.flight_high_water,uint64_t(b.pending)};std::copy(values.begin(),values.end(),out);}
 HX_API int hxb_profile(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_profile(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_feedback(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_feedback(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_progress(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_progress(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_progress_rows(void* p,int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){try{return static_cast<inference::Broker*>(p)->progress_rows(producer,game,token,after,text,edges,count)?1:0;}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API void hxb_schedule_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);out[0]=b.profile_enabled;std::copy(b.schedule.begin(),b.schedule.end(),out+1);}
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
