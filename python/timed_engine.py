@@ -29,7 +29,7 @@ def precise_timer():
 
 
 def proof_settings(solver):
-    """The checked proof workers and owner budget of a hybrid timed Bubble's `solver` settings."""
+    """The checked proof workers and owner budget of a timed Bubble's `solver` settings."""
     workers, budget = solver.get('workers', PROOF_WORKERS), solver.get('budget', PROOF_BUDGET)
     if type(workers) is not int or not 1 <= workers <= 64:
         raise ValueError('solver.workers must be an integer from 1 to 64')
@@ -38,15 +38,35 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
+SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor'},
+                solver={'enabled', 'stamps', 'workers', 'budget'})
+
+
+def check_settings(search, solver):
+    """Raise ValueError unless `search` and `solver` hold only timed Bubble SETTINGS with valid values. Proof
+    workers and budget apply only while both search and solver are on."""
+    for group, options in (('search', search), ('solver', solver)):
+        if not isinstance(options, dict) or options.keys()-SETTINGS[group]:
+            raise ValueError(f'Unsupported {group} settings: {options}')
+    cap = search.get('max_simulations', search.get('simulations'))
+    if cap is not None and (type(cap) is not int or cap <= 0):
+        raise ValueError('simulation cap must be a positive integer')
+    if search.get('enabled', True) and solver.get('enabled', True):
+        proof_settings(solver)
+    elif {'workers', 'budget'} & solver.keys():
+        raise ValueError('Proof workers and budget apply to searching turns with the solver on')
+
+
 SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'), id=('native:Native', 'drip:Drip'),
                  name=('Native', 'Drip'), checkpoint=('native', 'drip'), badge=('native', 'drip'))
+RETIRED = dict(search=('hybrid_scheduler', 'native_scheduler'), solver=('nodes', 'leaf'))
 
 
 def saved_ids(record):
     """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's ids and name in
     place of the ones older saved files store for it (SAVED_IDS). Only an object that is Drip's changes: one whose
-    kind, engine or id is the older one, or a timed identity whose engine_options are. A search setting stored as
-    native_scheduler reads as hybrid_scheduler."""
+    kind, engine or id is the older one, or a timed identity whose engine_options are. A Bubble configuration
+    loses the search and solver settings older files store and timed play no longer has (RETIRED)."""
     if isinstance(record, list):
         return [saved_ids(value) for value in record]
     if not isinstance(record, dict):
@@ -57,8 +77,10 @@ def saved_ids(record):
     found = {key: saved_ids(value) for key, value in record.items()}
     if drip:
         found.update({key: new for key, (old, new) in SAVED_IDS.items() if found.get(key) == old})
-    if 'native_scheduler' in found:
-        found['hybrid_scheduler'] = found.pop('native_scheduler')
+    if found.get('kind') == 'bubble':
+        for group, keys in RETIRED.items():
+            if isinstance(found.get(group), dict):
+                found[group] = {key: value for key, value in found[group].items() if key not in keys}
     return found
 
 
@@ -142,35 +164,28 @@ def complete_candidate(history, prefix):
         game.close()
 
 
-def dense_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
-    """One allowance for proofs and both stones; publish only complete legal turns."""
-    if getattr(player, 'hybrid_scheduler', False) and player.options['search']:
-        return hybrid_turn(player, history, limits, cancel, publish, analyze)
+def dense_turn(player, history, limits, cancel, publish=lambda result: None):
+    """One complete timed Bubble turn: a hybrid search (`hybrid_turn`), or the raw policy (`policy_turn`) when
+    search is off."""
+    if player.options['search']:
+        return hybrid_turn(player, history, limits, cancel, publish)
+    return policy_turn(player, history, limits, cancel, publish)
+
+
+def policy_turn(player, history, limits, cancel, publish=lambda result: None):
+    """A clocked turn of the network's raw policy, one forward per stone. With the solver on, a root proof bounded
+    by a quarter of the search time comes first and a verified win plays its certificate. Publishes only complete
+    legal turns."""
     import numpy as np
-    from neural_search import NeuralSearch
-    from dense_selfplay import root_value
+    from tactical_proof import MAX_NODES
     started = time.monotonic()
     hard = started + max(0, limits['hard_ms']-limits['reserve_ms'])/1000
-    normal = min(hard, started+limits['normal_ms']/1000)
     game = Game(history)
-    side, remaining = game.player, game.remaining
+    side = game.player
     result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
-                  player=side, win_probability=None, suggestions=[], winning_line=[], threat=None,
-                  proof_status='UNKNOWN', solver_status='off',
-                  settings=dict(player.options) | dict(simulations=limits.get('simulations')),
-                  completed=0, evaluated=0, solver_nodes=0)
-    tree = None
-    solver_left = [limits['normal_ms']*.25]
-    class ProofBudget:
-        def history(self, position, ms, **kwargs):
-            budget = max(0, min(ms, solver_left[0], (hard-time.monotonic())*1000))
-            if budget < 1 or cancel.is_set():
-                return dict(status='UNKNOWN')
-            t0 = time.monotonic()
-            answer = player.prover.history(position, ms=int(budget), nodes=player.options['solver_nodes'], **kwargs)
-            solver_left[0] -= (time.monotonic()-t0)*1000
-            return answer
-    proof_budget = ProofBudget()
+                  model_sha256=player.model_sha256, player=side, win_probability=None, suggestions=[],
+                  winning_line=[], threat=None, proof_status='UNKNOWN', solver_status='off',
+                  settings=dict(player.options), completed=0, evaluated=0, solver_nodes=0)
     def stopped():
         return cancel.is_set() or time.monotonic() >= hard
     def emit(moves, **updates):
@@ -178,112 +193,32 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
         publish(dict(result))
     try:
         emit(result['moves'])
-        if player.options['solver'] and not stopped():
-            ms = max(0, min(solver_left[0], (hard-time.monotonic())*1000))
-            if ms >= 1:
-                proof = proof_budget.history(history, ms=int(ms))
-                result['solver_status'] = proof['status']
-                result['solver_nodes'] = proof.get('nodes_used', 0)
-                if not stopped() and proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'):
-                    moves = complete_candidate(history, proof['moves'])
-                    emit(moves, proof_status='PROVEN_WIN', win_probability=1.,
-                         winning_line=[[q, r, side] for q, r in moves])
-                    return result
+        ms = int(min(60000, limits['normal_ms']*.25, (hard-time.monotonic())*1000))
+        proven = False
+        if player.options['solver'] and ms >= 1 and not cancel.is_set():
+            proof = player.prover.history(history, ms=ms, nodes=MAX_NODES)
+            result.update(solver_status=proof['status'], solver_nodes=proof.get('nodes_used', 0))
+            proven = not stopped() and proof['status'] == 'PROVEN_WIN' and proof.get('native_verified')
+            if proven:
+                moves = complete_candidate(history, proof['moves'])
+                emit(moves, proof_status='PROVEN_WIN', win_probability=1.,
+                     winning_line=[[q, r, side] for q, r in moves])
         selected = []
-        tree = getattr(player, '_timed_tree', None)
-        points = list(map(tuple, history))
-        if tree and list(map(tuple, tree.history)) != points[:len(tree.history)]:
-            tree.close()
-            tree = None
-        if tree:
-            for action in points[len(tree.history):]:
-                tree.advance(action)
-        else:
-            tree = NeuralSearch(player.evaluator, player.model_sha256, history, seed=1740,
-                                cache=player.cache, tactics=True,
-                                proof_solver=proof_budget if limits.get('leaf_solver') else None,
-                                q_range_floor=limits.get('q_range_floor', 0.))
-        player._timed_tree = tree
-        tree.proof_solver = proof_budget if limits.get('leaf_solver') else None
-        while game.player == side and game.winner < 0 and not stopped():
-            first = remaining == 2 and not selected
-            second_share = limits['normal_ms']*.4/1000
-            stage_end = (min(hard, started + limits['normal_ms']*.6/1000) if first else
-                         min(hard, max(normal, time.monotonic()+second_share)))
-            if first:
-                stage_end = min(stage_end, hard-max(.001, getattr(player, 'batch_seconds', .01)))
-            available = stage_end-time.monotonic()
-            simulation_cap = limits.get('simulations')
-            if first and simulation_cap is not None and simulation_cap > 1:
-                simulation_cap = max(1, int(simulation_cap*.6))
-            if available <= 0:
+        while not proven and game.player == side and game.winner < 0 and not stopped():
+            prediction = player.evaluator.evaluate([[cell[:2] for cell in game.cells]])[0]
+            result['evaluated'] += 1
+            if stopped():
                 break
-            current = [cell[:2] for cell in game.cells]
-            if player.options['search']:
-                rate = getattr(player, 'simulations_per_second', 200.)
-                sims = max(2, min(16384, int(rate*available)))
-                if limits.get('simulations') is not None:
-                    sims = min(sims, max(0, simulation_cap-result['completed']))
-                    if sims < 1:
-                        break
-                t0 = time.monotonic()
-                searched = tree.search(sims, root_samples=min(limits.get('root_samples', 16), sims), batch_size=min(16, sims),
-                                       milliseconds=available*1000, stop=cancel.is_set, anytime=True,
-                                       batch_seconds=getattr(player, 'batch_seconds', 0.))
-                duration = max(.000001, time.monotonic()-t0)
-                if searched['completed']:
-                    player.simulations_per_second = .7*rate + .3*searched['completed']/duration
-                player.batch_seconds = max(.001, searched.get('batch_seconds', .001))
-                result['completed'] += searched['completed']
-                result['evaluated'] += searched['evaluated']
-                extension_end = hard-max(second_share, player.batch_seconds) if first else hard
-                if (searched['action'] is not None and not searched['stable_choice'] and not searched['proven'] and
-                        searched['completed'] >= sims and not cancel.is_set() and
-                        extension_end-time.monotonic() > player.batch_seconds):
-                    extra = max(1, min(16384, int(player.simulations_per_second*(extension_end-time.monotonic()))))
-                    if limits.get('simulations') is not None:
-                        extra = min(extra, max(0, simulation_cap-result['completed']))
-                    order = np.argsort(-searched['scores'])
-                    finalists = searched['actions'][[i for i in order if np.isfinite(searched['scores'][i])][:2]]
-                    if extra and len(finalists):
-                        extended = tree.search(extra, root_samples=min(2, extra), batch_size=min(16, extra),
-                            milliseconds=max(.001, (extension_end-time.monotonic())*1000), stop=cancel.is_set,
-                            anytime=True, batch_seconds=player.batch_seconds, priority=finalists)
-                        result['completed'] += extended['completed']
-                        result['evaluated'] += extended['evaluated']
-                        if extended['action'] is not None:
-                            searched = extended
-                        elif tuple(searched['action']) not in {tuple(a) for a, p in
-                                zip(extended['actions'], extended['policy']) if p > 0}:
-                            extended['action'] = extended['actions'][extended['policy'].argmax()].tolist()
-                            searched = extended
-                if searched['proven']:
-                    result['proof_status'] = searched['proof_status']
-                action = searched['action']
-                if action is None:
-                    break
-                value = root_value(searched, game.player)
-                policy, actions = searched['policy'], searched['actions']
-            else:
-                if available < getattr(player, 'batch_seconds', 0.):
-                    break
-                t0 = time.monotonic()
-                prediction = player.evaluator.evaluate([current])[0]
-                player.batch_seconds = time.monotonic()-t0
-                if stopped():
-                    break
-                actions = prediction['actions']
-                policy = np.exp(prediction['logits']-max(prediction['logits']))
-                policy /= policy.sum()
-                action, value = actions[policy.argmax()].tolist(), float(prediction['q'][0])
-                result['evaluated'] += 1
+            actions = prediction['actions']
+            policy = np.exp(prediction['logits']-prediction['logits'].max())
+            policy /= policy.sum()
+            action = actions[policy.argmax()].tolist()
             if not selected:
                 result['suggestions'] = [dict(move=actions[i].tolist(), probability=float(policy[i]))
                                          for i in np.argsort(-policy)[:5]]
-                result['win_probability'] = (value+1)/2
+                result['win_probability'] = (float(prediction['q'][0])+1)/2
             game.play(*action)
-            selected.append(list(action))
-            tree.advance(action)
+            selected.append(action)
             emit(complete_candidate(history, selected))
         result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline' if stopped() else 'budget'
         return result
@@ -291,13 +226,10 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
         game.close()
 
 
-def hybrid_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
-    """A clocked hybrid turn: native graph owner, batched inference and concurrent proof slices."""
+def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
+    """A clocked hybrid turn: native graph owner, batched inference and concurrent proof slices. The graph and
+    its proof pool stay on `player._timed_hybrid` for the next turn while the model and settings agree."""
     started = time.monotonic()
-    if player.options['solver'] and player.solver_nodes_explicit:
-        raise ValueError('Hybrid timed solving uses time slices; omit solver_nodes or disable hybrid_scheduler')
-    if limits.get('leaf_solver'):
-        raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
     import numpy as np
     from neural_search import GameGraph
     from hybrid_scheduler import SearchPool, InferenceService
@@ -312,8 +244,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None, an
                   model_sha256=player.model_sha256, player=side, win_probability=None,
                   suggestions=[], winning_line=[], threat=None,
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
-                  settings=dict(player.options) | dict(hybrid_scheduler=True,
-                      simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8,
+                  settings=dict(player.options) | dict(simulations=limits.get('simulations'), solver_slice_ms=8,
                       proof_workers=workers, proof_budget=budget),
                   completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[], root_searches=[])
     service = None
@@ -535,8 +466,8 @@ def _worker(connection, cancellation, config):
     try:
         kind = config.get('kind', 'bubble')
         if kind == 'bubble':
-            if (config.get('search', {}).get('hybrid_scheduler')
-                    and config.get('search', {}).get('enabled', True)):
+            search, solver = config.get('search', {}), config.get('solver', {})
+            if search.get('enabled', True):
                 timer = precise_timer()
             import torch
             from dense_player import DensePlayer
@@ -552,22 +483,16 @@ def _worker(connection, cancellation, config):
                     checkpoint = max((p.parent for p in (run/'checkpoints').glob('*/*/ema.pt')),
                                      key=lambda p: int(p.name)).relative_to(run/'checkpoints').as_posix()
                 model = run/'checkpoints'/checkpoint/'ema.pt'
-            search, solver = config.get('search', {}), config.get('solver', {})
             player = DensePlayer(run, config.get('device', 'cpu'), model=model,
                                  tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
-                                 net_kernels=config.get('net_kernels', 'fused'),
-                                 hybrid_scheduler=search.get('hybrid_scheduler', False))
+                                 net_kernels=config.get('net_kernels', 'fused'))
             if player.prover is not None:
                 player.prover.stamps = bool(solver.get('stamps', False))
             options = dict(search=search.get('enabled', True), solver=solver.get('enabled', player.prover is not None))
             if 'simulations' in search:
                 options['simulations'] = search['simulations']
-            if 'nodes' in solver:
-                options['solver_nodes'] = solver['nodes']
             player.configure(options)
-            t0 = time.monotonic()
             player.evaluator.evaluate([[(0, 0)]])
-            player.batch_seconds = time.monotonic()-t0
             identity = dict(checkpoint=player.checkpoint, model_sha256=player.model_sha256)
             if player.evaluator.graph is not None:
                 started = time.monotonic()
@@ -579,20 +504,18 @@ def _worker(connection, cancellation, config):
                     budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
-                                 q_range_floor=search.get('q_range_floor', 0.),
-                                 leaf_solver=solver.get('leaf', False) and player.options['solver'])
-            if search.get('hybrid_scheduler'):
-                search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
-                if player.options['search'] and player.evaluator.cuda:
-                    # CUDA capture alone does not initialize packed inference,
-                    # its launcher thread or the proof pool. Exercise that path
-                    # before accepting short clocks, then discard its searches.
-                    started = time.monotonic()
-                    prepared = hybrid_turn(player, [[0, 0]], allowance(movetime=1000) |
-                        search_limits | dict(simulations=64), cancellation)
-                    player.set_history()
-                    identity['scheduler_preparation'] = dict(milliseconds=(time.monotonic()-started)*1000,
-                        completed=prepared['completed'], evaluated=prepared['evaluated'])
+                                 q_range_floor=search.get('q_range_floor', 0.))
+            search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
+            if player.options['search'] and player.evaluator.cuda:
+                # CUDA capture alone does not initialize packed inference,
+                # its launcher thread or the proof pool. Exercise that path
+                # before accepting short clocks, then discard its searches.
+                started = time.monotonic()
+                prepared = hybrid_turn(player, [[0, 0]], allowance(movetime=1000) |
+                    search_limits | dict(simulations=64), cancellation)
+                player.set_history()
+                identity['scheduler_preparation'] = dict(milliseconds=(time.monotonic()-started)*1000,
+                    completed=prepared['completed'], evaluated=prepared['evaluated'])
         elif kind == 'six':
             from six_engine import SixEngine
             player = SixEngine(config['command'], cancel=cancellation, mirrored=config.get('mirrored', False),
@@ -629,8 +552,6 @@ def _worker(connection, cancellation, config):
             if request[0] == 'reset':
                 if kind == 'bubble':
                     player.set_history(request[1])
-                    if hasattr(player, 'simulations_per_second'):
-                        del player.simulations_per_second
                 connection.send(('reset', None))
                 continue
             generation, history, limits = request
@@ -683,18 +604,8 @@ def _worker(connection, cancellation, config):
 class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
-        search, solver = config.get('search', {}), config.get('solver', {})
-        if config.get('kind') == 'bubble' and search.get('hybrid_scheduler') and search.get('enabled', True) and solver.get('enabled', True):
-            if 'nodes' in solver:
-                raise ValueError('Hybrid timed solving uses time slices; omit solver.nodes or disable hybrid_scheduler')
-            if solver.get('leaf'):
-                raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
-            proof_settings(solver)
-        elif {'workers', 'budget'} & solver.keys():
-            raise ValueError('Proof workers and budget apply to hybrid timed solving only')
-        cap = search.get('max_simulations', search.get('simulations'))
-        if cap is not None and (type(cap) is not int or cap <= 0):
-            raise ValueError('simulation cap must be a positive integer')
+        if config.get('kind', 'bubble') == 'bubble':
+            check_settings(config.get('search', {}), config.get('solver', {}))
         self.external = config.get('kind') in ('six', 'htttx')
         self.config = dict(config)
         context = mp.get_context('spawn')
@@ -765,7 +676,6 @@ class TimedEngine:
         history = [list(cell[:2]) for cell in game.cells]
         started = time.monotonic()
         hybrid_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
-                          self.config.get('search', {}).get('hybrid_scheduler') and
                           self.config.get('search', {}).get('enabled', True))
         # Leave time to finalize a graph root and transfer its immutable result,
         # in addition to delivering the turn through the controller.

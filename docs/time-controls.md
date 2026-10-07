@@ -85,7 +85,7 @@ First-stone wins and final half-turns retain the behavior merged in [#228](https
       "kind": "bubble",
       "checkpoint": "champion",
       "search": {"enabled": true, "root_samples": 16},
-      "solver": {"enabled": true, "nodes": 32768, "leaf": false},
+      "solver": {"enabled": true, "workers": 2},
       "net_kernels": "fused"
     },
     "circle": {"kind": "human"}
@@ -94,7 +94,7 @@ First-stone wins and final half-turns retain the behavior merged in [#228](https
 }
 ```
 
-Players can be `human`, `bubble`, `drip`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. `search.max_simulations` optionally caps timed search; otherwise it follows measured throughput. Solver node caps remain inside the clock. With `search.hybrid_scheduler`, `solver.workers` (default 2) sets the proof workers of the turn's native proof frontier and `solver.budget` (default `PROOF_BUDGET` in `timed_engine.py`) the share of the graph owner's time proof steps may take; the same keys work in `timed_match.py --a-settings`. `solver.leaf` shares the solver allowance with leaf proofs and certificate verification.
+Players can be `human`, `bubble`, `drip`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. Every searching Bubble turn runs on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)): a native game graph kept across turns, batched inference and time-sliced proofs on CPU workers. `search.enabled: false` plays the network's raw policy instead, one forward per stone; with the solver on, a root proof of at most a quarter of the turn comes first. `search.max_simulations` optionally caps a turn's search; otherwise the clock ends it. `solver.workers` (default 2) sets the proof workers of the turn's proof frontier and `solver.budget` (default `PROOF_BUDGET` in `timed_engine.py`) the share of the graph owner's time proof steps may take; both need search and solver on. The same keys work in `timed_match.py --a-settings`. Any other `search` or `solver` key is refused. A saved specification that still holds `search.hybrid_scheduler`, `solver.nodes` or `solver.leaf` loads without them.
 
 Creation returns HTTP 202, a `match_id` and `preparing` state. Poll until `ready`, then start. The initial history defaults to the origin. An optional `history` supplies an opening; `turn_cap_ms` adds a maximum time per turn.
 
@@ -127,7 +127,7 @@ fixed budget and are refused.
 python python/timed_match.py --run runs/dense-v1 --a main/132500 --b main/115000 --tc 180+2 --pairs 50 --device cuda --net-kernels fused --out artifacts/timed-matches/132500-v-115000
 ```
 
-`180` is Absolute and `180+2` is Fischer, in seconds. `--opening file.htttx` supplies a position. Each pair swaps colors. `--b-command` selects a Six opponent; `--b-url` selects an HTTP HTTTX opponent. One game runs at a time so unrelated inference queues do not consume the competitors' clocks.
+`180` is Absolute and `180+2` is Fischer, in seconds. `--opening file.htttx` supplies a position. Each pair swaps colors. `--b-command` selects a Six opponent; `--b-url` selects an HTTP HTTTX opponent. `--a-settings` and `--b-settings` take a JSON file of `search` and `solver` keys for that Bubble, for example `{"solver": {"enabled": false}}` to play without proofs. One game runs at a time so unrelated inference queues do not consume the competitors' clocks.
 
 Each match saves its specification, append-only events, final JSON and notation. Identities include the model, source revision, settings and native-library hashes. Timeout, illegal reply and engine crash are explicit outcomes. Placement caps are censored. Results stay outside the fixed-simulation league.
 
@@ -141,12 +141,10 @@ Controls with fractional seconds remain in JSON because notation specifies integ
 
 An external opponent must supply its own move. If it exceeds the allocated response time, the JSON result records `engine_timeout`, or `time` if the game clock expired too. The host never substitutes its legal fallback for an opponent's reply.
 
-The initial normal allowance divides remaining time and expected increments over 20 own turns. Its hard cap allows at most three normal work allowances plus the return reserve and never spends future increment. Reserve 10 ms for returning the move. Fixed move-time requests use their supplied allowance inside that reserve. These are initial settings, not measured optimal values.
+The initial normal allowance divides remaining time and expected increments over 20 own turns. Its hard cap allows at most three normal work allowances plus the return reserve and never spends future increment. A searching Bubble turn reserves 20 ms to finalize its root and return the move; other engines reserve 10 ms. Fixed move-time requests use their supplied allowance inside that reserve. These are initial settings, not measured optimal values.
 
-Give the first stone 60% of normal time and preserve time for the second. Root and optional leaf proofs share at most 25% of normal time. Keep a complete legal candidate before solving or inference. A persistent worker owns the model; the controller can return that candidate while a non-cancellable call finishes. Generation IDs discard late results.
+The first stone gets 60% of normal time and the second the rest. The worker publishes a complete legal candidate before any search and replaces it only with complete legal turns: each finished root, and for the second stone each progress snapshot of its comparison. At the search deadline the service stops admitting work and the turn waits until the response deadline for the root's final choice; without one it keeps the latest progress candidate or the legal fallback. A persistent worker owns the model and keeps the turn's graph and proof pool for the next turn while the model and settings agree. The controller can return the newest candidate while the worker drains, and generation IDs discard late results.
 
-Timed Gumbel search saves a completed comparison at the existing final halving boundary. Interruption returns that recommendation after filtering newly refuted moves. Before that boundary, retain the legal fallback. Fixed-simulation training is unchanged. If the last round changes the recommendation, search can compare finalists longer while preserving second-stone time. It reuses visits and caches; the existing `hxg_begin` redraws noise for that extension. No new ABI is needed.
+On CUDA the worker captures its inference graphs and plays one 64-simulation hybrid turn before it reports ready, so the first clocked turn does not pay for packed inference start-up. The controller and host enforce the response deadline. This is not a hard real-time operating-system guarantee.
 
-Measure batch latency during warmup and search, and avoid starting a batch that the measured latency says will not fit. The controller and host enforce the response deadline. This is not a hard real-time operating-system guarantee.
-
-CPU verification covers half-turn accounting, single increments, pause/resume, timeout precedence, restoration, WebSocket rollback and clocks, responsive Six commands, interrupted comparisons and a real dense worker using a tiny CPU checkpoint. Training and production evaluation need no restart. Start the new API or restart an existing Six/play adapter to load the new Python code.
+CPU verification covers half-turn accounting, single increments, pause/resume, timeout precedence, restoration, WebSocket rollback and clocks, responsive Six commands, hybrid turn deadlines and a real dense worker using a tiny CPU checkpoint. Training and production evaluation need no restart. Start the new API or restart an existing Six/play adapter to load the new Python code.

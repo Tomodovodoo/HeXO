@@ -3252,8 +3252,8 @@ class Session:
                 raise
 
     def timed_config(self, seat):
-        """The `timed_engine` configuration of `seat`, its budget as a ceiling; ValueError for an engine that cannot
-        keep a clock (`keeps_clock`)."""
+        """The `timed_engine` configuration of `seat`, its simulations as a ceiling and a nonzero solver_nodes turning
+        on the turn's time-sliced proofs; ValueError for an engine that cannot keep a clock (`keeps_clock`)."""
         entry, budget = self.entries[seat['engine']], seat['budget']
         kind = entry['kind']
         if not keeps_clock(entry):
@@ -3265,8 +3265,7 @@ class Session:
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
                         max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
-                        solver=dict(enabled=budget['solver_nodes'] > 0, nodes=max(1, budget['solver_nodes']),
-                                    stamps=getattr(self.engines, 'proof_stamps', False)))
+                        solver=dict(enabled=budget['solver_nodes'] > 0, stamps=getattr(self.engines, 'proof_stamps', False)))
         if kind == 'six':
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
                         cwd=str(entry.get('cwd') or ROOT), path=list(map(str, entry.get('libraries', []))),

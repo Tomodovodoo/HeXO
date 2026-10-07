@@ -37,7 +37,7 @@ class ActorSettings:
     leaf_batch: int = 256
     native_feed: bool = False    # compiled selection, context cache and batch installation
     native_packing: bool = False # native crop packing/output decoding; requires native_feed
-    hybrid_scheduler: bool = False # persistent native owners, one model-keyed inference queue
+    hybrid_scheduler: bool = True # persistent native owners, one model-keyed inference queue; False: neural_search trees
     hybrid_round_barrier: bool = False # explicit root sets, drain only before halving
     hybrid_producers: int = 4
     hybrid_model_producers: int = 1 # producers splitting each model's actor slots, within hybrid_producers
@@ -62,7 +62,7 @@ class ActorSettings:
     # game_graph > 0: each game's trees are shared game graphs (neural_search.GameGraph) keeping at most that many
     # expanded nodes between searches; 0 keeps one tree per model, pruned on every advance. pv_check (needs a game
     # graph): share of a full search's simulations its principal-variation check takes (neural_search.Recheck).
-    # With hybrid_scheduler, 0 takes HYBRID_GAME_GRAPH.
+    # With hybrid_scheduler, 0 takes HYBRID_GAME_GRAPH (graph_nodes).
     game_graph: int = 0
     pv_check: float = 0.
     cache_positions: int = 4096
@@ -128,9 +128,12 @@ class ActorSettings:
     net_kernels: str = 'reference'  # opt-in Triton features, normalization and inference LineConv
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
+    @property
+    def graph_nodes(self):
+        """Expanded nodes each game graph keeps: game_graph, or HYBRID_GAME_GRAPH for a hybrid actor at 0."""
+        return self.game_graph or (HYBRID_GAME_GRAPH if self.hybrid_scheduler else 0)
+
     def __post_init__(self):
-        if self.hybrid_scheduler and not self.game_graph:
-            object.__setattr__(self, 'game_graph', HYBRID_GAME_GRAPH)
         if self.hybrid_round_barrier and not self.hybrid_scheduler:
             raise ValueError('hybrid_round_barrier requires hybrid_scheduler')
         if not 1 <= self.hybrid_producers <= 16 or not 4 <= self.hybrid_quantum <= 128 or not 1 <= self.hybrid_views <= 64 or not 1 <= self.hybrid_depth <= 32:
@@ -138,10 +141,11 @@ class ActorSettings:
         if (not 0 <= self.hybrid_proof_workers <= 16 or not 0 < self.hybrid_proof_slice_ms <= 1000
                 or not 0 < self.hybrid_proof_budget <= 1):
             raise ValueError('Invalid hybrid proof worker, slice or budget setting')
-        if self.hybrid_scheduler and (not self.game_graph or self.pv_check or self.proven_line_rows or
+        if self.hybrid_scheduler and (self.pv_check or self.proven_line_rows or
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,
                      self.solver_deep_nodes,self.solver_leaf_nodes))):
-            raise ValueError('hybrid_scheduler requires game_graph and frontier slices instead of legacy solver budgets or PV checks')
+            raise ValueError('hybrid_scheduler uses frontier slices instead of legacy solver budgets, PV checks or '
+                             'certificate line rows; set hybrid_scheduler to false for those')
         if not 1 <= self.hybrid_model_producers <= self.hybrid_producers:
             raise ValueError('hybrid_model_producers must lie between one and hybrid_producers')
         if self.hybrid_scheduler and self.historical_fraction and self.hybrid_producers<2*self.hybrid_model_producers:
