@@ -491,10 +491,19 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
 
 def _worker(connection, cancellation, config):
     """Own the model and its mutable tree in one spawned process."""
-    player = None
+    player = timer = None
     try:
         kind = config.get('kind', 'bubble')
         if kind == 'bubble':
+            if (config.get('search', {}).get('native_scheduler')
+                    and config.get('search', {}).get('enabled', True)):
+                import sys
+                if sys.platform == 'win32':
+                    import ctypes
+                    winmm = ctypes.WinDLL('winmm')
+                    if winmm.timeBeginPeriod(1):
+                        raise RuntimeError('Could not request 1 ms native search timers')
+                    timer = winmm
             import torch
             from dense_player import DensePlayer
             torch.set_num_threads(2)
@@ -628,9 +637,13 @@ def _worker(connection, cancellation, config):
         except (EOFError, BrokenPipeError):
             pass
     finally:
-        if player and config.get('kind') != 'seal':
-            player.close()
-        connection.close()
+        try:
+            if player and config.get('kind') != 'seal':
+                player.close()
+        finally:
+            if timer is not None:
+                timer.timeEndPeriod(1)
+            connection.close()
 
 
 class TimedEngine:
