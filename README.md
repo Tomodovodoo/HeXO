@@ -65,11 +65,11 @@ The tactical solver needs Rust and Cargo with edition 2024 support:
 python tools/build_tactical.py
 ```
 
-Without it the search plays without proofs and the launcher skips the proof pass. Check the build with the tests:
+Without it the search plays without proofs and the launcher skips the proof pass. Check the build with the fast
+test tier; [docs/testing.md](docs/testing.md) describes the tiers and the slow one:
 
 ```sh
-python -m unittest tests.test_engine tests.test_neural_search tests.test_proof tests.test_notation_api -v
-python -m unittest tests.test_dense tests.test_dense_solve tests.test_openings tests.test_bubble -v
+python -m tests
 ```
 
 ## Train

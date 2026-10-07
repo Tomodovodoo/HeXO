@@ -21,7 +21,7 @@ from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARI
                   model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review,
                   review_plies, scan, six_backend)
 from process_tree import TreeProcess
-from tests import PATIENCE
+from tests import PATIENCE, slow
 
 STANDARD = PRESETS['bubble']['standard']
 SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
@@ -2369,6 +2369,7 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual((found['moves'], found['value'], found['proof']), ([[1, 0], [2, 0]], 1., dict(winner=1, turns=2, plies=6)))
         self.assertEqual(self.trees, [])
 
+    @slow
     def test_solver_leaves_prove_the_supplied_losing_half_turn(self):
         import tactical_proof
         from play import evaluate, solve

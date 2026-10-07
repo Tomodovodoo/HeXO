@@ -301,7 +301,7 @@ class SixProtocolTests(unittest.TestCase):
                 try:
                     while not game.over():
                         action = next((m for m in game.game.legal_moves() if m not in [(0, 0)]), None)
-                        game.searched({'action': action})
+                        game.searched({'action': action, 'actions': [action], 'policy': [1.]})
                     record = game.finish()
                     self.assertNotIn('error', record)
                     self.assertGreater(record['plies'], 2)

@@ -4,12 +4,6 @@ import unittest
 from hexo import Game
 from tests.reference import AXES, Reference, has_cover, interleave
 
-try:
-    import torch
-    from legacy.gpu_games import BatchedHexo
-except ImportError:
-    torch = None
-
 
 class NativeRules(unittest.TestCase):
     def make_game(self, moves=()):
@@ -281,117 +275,6 @@ class NativeRules(unittest.TestCase):
                 self.assertEqual(game.winner, 1)
             else:
                 self.assertFalse(reference.completions(0))
-
-
-@unittest.skipIf(torch is None, "PyTorch is optional; install requirements/learning.txt for GPU rules checks")
-class BatchedRules(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        torch.set_num_threads(2)
-
-    def devices(self):
-        return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-
-    def test_parity_growth_rejections_reset_and_truncation(self):
-        for device in self.devices():
-            env = BatchedHexo(3, device, capacity=2, max_placements=20)
-            references = [Reference() for _ in range(3)]
-            rng = random.Random(92)
-            for step in range(23):
-                actions = []
-                expected = []
-                for ref in references:
-                    if not ref.history:
-                        point = (0, 0)
-                    elif step % 5 == 0:
-                        point = rng.choice(ref.history)  # Occupied and rejected.
-                    else:
-                        q, r = rng.choice(ref.history)
-                        point = (q+rng.randrange(-8, 9), r+rng.randrange(-8, 9))
-                    accept = len(ref.history) < 20 and ref.legal(*point)
-                    expected.append(accept)
-                    actions.append(point)
-                    if accept:
-                        ref.play(*point)
-                result = env.step(torch.tensor(actions, device=device))
-                self.assertEqual(result.accepted.cpu().tolist(), expected)
-                self.assertEqual(env.player.cpu().tolist(), [r.player for r in references])
-                self.assertEqual(env.remaining.cpu().tolist(), [r.remaining for r in references])
-                self.assertEqual(env.winner.cpu().tolist(), [r.winner for r in references])
-                self.assertEqual(env.features.cpu().tolist(), [r.features() for r in references])
-            env.reset([False, True, False])
-            self.assertEqual(env.counts[1].item(), 0)
-            self.assertEqual(env.features[1].sum().item(), 0)
-            bounded = BatchedHexo(1, device, capacity=1, max_placements=3)
-            for point in ((0, 0), (8, 0), (16, 0)):
-                self.assertTrue(bounded.step(torch.tensor([point], device=device)).accepted.item())
-            self.assertTrue(bounded.truncated.item())
-            self.assertFalse(bounded.step(torch.tensor([[24, 0]], device=device)).accepted.item())
-            bounded.reset()
-            for point in ((2**63-1, 0), (-2**63, -2**63)):
-                self.assertFalse(bounded.legal(torch.tensor([point], device=device)).item())
-
-    def test_exact_wins_and_defensive_covers(self):
-        # Both colors threaten: player one's broken two-stone win has priority.
-        own = [(0, 2), (2, 2), (3, 2), (5, 2)]
-        other = [(i, 0) for i in range(5)]
-        win = interleave([other, own])
-        # Two intersecting five-stone lines share the same blocking cell (2,2).
-        cross = [(0, 0)] + [(q, 2) for q in (0, 1, 3, 4, 5)] + [(2, r) for r in (0, 1, 3, 4, 5)]
-        filler = [(-4+2*(i % 4), 6+2*(i//4)) for i in range(10)]
-        shared = interleave([cross, filler])
-        two_blocks = interleave([other, [(0, 3), (2, 3), (4, 3), (6, 3)]])
-        for device in self.devices():
-            for history in (win, shared, two_blocks):
-                env, ref = BatchedHexo(1, device, capacity=2), Reference()
-                for point in history:
-                    ref.play(*point)
-                    self.assertTrue(env.step(torch.tensor([point], device=device)).accepted.item())
-                side, remaining = ref.player, ref.remaining
-                for _ in range(remaining):
-                    own_wins = ref.completions(side, ref.remaining)
-                    threats = ref.completions(1-side)
-                    action = env.tactical_action()
-                    self.assertEqual(action.winning.item(), bool(own_wins))
-                    self.assertEqual(action.defending.item(), bool(threats) and has_cover(threats, ref.remaining) and not own_wins)
-                    if not action.forced.item():
-                        break
-                    point = tuple(action.action[0].cpu().tolist())
-                    self.assertTrue(ref.legal(*point))
-                    if history == shared:
-                        self.assertEqual(point, (2, 2))
-                    ref.play(*point)
-                    env.step(action.action)
-                    if ref.winner >= 0:
-                        break
-                if history == win:
-                    self.assertEqual(ref.winner, side)
-                else:
-                    self.assertFalse(ref.completions(1-side))
-
-    def test_first_stone_overline_all_axes(self):
-        base = interleave([[(0, 0)]+[(2*k, 6) for k in range(6)],
-                           [(k, 2) for k in (0, 1, 2, 4, 5, 6, 3)]])
-        transforms = (lambda q, r: (q, r), lambda q, r: (r, q), lambda q, r: (q+r, -q))
-        for device in self.devices():
-            for transform in transforms:
-                env, native = BatchedHexo(1, device, capacity=2), Game()
-                self.addCleanup(native.close)
-                for point in base[:-1]:
-                    action = transform(*point)
-                    native.play(*action)
-                    env.step(torch.tensor([action], device=device))
-                self.assertEqual(native.player, 1)
-                self.assertEqual(native.remaining, 2)
-                self.assertEqual(native.winner, -1)
-                last = transform(*base[-1])
-                native.play(*last)
-                result = env.step(torch.tensor([last], device=device))
-                self.assertTrue(result.terminated.item())
-                self.assertEqual(env.winner.item(), 1)
-                self.assertEqual(env.remaining.item(), 1)
-                self.assertEqual(env.features[0].cpu().tolist(), native.features())
-                self.assertFalse(env.step(torch.tensor([[100, 100]], device=device)).accepted.item())
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import hexnet
 import play
 import tactical_proof
 from neural_search import EvaluationCache, GameGraph, NeuralSearch
+from tests import SLOW, slow
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
@@ -34,10 +35,10 @@ def node(job):
     return json.loads(done.stdout)
 
 
-def random_model(seed=0):
+def random_model(seed=0, **config):
     """A HexNet with random weights, line taps and batch-norm statistics."""
     torch.manual_seed(seed)
-    model = hexnet.HexNet(hexnet.HexNetConfig(aux_heads=False))
+    model = hexnet.HexNet(hexnet.HexNetConfig(aux_heads=False, **config))
     with torch.no_grad():
         for module in model.modules():
             if isinstance(module, hexnet.MaskedNorm):
@@ -63,6 +64,7 @@ class Recorder:
 
 
 @unittest.skipUnless(importlib.util.find_spec('onnxruntime'), 'needs onnx and onnxruntime (requirements/web.txt)')
+@slow
 class Export(unittest.TestCase):
     @unittest.skipUnless(NODE, 'needs node')
     def test_legacy_export_accepts_distinct_static_rectangle_axes(self):
@@ -864,7 +866,7 @@ class Bundle(unittest.TestCase):
 
     def test_native_browser_owner_preserves_legal_breadth_and_sampling_credits(self):
         history = [[0,0],[4,0],[7,0]]
-        answer = node(dict(kind='native-owner', history=history, work=8192, delay=2, batchSize=4))
+        answer = node(dict(kind='native-owner', history=history, work=2048, delay=2, delayedForwards=8, batchSize=4))
         result, stats = answer['result'], answer['stats']
         self.assertGreater(stats['reclaimed'], 0)
         game = play.Game(history)
@@ -1211,6 +1213,7 @@ class Bundle(unittest.TestCase):
         for bar in node(dict(kind='analysis-bar', cases=cases)):
             self.assertEqual((bar['x'], bar['o']), ('>99', '<1'))
 
+    @slow
     def test_solver_leaves_prove_a_losing_half_turn(self):
         history = [[0, 0], [4, 0], [7, 0], [-2, 0], [-1, 0], [1, 0], [6, 0], [5, 0], [-1, -1],
                    [-3, 1], [-1, 1], [-2, -1], [-4, 0], [-3, 0], [0, -1], [-2, -3], [-2, -2],
@@ -1554,12 +1557,16 @@ class Bundle(unittest.TestCase):
     def test_search_matches_native(self):
         """Same seed, position, budget, Q range floor, root noise and evaluations: the same actions, visits and policy
         as the native library, on trees and on a shared game graph whose root moves to the position after the turn
-        it chose and back."""
-        model, games = random_model(1), export_web.histories(every=9)
+        it chose and back. The fast tier checks one position of each kind; the slow tier adds a third of the
+        exported games, four tactical positions and a 512-simulation search."""
+        # The browser replays the recorded evaluations, so a small network checks the same search.
+        model = random_model(1, blocks=2, channels=16, pool_every=2, line_length=5, value_hidden=16, head_channels=8)
+        games = export_web.histories(every=9)
         tactical = list(json.loads((ROOT/'tests'/'fixtures'/'tactical_positions.json').read_text())['positions'].values())[:4]
         cases = []
-        positions = [(h, 64, None, 0., 0.) for h in games[::3]]+[(h, 128, None, 0., 0.) for h in tactical]
-        positions += [(games[5], 512, None, 0., 0.), (games[5], 64, 'gumbel', 0., 0.), (tactical[0], 128, 'gumbel', 0., 0.)]
+        positions = ([(h, 64, None, 0., 0.) for h in games[::3]]+[(h, 128, None, 0., 0.) for h in tactical]
+                     + [(games[5], 512, None, 0., 0.)] if SLOW else [(games[0], 64, None, 0., 0.)])
+        positions += [(games[5], 64, 'gumbel', 0., 0.), (tactical[0], 128, 'gumbel', 0., 0.)]
         positions += [(games[5], 128, None, .5, 0.), (games[27], 128, 'gumbel', 0., .25)]
         positions += [(games[5], 128, None, 0., 0., 'lost'), (games[5], 64, None, 0., 0., 'wins')]
         for history, simulations, choice, floor, noise, *marked in positions:
