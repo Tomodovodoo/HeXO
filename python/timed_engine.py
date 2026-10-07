@@ -295,6 +295,10 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                    exact_winner=winner, completed=found['root_completed'],
                    scheduler_completed=found['completed'],
                    root_completed=found['root_completed'], context=found['context'])
+        row['position_edge_visits'] = int(edges[:, 6].sum())
+        row['source'] = ('verified_proof' if winner >= 0 else 'completed_comparisons'
+                         if found['root_completed'] else 'position_search'
+                         if row['position_edge_visits'] else 'uncredited_estimate')
         return edges, winner, probability, action, witness, row
     try:
         emit(result['moves'])
@@ -417,12 +421,12 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             root_search.update(elapsed_ms=found.get('elapsed_ms'),
                                issued=found.get('issued'), completed=found['root_completed'])
             if found['exact_winner'] < 0 and not found['root_completed']:
-                # Expansion or inherited evidence can leave a legal choice, but
-                # neither is a completed comparison at this commanded root.
+                # Same-position evidence can improve the move without adding
+                # current-root comparison credit. Keep its provenance explicit.
                 root_search['error'] = 'no_completed_comparison'
                 if progress_candidate is not None:
                     result = progress_candidate
-                break
+                    break
             edges, winner, probability, action, witness, row = read_choice(found, current)
             token += 1
             result['completed'] += found['root_completed']

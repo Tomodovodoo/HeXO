@@ -342,9 +342,16 @@ failed in the eighteenth saved trial. The forcing-position second root had zero
 completed comparisons, despite 80 issued requests; the fenced turn took 1.898
 seconds against a one-second allowance. A new 32x40 capture and a competing CI
 CUDA context were present, but neither is established as the cause. The caller
-now keeps that attempt in the clock record without claiming it as a searched
-stone. Exact evidence remains usable without neural comparison credits. This
-reporting correction does not resolve the missed work. Earlier one-searched-stone
+now keeps that attempt in the clock record with zero fresh root comparisons. A
+matching final graph choice remains useful even without fresh comparison credits.
+Each stone distinguishes current-root comparisons, accumulated position-edge
+visits, an uncredited estimate and verified proof. Edge visits are neither unique
+neural evaluations nor an age measurement. An uncredited estimate can already
+include proof exclusions and the improved-policy transform, so it is not labelled
+as a raw network prediction. A matching completed progress candidate remains
+preferred to a later uncredited final estimate. Exact evidence remains usable
+without neural comparison credits. This reporting correction does not resolve
+the missed work. Earlier one-searched-stone
 timing failures are also retained. Measure caller return separately from
 post-return neural/proof drainage and trace capture, installation and publication
 boundaries before attributing the delay.
