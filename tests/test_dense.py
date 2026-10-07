@@ -9935,13 +9935,16 @@ class DenseTimedWorker(unittest.TestCase):
                 service.event.side_effect = [first, dict(producer=0, game=0, model=0,
                     token=2, history=history+[[1, 0]], context='second', action=[2, 0],
                     exact_winner=winner, root_completed=0, completed=200, issued=80,
-                    elapsed_ms=476., winning_turn=[[2, 0]] if winner == 1 else [],
+                    elapsed_ms=476., result_build_ms=2., result_ready_elapsed_ms=478.,
+                    publish_delay_ms=1., event_queue_ms=784.,
+                    winning_turn=[[2, 0]] if winner == 1 else [],
                     edges=np.array([[2, 0, 0, 0, .8, 1, 200, 0, 1]], float))]
                 result = native_turn(player, history, allowance(movetime=1000), threading.Event())
             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
             self.assertEqual(result['completed'], 2)
             self.assertEqual(result['root_searches'][1]['issued'], 80)
             self.assertEqual(result['root_searches'][1]['completed'], 0)
+            self.assertEqual(result['root_searches'][1]['event_queue_ms'], 784.)
             if winner < 0:
                 self.assertEqual(len(result['stones']), 1)
                 self.assertEqual(result['moves'], complete_candidate(history, [[1, 0]]))

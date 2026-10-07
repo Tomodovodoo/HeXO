@@ -1757,6 +1757,8 @@ class NativeScheduler(unittest.TestCase):
                     self.assertEqual((frame['kind'],frame['token'],frame['history']), ('progress',1,[[0,0]]))
                     self.assertEqual(frame['credit_source'], 'completed_comparisons')
                     self.assertGreater(frame['root_completed'],0)
+                    self.assertGreaterEqual(frame['result_ready_elapsed_ms'],frame['elapsed_ms'])
+                    self.assertGreaterEqual(frame['observation_age_ms'],0)
                     snapshots.append(frame)
                     with self.assertRaisesRegex(ValueError, 'matching game completion'):
                         service.retarget(0,0,[(0,0)],expected=0,work=4,views=1)
@@ -1774,10 +1776,18 @@ class NativeScheduler(unittest.TestCase):
             self.assertGreater(service.stats()['schedule_snapshot_gate_samples'],0)
             saved = snapshots[0]['edges'].copy()
             service.cancel()
+            until = time.monotonic()+1
+            while time.monotonic()<until:
+                if service.wait(1.):break
+                time.sleep(.001)
+            else:self.fail('Cancelled root did not publish its completion')
+            time.sleep(.01)  # Hold the available completion on the consumer side.
         finally:
             final = service.close(completions=True)
         self.assertEqual(len(final),1)
         self.assertEqual((final[0]['token'],final[0]['history']), (1,[[0,0]]))
+        self.assertGreaterEqual(final[0]['event_queue_ms'],8.)
+        self.assertGreaterEqual(final[0]['result_ready_elapsed_ms'],final[0]['elapsed_ms'])
         np.testing.assert_array_equal(snapshots[0]['edges'],saved)
         self.assertEqual(service.close(completions=True),[])
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))

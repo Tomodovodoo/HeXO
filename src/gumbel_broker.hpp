@@ -50,8 +50,10 @@ struct Broker;
 // Completed roots own their numeric records. Consumers never borrow a graph,
 // and the large legal-action table need not pass through an ASCII formatter.
 struct RootEvent {
- std::string text;std::vector<double> edges;bool has_edges=false;
- RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
+  std::string text;std::vector<double> edges;bool has_edges=false;
+  Clock::time_point built{},published{};
+  RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
+  void timing(const char* name,double ms){text.pop_back();text+=",\""+std::string(name)+"\":"+std::to_string(ms)+'}';}
 };
 struct Command {int game,samples,views;uint64_t token,work;double ms,noise;std::vector<int64_t> cells;
  int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;Clock::time_point queued{};};
@@ -351,10 +353,14 @@ struct Broker {
   return out;
  }
  void publish(Producer& p,int game,uint64_t token,RootEvent event,bool released=false){
-  std::lock_guard lock(mutex);p.progress[game]={};p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
+  std::lock_guard lock(mutex);stamp(event);p.progress[game]={};p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
  }
  void publish_progress(Producer& p,int game,uint64_t sequence,RootEvent event){
-  std::lock_guard lock(mutex);p.progress_sequence[game]=sequence;p.progress[game]=std::move(event);wake.notify_all();
+  std::lock_guard lock(mutex);stamp(event);p.progress_sequence[game]=sequence;p.progress[game]=std::move(event);wake.notify_all();
+ }
+ void stamp(RootEvent& event){
+  if(event.built==Clock::time_point{})return;
+  event.published=Clock::now();event.timing("publish_delay_ms",std::chrono::duration<double,std::milli>(event.published-event.built).count());
  }
  bool progress_rows(int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){
   std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);
@@ -363,7 +369,8 @@ struct Broker {
   if(!p.requested[game] || token!=p.epochs[game]+1 || p.progress_sequence[game]<=after || p.progress[game].text.empty())return false;
   // Observation cannot acknowledge a completion or permit another command.
   // Own the copy separately from the final event's borrowed ABI records.
-  last_progress=p.progress[game];*text=last_progress.text.c_str();*edges=last_progress.edges.data();*count=int(last_progress.edges.size()/9);return true;
+  last_progress=p.progress[game];if(last_progress.published!=Clock::time_point{})last_progress.timing("observation_age_ms",std::chrono::duration<double,std::milli>(Clock::now()-last_progress.published).count());
+  *text=last_progress.text.c_str();*edges=last_progress.edges.data();*count=int(last_progress.edges.size()/9);return true;
  }
  // Block a consumer until a root event, a failure or the end of all producers.
  bool wait_event(double ms){
@@ -373,7 +380,8 @@ struct Broker {
  }
  bool next_event(){
   std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);if(events.empty())return false;
-  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);return true;
+  auto event=std::move(events.front());events.pop_front();event.producer->reported[event.game]=true;last_data=std::move(event.data);
+  if(last_data.published!=Clock::time_point{})last_data.timing("event_queue_ms",std::chrono::duration<double,std::milli>(Clock::now()-last_data.published).count());return true;
  }
  bool event_rows(const char** text,const double** edges,int* count){
   if(!next_event())return false;
@@ -675,12 +683,17 @@ inline std::vector<Cell> winning_turn(owner::Owner& owner,Cell first){
  return second?std::vector<Cell>{first,second->action}:std::vector<Cell>{};
 }
 inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
+ auto build_start=broker.progress_enabled?Clock::now():Clock::time_point{};
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
+ auto finish=[&](RootEvent result){
+  if(broker.progress_enabled){result.built=Clock::now();result.timing("result_build_ms",std::chrono::duration<double,std::milli>(result.built-build_start).count());result.timing("result_ready_elapsed_ms",o.elapsed());}
+  return result;
+ };
  if(pool.failed[index] || (!n.expanded && o.stopped)){
   int producer=this->index;
   std::string reason=pool.failed[index]?"span":o.deadline?"deadline":"cancelled";
   std::string out="{\"producer\":"+std::to_string(producer)+",\"model\":"+std::to_string(model)+",\"game\":"+std::to_string(index)+",\"token\":"+std::to_string(token)+",\"error\":\""+reason+"\",\"history\":[";
-  for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return out+"]}";
+   for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return finish(out+"]}");
  }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");
  t.current(n);int ignored=0;auto q=t.completed_q(n,ignored);
@@ -707,7 +720,8 @@ inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(prefixes[ply].first);if(fact!=o.game->outcomes.end()){
   if(count++)out<<',';out<<'['<<ply<<','<<fact->second.winner<<','<<fact->second.distance<<",[";size_t actions=0;
   for(auto& edge:fact->second.edges)if(edge.winner==fact->second.winner && edge.distance==fact->second.distance){if(actions++)out<<',';out<<'['<<edge.action.q<<','<<edge.action.r<<']';}out<<"]]";}}
- out<<"]}";result.text=out.str();return result;
+ out<<"]}";result.text=out.str();
+ return finish(std::move(result));
 }
 }
 extern "C" {

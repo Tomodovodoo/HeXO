@@ -400,6 +400,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             root_search['received_ms'] = (time.monotonic()-started)*1000
             if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token+1, current):
                 raise ValueError('Native turn completion does not match the current position')
+            for key in ('result_build_ms', 'result_ready_elapsed_ms', 'publish_delay_ms', 'event_queue_ms'):
+                if key in found:
+                    root_search[key] = found[key]
             if 'error' in found:
                 root_search['error'] = found['error']
                 if found['error'] in ('deadline', 'cancelled'):

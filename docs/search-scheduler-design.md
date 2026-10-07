@@ -1,6 +1,6 @@
 # HeXO search scheduler
 
-Updated 2026-10-07. Merged source baseline: main `267e9ef`, through PR441.
+Updated 2026-10-07. Merged source baseline: main `df8f8ee`, including PR439 and PR441.
 PR438 also includes the still-unmerged actor launcher from PR433. Draft work
 is identified below; its presence on this branch does not make it deployed.
 This replaces the October 3 proposal.
@@ -33,8 +33,8 @@ of that question.
 | Retarget and actor records | Avoid redundant eviction scans; retain the raw root prediction; incremental prefix keys | PR425, PR428, PR429 |
 | Proof supply | Wake one worker, close unsupported quiet sides, retry only after fresh work and count supply exclusions | PR415, PR427; PR440 sets opt-in proof defaults |
 | Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 is pending, including a queued-shard naming fix |
-| Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; actual one-second GPU delivery remains unverified |
-| Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 is pending actual two-model CUDA validation |
+| Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; an actual GPU trial missed second-root work; diagnosis remains open |
+| Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 merged after actual two-model CUDA validation |
 | Shared proof workers | Lend globally bounded workers across producer loops while graph owners install results | Claimed on issue414; not merged or runtime-verified |
 
 These are source deliveries. Native actor/continuous-proof modes remain opt-in.
@@ -338,10 +338,16 @@ this mailbox cannot manufacture a searched turn.
 
 Native ownership/backpressure, CPU Play, browser behavior and exact-head review
 passed on implementation `6195d27`. Actual one-second GPU/controller delivery
-is still queued. Earlier
-one-searched-stone timing failures are retained; passing a saved fixture does not
-prove those unrecovered cases resolved. Measure caller return separately from
-post-return neural/proof drainage.
+failed in the eighteenth saved trial. The forcing-position second root had zero
+completed comparisons, despite 80 issued requests; the fenced turn took 1.898
+seconds against a one-second allowance. A new 32x40 capture and a competing CI
+CUDA context were present, but neither is established as the cause. The caller
+now keeps that attempt in the clock record without claiming it as a searched
+stone. Exact evidence remains usable without neural comparison credits. This
+reporting correction does not resolve the missed work. Earlier one-searched-stone
+timing failures are also retained. Measure caller return separately from
+post-return neural/proof drainage and trace capture, installation and publication
+boundaries before attributing the delay.
 
 ### Queueing and transfers
 
