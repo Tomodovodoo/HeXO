@@ -2292,7 +2292,7 @@ class Session:
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'refuted', 'solver')}
+                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'solver_ms', 'refuted', 'solver')}
                     if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')
