@@ -265,8 +265,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     import numpy as np
     from neural_search import GameGraph
     from native_scheduler import SearchPool, InferenceService
-    hard = limits.get('response_deadline', started + max(0, limits['hard_ms'])/1000)
-    normal = min(hard-limits['reserve_ms']/1000,
+    turn_deadline = limits.get('hard_deadline', started + max(0, limits['hard_ms'])/1000)
+    hard = limits.get('response_deadline', turn_deadline)
+    normal = min(turn_deadline-limits['reserve_ms']/1000,
                  limits.get('search_deadline', started + limits['normal_ms']/1000))
     workers, budget = limits.get('proof_workers', PROOF_WORKERS), limits.get('proof_budget', PROOF_BUDGET)
     game = Game(history)
@@ -288,6 +289,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             output['evaluated'] = service.stats()['launched_rows']
         output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000,
                       turn_complete=complete)
+        if complete:
+            output.setdefault('stop_reason',
+                'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget')
         publish(dict(output, stones=list(output['stones']),
                      root_searches=[dict(root) for root in output['root_searches']]))
     def read_choice(found, current):
@@ -783,7 +787,8 @@ class TimedEngine:
             if native_clocked:
                 # Monotonic time is shared by local processes. Queue/IPC delay
                 # consumes the turn instead of restarting its clock on receipt.
-                worker_limits.update(response_deadline=deadline,
+                worker_limits.update(hard_deadline=started+limits['hard_ms']/1000,
+                                     response_deadline=deadline,
                                      search_deadline=started+limits['normal_ms']/1000)
             self.connection.send((generation, history, worker_limits))
             self.busy = True

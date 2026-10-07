@@ -273,7 +273,7 @@ class TimedClocks(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import Mock
         clock = [0.]
-        chosen = dict(moves=[[1, 0], [2, 0]], turn_complete=True, completed=8)
+        chosen = dict(moves=[[1, 0], [2, 0]], turn_complete=True, completed=8, stop_reason='deadline')
         for complete in (False, True):
             with self.subTest(turn_complete=complete):
                 clock[0] = 0.
@@ -309,8 +309,10 @@ class TimedClocks(unittest.TestCase):
                 self.assertEqual(engine.busy, complete)
                 self.assertEqual(engine.cancellation.is_set(), complete)
                 self.assertLess(result['elapsed_ms'], 100)
+                self.assertEqual(result['stop_reason'], 'deadline')
                 limits = engine.connection.send.call_args.args[0][2]
                 self.assertAlmostEqual(limits['search_deadline'], .08)
+                self.assertAlmostEqual(limits['hard_deadline'], .1)
                 self.assertLess(limits['response_deadline'], .1)
 
     def test_clocked_comparison_book_settings_and_paired_scores(self):
