@@ -12,8 +12,12 @@ Native search uses no transposition table. The experimental Python
 it is off by default and never caches score bounds.
 The existing line-count arithmetic is precomputed into 1 KiB of immutable
 constants. Without optional pattern adjustments, candidate updates skip that
-adjustment arithmetic and windows whose gains did not change. Candidate selection
-sorts only the retained cells, preserving their scores and tie order.
+adjustment arithmetic and windows whose gains did not change. A placement sums
+the changes of all windows along one axis and writes each affected candidate
+record once. During search, the six windows of an axis through a cell sit next
+to each other in the temporary line array. Candidate selection keeps a bounded
+sorted list of the best cells instead of ranking every cached cell, with the
+same scores and tie order.
 The root prover can also cover an attack that leaves the defender a free second
 stone. It first finds a strategy against the mandatory block and records which
 empty cells can affect its moves or threats. Fillers outside that set share the

@@ -57,10 +57,15 @@ struct WindowTable {
     size_t count=0;
     std::vector<WindowData> dense;
     std::vector<uint64_t> dense_used;
-    static int dense_index(Window w) {
-        if(w.start.q < -32 || w.start.q>=32 || w.start.r < -32 || w.start.r>=32) return -1;
-        return int((w.axis*64+w.start.q+32)*64+w.start.r+32);
+    // The six windows of one axis through a cell are adjacent: rows hold a
+    // line and columns the position along it, so a placement touches few cache lines.
+    static constexpr int dense_size=4*64*64;
+    static int dense_index(int64_t start_q,int64_t start_r,int axis) {
+        if(start_q < -32 || start_q>=32 || start_r < -32 || start_r>=32) return -1;
+        const auto q=int(start_q)+32,r=int(start_r)+32;
+        return axis==0?r*64+q:axis==1?64*64+q*64+r:2*64*64+(q+r)*64+q;
     }
+    static int dense_index(Window w) {return dense_index(w.start.q,w.start.r,w.axis);}
     struct View {
         const WindowTable& table;
         struct Iterator {
@@ -76,8 +81,10 @@ struct WindowTable {
             }
             Slot operator*() const {
                 if(index>=table->dense.size()) return table->slots[index-table->dense.size()];
-                auto a=index/(64*64),q=(index/64)%64,r=index%64;
-                return {Cell{int64_t(q)-32,int64_t(r)-32},1,table->dense[index],uint8_t(a)};
+                const auto row=int64_t(index/64),column=int64_t(index%64);
+                const auto a=std::min<size_t>(2,index/(64*64));
+                const auto q=a==0?column:a==1?row-64:column,r=a==0?row:a==1?column:row-128-column;
+                return {Cell{q-32,r-32},1,table->dense[index],uint8_t(a)};
             }
             Iterator& operator++(){++index;skip();return *this;}
             bool operator!=(const Iterator& other) const{return index!=other.index;}
@@ -97,9 +104,15 @@ struct WindowTable {
         }
         return nullptr;
     }
-    WindowData& get(Window w) {
-        const int index=dense.empty()?-1:dense_index(w);
+    WindowData& get(Window w) {return get(w.start.q,w.start.r,w.axis);}
+    // Scalar arguments and a separate sparse path let the placement loop
+    // inline the dense lookup without building a window key in memory.
+    WindowData& get(int64_t q,int64_t r,int axis) {
+        const int index=dense.empty()?-1:dense_index(q,r,axis);
         if(index>=0) {dense_used[index/64]|=uint64_t(1)<<(index%64);return dense[index];}
+        return sparse({{q,r},axis});
+    }
+    WindowData& sparse(Window w) {
         if((count+1)*4>=slots.size()*3) {
             auto old=std::move(slots);slots=std::vector<Slot>(old.size()*2);count=0;
             for(const auto& s:old) if(s.hash) get(s.key())=s.data;
@@ -135,7 +148,7 @@ struct DenseWindows {
     DenseWindows(WindowTable& table,bool use):table(table),enabled(use && table.dense.empty()) {
         if(!enabled) return;
         WindowTable next;
-        next.dense.resize(3*64*64);next.dense_used.resize(3*64);
+        next.dense.resize(WindowTable::dense_size);next.dense_used.resize(WindowTable::dense_size/64);
         for(const auto& slot:table.slots) if(slot.hash) next.get(slot.key())=slot.data;
         saved=std::move(table.slots);count=table.count;
         table.slots=std::move(next.slots);table.count=next.count;
@@ -282,6 +295,10 @@ struct CandidateCache {
     }
     CandidateData& get(Cell c) {
         const int i=index(c);
+        if(i>=0 && lookup[i]) return slots[lookup[i]-1].data;
+        return add(c,i);
+    }
+    CandidateData& add(Cell c,int i) {
         auto& id=i>=0?lookup[i]:outside[c];
         if(!id) {slots.push_back({c,CandidateData{empty_gain}});id=uint32_t(++count);}
         return slots[id-1].data;
@@ -413,64 +430,84 @@ struct Board {
     }
     uint64_t hash() const { return stones_hash ^ mix(100+player*3+remaining) ^ mix(200+winner); }
     void update(Cell c,int p,int delta) {
-        for(int d=0;d<3;++d) for(int k=0;k<6;++k) {
-            Window w{c+axes[d]*(-k),d};
-            auto& data=windows.get(w);
-            Counts& n=data.counts;
-            auto& pattern=data.pattern;
-            const auto old_counts=n;const int old_pattern=pattern;
-            if(pattern) --features[pattern];
-            learned_score-=adjustment[pattern];
-            evaluation-=value(n);
-            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) --threes[side];
-            for(int side=0;side<2;++side)
-                if(n[side]>=4 && n[1-side]==0) threats[side].erase(w);
-            n[p]+=delta;
-            pattern+=delta*(p+1)*powers[k];
-            data.empty^=uint8_t(1<<k);
-            if(candidates && n[0]+n[1]<6 && old_counts[0]+old_counts[1]<6) {
-                const std::array<int,2> gain_delta={count_gain(n,0)-count_gain(old_counts,0),
-                                                   count_gain(n,1)-count_gain(old_counts,1)};
-                const int pattern_delta=adjustment[old_pattern]-adjustment[pattern];
-                const int line_delta=int(promising(n))-int(promising(old_counts));
-                if(candidates->adjusted) {
-                    for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
-                        int j=std::countr_zero(gaps);
-                        auto& item=candidates->get(w.start+axes[d]*j);
-                        for(int side=0;side<2;++side) {
-                            int change=adjustment[pattern+(side+1)*powers[j]]-
-                                       adjustment[old_pattern+(side+1)*powers[j]]+pattern_delta;
-                            item.gain[side]+=gain_delta[side]+(side==0?change:-change);
+        // Changes to the cached candidate values of one axis, by offset -5..5
+        // from c. Up to five windows reach each cell; each record is written once.
+        struct Pending {
+            std::array<int,2> gain,scalar;std::array<int,4> setups;
+            std::array<uint32_t,2> clear,set;int lines;
+        };
+        for(int d=0;d<3;++d) {
+            std::array<Pending,11> pending;unsigned touched=0;
+            for(int k=0;k<6;++k) {
+                const Cell start=c+axes[d]*(-k);
+                auto& data=windows.get(start.q,start.r,d);
+                Counts& n=data.counts;
+                auto& pattern=data.pattern;
+                const auto old_counts=n;const int old_pattern=pattern;
+                if(pattern) --features[pattern];
+                learned_score-=adjustment[pattern];
+                evaluation-=value(n);
+                for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) --threes[side];
+                n[p]+=delta;
+                pattern+=delta*(p+1)*powers[k];
+                data.empty^=uint8_t(1<<k);
+                if(candidates && n[0]+n[1]<6 && old_counts[0]+old_counts[1]<6) {
+                    const std::array<int,2> gain_delta={count_gain(n,0)-count_gain(old_counts,0),
+                                                       count_gain(n,1)-count_gain(old_counts,1)};
+                    const int pattern_delta=adjustment[old_pattern]-adjustment[pattern];
+                    const int line_delta=int(promising(n))-int(promising(old_counts));
+                    if(candidates->adjusted) {
+                        for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
+                            int j=std::countr_zero(gaps);
+                            auto& item=candidates->get(start+axes[d]*j);
+                            for(int side=0;side<2;++side) {
+                                int change=adjustment[pattern+(side+1)*powers[j]]-
+                                           adjustment[old_pattern+(side+1)*powers[j]]+pattern_delta;
+                                item.gain[side]+=gain_delta[side]+(side==0?change:-change);
+                            }
+                            item.lines+=line_delta;
                         }
-                        item.lines+=line_delta;
-                    }
-                } else if(gain_delta[0] || gain_delta[1] || line_delta) {
-                    const auto& before=placement_score(old_counts);const auto& after=placement_score(n);
-                    const std::array<int,2> scalar_delta={after.scalar[0]-before.scalar[0],after.scalar[1]-before.scalar[1]};
-                    const std::array<int,4> setup_delta={after.setups[0]-before.setups[0],after.setups[1]-before.setups[1],after.setups[2]-before.setups[2],after.setups[3]-before.setups[3]};
-                    const std::array<bool,2> attacking={n[0]>=3 && !n[1],n[1]>=3 && !n[0]};
-                    for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
-                        const int j=std::countr_zero(gaps);
-                        auto& item=candidates->get(w.start+axes[d]*j);
-                        item.gain[0]+=gain_delta[0];item.gain[1]+=gain_delta[1];
-                        item.lines+=line_delta;
-                        const auto bit=uint32_t(1)<<(d*6+j);
-                        for(int p=0;p<2;++p) {
-                            item.scalar[p]+=scalar_delta[p];
-                            item.attack[p]=(item.attack[p]&~bit)|(attacking[p]?bit:0);
+                    } else if(gain_delta[0] || gain_delta[1] || line_delta) {
+                        const auto& before=placement_score(old_counts);const auto& after=placement_score(n);
+                        const std::array<bool,2> attacking={n[0]>=3 && !n[1],n[1]>=3 && !n[0]};
+                        for(unsigned gaps=data.empty & ~(1u<<k);gaps;gaps&=gaps-1) {
+                            const int j=std::countr_zero(gaps);
+                            const int offset=j-k+5;
+                            if(!(touched>>offset&1)) {pending[offset]={};touched|=1u<<offset;}
+                            auto& item=pending[offset];
+                            item.gain[0]+=gain_delta[0];item.gain[1]+=gain_delta[1];
+                            item.lines+=line_delta;
+                            const auto bit=uint32_t(1)<<(d*6+j);
+                            for(int side=0;side<2;++side) {
+                                item.scalar[side]+=after.scalar[side]-before.scalar[side];
+                                item.clear[side]|=bit;
+                                if(attacking[side]) item.set[side]|=bit;
+                            }
+                            for(int i=0;i<4;++i) item.setups[i]+=after.setups[i]-before.setups[i];
                         }
-                        for(int j=0;j<4;++j) item.setups[j]+=setup_delta[j];
                     }
                 }
+                if(pattern) ++features[pattern];
+                learned_score+=adjustment[pattern];
+                evaluation+=value(n);
+                for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) ++threes[side];
+                for(int side=0;side<2;++side) {
+                    const bool was=old_counts[side]>=4 && !old_counts[1-side],is=n[side]>=4 && !n[1-side];
+                    if(was!=is) {if(is) threats[side].insert({start,d}); else threats[side].erase({start,d});}
+                }
+                if(n[p]>=6) winner=p;
+                if(n[0]+n[1]==0) windows.erase({start,d});
             }
-            if(pattern) ++features[pattern];
-            learned_score+=adjustment[pattern];
-            evaluation+=value(n);
-            for(int side=0;side<2;++side) if(n[side]==3 && !n[1-side]) ++threes[side];
-            for(int side=0;side<2;++side)
-                if(n[side]>=4 && n[1-side]==0) threats[side].insert(w);
-            if(n[p]>=6) winner=p;
-            if(n[0]+n[1]==0) windows.erase(w);
+            for(int o=0;o<11;++o) if(touched>>o&1) {
+                const auto& change=pending[o];
+                auto& item=candidates->get(c+axes[d]*(o-5));
+                for(int side=0;side<2;++side) {
+                    item.gain[side]+=change.gain[side];item.scalar[side]+=change.scalar[side];
+                    item.attack[side]=(item.attack[side]&~change.clear[side])|change.set[side];
+                }
+                item.lines+=change.lines;
+                for(int i=0;i<4;++i) item.setups[i]=int8_t(item.setups[i]+change.setups[i]);
+            }
         }
     }
     void make(Cell c) {
@@ -807,14 +844,40 @@ struct Search {
         ranked.resize(count);
         std::vector<Cell> out;
         for(int i=0;i<std::min(limit,int(ranked.size()));++i) out.push_back(ranked[i].second);
+        return with_tactics(b,std::move(out));
+    }
+    static std::vector<Cell> with_tactics(const Board& b,std::vector<Cell> out) {
         // Tactical cells cannot be removed by ordinary move ordering.
         for(int p=0;p<2;++p) for(auto& e:b.completions(p)) for(auto c:e)
             if(std::find(out.begin(),out.end(),c)==out.end() && b.legal(c)) out.push_back(c);
         return out;
     }
+    // The cells select_candidates would return from candidate_scores. Offensive
+    // ranking scores 4*own-3*opponent gain. With the search cache, a bounded
+    // sorted list replaces ranking every cached cell.
+    static std::vector<Cell> best_candidates(Board& b,int limit,bool offensive=false) {
+        if(!b.candidates) {
+            auto ranked=candidate_scores(b);
+            if(offensive) for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-b.player);
+            return select_candidates(b,std::move(ranked),limit);
+        }
+        const auto better=[](const auto& a,const auto& z){ return a.first!=z.first ? a.first>z.first : a.second<z.second; };
+        RankedCells top;top.reserve(limit+1);
+        for(const auto& slot:b.candidates->slots) {
+            const auto& c=slot.cell;const auto& item=slot.data;
+            if(item.occupied || !(item.nearby || item.lines) || std::abs(c.q)>1000000000000LL || std::abs(c.r)>1000000000000LL) continue;
+            const std::pair<int,Cell> entry{offensive?4*item.gain[b.player]-3*item.gain[1-b.player]:item.gain[b.player],c};
+            if(int(top.size())==limit && !better(entry,top.back())) continue;
+            top.insert(std::upper_bound(top.begin(),top.end(),entry,better),entry);
+            if(int(top.size())>limit) top.pop_back();
+        }
+        std::vector<Cell> out;out.reserve(top.size());
+        for(const auto& entry:top) out.push_back(entry.second);
+        return with_tactics(b,std::move(out));
+    }
     static std::vector<Cell> candidates(Board& b,int limit) {
         if(b.cells.empty()) return {{0,0}};
-        return select_candidates(b,candidate_scores(b),limit);
+        return best_candidates(b,limit);
     }
     static bool candidate_cell(const Board& b,Cell c) {
         for(int q=-2;q<=2;++q) for(int r=std::max(-2,-q-2);r<=std::min(2,-q+2);++r)
@@ -826,7 +889,6 @@ struct Search {
         return false;
     }
     static RankedCells following_scores(Board& b,const RankedCells& base,Cell first) {
-        if(b.candidates) return candidate_scores(b);
         // Only the 18 windows through the first stone changed. Keep all other
         // scalar rankings and discover only the newly reachable candidates.
         RankedCells ranked;ranked.reserve(base.size()+48);
@@ -923,12 +985,10 @@ struct Search {
         if(cut) return result;
         const bool pinned=!result.empty();
         RankedCells base;
-        // Cached following scores do not use base. Only the fallback needs
-        // coordinate order; selecting first placements sorts by gain itself.
-        if(!b.model && b.remaining==2 && (!b.candidates || (constraints.empty() && !first_only))) {
+        // Without the search cache, following scores update base in coordinate order.
+        if(!b.model && b.remaining==2 && !b.candidates) {
             base=candidate_scores(b);
-            if(!b.candidates)
-                std::sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.second<z.second;});
+            std::sort(base.begin(),base.end(),[](const auto& a,const auto& z){return a.second<z.second;});
         }
         auto follow=[&](Cell first,int limit) {
             Restore restore(b);b.make(first);
@@ -941,7 +1001,7 @@ struct Search {
                 }
                 if(!attack) return;
             }
-            auto seconds=b.model?candidates(b,limit):select_candidates(b,following_scores(b,base,first),limit);
+            auto seconds=b.model || b.candidates?candidates(b,limit):select_candidates(b,following_scores(b,base,first),limit);
             if(b.model) {
                 b.undo();
                 for(auto c:seconds) add({{first,c},2,0});
@@ -1009,7 +1069,7 @@ struct Search {
             }
             if(!result.empty()) {std::sort(result.begin()+int(pinned),result.end(),[](const Turn& a,const Turn& z){return a.score>z.score;});return result;}
         }
-        auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,b.candidates?std::move(base):base,width);
+        auto firsts=first_only?std::vector<Cell>{*first_only}:base.empty()?candidates(b,width):select_candidates(b,base,width);
         for(auto a:firsts) {
             if(timed) check();
             if(b.remaining==1) {add({{a,{}},1,0});if(cut) return result;continue;}
@@ -1050,11 +1110,9 @@ struct Search {
         const bool constrained=!b.completions(1-attacker).empty();
         // Reversing a pair in another first-stone batch is the same attack.
         std::unordered_set<uint64_t> generated;
-        auto ranked=candidate_scores(b);
         // Continuous attacks need offensive candidates: cancel the defensive
         // three-quarter term shared by the two cached scalar rankings.
-        for(auto& [score,c]:ranked) score=4*score-3*b.gain(c,1-attacker);
-        auto firsts=constrained?std::vector<Cell>{{}}:select_candidates(b,std::move(ranked),width);
+        auto firsts=constrained?std::vector<Cell>{{}}:best_candidates(b,width,true);
         for(auto first:firsts) for(const auto& attack:turns(b,true,{},true,constrained?nullptr:&first,&generated)) {
             if(Clock::now()>=proof_deadline) throw Timeout{};
             Restore restore(b);apply(b,attack);
