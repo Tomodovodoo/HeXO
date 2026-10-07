@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import numpy as np
+from tests import slow
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
@@ -55,6 +56,7 @@ def random_net():
 
 
 @unittest.skipUnless(HAS_ORT, 'needs onnx and onnxruntime (requirements/web.txt)')
+@slow
 class Export(unittest.TestCase):
     def test_graph_matches_the_evaluator_forward(self):
         model = random_net()

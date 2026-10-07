@@ -3,11 +3,11 @@ on:
   pull_request:
     paths:
       - 'src/**'
-      - 'python/**'
-      - 'pyproject.toml'
-      - 'requirements/**'
-      - 'tests/**'
-      - 'tools/seal_current*'
+      - 'tests/*.cpp'
+      - 'tests/benchmark.py'
+      - 'tests/reference.py'
+      - 'tests/test_engine.py'
+      - 'tests/test_leaf_tactics.py'
       - 'tools/tactical/**'
       - 'CMakeLists.txt'
       - '.github/workflows/native.yml'
@@ -15,6 +15,7 @@ on:
 permissions:
   contents: read
 jobs:
+  # The C++ and Rust tests and the profile-guided build. The Python tests run in the Contracts workflow.
   rules:
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -23,17 +24,13 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build --parallel 2
+      - run: c++ -std=c++20 -O2 tests/tt_injection.cpp -o tt_injection && ./tt_injection
+      - run: c++ -std=c++20 -O2 tests/gumbel.cpp -o gumbel_test && ./gumbel_test
+      - run: cargo test --release --manifest-path tools/tactical/Cargo.toml
+        env:
+          CARGO_BUILD_JOBS: 2
       - run: python -m pip install numpy
-      - run: python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install --no-deps -e .
-      - run: CARGO_BUILD_JOBS=2 python tools/build_tactical.py
-      - run: python -m unittest tests.test_neural_search tests.test_engine.NativeRules tests.test_curriculum tests.test_proof tests.test_leaf_tactics tests.test_notation_api tests.test_seal_current tests.test_forcing_material tests.test_isolated_tactics tests.test_dense_solver -v
-      - run: c++ -std=c++20 -O2 tests/tt_injection.cpp -o build/tt_injection
-      - run: ./build/tt_injection
-      - run: c++ -std=c++20 -O2 tests/gumbel.cpp -o build/gumbel_test
-      - run: ./build/gumbel_test
       - name: Check GCC profile build
         run: |
           cmake -S . -B build/pgo -DCMAKE_BUILD_TYPE=Release -DHEXO_NATIVE_CPU=ON -DHEXO_NATIVE_PGO=GENERATE

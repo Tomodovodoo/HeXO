@@ -2651,6 +2651,7 @@ class DenseDataTests(unittest.TestCase):
         out = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True, check=True).stdout
         self.assertEqual(out.strip(), 'False')
 
+    @slow
     def test_start_hidden_keeps_the_parent_main_out_of_spawned_children(self):
         script = ("import multiprocessing, sys\nimport torch\nimport dense_data\n"
                   "if __name__ == '__main__':\n"
@@ -4038,6 +4039,7 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(recent['history'], saved['history'][1:])
             json.dumps(saved, allow_nan=False)
 
+    @slow
     def test_export_recalibrates_ema_norm_statistics(self):
         """The raw model drifts (here: perturbed weights) after the EMA was taken. The exported EMA must carry norm
         statistics of its own weights, so its eval-mode losses match its train-mode (batch statistics) losses,
@@ -10178,6 +10180,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['stones'][1]['source'], 'verified_proof')
                 self.assertNotIn('error', result['root_searches'][1])
 
+    @slow
     def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
         from timed_engine import TimedEngine, legal_turn
         with tempfile.TemporaryDirectory() as folder:

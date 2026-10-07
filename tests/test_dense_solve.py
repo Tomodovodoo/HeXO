@@ -24,6 +24,7 @@ from forcing_material import worth_solving
 from hexo import Game
 from proof import VerificationTimeout
 from tactical_proof import NativeTactics
+from tests import slow
 from tests.test_dense import source_shard, winning_game, write_games
 from tests.test_dense_solver import TINY, tiny_model
 from tests.test_tactical_proof import FIXTURE
@@ -181,6 +182,7 @@ class PassTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         self.assertFalse((self.run/'shards'/'1000000000001'/'proofs.jsonl').exists())
 
+    @slow
     def test_worker_processes_match_the_in_process_solver_and_resume(self):
         out = self.run.parent/'out'
         coordinator = dense_solve.Pass(self.run, out, SMALL)

@@ -142,7 +142,7 @@ if (job.kind === 'encode') {
       channel.port1.onmessage = () => {messageCancelled = true;channel.port1.close();channel.port2.close();};
       channel.port2.postMessage('cancel');
     }
-    if (job.delay) {
+    if (job.delay && forwardCalls <= (job.delayedForwards ?? Infinity)) {
       await new Promise(resolve => setTimeout(resolve, job.delay));
       readyBeforeResult = Math.max(readyBeforeResult, Number(owner.m._hxgf_queued(owner.feed)));
     }
@@ -823,6 +823,7 @@ if (job.kind === 'encode') {
     await s.request('/play', {q: 0, r: 0}, 'POST'); await s.saving;
     const before = s.paused;
     const back = new BrowserSession(native); back.storage = s.storage; await back.restore();
+    clearTimeout(s.flag); clearTimeout(back.flag);  // the running game clocks would keep node alive for a minute
     return {before, after: back.paused, clock: Boolean(back.clock)};
   };
   answer = {budget: await make(null), clocked: await make(job.clock)};
