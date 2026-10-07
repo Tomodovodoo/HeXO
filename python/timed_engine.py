@@ -282,11 +282,12 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     service = None
     def stopped():
         return cancel.is_set() or time.monotonic() >= normal
-    def emit(moves, candidate=None):
+    def emit(moves, candidate=None, complete=False):
         output = result if candidate is None else candidate
         if service is not None:
             output['evaluated'] = service.stats()['launched_rows']
-        output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
+        output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000,
+                      turn_complete=complete)
         publish(dict(output, stones=list(output['stones']),
                      root_searches=[dict(root) for root in output['root_searches']]))
     def read_choice(found, current):
@@ -466,9 +467,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     game.play(*second)
                     selected.append(second)
                 result['winning_turn'] = list(selected)
-                emit(selected)
+                emit(selected, complete=True)
                 break
-            emit(complete_candidate(history, selected))
+            emit(complete_candidate(history, selected), complete=game.player != side or game.winner >= 0)
         result['stop_reason'] = result.get('stop_reason',
             'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget')
     finally:
@@ -539,6 +540,16 @@ def _worker(connection, cancellation, config):
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
             if search.get('native_scheduler'):
                 search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
+                if player.options['search'] and player.evaluator.cuda:
+                    # CUDA capture alone does not initialize packed inference,
+                    # its launcher thread or the proof pool. Exercise that path
+                    # before accepting short clocks, then discard its searches.
+                    started = time.monotonic()
+                    prepared = native_turn(player, [[0, 0]], allowance(movetime=1000) |
+                        search_limits | dict(simulations=64), cancellation)
+                    player.set_history()
+                    identity['scheduler_preparation'] = dict(milliseconds=(time.monotonic()-started)*1000,
+                        completed=prepared['completed'], evaluated=prepared['evaluated'])
         elif kind == 'six':
             from six_engine import SixEngine
             player = SixEngine(config['command'], cancel=cancellation, mirrored=config.get('mirrored', False),
@@ -713,9 +724,9 @@ class TimedEngine:
         native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
                           self.config.get('search', {}).get('native_scheduler') and
                           self.config.get('search', {}).get('enabled', True))
-        # Native search stops before the reserve; its final result is delivered
-        # during it. Keep listening through the inclusive response deadline.
-        response_ms = limits['hard_ms'] if native_clocked else limits['hard_ms']-limits['reserve_ms']
+        # Native search stops before the reserve. Leave three milliseconds of
+        # that reserve for validating and delivering the selected turn.
+        response_ms = limits['hard_ms']-min(3., limits['reserve_ms']) if native_clocked else limits['hard_ms']-limits['reserve_ms']
         deadline = started + max(0, response_ms)/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
@@ -767,9 +778,14 @@ class TimedEngine:
                     if cancel is not None and cancel.is_set():
                         best['stop_reason'] = 'stop'
                         break
-                    if not self.connection.poll(min(.005, max(0, deadline-time.monotonic()))):
+                    # Windows pipe waits can round a short timeout to a much
+                    # coarser timer tick. Python's sleep uses a precise timer.
+                    wait = 0 if native_clocked else min(.005, max(0, deadline-time.monotonic()))
+                    if not self.connection.poll(wait):
                         if not self.process.is_alive():
                             raise RuntimeError('Engine worker exited')
+                        if native_clocked:
+                            time.sleep(min(.001, max(0, deadline-time.monotonic())))
                         continue
                     ident, status, result = self.connection.recv()
                     if ident != generation:
@@ -783,7 +799,10 @@ class TimedEngine:
                     best.update(result)
                     if publish:
                         publish(dict(best))
-                    if status == 'done':
+                    if status == 'done' or (native_clocked and result.get('turn_complete')
+                            and deadline-time.monotonic() <= limits['reserve_ms']/1000):
+                        # Both stones are selected. Resource drainage can take
+                        # longer and remains owned by the worker/wait_idle().
                         complete = True
                         best['stop_reason'] = result.get('stop_reason', 'budget')
                         break

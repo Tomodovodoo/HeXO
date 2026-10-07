@@ -268,6 +268,51 @@ class OfficialAPI(unittest.TestCase):
 
 
 class TimedClocks(unittest.TestCase):
+    def test_native_clocked_reply_does_not_wait_for_resource_drain(self):
+        from timed_engine import TimedEngine
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        clock = [0.]
+        chosen = dict(moves=[[1, 0], [2, 0]], turn_complete=True, completed=8)
+        for complete in (False, True):
+            with self.subTest(turn_complete=complete):
+                clock[0] = 0.
+                engine = TimedEngine.__new__(TimedEngine)
+                engine.config = dict(kind='bubble', search=dict(native_scheduler=True))
+                engine.external, engine.checkpoint, engine.model_sha256 = False, 'test', 'test'
+                engine.lock, engine.cancellation = threading.Lock(), threading.Event()
+                engine.generation, engine.busy = 0, False
+                engine.process = SimpleNamespace(is_alive=lambda: True)
+                delivered = [False]
+                def poll(timeout=0):
+                    if not engine.busy:
+                        return False
+                    if not delivered[0]:
+                        clock[0] = .09
+                        return True
+                    clock[0] = .097
+                    return True
+                def receive():
+                    if not delivered[0]:
+                        delivered[0] = True
+                        return (1, 'progress', dict(chosen, turn_complete=complete))
+                    return (1, 'done', dict(chosen, moves=[[1, 0], [3, 0]]))
+                engine.connection = Mock(poll=poll, recv=Mock(side_effect=receive))
+                game = Game([[0, 0]])
+                try:
+                    with patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                        result = engine.turn(game, 100)
+                finally:
+                    game.close()
+                self.assertEqual(result['moves'], [[1, 0], [2, 0] if complete else [3, 0]])
+                self.assertEqual(engine.connection.recv.call_count, 1 if complete else 2)
+                self.assertEqual(engine.busy, complete)
+                self.assertEqual(engine.cancellation.is_set(), complete)
+                self.assertLess(result['elapsed_ms'], 100)
+                limits = engine.connection.send.call_args.args[0][2]
+                self.assertAlmostEqual(limits['search_deadline'], .09)
+                self.assertLess(limits['response_deadline'], .1)
+
     def test_clocked_comparison_book_settings_and_paired_scores(self):
         from timed_match import side_settings, paired_openings, comparison_summary
         from dense_openings import canonical

@@ -10136,7 +10136,11 @@ class DenseTimedWorker(unittest.TestCase):
                     publish_delay_ms=1., event_queue_ms=784.,
                     winning_turn=[[2, 0]] if winner == 1 else [],
                     edges=np.array([[2, 0, 0, 0, .8, 1, visits, 0, 1]], float))]
-                result = native_turn(player, history, allowance(movetime=1000), threading.Event())
+                published = []
+                result = native_turn(player, history, allowance(movetime=1000), threading.Event(), published.append)
+            self.assertFalse(published[0]['turn_complete'])
+            self.assertFalse(published[1]['turn_complete'])
+            self.assertTrue(published[-1]['turn_complete'])
             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
             self.assertEqual(result['completed'], 2)
             self.assertEqual(result['root_searches'][1]['issued'], 80)
