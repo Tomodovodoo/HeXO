@@ -739,6 +739,7 @@ class NativeStrategy(unittest.TestCase):
         self.assertEqual(r['status'], 'UNKNOWN')
         self.assertIn('counterwin', r['reason'])
 
+    @slow
     def test_free_second_every_legal_filler_has_verified_continuation(self):
         from tests.reference import interleave, Reference
         ours = [(q,r) for r in (0,3,6,9) for q in range(3)] + [(12,0)]

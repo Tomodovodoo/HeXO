@@ -26,7 +26,8 @@ import dense_selfplay
 import hexcrop
 import hexnet
 from legacy import train
-from tests.test_dense import TINY, scripted
+from tests.test_dense import TINY, needs_seal, scripted
+from tests import slow
 
 CHAMPION = 'main/000010'
 
@@ -1013,6 +1014,8 @@ class EvaluatorBookTests(unittest.TestCase):
         self.assertEqual(league['matrix']['main/000020'][CHAMPION]['games'], len(report['games']))
         self.assertIsNotNone(next(c for c in league['checkpoints'] if c['id'] == 'main/000020')['elo'])
 
+    @slow
+    @needs_seal
     def test_a_seal_anchor_owed_across_a_protocol_change_is_played_under_the_new_one(self):
         """The champion's Seal games count toward its anchor under every protocol; an anchor still owed after a
         change (such as a book refresh) archives the old report and continues under the new protocol."""

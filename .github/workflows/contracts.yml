@@ -1,75 +1,36 @@
 name: Contracts
 on:
   pull_request:
-    paths:
-      # Everything the three suites import or read (modules, native code, openings, served pages), directly or not.
-      - 'python/bot_api.py'
-      - 'python/dashboard.py'
-      - 'python/dense_*.py'
-      - 'python/engine_setup.py'
-      - 'python/forcing_material.py'
-      - 'python/formats.py'
-      - 'python/hexcrop.py'
-      - 'python/hexnet*.py'
-      - 'python/hexo.py'
-      - 'python/native_dense.py'
-      - 'python/native_feed.py'
-      - 'python/native_scheduler.py'
-      - 'python/native_selfplay.py'
-      - 'python/neural_search.py'
-      - 'python/notation.py'
-      - 'python/play.py'
-      - 'python/process_tree.py'
-      - 'python/proof.py'
-      - 'python/puct_search.py'
-      - 'python/six_engine.py'
-      - 'python/tactical_proof.py'
-      - 'python/time_control.py'
-      - 'python/timed_engine.py'
-      - 'python/legacy/**'
-      - 'src/**'
-      - 'openings/**'
-      - 'web/*.html'
-      - 'web/coi-sw.js'
-      - 'web/engine/**'
-      - 'CMakeLists.txt'
-      - 'pyproject.toml'
-      - 'requirements/**'
-      - 'tools/bench_dense_data.py'
-      - 'tools/build_tactical.py'
-      - 'tools/compare_search_modes.py'
-      - 'tools/orca_adapter.py'
-      - 'tools/proof_stamps.py'
-      - 'tools/seal_current.py'
-      - 'tools/strix_learned_adapter.py'
-      - 'tools/tactical/**'
-      - 'tests/__init__.py'
-      - 'tests/fixtures/**'
-      - 'tests/reference.py'
-      - 'tests/test_dense.py'
-      - 'tests/test_neural_search.py'
-      - 'tests/test_play.py'
-      - 'tests/test_tactical_proof.py'
-      - '.github/workflows/contracts.yml'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'tests/web/**'
+      - 'tests/test_web_*.py'
+      - '.github/workflows/native.yml'
+      - '.github/workflows/web.yml'
+      - '.github/workflows/engines.yml'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  # The Python fast tier outside the browser tests (those run in the Browser engine workflow). A manual dispatch
+  # runs the slow tier too.
   contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 8 || 20 }}
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 10 || 30 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build --parallel 2
-      - run: python -m pip install numpy
+      - run: cmake --build build --parallel 4
+      - run: python -m pip install numpy packaging -r requirements/api.txt
       - run: python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install --no-deps -e .
-      - run: CARGO_BUILD_JOBS=2 python tools/build_tactical.py
-      # Pull requests skip the slow classes; a manual run includes them.
-      - run: python -m unittest tests.test_dense tests.test_play tests.test_tactical_proof -v
+      - run: CARGO_BUILD_JOBS=4 python tools/build_tactical.py
+      - run: python -m tests -j 4 '!test_web_*'
         env:
-          HEXO_SKIP_SLOW: ${{ github.event_name == 'pull_request' && '1' || '' }}
+          OMP_NUM_THREADS: 2
+          HEXO_SLOW: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}

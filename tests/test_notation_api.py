@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from bot_api import APIError, Adapter, MAX_CELLS, board_game, server
 from hexo import Game
 from notation import MAX_STONES, NotationConflict, Record, dumps, loads
+from tests import PATIENCE
 from tests.reference import interleave
 
 
@@ -683,6 +684,10 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         await ws.send_json(dict(type='move_request', side='o', previous=[], request_id=1))
         await ws.receive_json(timeout=1)
         await asyncio.wait_for(self.client.close(), 1)
+        # The session's handler releases its engine as the server closes its socket, possibly after close returns.
+        end = time.monotonic()+PATIENCE
+        while not all(engine.closed for engine in self.engines) and time.monotonic() < end:
+            await asyncio.sleep(.01)
         self.assertTrue(all(engine.closed for engine in self.engines))
 
     async def test_finished_match_releases_its_engines(self):
