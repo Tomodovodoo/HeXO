@@ -18,7 +18,7 @@ class NativeRules(unittest.TestCase):
         game = self.make_game(history)
         before = game.state(), game.key
         seal = Seal.__new__(Seal)
-        for first, count in (((-5,0), 1), ((-2,1), 2)):
+        for first, count in (((-5,0), 1), ((-2,1), 2), ((0,0), 2)):
             with self.subTest(first=first):
                 def reply(data, size, side, remaining, ms, out):
                     out[:] = (*first, 2, 0)

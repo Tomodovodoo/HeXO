@@ -32,6 +32,8 @@ class Seal:
             # Check on a copy so callers keep their original board unchanged.
             after = Game([(q, r) for q, r, _ in cells])
             try:
+                if not after.legal(*moves[0]):
+                    return moves  # Let the caller classify an illegal engine reply.
                 after.play(*moves[0])
                 if after.winner >= 0:
                     return moves[:1]
