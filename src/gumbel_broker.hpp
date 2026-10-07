@@ -610,9 +610,24 @@ inline void Producer::run()noexcept{
     auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
    }
    if(broker.profile_enabled && neural && !pool.stopped && int(outstanding.size())>=broker.pending)broker.snapshot_gate(hxgf_queued(pool.feed));
-   if(neural && int(outstanding.size())<broker.pending && !pool.stopped){
+   // Export work already prepared by the joined owner phase without running
+   // another proof/selection pass for each available snapshot slot.
+   while(neural && int(outstanding.size())<broker.pending && !pool.stopped && !broker.cancelled && !this->retiring){
+    neural=broker.admission(pause_token);if(!neural)break;
+    bool any_active=false;
+    for(size_t i=0;i<pool.games.size();++i){
+     auto& game=pool.games[i];
+     if(!game->stopped && game->expired()){
+      game->deadline=true;game->stop();
+      if(broker.continuous && active[i]){
+       auto token=active[i];auto event=result(int(i),token);active[i]=0;broker.publish(*this,int(i),token,std::move(event));progress=1;
+      }
+     }
+     any_active|=!game->stopped;
+    }
+    pool.stopped=!any_active;if(pool.stopped)break;
     int64_t layout[2];if(!hxgf_layout(pool.feed,broker.quantum,layout))throw std::runtime_error(gumbel::error);
-    int count=int(layout[0]);if(count){
+    int count=int(layout[0]);if(!count)break;
      auto job=std::make_shared<Job>();job->owner=shared_from_this();job->ids.resize(count);job->results.resize(count);job->installed.resize(count);job->remaining=count;
      std::vector<void*> trees(count);std::vector<int> requests(count);
      if(!hxgf_take(pool.feed,count,job->ids.data(),trees.data(),requests.data(),nullptr,nullptr,0))throw std::runtime_error(gumbel::error);
@@ -621,7 +636,6 @@ inline void Producer::run()noexcept{
       job->keys.emplace_back(1,int64_t(model));job->keys.back().insert(job->keys.back().end(),key,key+size);
      }
      outstanding.push_back(job);broker.enqueue(job);progress=1;
-    }
    }
    if(broker.progress_enabled)for(size_t i=0;i<active.size();++i)if(active[i]){
     auto& root=pool.games[i]->views[0];
