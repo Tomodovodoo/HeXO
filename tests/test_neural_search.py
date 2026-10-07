@@ -2860,6 +2860,186 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(sum(r['queries'] for r in effort.values()), proofs.stats()['finished'])
         self.assertEqual(effort[1]['queries'], stats['finished'])
 
+    def shared(self, **options):
+        from native_scheduler import ProofWorkers
+        workers = ProofWorkers(**options)
+        self.addCleanup(workers.close)  # Registered before any pool, so it closes last.
+        return workers
+
+    def offers(self, loop, count, game=0):
+        for k in range(1, count+1):
+            loop.offer(game, [[0,0],[k%8+1,-1-k//8],[k%8+1,1+k//8]])
+
+    def test_one_shared_worker_serves_every_producer_and_answers_wait_for_their_owner(self):
+        from tactical_proof import independent_verify
+        workers = self.shared(workers=1, queue=8)
+        pools = [self.pool([self.graph(self.opening) for _ in range(3)], quantum=16, views=1, work=4096)
+                 for _ in range(2)]
+        loops = [self.loop(pool, shared=workers) for pool in pools]
+        for pool, loop in zip(pools, loops):
+            pool.step();self.answer(pool);loop.step()
+        submitted = [loop.stats()['submitted'] for loop in loops]
+        self.assertEqual(submitted, [3, 3])
+        self.wait(lambda: [loop.stats()['finished'] for loop in loops] == submitted)
+        # Every answer is back, yet a producer's graphs change only on its own owner's step.
+        loops[1].step()
+        self.assertEqual([native.hxg_exact(native.hxgo_root(g.ptr)) for g in pools[0].games], [-1]*3)
+        self.assertEqual([native.hxg_exact(native.hxgo_root(g.ptr)) for g in pools[1].games], [0]*3)
+        loops[0].step()
+        self.assertEqual([native.hxg_exact(native.hxgo_root(g.ptr)) for g in pools[0].games], [0]*3)
+        for loop in loops:
+            stats, records = loop.stats(), loop.records()
+            self.assertEqual((stats['started'], stats['finished'], stats['installed']), (3, 3, 3))
+            self.assertEqual(sorted(r['game'] for r in records), [0, 1, 2])
+            self.assertEqual(len({r['id'] for r in records}), 3)
+            for row in records:
+                self.assertEqual(independent_verify(row['result']['certificate'], row['request']['history'],
+                                 known=row['request']['known']), 'PROVEN_WIN')
+        stats = workers.stats()
+        self.assertEqual((stats['queued'], stats['live'], stats['active'], stats['loops']), (0, 0, 0, 2))
+        self.assertAlmostEqual(stats['worker_service_ms'], sum(l.stats()['worker_service_ms'] for l in loops))
+
+    def test_shared_queue_splits_between_producers_with_work(self):
+        workers = self.shared(workers=1, queue=4)
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        first, second = (pool.enable_proofs(slice_ms=50, table_mb=1, tasks=32, shared=workers) for pool in pools)
+        self.offers(first, 20);first.step()
+        # Alone with work, one producer may hold the whole queue.
+        self.assertEqual(first.stats()['submitted'], 4)
+        self.offers(second, 20);second.step()
+        self.assertEqual((second.stats()['submitted'], second.stats()['supply_full_exits']), (0, 1))
+        self.wait(lambda: first.stats()['finished'] == 4)
+        first.step();second.step()
+        self.assertEqual((first.stats()['submitted'], second.stats()['submitted']), (6, 2))
+        for loop in (first, second):
+            loop.drain()
+        self.assertEqual(workers.stats()['live'], 0)
+
+    def held_workers(self, capacity):
+        """A raw shared service of one worker whose answers wait for `release`.
+
+        Create the pools first: cleanups free every joined loop, then the service."""
+        import ctypes as C
+        import json
+        import threading
+        from neural_search import checked, ptr
+        from tactical_proof import NativeTactics
+        library = NativeTactics(independent=True)
+        self.addCleanup(library.close)
+        entered, release, order = threading.Event(), threading.Event(), []
+        actual = library.lib.hexo_tactical_worker_answer
+        actual.argtypes, actual.restype = [ptr, C.c_char_p], ptr
+        @C.CFUNCTYPE(ptr, ptr, C.c_char_p)
+        def query(worker, request):
+            order.append(json.loads(request)['history'])
+            entered.set();release.wait(5)
+            return actual(worker, request)
+        names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
+                 'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
+        functions = np.asarray([C.cast(query if name == 'worker_answer' else
+                                getattr(library.lib, 'hexo_tactical_'+name), ptr).value for name in names], np.uint64)
+        service = native.hxps_new(functions.ctypes.data, 1, capacity)
+        self.assertTrue(service)
+        self.addCleanup(lambda: (query, checked(native.hxps_free(service))))
+        def join(pool):
+            loop = native.hxp_join(pool.ptr, service, 50, 1, 32, 0)
+            self.assertTrue(loop)
+            self.addCleanup(lambda: (release.set(), native.hxp_cancel(loop), checked(native.hxp_drain(loop)),
+                                     checked(native.hxp_free(loop))))
+            return loop
+        return service, join, entered, release, order
+
+    def test_shared_workers_take_turns_between_producers_with_queued_work(self):
+        from neural_search import checked
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        service, join, entered, release, order = self.held_workers(16)
+        loops = [join(pool) for pool in pools]
+        sides = ([[0,0],[k,-1],[k,1]] for k in range(1, 9)), ([[0,0],[-k,1],[-k,2]] for k in range(1, 9))
+        # The first producer's positions rank far above the second's and it refills first.
+        for loop, histories, relevance in zip(loops, sides, (100., .01)):
+            for history in histories:
+                cells = np.asarray(history, np.int64)
+                checked(native.hxp_offer(loop, 0, cells.ctypes.data, len(cells), relevance))
+            checked(native.hxp_step(loop))
+            self.assertTrue(entered.wait(2))
+        release.set()
+        self.wait(lambda: len(order) == 16)
+        self.assertEqual([0 if h[1][1] == -1 else 1 for h in order], [0]+[1, 0]*7+[1])
+
+    def test_concurrent_producer_refills_never_exceed_the_shared_bound(self):
+        import threading
+        from neural_search import checked
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(3)]
+        service, join, entered, release, order = self.held_workers(4)
+        loops = [join(pool) for pool in pools]
+        for i, loop in enumerate(loops):
+            for k in range(1, 9):
+                cells = np.asarray([[0,0],[k,-1-i],[k,1+i]], np.int64)
+                checked(native.hxp_offer(loop, 0, cells.ctypes.data, len(cells), 1.))
+        # Owners refill at once while the worker holds its first answer, so no slot frees up.
+        start = threading.Barrier(len(loops))
+        def refill(loop):
+            start.wait()
+            for _ in range(50):
+                checked(native.hxp_step(loop))
+        threads = [threading.Thread(target=refill, args=(loop,)) for loop in loops]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        out, times = np.empty(5, np.uint64), np.empty(5, np.float64)
+        native.hxps_stats(service, out.ctypes.data, times.ctypes.data)
+        self.assertEqual(int(out[3]), 4)
+        submitted, stats = 0, np.empty(16, np.uint64)
+        for loop in loops:
+            native.hxp_stats(loop, stats.ctypes.data, times.ctypes.data)
+            submitted += int(stats[1])
+        self.assertEqual(submitted, 4)
+
+    def test_retiring_a_game_or_producer_cancels_only_its_jobs_on_shared_workers(self):
+        workers = self.shared(workers=1, queue=16)
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(3)]
+        loops = [pool.enable_proofs(slice_ms=50, table_mb=1, tasks=32, shared=workers) for pool in pools]
+        for loop in loops:
+            self.offers(loop, 5);loop.step()
+        self.assertEqual([loop.stats()['submitted'] for loop in loops], [5, 5, 5])
+        pools[0].retarget(0, [[0,0],[1,2],[3,-1]], work=4096)
+        retired = loops[0].stats()
+        self.assertEqual((retired['queued'], retired['cancelled']), (0, 5))
+        loops[1].close()
+        self.assertEqual(workers.stats()['loops'], 2)
+        survivor = loops[2]
+        self.wait(lambda: survivor.stats()['finished'] == 5)
+        self.assertEqual(survivor.stats()['cancelled'], 0)
+        loops[0].drain();survivor.step();survivor.drain()
+        self.assertEqual(survivor.stats()['unknown']+survivor.stats()['installed'], 5)
+        stats = workers.stats()
+        self.assertEqual((stats['queued'], stats['live'], stats['active']), (0, 0, 0))
+
+    def test_shared_workers_close_after_their_loops_and_split_idle_time(self):
+        import time
+        from native_scheduler import ProofWorkers
+        workers = ProofWorkers(workers=2, queue=4)
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        with self.assertRaisesRegex(ValueError, 'fix the package'):
+            pools[0].enable_proofs(workers=2, shared=workers)
+        self.assertIsNone(pools[0].proofs)
+        loops = [pool.enable_proofs(slice_ms=50, table_mb=1, tasks=8, shared=workers) for pool in pools]
+        for loop in loops:
+            loop.step()
+        time.sleep(.05)
+        idle = [loop.stats()['idle_empty_ms'] for loop in loops]
+        # Two idle workers, charged half to each loop whose refill found nothing.
+        self.assertGreaterEqual(min(idle), 45)
+        self.assertLessEqual(sum(idle), workers.stats()['worker_idle_ms']+1e-6)
+        with self.assertRaisesRegex(ValueError, 'Free every proof loop'):
+            workers.close()
+        for loop in loops:
+            loop.close()
+        workers.close()
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            workers.stats()
+
     def test_attached_loop_prevents_pool_free_and_duplicate_owners(self):
         graph = self.graph()
         pool = self.pool([graph], quantum=16, work=32)

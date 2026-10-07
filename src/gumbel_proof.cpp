@@ -103,8 +103,9 @@ struct Frontier {
    tasks.emplace(key,std::move(task));
  }
 };
+struct Loop;
 struct Job {
- uint64_t id=0,token=0;size_t game=0;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
+ uint64_t id=0,token=0;size_t game=0;Loop* loop=nullptr;std::shared_ptr<Task> task;std::shared_ptr<Node> pin;
   std::vector<Cell> history;std::vector<Dependency> scope;std::string context,request,result,error;int side=0,worker=-1,preferred=-1,quantum=0;uint64_t generation=0,facts=0;
  Clock::time_point queued,started,deadline{};double elapsed=0,wait=0;bool cancelled=false,pruned=false,wake_owner=false;
  std::array<uint64_t,13> info{};std::array<int64_t,4> moves{};int move_count=0;std::vector<int64_t> neural;
@@ -113,54 +114,74 @@ struct Worker {void* native=nullptr;
 #ifndef __EMSCRIPTEN__
  std::thread thread;
 #endif
- std::shared_ptr<Job> active;uint64_t token=0;double service=0,idle=0;Clock::time_point idle_since=Clock::now();};
+ std::shared_ptr<Job> active;uint64_t token=0;double service=0;};
+// Native proof workers and their resident solver tables, shared by the proof
+// loops of one or more producers. Loops queue immutable jobs in their owners'
+// priority order; workers serve the loops with queued jobs in turn and hand
+// each answer back to its loop, whose graph owner alone installs it.
+// `capacity` bounds queued plus running jobs over all loops; a loop with work
+// gets an equal share while others have work too. Resident tables stay with
+// their worker threads: a continuation prefers the worker of its last slice,
+// and a query with exact premises clears that worker's table, whichever
+// producer it serves. One mutex guards the service and every attached loop's
+// queues and counters.
+struct Service {
+ API api;std::vector<std::unique_ptr<Worker>> workers;std::mutex mutex;
+ // Idle workers sleep on wake and each queued job wakes one of them, so the
+ // graph owner's admission never queues behind every idle worker.
+ std::condition_variable wake;std::vector<Loop*> loops;
+ size_t capacity,waiting=0,idle_workers=0,turn=0;Clock::time_point idle_mark=Clock::now();double idle_ms=0;bool stopping=false,external;
+ Service(const uint64_t* functions,int count,int queue);
+ ~Service(){stop();}
+ void stop();
+ void account(Clock::time_point now);
+ size_t room(const Loop& loop)const;
+ std::shared_ptr<Job> take(int worker);
+#ifndef __EMSCRIPTEN__
+ void run(size_t i)noexcept;
+#endif
+};
 struct Loop {
  API::Moves endpoint=nullptr;int endpoint_limit=0;uint64_t endpoint_paths=0,endpoint_candidates=0,endpoint_rejected=0,endpoint_bytes=0,endpoint_ns=0;
  std::deque<std::string> endpoint_records;
- owner::Pool& pool;API api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>> workers;
- std::mutex mutex;
- // Idle workers sleep on wake and each queued job wakes one of them, so the
- // graph owner's admission never queues behind every idle worker. Drain waits on answered.
- std::condition_variable wake,answered;std::deque<std::shared_ptr<Job>> queued,done;
+ std::unique_ptr<Service> owned;Service& service;std::mutex& mutex;
+ owner::Pool& pool;API& api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>>& workers;
+ // Jobs wait in their own loop's queue; drain and detach wait on answered.
+ std::condition_variable answered;std::deque<std::shared_ptr<Job>> queued,done;
  std::shared_ptr<owner::Signal> listener;std::atomic<bool> completion_ready=false;size_t urgent=0;
-  std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t capacity,cursor=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false;
- uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0;
+  std::unordered_map<uint64_t,std::shared_ptr<Job>> live;size_t cursor=0,reserved=0;int slice,table,external_limit=64;bool stopping=false,enabled=true,stamps=false,external=false,attached=false;
+ double service_ms=0;
+ uint64_t next=0,ticks=0,submitted=0,started=0,finished=0,installed=0,cancelled=0,pruned=0,unknown=0,fresh=0,missing_fresh=0,snapshot_ns=0,install_ns=0,step_ns=0;
  uint64_t available_facts=0,sent_facts=0,empty_scope_jobs=0,quantum_ms=0;
  std::deque<std::string> records;
  std::string released_effort;
  // Supply census. Idle native-worker time is charged to the reason the last
  // refill stopped: every slot held, retries held back for fresh work, or no
  // dispatchable task, split over the exclusions (pending neural work, closed
- // scope, dormant) or none at all.
+ // scope, dormant) or none at all. A shared service charges each attached
+ // loop an equal part of its idle time, so the loops' sums are the service's.
  // The owner counts one refill locally and publishes it under the mutex.
  enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Reasons};
  enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,Counts};
  using Census=std::array<uint64_t,Counts>;
- std::array<double,Reasons> idle_ms{};size_t idle_workers=0;Clock::time_point idle_mark=Clock::now();Idle stop=Empty;
+ std::array<double,Reasons> idle_ms{};Idle stop=Empty;
  std::array<uint64_t,3> excluded{};Census census{};
  void publish(const Census& refill,Idle reason,int exit){
-  account(Clock::now());stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
+  service.account(Clock::now());stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
   if(reason==Empty)std::copy_n(refill.begin()+Excluded,3,excluded.begin());
  }
- void account(Clock::time_point now){
-  if(idle_workers && now>idle_mark){
-   double ms=std::chrono::duration<double,std::milli>(now-idle_mark).count()*double(idle_workers),total=double(excluded[0]+excluded[1]+excluded[2]);
-   if(stop!=Empty)idle_ms[stop]+=ms;else if(!total)idle_ms[Empty]+=ms;
-   else for(size_t k=0;k<excluded.size();++k)idle_ms[Pending+k]+=ms*double(excluded[k])/total;
-  }
-  idle_mark=now;
+ void charge(double ms){
+  double total=double(excluded[0]+excluded[1]+excluded[2]);
+  if(stop!=Empty)idle_ms[stop]+=ms;else if(!total)idle_ms[Empty]+=ms;
+  else for(size_t k=0;k<excluded.size();++k)idle_ms[Pending+k]+=ms*double(excluded[k])/total;
  }
-  Loop(owner::Pool& source,const uint64_t* functions,int count,int queue,int ms,int mb,int tasks,bool use_stamps):pool(source),api(functions),capacity(queue),slice(ms),table(mb),stamps(use_stamps),external(!functions){
-  if(pool.proof_owner || count<1 || count>16 || queue<count || queue>128 || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
+ // Attaches to `shared`, or to `own` when this loop is the service's only client.
+ Loop(owner::Pool& source,Service* shared,std::unique_ptr<Service> own,int ms,int mb,int tasks,bool use_stamps):owned(std::move(own)),service(shared?*shared:*owned),mutex(service.mutex),
+   pool(source),api(service.api),workers(service.workers),slice(ms),table(mb),stamps(use_stamps),external(service.external){
+  if(pool.proof_owner || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
   frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks,stamps);
-  try {
-    for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();if(!external){worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");}workers.push_back(std::move(worker));}
-#ifndef __EMSCRIPTEN__
-    if(!external)for(size_t i=0;i<workers.size();++i)workers[i]->thread=std::thread([this,i]{run(i);});
-#else
-    if(!external)throw std::runtime_error("Browser proofs require external solver workers");
-#endif
-  }catch(...){shutdown();throw;}
+  {std::lock_guard lock(mutex);if(service.stopping || service.loops.size()>=64)throw std::runtime_error("Proof service cannot take another loop");
+   service.account(Clock::now());service.loops.push_back(this);attached=true;}
   for(size_t i=0;i<pool.games.size();++i)bind(int(i));
   pool.proof_owner=this;pool.proof_step=[](void* p){static_cast<Loop*>(p)->step();};pool.proof_retarget=[](void* p,int i){static_cast<Loop*>(p)->retarget(i);};
   pool.proof_collect=[](void* p){return static_cast<Loop*>(p)->feedback();};
@@ -178,15 +199,19 @@ struct Loop {
  }
  void mark(Job& job,bool obsolete=false){
   if(!job.cancelled){job.cancelled=true;++cancelled;}if(obsolete && !job.pruned){job.pruned=true;++pruned;}
-  for(auto& worker:workers)if(worker->active.get()==&job && worker->token)api.cancel(worker->token);
+  if(job.worker>=0 && workers[job.worker]->active.get()==&job && workers[job.worker]->token)api.cancel(workers[job.worker]->token);
  }
+ // Cancelled jobs leave the queue at once; workers busy for other loops never delay them.
+ void sweep(){
+  for(auto it=queued.begin();it!=queued.end();)if((*it)->cancelled){(*it)->info[4]=1;completed(*it);++finished;--service.waiting;it=queued.erase(it);}else ++it;
+  answered.notify_all();
+ }
+ bool running()const{return std::any_of(workers.begin(),workers.end(),[&](const auto& w){return w->active && w->active->loop==this;});}
+ // Afterwards no worker holds or can take one of this loop's jobs.
  void shutdown(){
-  {std::lock_guard lock(mutex);stopping=true;for(auto& [id,job]:live)mark(*job);}wake.notify_all();
-   for(auto& worker:workers){
-#ifndef __EMSCRIPTEN__
-    if(worker->thread.joinable())worker->thread.join();
-#endif
-    if(worker->native){api.worker_free(worker->native);worker->native=nullptr;}}
+  std::unique_lock lock(mutex);if(!attached)return;stopping=true;for(auto& [id,job]:live)mark(*job);sweep();
+  if(!external)answered.wait(lock,[&]{return !running();});
+  service.account(Clock::now());service.loops.erase(std::find(service.loops.begin(),service.loops.end(),this));attached=false;
  }
  void observe(Tree& t,const gumbel::Path& path){
   size_t i=0;while(i<pool.games.size() && pool.games[i]->game.get()!=t.state.get())++i;if(i==pool.games.size() || pool.games[i]->stopped)return;
@@ -267,17 +292,18 @@ struct Loop {
   std::vector<Ready> ready;Census refill{};
   for(;;){
    size_t available,spare;
+   // One reserved slot covers this job while it is built outside the lock.
    {std::lock_guard lock(mutex);if(stopping || !enabled)return;
-    if(live.size()>=capacity){publish(refill,Full,FullExits);return;}available=capacity-live.size();
-    size_t idle=std::count_if(workers.begin(),workers.end(),[](const auto& w){return !w->active;});spare=idle>queued.size()?idle-queued.size():0;}
+    available=service.room(*this);if(!available){publish(refill,Full,FullExits);return;}++reserved;
+    size_t idle=std::count_if(workers.begin(),workers.end(),[](const auto& w){return !w->active;});spare=idle>service.waiting?idle-service.waiting:0;}
    if(ready.empty())ready=prepare(available,refill);
    size_t i=0;auto task=take(ready,i);
-   if(!task){std::lock_guard lock(mutex);publish(refill,Empty,EmptyExits);return;}
+   if(!task){std::lock_guard lock(mutex);--reserved;publish(refill,Empty,EmptyExits);return;}
    bool cooling=task->ready>Clock::now();
-   if(cooling && !spare){std::lock_guard lock(mutex);publish(refill,Held,HeldExits);return;}
+   if(cooling && !spare){std::lock_guard lock(mutex);--reserved;publish(refill,Held,HeldExits);return;}
    refill[FirstQueries]+=!task->queried;task->queried=true;refill[Retries]+=cooling;
    auto node=task->node.lock();auto& o=*pool.games[i];
-   auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->task=task;job->pin=node;job->history=task->history;
+   auto job=std::make_shared<Job>();job->id=++next;job->game=i;job->loop=this;job->task=task;job->pin=node;job->history=task->history;
    job->side=task->side;job->preferred=task->worker;job->quantum=std::min(1000,slice*int(uint64_t(1)<<std::min(6u,task->attempts[job->side])));
     // Without a shared cancel flag, bound the synchronous WASM call by a short
     // slice. Cooperative adapters may continue longer on the same resident table.
@@ -286,8 +312,8 @@ struct Loop {
    available_facts+=frontiers[i].facts.size();sent_facts+=task->scope.size();empty_scope_jobs+=task->scope.empty();quantum_ms+=job->quantum;
    if(o.time_limit_ms)job->deadline=o.started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(o.time_limit_ms));
    task->flight=true;task->attempted_change=task->observed_change;o.game->pins[task.get()]={node.get()};
-   {std::lock_guard lock(mutex);live.emplace(job->id,job);queued.push_back(job);++submitted;}
-   cursor=(i+1)%frontiers.size();wake.notify_one();
+   {std::lock_guard lock(mutex);--reserved;live.emplace(job->id,job);queued.push_back(job);++service.waiting;++submitted;}
+   cursor=(i+1)%frontiers.size();service.wake.notify_one();
   }
  }
   std::string request(const Job& job,int ms,uint64_t token=0)const{
@@ -298,12 +324,11 @@ struct Loop {
    auto& worker=*workers[index];if(worker.active)throw std::runtime_error("External proof worker is busy");
    while(enabled && !stopping && !queued.empty()){
     auto it=std::find_if(queued.begin(),queued.end(),[&](const auto& j){return j->preferred<0 || j->preferred==index;});
-    if(it==queued.end())it=queued.begin();auto job=*it;queued.erase(it);
+    if(it==queued.end())it=queued.begin();auto job=*it;queued.erase(it);--service.waiting;
     int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
     if(ms<1)mark(*job);
     if(job->cancelled){job->info[4]=1;completed(job);++finished;continue;}
     job->worker=index;job->started=Clock::now();job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
-    worker.idle+=std::chrono::duration<double,std::milli>(job->started-worker.idle_since).count();
     job->request=request(*job,ms);worker.active=job;++started;return job->id;
    }return 0;
   }
@@ -313,47 +338,9 @@ struct Loop {
    if(!job || job->id!=id || !info || count<0 || count>2 || (count && !moves))throw std::runtime_error("Unknown external proof completion");
    std::copy_n(info,13,job->info.begin());job->move_count=count;if(count)std::copy_n(moves,2*count,job->moves.begin());
    if(result)job->result=result;if(error)job->error=error;
-   job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();worker.service+=job->elapsed;
-   worker.idle_since=Clock::now();worker.active.reset();completed(job);++finished;
+   job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();worker.service+=job->elapsed;service_ms+=job->elapsed;
+   worker.active.reset();completed(job);++finished;
   }
-#ifndef __EMSCRIPTEN__
-  void run(size_t i) noexcept {
-  auto& worker=*workers[i];auto idle_start=Clock::now();
-  for(;;){std::unique_lock lock(mutex);account(Clock::now());++idle_workers;
-   wake.wait(lock,[&]{return stopping || !queued.empty();});account(Clock::now());--idle_workers;if(stopping && queued.empty())return;
-   // Prefer a continuation's resident table, but steal work rather than idle.
-   auto next=std::find_if(queued.begin(),queued.end(),[&](const auto& j){return j->preferred<0 || j->preferred==int(i);});
-   if(next==queued.end())next=queued.begin();auto job=*next;queued.erase(next);worker.active=job;job->worker=int(i);job->started=Clock::now();++started;
-   worker.idle+=std::chrono::duration<double,std::milli>(job->started-idle_start).count();job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
-   job->info[4]=1; // Every pre-dispatch exit has confirmed zero fresh work.
-   void* answer=nullptr;void* raw=nullptr;
-   try {
-    int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
-    if(ms<1)mark(*job);
-    if(!job->cancelled){worker.token=api.prepare();if(!worker.token)job->error="cancellation token limit";
-     else{job->token=worker.token;
-       std::string payload=request(*job,ms,worker.token);
-      job->info[4]=0;lock.unlock();answer=api.query(worker.native,payload.c_str());
-      if(!answer || !api.info(answer,job->info.data()))job->error="missing typed native answer";
-      else{job->move_count=api.moves(answer,job->moves.data(),2);if(job->move_count<0)throw std::runtime_error("Invalid typed proof witness");
-       if(endpoint && !job->side){int count=endpoint(answer,nullptr,0);if(count<0 || count>endpoint_limit*130)throw std::runtime_error("Invalid neural frontier size");job->neural.resize(count);if(count && endpoint(answer,job->neural.data(),count)!=count)throw std::runtime_error("Invalid neural frontier payload");}
-       if(job->info[0] || !job->neural.empty()){raw=api.json(answer);if(raw){job->result=static_cast<char*>(raw);api.buffer_free(raw);raw=nullptr;}}
-      }
-      if(answer){api.answer_free(answer);answer=nullptr;}
-      // A deadline may return before cooperative background cancellation finishes.
-      while(api.busy(worker.native))std::this_thread::sleep_for(std::chrono::microseconds(100));
-      lock.lock();
-     }
-    }
-   }catch(...){if(answer)api.answer_free(answer);if(raw)api.buffer_free(raw);if(!lock.owns_lock())lock.lock();job->error="native proof worker failure";}
-   if(worker.token){api.release(worker.token);worker.token=0;}job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();
-   worker.service+=job->elapsed;++finished;completed(job);worker.active.reset();idle_start=Clock::now();answered.notify_all();
-   // Do not acquire the broker's mutex while holding the proof mutex. Retain
-   // only its independent signal so detach/free cannot invalidate this wake.
-   auto signal=job->wake_owner?listener:nullptr;lock.unlock();if(signal)signal->notify();
-  }
- }
-#endif
  void publish(Tree& view,const Board& board,const gumbel::Outcome& outcome){
   auto key=gumbel::keys(board).first;
   if(auto old=view.outcomes.find(key);old!=view.outcomes.end() && old->second.winner!=outcome.winner)throw std::runtime_error("Conflicting verified graph proof");
@@ -422,17 +409,17 @@ struct Loop {
  }
  void collect(){for(;;){std::shared_ptr<Job> job;{std::lock_guard lock(mutex);if(done.empty())return;job=done.front();done.pop_front();if(job->wake_owner){--urgent;completion_ready.store(urgent!=0,std::memory_order_release);}live.erase(job->id);}install(*job);}}
  void prune(){
-  {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}}
+  {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}sweep();}
  }
  uint64_t feedback(){auto before=installed;prune();collect();prune();return installed-before;}
   void step(){
-   ++ticks;feedback();
+   auto start=Clock::now();++ticks;feedback();
   for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;
    for(auto& v:o.views)if(v.active && v.tree->root->expanded)frontiers[i].offer(v.tree->root,v.history,v.relevance,std::abs(v.tree->root->q-v.tree->root->value));
   }
-  admit();
+  admit();step_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
  }
- void retarget(int game){auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);}
+ void retarget(int game){auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);sweep();}
  const char* release(int game){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))return nullptr;}
   auto& f=frontiers[game];released_effort="[";int count=0;
@@ -441,7 +428,7 @@ struct Loop {
   auto& store=*pool.games[game]->game;store.evidence=nullptr;store.evidence_owner=nullptr;
   return released_effort.c_str();
  }
-  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);if(external){for(auto& job:queued){job->info[4]=1;completed(job);++finished;}queued.clear();}wake.notify_all();}
+  void cancel_all(){std::lock_guard lock(mutex);enabled=false;for(auto& [id,job]:live)mark(*job);sweep();}
  void resume(){std::lock_guard lock(mutex);enabled=true;}
   void drain(){cancel_all();if(external){collect();if(!live.empty())throw std::runtime_error("Complete external proof slices before freeing their graph");return;}
 #ifndef __EMSCRIPTEN__
@@ -449,9 +436,98 @@ struct Loop {
 #endif
   }
 };
+Service::Service(const uint64_t* functions,int count,int queue):api(functions),capacity(queue),external(!functions){
+ if(count<1 || count>16 || queue<count || queue>128)throw std::runtime_error("Invalid native proof worker limits");
+ try {
+  for(int i=0;i<count;++i){auto worker=std::make_unique<Worker>();if(!external){worker->native=api.make();if(!worker->native)throw std::runtime_error("Could not create native proof worker");}workers.push_back(std::move(worker));}
+#ifndef __EMSCRIPTEN__
+  if(!external)for(size_t i=0;i<workers.size();++i)workers[i]->thread=std::thread([this,i]{run(i);});
+#else
+  if(!external)throw std::runtime_error("Browser proofs require external solver workers");
+#endif
+ }catch(...){stop();throw;}
 }
-extern "C" HX_API void* hxp_new(void* pool,const uint64_t* functions,int workers,int capacity,int slice,int table,int tasks,int stamps){try{if(!pool || !functions)throw std::runtime_error("Missing proof pool");return new proving::Loop(*static_cast<owner::Pool*>(pool),functions,workers,capacity,slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
-extern "C" HX_API void* hxpe_new(void* pool,int workers,int capacity,int slice,int table,int tasks,int stamps,int maximum){try{if(!pool || maximum<1 || maximum>1000)throw std::runtime_error("Invalid external proof limits");auto* loop=new proving::Loop(*static_cast<owner::Pool*>(pool),nullptr,workers,capacity,slice,table,tasks,stamps!=0);loop->external_limit=maximum;return loop;}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+void Service::stop(){
+ {std::lock_guard lock(mutex);stopping=true;}wake.notify_all();
+ for(auto& worker:workers){
+#ifndef __EMSCRIPTEN__
+  if(worker->thread.joinable())worker->thread.join();
+#endif
+  if(worker->native){api.worker_free(worker->native);worker->native=nullptr;}}
+ workers.clear();
+}
+void Service::account(Clock::time_point now){
+ if(idle_workers && now>idle_mark){
+  double ms=std::chrono::duration<double,std::milli>(now-idle_mark).count()*double(idle_workers);idle_ms+=ms;
+  for(auto* loop:loops)loop->charge(ms/double(loops.size()));
+ }
+ idle_mark=now;
+}
+// Free slots for `loop`: the service bound, and an equal share among loops
+// that hold jobs or whose last refill found work.
+size_t Service::room(const Loop& loop)const{
+ size_t held=0,wanting=0,own=loop.live.size()+loop.reserved;
+ for(auto* l:loops){size_t h=l->live.size()+l->reserved;held+=h;wanting+=l==&loop || h || (l->enabled && l->stop!=Loop::Empty);}
+ size_t share=std::max<size_t>(1,capacity/wanting);
+ return held>=capacity || own>=share?0:std::min(capacity-held,share-own);
+}
+// The next loop in turn with queued jobs gives its oldest job this worker may
+// continue, else its oldest job; no producer's queue waits behind another's refills.
+std::shared_ptr<Job> Service::take(int worker){
+ size_t n=0;while(loops[(turn+n)%loops.size()]->queued.empty())++n;
+ auto& q=loops[(turn+n)%loops.size()]->queued;turn=(turn+n+1)%loops.size();
+ auto it=std::find_if(q.begin(),q.end(),[&](const auto& j){return j->preferred<0 || j->preferred==worker;});if(it==q.end())it=q.begin();
+ auto job=*it;q.erase(it);--waiting;return job;
+}
+#ifndef __EMSCRIPTEN__
+void Service::run(size_t i)noexcept{
+ auto& worker=*workers[i];
+ for(;;){std::unique_lock lock(mutex);account(Clock::now());++idle_workers;
+  wake.wait(lock,[&]{return stopping || waiting;});account(Clock::now());--idle_workers;if(stopping)return;
+  auto job=take(int(i));auto& loop=*job->loop;worker.active=job;job->worker=int(i);job->started=Clock::now();++loop.started;
+  job->wait=std::chrono::duration<double,std::milli>(job->started-job->queued).count();
+  job->info[4]=1; // Every pre-dispatch exit has confirmed zero fresh work.
+  void* answer=nullptr;void* raw=nullptr;
+  try {
+   int ms=job->quantum;if(job->deadline!=Clock::time_point{})ms=std::min(ms,int(std::chrono::duration_cast<std::chrono::milliseconds>(job->deadline-Clock::now()).count()));
+   if(ms<1)loop.mark(*job);
+   if(!job->cancelled){worker.token=api.prepare();if(!worker.token)job->error="cancellation token limit";
+    else{job->token=worker.token;
+     std::string payload=loop.request(*job,ms,worker.token);
+     // The loop stays attached while this worker holds its job, and its
+     // frontier endpoint changes only while it has no live jobs.
+     job->info[4]=0;lock.unlock();answer=api.query(worker.native,payload.c_str());
+     if(!answer || !api.info(answer,job->info.data()))job->error="missing typed native answer";
+     else{job->move_count=api.moves(answer,job->moves.data(),2);if(job->move_count<0)throw std::runtime_error("Invalid typed proof witness");
+      if(loop.endpoint && !job->side){int count=loop.endpoint(answer,nullptr,0);if(count<0 || count>loop.endpoint_limit*130)throw std::runtime_error("Invalid neural frontier size");job->neural.resize(count);if(count && loop.endpoint(answer,job->neural.data(),count)!=count)throw std::runtime_error("Invalid neural frontier payload");}
+      if(job->info[0] || !job->neural.empty()){raw=api.json(answer);if(raw){job->result=static_cast<char*>(raw);api.buffer_free(raw);raw=nullptr;}}
+     }
+     if(answer){api.answer_free(answer);answer=nullptr;}
+     // A deadline may return before cooperative background cancellation finishes.
+     while(api.busy(worker.native))std::this_thread::sleep_for(std::chrono::microseconds(100));
+     lock.lock();
+    }
+   }
+  }catch(...){if(answer)api.answer_free(answer);if(raw)api.buffer_free(raw);if(!lock.owns_lock())lock.lock();job->error="native proof worker failure";}
+  if(worker.token){api.release(worker.token);worker.token=0;}job->elapsed=std::chrono::duration<double,std::milli>(Clock::now()-job->started).count();
+  worker.service+=job->elapsed;loop.service_ms+=job->elapsed;++loop.finished;loop.completed(job);worker.active.reset();loop.answered.notify_all();
+  // Do not acquire the broker's mutex while holding the proof mutex. Retain
+  // only its independent signal so detach/free cannot invalidate this wake.
+  auto signal=job->wake_owner?loop.listener:nullptr;lock.unlock();if(signal)signal->notify();
+ }
+}
+#endif
+}
+extern "C" HX_API void* hxp_new(void* pool,const uint64_t* functions,int workers,int capacity,int slice,int table,int tasks,int stamps){try{if(!pool || !functions)throw std::runtime_error("Missing proof pool");return new proving::Loop(*static_cast<owner::Pool*>(pool),nullptr,std::make_unique<proving::Service>(functions,workers,capacity),slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API void* hxpe_new(void* pool,int workers,int capacity,int slice,int table,int tasks,int stamps,int maximum){try{if(!pool || maximum<1 || maximum>1000)throw std::runtime_error("Invalid external proof limits");auto* loop=new proving::Loop(*static_cast<owner::Pool*>(pool),nullptr,std::make_unique<proving::Service>(nullptr,workers,capacity),slice,table,tasks,stamps!=0);loop->external_limit=maximum;return loop;}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+// Native proof workers shared by the loops that join them; free after every loop.
+extern "C" HX_API void* hxps_new(const uint64_t* functions,int workers,int capacity){try{if(!functions)throw std::runtime_error("Missing proof callbacks");return new proving::Service(functions,workers,capacity);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API void* hxp_join(void* pool,void* service,int slice,int table,int tasks,int stamps){try{if(!pool || !service)throw std::runtime_error("Missing proof pool or service");return new proving::Loop(*static_cast<owner::Pool*>(pool),static_cast<proving::Service*>(service),nullptr,slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+extern "C" HX_API int hxps_free(void* p){auto* service=static_cast<proving::Service*>(p);{std::lock_guard lock(service->mutex);if(!service->loops.empty()){gumbel::error="Free every proof loop before its worker service";return 0;}}delete service;return 1;}
+// out: workers, busy workers, queued jobs, live jobs, attached loops; times: service and idle ms summed over workers.
+extern "C" HX_API void hxps_stats(void* p,uint64_t* out,double* times){auto& service=*static_cast<proving::Service*>(p);std::lock_guard lock(service.mutex);service.account(proving::Clock::now());
+ uint64_t busy=0,live=0;double work=0;for(auto& w:service.workers){busy+=bool(w->active);work+=w->service;}for(auto* loop:service.loops)live+=loop->live.size();
+ std::array<uint64_t,5> values{uint64_t(service.workers.size()),busy,uint64_t(service.waiting),live,uint64_t(service.loops.size())};std::copy(values.begin(),values.end(),out);times[0]=work;times[1]=service.idle_ms;}
 extern "C" HX_API int hxp_neural(void* p,uint64_t callback,int limit){try{
  auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);
  if(limit<0 || limit>8 || !loop.live.empty() || (!loop.external && limit && !callback))throw std::runtime_error("Invalid neural frontier configuration");
@@ -479,14 +555,14 @@ extern "C" HX_API int hxp_offer(void* p,int game,const int64_t* cells,int count,
  std::vector<Cell> history;for(int i=0;i<count;++i)history.push_back({cells[2*i],cells[2*i+1]});auto& owner=*loop.pool.games[game];
  gumbel::Tree view(0,owner.game);view.shared=view.graph=view.scheduler_owned=true;view.root_at(history);loop.frontiers[game].offer(view.root,history,relevance,0);return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);uint64_t active=0,tasks=0,facts=0;double service=0,idle=0;for(auto& w:loop.workers){active+=bool(w->active);service+=w->service;idle+=w->idle;}for(auto& f:loop.frontiers){tasks+=f.tasks.size();facts+=f.facts.size();}
- std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;}
+extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.service.account(proving::Clock::now());uint64_t active=0,tasks=0,facts=0;double service=loop.service_ms,idle=0;for(auto& w:loop.workers)active+=w->active && w->active->loop==&loop;for(double ms:loop.idle_ms)idle+=ms;for(auto& f:loop.frontiers){tasks+=f.tasks.size();facts+=f.facts.size();}
+ std::array<uint64_t,16> values{loop.ticks,loop.submitted,loop.started,loop.finished,loop.installed,loop.cancelled,loop.pruned,loop.unknown,loop.fresh,loop.missing_fresh,uint64_t(loop.queued.size()),active,uint64_t(loop.done.size()),tasks,facts,uint64_t(loop.records.size())};std::copy(values.begin(),values.end(),out);times[0]=service;times[1]=idle;times[2]=loop.snapshot_ns/1e6;times[3]=loop.install_ns/1e6;times[4]=loop.step_ns/1e6;}
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 // counts: refill scans, candidates seen, eligible, eligible inside a retry delay, excluded by pending neural work,
 // closed scope and dormancy, refills stopped with every slot held, with retries held back, without a dispatchable
 // task, first queries of frontier entries, dispatches inside a retry delay.
 // idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, and no candidate at all.
-extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.account(proving::Clock::now());
+extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.service.account(proving::Clock::now());
  std::copy(loop.census.begin(),loop.census.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
 extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;
  for(auto& f:loop.frontiers){checks+=f.scope_checks;changed+=f.scope_changed;unchanged+=f.scope_unchanged;ns+=f.scope_ns;cells+=f.members.size();for(auto& [key,task]:f.tasks)closed+=bool(task->closed&1)+bool(task->closed&2);}
