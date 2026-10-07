@@ -2411,6 +2411,24 @@ class TurnTrees(unittest.TestCase):
         self.assertTrue(self.trees)
         self.assertIsNone(self.trees[-1].ptr)
 
+    def test_cancelled_root_query_gets_its_stop_event_set(self):
+        from play import solve
+        from types import SimpleNamespace
+        events, aborted = [], []
+
+        def watch(count):
+            raise Cancelled()
+
+        def history(*args, cancel_event, **options):
+            events.append(cancel_event)
+            cancel_event.wait(PATIENCE)
+            return dict(status='UNKNOWN', reason='cancelled', nodes_used=0)
+
+        with self.assertRaises(Cancelled):
+            solve(SimpleNamespace(history=history, abort=lambda: aborted.append(True)), [(0, 0)], 100, watch)
+        self.assertEqual(aborted, [True])
+        self.assertTrue(events and events[0].is_set())
+
     def test_pooled_evaluations_match_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]
