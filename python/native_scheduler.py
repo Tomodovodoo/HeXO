@@ -36,6 +36,8 @@ for name, result, args in (
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
     ('profile', C.c_int, [ptr, C.c_int]), ('feedback', C.c_int, [ptr, C.c_int]), ('schedule_stats', None, [ptr, ptr]),
+    ('progress', C.c_int, [ptr, C.c_int]),
+    ('progress_rows', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, C.c_uint64, ptr, ptr, ptr]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
     ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
@@ -495,7 +497,7 @@ class InferenceService:
     available with ms=0; interactive comparisons use a common clock.
     """
     def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
-                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False):
+                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False, progress=False):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
@@ -515,6 +517,7 @@ class InferenceService:
             checked(native.hxb_flights(self._ptr, flights))
             checked(native.hxb_profile(self._ptr, bool(profile)))
             checked(native.hxb_feedback(self._ptr, self.interleave_feedback))
+            checked(native.hxb_progress(self._ptr, bool(progress)))
             for pool in pools:
                 self.attach(pool,self.models[versions.index(pool.model_version)])
         except BaseException:
@@ -697,6 +700,25 @@ class InferenceService:
             result['edges'] = np.ctypeslib.as_array(edges,shape=(count.value,9)).copy()
         return result
 
+    def progress(self, producer, game, *, token, after=0):
+        """Copy the latest completed-comparison observation without consuming it.
+
+        This does not acknowledge the root, authorize retargeting, or add visits.
+        The producer retains only one frame per game. Returned arrays are owned.
+        """
+        import json
+        self._raise()
+        text, edges, count = C.c_char_p(), C.POINTER(C.c_double)(), C.c_int()
+        status = native.hxb_progress_rows(self.ptr, producer, game, token, after,
+                                         C.byref(text), C.byref(edges), C.byref(count))
+        if status<0:
+            checked(False)
+        if not status:
+            return None
+        result = json.loads(text.value)
+        result['edges'] = np.ctypeslib.as_array(edges, shape=(count.value, 9)).copy()
+        return result
+
     def pause(self, *, timeout=None):
         """Fence neural forwards and retain queued work; native CPU proofs continue.
 
@@ -855,7 +877,9 @@ class InferenceService:
         finally:
             self.close()
 
-    def close(self):
+    def close(self, *, completions=False):
+        """Fence and join; optionally retain final writer-owned root events."""
+        final = []
         if self._ptr:
             self.cancel()
             if self._launcher is not None:
@@ -879,8 +903,14 @@ class InferenceService:
                 raise ValueError('Complete or abandon_fenced every manually taken service batch before close')
             checked(native.hxb_join(self._ptr))
             self._stats = self.stats()
-            checked(native.hxb_free(self._ptr))
-            self._ptr = None
-            for pool in self.pools:
-                if pool is not None:
-                    pool._service = None
+            try:
+                if completions:
+                    while (event := self.event()) is not None:
+                        final.append(event)
+            finally:
+                checked(native.hxb_free(self._ptr))
+                self._ptr = None
+                for pool in self.pools:
+                    if pool is not None:
+                        pool._service = None
+        return final if completions else None

@@ -21,6 +21,7 @@ from collections import Counter
 from types import SimpleNamespace
 import unittest
 import unittest.mock
+import zlib
 
 import numpy as np
 import torch
@@ -3046,6 +3047,23 @@ class CheapRowTests(unittest.TestCase):
             kept = set(half.index)
             self.assertEqual(held.total_rows, len(held.index)+sum(key in kept for key in held.validation))
 
+    def test_surveyed_counts_pace_like_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 3, 10, 30, proven=True)
+            survey = dense_data.survey(tmp, 4, .5, processes=1)
+            primed = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4,
+                                             survey=survey)
+            plain = dense_data.ReplayWindow(tmp, 10**6, 10**6, cheap_row_fraction=.5, seed=4)
+            self.assertEqual(primed.total_rows, plain.total_rows)
+            self.assertEqual(primed.total_rows, len(primed.index))
+            before = primed.total_rows
+            self.label(tmp, '000001', list(range(30)))    # the dropped cheap rows of game 0 become exact
+            for window in (primed, plain):
+                window.refresh()
+            self.assertGreater(primed.total_rows, before)
+            self.assertEqual(primed.total_rows, plain.total_rows)
+            self.assertEqual(primed.total_rows, len(primed.index))
+
     def test_retention_is_stable_across_rebuilds(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic_run(tmp, 3, 8, 30)
@@ -3419,6 +3437,80 @@ class ValidationSourceTests(unittest.TestCase):
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
+
+    def test_subsets_follow_the_documented_walk_with_a_cold_or_surveyed_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in (1, 2):
+                source_shard(run/'shards'/f'{k:06d}', k, 'old', 'converted', games=10, policy_every=1)
+            for k in range(6):
+                source_shard(run/'shards'/f'10000000000{k:02d}', 10+k, 'x', checkpoint='main/000010', games=10, policy_every=1)
+            limit, quota, seed, fraction = 25, 6, 5, .4
+            expected = {}
+            for source, origin in (('converted', 'converted'), ('fresh', 'actor')):
+                for split in ('held', 'train'):
+                    chosen = []
+                    for path in dense_data.shard_dirs(run):
+                        if dense_data.origin(dense_data.manifest(path)) != origin or len(chosen) >= limit:
+                            continue
+                        episodes, rows = dense_data.read_shard(path)
+                        full = [i for i, r in enumerate(rows) if len(r['policy'])]
+                        order = np.random.default_rng([seed, zlib.crc32(path.name.encode())]).permutation(len(full))
+                        picked = [full[k] for k in order if dense_data.holdout(episodes[rows[full[k]]['game']], fraction) == (split == 'held')]
+                        chosen += [(path.name, i) for i in picked[:min(quota, limit-len(chosen))]]
+                    expected[source, split] = chosen
+            cold = dense_data.ValidationSets(run, fraction, seed, limit, quota)
+            cold.refresh()
+            with unittest.mock.patch.object(dense_data, 'SURVEY_CHUNK', 2):
+                survey = dense_data.survey(run, seed, .5, processes=2)    # two spawned workers over the cached index
+            self.assertEqual({n: v.actors for n, v in survey.items()}, cold.actors)
+            self.assertEqual({n: v.manifest for n, v in survey.items()}, cold.manifests)
+            primed = dense_data.ValidationSets(run, fraction, seed, limit, quota, survey)
+            primed.refresh()
+            for sets in (cold, primed):
+                subsets = {k: [(r.shard, r.index) for r in refs] for k, refs in sets.subsets.items()}
+                for key, chosen in expected.items():
+                    self.assertEqual(subsets[key], chosen, key)
+                self.assertEqual(subsets['newest', 'held'], subsets['fresh', 'held'])
+                self.assertEqual(sets.newest_checkpoint, 'main/000010')
+
+    def test_shard_index_follows_replaced_and_tampered_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 1, 'x', games=4)
+            source_shard(run/'shards'/'1000000000002', 2, 'x', games=4)
+            first = dense_data.ReplayWindow(run, 10**6, 10**6)
+            built = []
+            index_shard = dense_data.index_shard
+            with unittest.mock.patch.object(dense_data, 'index_shard', lambda path: built.append(path.name) or index_shard(path)):
+                again = dense_data.ReplayWindow(run, 10**6, 10**6)
+                self.assertEqual(built, [])    # unchanged shards are read from their index
+                self.assertEqual(list(again.index), list(first.index))
+                shutil.rmtree(run/'shards'/'1000000000002')
+                time.sleep(.01)
+                source_shard(run/'shards'/'1000000000002', 7, 'x', games=9)
+                replaced = dense_data.ReplayWindow(run, 10**6, 10**6)
+                self.assertEqual(built, ['1000000000002'])
+            episodes, rows = dense_data.read_shard(run/'shards'/'1000000000002', policies=False)
+            refs = [replaced.ref(n, i) for n, i in replaced.index if n == '1000000000002']
+            self.assertEqual(len(refs), sum(dense_data.trained(episodes[r['game']], r['ply']) for r in rows))
+            for ref in refs:
+                self.assertEqual(ref.episode['moves'], episodes[ref.row['game']]['moves'])
+            # A replacement that keeps every file's size and mtime is still caught by its manifest's hashes.
+            stamp = dense_data.shard_stamp(run/'shards'/'1000000000002')
+            shutil.rmtree(run/'shards'/'1000000000002')
+            source_shard(run/'shards'/'1000000000002', 8, 'x', games=9)
+            with unittest.mock.patch.object(dense_data, 'shard_stamp', lambda path: stamp):
+                restored = dense_data.ReplayWindow(run, 10**6, 10**6)
+            episodes, _ = dense_data.read_shard(run/'shards'/'1000000000002', policies=False)
+            for n, i in restored.index:
+                if n == '1000000000002':
+                    ref = restored.ref(n, i)
+                    self.assertEqual(ref.episode['moves'], episodes[ref.row['game']]['moves'])
+            path = run/'shards'/'1000000000001'/'rows.json'
+            path.write_text(path.read_text().replace('"ply": 0', '"ply": 1', 1))
+            with self.assertRaisesRegex(ValueError, 'Shard changed'):
+                dense_data.ReplayWindow(run, 10**6, 10**6)
 
     def test_learner_settings_size_the_subsets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -10001,6 +10093,55 @@ class SlowDenseTests(unittest.TestCase):
 
 
 class DenseTimedWorker(unittest.TestCase):
+    def test_unsearched_completion_preserves_candidate_and_exact_evidence(self):
+        from types import SimpleNamespace
+        from timed_engine import native_turn, legal_turn
+        from time_control import allowance
+        import threading
+        history = [[0, 0]]
+        first = dict(producer=0, game=0, model=0, token=1, history=history,
+                     context='first', action=[1, 0], exact_winner=-1,
+                     root_completed=2, completed=2,
+                     edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
+        for winner, visits in ((-1, 200), (-1, 0), (1, 0)):
+            with self.subTest(exact_winner=winner, position_edge_visits=visits), \
+                    unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                pool = unittest.mock.Mock(proofs=None)
+                player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
+                    model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
+                    _timed_native=(None, pool, ('fixed', False, False, 0.)))
+                service = service_type.return_value
+                service.stats.return_value = dict(launched_rows=80)
+                service.progress.return_value = None
+                service.event.side_effect = [first, dict(producer=0, game=0, model=0,
+                    token=2, history=history+[[1, 0]], context='second', action=[2, 0],
+                    exact_winner=winner, root_completed=0, completed=200, issued=80,
+                    elapsed_ms=476., result_build_ms=2., result_ready_elapsed_ms=478.,
+                    publish_delay_ms=1., event_queue_ms=784.,
+                    winning_turn=[[2, 0]] if winner == 1 else [],
+                    edges=np.array([[2, 0, 0, 0, .8, 1, visits, 0, 1]], float))]
+                result = native_turn(player, history, allowance(movetime=1000), threading.Event())
+            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+            self.assertEqual(result['completed'], 2)
+            self.assertEqual(result['root_searches'][1]['issued'], 80)
+            self.assertEqual(result['root_searches'][1]['completed'], 0)
+            self.assertEqual(result['root_searches'][1]['event_queue_ms'], 784.)
+            if winner < 0:
+                self.assertEqual(len(result['stones']), 2)
+                self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                self.assertEqual(result['scheduler_completed'], 202)
+                self.assertEqual(result['stones'][1]['source'], 'position_search' if visits else 'uncredited_estimate')
+                self.assertEqual(result['stones'][1]['position_edge_visits'], visits)
+                self.assertEqual(result['stones'][1]['root_completed'], 0)
+                self.assertEqual(result['root_searches'][1]['error'], 'no_completed_comparison')
+                self.assertEqual(result['proof_status'], 'UNKNOWN')
+            else:
+                self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                self.assertEqual(len(result['stones']), 2)
+                self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+                self.assertEqual(result['stones'][1]['source'], 'verified_proof')
+                self.assertNotIn('error', result['root_searches'][1])
+
     def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
         from timed_engine import TimedEngine, legal_turn
         with tempfile.TemporaryDirectory() as folder:
@@ -10026,8 +10167,11 @@ class DenseTimedWorker(unittest.TestCase):
                             self.assertEqual([list(cell[:2]) for cell in game.cells], history)
                             if native:
                                 self.assertTrue(result['settings']['native_scheduler'])
-                                self.assertTrue(result['stones'])
+                                self.assertEqual(len(result['stones']), 2, result)
+                                self.assertEqual([s['move'] for s in result['stones']], result['moves'])
                                 self.assertEqual(result['stones'][0]['history'], history)
+                                self.assertEqual(result['stones'][1]['history'], history+[result['moves'][0]])
+                                self.assertTrue(all(s['root_completed'] > 0 for s in result['stones']))
                                 self.assertEqual(result['completed'], sum(s['root_completed'] for s in result['stones']))
                                 self.assertGreaterEqual(result['scheduler_completed'], result['completed'])
                                 if solver:
@@ -10082,20 +10226,136 @@ class DenseTimedWorker(unittest.TestCase):
                 for winner, status, value in ((1, 'PROVEN_WIN', 1.), (0, 'UNKNOWN', .5)):
                     with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                         service = service_type.return_value
+                        service.progress.return_value = None
                         service.stats.return_value = dict(launched_rows=2)
                         service.event.side_effect = [
                             dict(producer=0, game=0, model=0, token=1, history=[[0, 0]], context='first',
                                  action=[1, 0], exact_winner=-1, root_completed=1, completed=1,
-                                 edges=np.array([[1, 0, 0, 0, 0, 1, -1, -1, 0]], float)),
+                                  edges=np.array([[1, 0, 0, 0, 0, 1, 1, 1, 1]], float)),
                             dict(producer=0, game=0, model=0, token=2, history=[[0, 0], [1, 0]], context='second',
                                  action=[2, 0], exact_winner=winner, root_completed=1, completed=1,
-                                 edges=np.array([[2, 0, 0, 0, 0, 1, winner, 1, 0]], float))]
+                                  edges=np.array([[2, 0, 0, 0, 0, 1, 1, 1, 1]], float))]
                         result = player.turn(game, 1000)
                     self.assertEqual(result['proof_status'], status)
                     self.assertEqual(result['win_probability'], value)
                     self.assertEqual(result['stones'][0]['exact_winner'], -1)
                     self.assertEqual(result['stones'][1]['exact_winner'], winner)
                     self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                # Play follows the full improved policy, including a move outside
+                # the owner's last halving finalists, and retargets that position.
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    service = service_type.return_value
+                    service.progress.return_value = None
+                    service.stats.return_value = dict(launched_rows=2)
+                    service.event.side_effect = [
+                        dict(producer=0, game=0, model=0, token=1, history=[[0,0]], context='first',
+                             action=[1,0], exact_winner=-1, root_completed=2, completed=3,
+                             edges=np.array([[1,0,0,0,.1,.1,2,2,1], [0,1,0,0,.7,.9,0,0,1]], float)),
+                        dict(producer=0, game=0, model=0, token=2, history=[[0,0],[0,1]], context='second',
+                             action=[0,2], exact_winner=-1, root_completed=3, completed=4,
+                             edges=np.array([[0,2,0,0,.6,1,3,3,1]], float))]
+                    result = player.turn(game, 1000)
+                    self.assertEqual(service.retarget.call_args_list[1].args[2], [[0,0],[0,1]])
+                self.assertEqual(result['moves'], [[0,1],[0,2]])
+                self.assertEqual(result['stones'][1]['history'], [[0,0],[0,1]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
+                self.assertEqual((result['completed'], result['scheduler_completed']), (5,7))
+                # The searched second root can arrive only at shutdown. Its
+                # matching final frame replaces the provisional legal filler.
+                clock = [0.]
+                frames = [dict(producer=0, game=0, model=0, token=1, history=[[0,0]],
+                               context='first', action=[1,0], exact_winner=-1, root_completed=2, completed=2,
+                               edges=np.array([[1,0,0,0,.2,1,2,2,1]], float)),
+                          dict(producer=0, game=0, model=0, token=2, history=[[0,0],[1,0]],
+                               context='second', action=[2,0], exact_winner=-1, root_completed=3, completed=3,
+                               edges=np.array([[2,0,0,0,.6,1,3,3,1]], float))]
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
+                    service = service_type.return_value
+                    service.progress.return_value = None
+                    service.stats.return_value = dict(launched_rows=2)
+                    def completion():
+                        if service.event.call_count == 1:
+                            return frames[0]
+                        clock[0] = 1.
+                        return None
+                    service.event.side_effect = completion
+                    service.close.side_effect = lambda **kw: [frames[1]] if kw.get('completions') else None
+                    result = player.turn(game, 1000)
+                    service.launch.assert_called_once()
+                    service.cancel.assert_called_once()
+                    service.pump.assert_not_called()
+                    self.assertIn(unittest.mock.call(completions=True), service.close.call_args_list)
+                self.assertEqual(result['moves'], [[1,0],[2,0]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
+                self.assertEqual(result['completed'], 5)
+                self.assertEqual(result['proof_status'], 'UNKNOWN')
+                # Progress replaces the second row while the final root remains
+                # outstanding. Repeated cumulative counts are never added twice.
+                clock[0] = 0.
+                snapshots = [dict(frames[1], kind='progress', snapshot_sequence=1),
+                             dict(frames[1], kind='progress', snapshot_sequence=2,
+                                  root_completed=7, completed=9,
+                                  action=[2,1], edges=np.array([[2,1,0,0,.8,1,7,7,1]], float))]
+                published = []
+                from timed_engine import native_turn
+                from time_control import allowance
+                import threading
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=5)
+                    service.event.side_effect = lambda: frames[0] if service.event.call_count == 1 else None
+                    def progress(*args, **kwargs):
+                        if service.progress.call_count == 1:
+                            return snapshots[0]
+                        clock[0] = 1.
+                        return snapshots[1]
+                    service.progress.side_effect = progress
+                    service.close.side_effect = lambda **kw: [] if kw.get('completions') else None
+                    result = native_turn(player, [[0,0]], allowance(movetime=1000),
+                                         threading.Event(), published.append)
+                    self.assertEqual(service.retarget.call_count, 2)
+                    self.assertEqual(service.progress.call_args.kwargs, dict(token=2, after=1))
+                self.assertEqual(result['moves'], [[1,0],[2,1]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,7])
+                self.assertEqual((result['completed'], result['scheduler_completed']), (9,11))
+                self.assertEqual(result['stones'][1]['snapshot_sequence'], 2)
+                self.assertEqual(result['root_searches'][1]['error'], 'no_completion')
+                self.assertEqual(published[-2]['moves'], [[1,0],[2,0]])
+                self.assertEqual(published[-2]['completed'], 5)
+                # A cold continuation can miss its deadline. Record that
+                # attempted position without counting legal filler as search.
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    service = service_type.return_value
+                    service.progress.return_value = None
+                    service.stats.return_value = dict(launched_rows=1)
+                    service.event.side_effect = [frames[0],
+                        dict(producer=0, game=0, model=0, token=2,
+                             history=[[0,0],[1,0]], error='deadline')]
+                    result = player.turn(game, 1000)
+                self.assertEqual(len(result['stones']), 1)
+                self.assertEqual(result['root_searches'][1]['history'], [[0,0],[1,0]])
+                self.assertEqual(result['root_searches'][1]['error'], 'deadline')
+                self.assertEqual(result['stop_reason'], 'deadline')
+                self.assertNotIn('completed', result['root_searches'][1])
+                self.assertEqual(result['completed'], 2)
+                # Completion delivery is not itself a budget stop. Preserve the
+                # worker's deadline/cancellation reason at the controller too.
+                import threading
+                for reason in ('deadline','stop','budget'):
+                    controller = TimedEngine.__new__(TimedEngine)
+                    controller.config = dict(kind='bubble',search=dict(native_scheduler=True))
+                    controller.external = controller.busy = False
+                    controller.checkpoint, controller.model_sha256 = player.checkpoint, player.model_sha256
+                    controller.lock, controller.cancellation = threading.Lock(), threading.Event()
+                    controller.generation = 0
+                    controller.process = unittest.mock.Mock()
+                    controller.process.is_alive.return_value = True
+                    controller.connection = unittest.mock.Mock()
+                    controller.connection.poll.side_effect = [False,True]
+                    controller.connection.recv.return_value = (1,'done',dict(moves=[[1,0],[2,0]],stop_reason=reason))
+                    self.assertEqual(controller.turn(game,1000)['stop_reason'],reason)
                 # A real immediate pair is committed before the first winning
                 # publication can cancel the worker. No second inference is needed.
                 from timed_engine import dense_turn
@@ -10124,9 +10384,31 @@ class DenseTimedWorker(unittest.TestCase):
                     finished.close()
                 self.assertTrue(all(event['moves'] == result['moves'] for event in published
                                     if event['proof_status'] == 'PROVEN_WIN'))
+                # A complete certified turn stays authoritative even when the
+                # estimated policy assigns more mass to a different legal stone.
+                finished = Game(history)
+                try:
+                    with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                        service = service_type.return_value
+                        service.progress.return_value = None
+                        service.stats.return_value = dict(launched_rows=0)
+                        service.event.return_value = dict(producer=0, game=0, model=0, token=1,
+                            history=history, context='witnessed', action=[4,0], winning_turn=[[4,0],[5,0]],
+                            exact_winner=0, root_completed=1, completed=1,
+                            edges=np.array([[4,0,0,0,1,.1,0,2,1], [2,5,0,0,.5,.9,-1,-1,1]], float))
+                        result = player.turn(finished, 1000)
+                    self.assertEqual(result['moves'], [[4,0],[5,0]])
+                    self.assertEqual(result['winning_turn'], result['moves'])
+                    for action in result['moves']:
+                        finished.play(*action)
+                    self.assertEqual(finished.winner, 0)
+                    self.assertEqual(service.retarget.call_count, 1)
+                finally:
+                    finished.close()
                 # A bare exact value cannot certify an arbitrary second stone.
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
+                    service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=0)
                     service.event.return_value = dict(producer=0, game=0, model=0, token=1,
                         history=[[0,0]], context='unwitnessed', action=[1,0], exact_winner=1,
