@@ -73,9 +73,12 @@ class ProofLoop:
     A slice is a CPU scheduling quantum. UNKNOWN remains unknown. Resident tables
     and bounded best-first frontiers survive compatible slices and retargets.
     Recursive level-1 frames and kernel memos are still rebuilt per query.
+    `queue` bounds queued plus running jobs; by default eight per worker, so
+    workers keep work between the graph owner's refills.
     """
-    def __init__(self, pool, package=None, *, workers=2, queue=8, slice_ms=8, table_mb=4,
+    def __init__(self, pool, package=None, *, workers=2, queue=None, slice_ms=8, table_mb=4,
                  tasks=256, stamps=False, endpoints=8, direct=False):
+        queue = 8*workers if queue is None else queue
         if not isinstance(endpoints,int) or not 0<=endpoints<=8:
             raise ValueError('Neural frontier limit must be an integer from 0 to 8')
         from tactical_proof import NativeTactics, PACKAGE
