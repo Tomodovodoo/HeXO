@@ -65,6 +65,10 @@ Measured on the RTX 3070 Ti with a read-only copy of the run at `reset/195000` (
 | | samples/s |
 |---|---:|
 | learner at 0341850 (three runs) | 746, 785, 808 |
-| current learner (two runs) | 1010, 1011 |
+| learner at 267e9ef (two runs) | 1010, 1011 |
+| same day as the next row, at df8f8ee (two runs) | 926, 943 |
+| channels-last training (two runs) | 1135, 1158 |
 
 A steady export takes 31 s instead of 35 s, so a 2500-step export cycle trains about 960 samples/s instead of 750. Before, the training thread stalled 2.8 s every 30 seconds rebuilding replay priorities, buckets were padded to 16 rows (25% more cells than the rows hold), each batch was read from the worker pipe on the training thread, and the line convolution and pooling took 29% of the GPU step. Two 1500-step runs from the same checkpoint give the same training losses and validation metrics within their noise.
+
+With `--net-kernels fused` the learner trains channels-last: cuDNN no longer converts every convolution's operands to NHWC and back (about a tenth of the GPU step), and the tap gradients of the line convolution are reduced over position tiles of all taps at once (178 ms per ten steps instead of 436). Saved-batch steps run at 1210 to 1218 samples/s against 985 to 989 for main. Two 1500-step runs per arm from the same checkpoint give training losses within the spread of their 20-step logs and the same exported validation metrics within the arms' own run-to-run spread.
