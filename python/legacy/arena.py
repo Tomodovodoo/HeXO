@@ -26,7 +26,18 @@ class Seal:
         count = self.fn(data, len(cells), game.player, game.remaining, ms, out)
         if count < 0:
             raise RuntimeError("Seal board range exceeded")
-        return [(out[2*i], out[2*i+1]) for i in range(count)]
+        moves = [(out[2*i], out[2*i+1]) for i in range(count)]
+        if count == 2:
+            # Seal may supply a spare stone even when its first placement wins.
+            # Check on a copy so callers keep their original board unchanged.
+            after = Game([(q, r) for q, r, _ in cells])
+            try:
+                after.play(*moves[0])
+                if after.winner >= 0:
+                    return moves[:1]
+            finally:
+                after.close()
+        return moves
 
 
 def wilson(wins, games):

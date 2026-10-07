@@ -11,6 +11,22 @@ class NativeRules(unittest.TestCase):
         self.addCleanup(game.close)
         return game
 
+    def test_seal_stops_after_a_winning_first_stone_without_mutating_the_board(self):
+        from legacy.arena import Seal
+        history = [(0,0),(1,0),(0,-8),(-1,0),(-2,0),(-2,-8),(-4,-8),
+                   (-3,0),(-4,0),(-6,-8),(-8,-8)]
+        game = self.make_game(history)
+        before = game.state(), game.key
+        seal = Seal.__new__(Seal)
+        for first, count in (((-5,0), 1), ((-2,1), 2)):
+            with self.subTest(first=first):
+                def reply(data, size, side, remaining, ms, out):
+                    out[:] = (*first, 2, 0)
+                    return 2
+                seal.fn = reply
+                self.assertEqual(seal(game, 100), [first, (2,0)][:count])
+                self.assertEqual((game.state(), game.key), before)
+
     def test_benchmark_records_only_executed_placements(self):
         import contextlib
         import io
