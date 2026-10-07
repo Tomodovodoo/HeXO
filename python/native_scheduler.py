@@ -56,6 +56,11 @@ for name, result, args in (
 ):
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
+bind('hxp_join', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int)
+bind('hxp_budget', C.c_int, ptr, C.c_double)
+bind('hxps_new', ptr, ptr, C.c_int, C.c_int)
+bind('hxps_free', C.c_int, ptr)
+bind('hxps_stats', None, ptr, ptr, ptr)
 bind('hxp_neural', C.c_int, ptr, C.c_uint64, C.c_int)
 bind('hxp_neural_stats', None, ptr, ptr)
 bind('hxp_neural_record', C.c_char_p, ptr, C.c_int)
@@ -69,42 +74,102 @@ for name, result, args in (
     bind('hxp_'+name, result, *args)
 
 
+def _solver(package, direct):
+    """The tactical library and its native worker callbacks."""
+    from tactical_proof import NativeTactics, PACKAGE
+    library = NativeTactics(PACKAGE if package is None else package)
+    names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
+             'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
+    if direct:
+        names = tuple(name+'_direct' if name in ('worker_new','worker_free','worker_answer','worker_busy')
+                      else name for name in names)
+    return library, np.asarray([C.cast(getattr(library.lib, 'hexo_tactical_'+name), ptr).value
+                                for name in names], np.uint64)
+
+
+class ProofWorkers:
+    """Native proof workers shared by the proof loops of several producers.
+
+    Pass it as `shared=` to `SearchPool.enable_proofs`. A worker takes the best
+    queued job of any attached loop, preferring a continuation of its own resident
+    table, and returns the answer to that loop; only the loop's graph owner installs
+    it. `queue` bounds queued plus running jobs over all loops, eight per worker by
+    default, and a loop gets an equal share of it while other loops have work.
+    Close every attached loop first.
+    """
+    def __init__(self, package=None, *, workers=12, queue=None, direct=False):
+        queue = 8*workers if queue is None else queue
+        self.library, functions = _solver(package, direct)
+        self._ptr = native.hxps_new(functions.ctypes.data, workers, queue)
+        if not self._ptr:
+            self.library.close()
+            checked(False)
+
+    @property
+    def ptr(self):
+        if not self._ptr:
+            raise ValueError('Proof workers are closed')
+        return self._ptr
+
+    def stats(self):
+        """Busy workers, queued and live jobs over all loops, and worker wall time."""
+        out, times = np.empty(5, np.uint64), np.empty(2, np.float64)
+        native.hxps_stats(self.ptr, out.ctypes.data, times.ctypes.data)
+        result = dict(zip(('workers', 'active', 'queued', 'live', 'loops'), map(int, out)))
+        result.update(zip(('worker_service_ms', 'worker_idle_ms'), map(float, times)))
+        return result
+
+    def close(self):
+        if self._ptr:
+            checked(native.hxps_free(self._ptr))
+            self._ptr = None
+            self.library.close()
+
+
 class ProofLoop:
     """Native frontier and immutable jobs; Python never dispatches individual queries.
 
     A slice is a CPU scheduling quantum. UNKNOWN remains unknown. Resident tables
     and bounded best-first frontiers survive compatible slices and retargets.
     Recursive level-1 frames and kernel memos are still rebuilt per query.
-    `queue` bounds queued plus running jobs; by default eight per worker, so
-    workers keep work between the graph owner's refills.
+    Without `shared`, the loop owns `workers` native workers (default 2) and
+    `queue` bounds its queued plus running jobs, by default eight per worker, so
+    workers keep work between the graph owner's refills. With `shared`, it queues
+    on those ProofWorkers instead and takes no package, workers, queue or direct.
+    `owner_budget` is the share of the graph owner's recent wall time that proof
+    steps and installation may take; above it the loop installs answers but admits
+    no new jobs, so more workers never take more of that owner's time.
     """
-    def __init__(self, pool, package=None, *, workers=2, queue=None, slice_ms=8, table_mb=4,
-                 tasks=256, stamps=False, endpoints=8, direct=False):
-        queue = 8*workers if queue is None else queue
+    def __init__(self, pool, package=None, *, workers=None, queue=None, slice_ms=8, table_mb=4,
+                 tasks=256, stamps=False, endpoints=8, direct=False, shared=None, owner_budget=1.):
         if not isinstance(endpoints,int) or not 0<=endpoints<=8:
             raise ValueError('Neural frontier limit must be an integer from 0 to 8')
-        from tactical_proof import NativeTactics, PACKAGE
-        self.pool = pool
-        self.library = NativeTactics(PACKAGE if package is None else package)
-        names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
-                 'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
-        if direct:
-            names = tuple(name+'_direct' if name in ('worker_new','worker_free','worker_answer','worker_busy')
-                          else name for name in names)
-        functions = np.asarray([C.cast(getattr(self.library.lib, 'hexo_tactical_'+name), ptr).value
-                                for name in names], np.uint64)
+        if shared is not None and (package is not None or workers is not None or queue is not None or direct):
+            raise ValueError('Shared proof workers fix the package, worker count, queue and solver mode')
+        self.pool, self.shared = pool, shared
+        if shared is None:
+            workers = 2 if workers is None else workers
+            queue = 8*workers if queue is None else queue
+            self.library, functions = _solver(package, direct)
+        else:
+            self.library = shared.library
         self._ptr = None
         try:
             callback=C.cast(self.library.lib.hexo_tactical_answer_frontier, ptr).value if endpoints else 0
-            self._ptr = native.hxp_new(pool.ptr, functions.ctypes.data, workers, queue, slice_ms,
-                                       table_mb, tasks, bool(stamps))
+            if shared is None:
+                self._ptr = native.hxp_new(pool.ptr, functions.ctypes.data, workers, queue, slice_ms,
+                                           table_mb, tasks, bool(stamps))
+            else:
+                self._ptr = native.hxp_join(pool.ptr, shared.ptr, slice_ms, table_mb, tasks, bool(stamps))
             if not self._ptr:
                 checked(False)
             checked(native.hxp_neural(self._ptr, callback, endpoints))
+            checked(native.hxp_budget(self._ptr, owner_budget))
         except BaseException:
             if self._ptr:
                 checked(native.hxp_free(self._ptr));self._ptr=None
-            self.library.close()
+            if shared is None:
+                self.library.close()
             raise
 
     @property
@@ -133,12 +198,12 @@ class ProofLoop:
         checked(native.hxp_offer(self.ptr, game, cells.ctypes.data, len(cells), relevance))
 
     def stats(self):
-        out, times = np.empty(16, np.uint64), np.empty(4, np.float64)
+        out, times = np.empty(16, np.uint64), np.empty(5, np.float64)
         native.hxp_stats(self.ptr, out.ctypes.data, times.ctypes.data)
         result = dict(zip(('ticks', 'submitted', 'started', 'finished', 'installed', 'cancelled',
                            'pruned', 'unknown', 'fresh_nodes', 'missing_fresh', 'queued', 'active',
                            'ready', 'tasks', 'facts', 'records'), map(int, out)))
-        result.update(zip(('worker_service_ms', 'worker_idle_ms', 'snapshot_ms', 'install_ms'),
+        result.update(zip(('worker_service_ms', 'worker_idle_ms', 'snapshot_ms', 'install_ms', 'owner_step_ms'),
                            map(float, times)))
         scope = np.empty(10, np.uint64)
         native.hxp_scope_stats(self.ptr, scope.ctypes.data)
@@ -147,13 +212,14 @@ class ProofLoop:
         frontier=np.empty(6, np.uint64)
         native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
         result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
-        counts, idle = np.empty(12, np.uint64), np.empty(6, np.float64)
+        counts, idle = np.empty(13, np.uint64), np.empty(7, np.float64)
         native.hxp_supply_stats(self.ptr, counts.ctypes.data, idle.ctypes.data)
         result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_deferred', 'supply_pending',
                            'supply_closed', 'supply_dormant', 'supply_full_exits', 'supply_held_exits',
-                           'supply_empty_exits', 'supply_first_queries', 'supply_deferred_dispatched'), map(int, counts)))
+                           'supply_empty_exits', 'supply_first_queries', 'supply_deferred_dispatched',
+                           'supply_owner_exits'), map(int, counts)))
         result.update(zip(('idle_capacity_ms', 'idle_held_ms', 'idle_pending_ms', 'idle_closed_ms',
-                           'idle_dormant_ms', 'idle_empty_ms'), map(float, idle)))
+                           'idle_dormant_ms', 'idle_empty_ms', 'idle_owner_ms'), map(float, idle)))
         return result
 
     def records(self):
@@ -182,7 +248,8 @@ class ProofLoop:
             self.drain()
             checked(native.hxp_free(self._ptr))
             self._ptr = None
-            self.library.close()
+            if self.shared is None:
+                self.library.close()
             self.pool.proofs = None
 
 

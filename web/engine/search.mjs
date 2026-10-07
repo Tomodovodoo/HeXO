@@ -736,15 +736,15 @@ export class NativeProofs {
     }
   }
   stats() {
-    const out = this.n.alloc(128), times = this.n.alloc(32);
+    const out = this.n.alloc(128), times = this.n.alloc(40);
     try {
       this.m._hxp_stats(this.ptr, out, times);
-      const values = Array.from(this.n.view(BigUint64Array, out, 16), Number), elapsed = Array.from(this.n.view(Float64Array, times, 4));
+      const values = Array.from(this.n.view(BigUint64Array, out, 16), Number), elapsed = Array.from(this.n.view(Float64Array, times, 5));
       this.m._hxp_neural_stats(this.ptr, out);
       const neural = Array.from(this.n.view(BigUint64Array, out, 6), Number);
       return {...Object.fromEntries(['ticks','submitted','started','finished','installed','cancelled','pruned','unknown','fresh_nodes','missing_fresh','queued','active','ready','tasks','facts','records'].map((name, i) => [name, values[i]])),
         neural_frontier: Object.fromEntries(['paths','candidates','rejected','bytes','install_ns','records'].map((name, i) => [name, neural[i]])),
-        ...Object.fromEntries(['worker_service_ms','worker_idle_ms','snapshot_ms','install_ms'].map((name, i) => [name, elapsed[i]]))};
+        ...Object.fromEntries(['worker_service_ms','worker_idle_ms','snapshot_ms','install_ms','owner_step_ms'].map((name, i) => [name, elapsed[i]]))};
     } finally { this.m._free(out); this.m._free(times); }
   }
   close() {
