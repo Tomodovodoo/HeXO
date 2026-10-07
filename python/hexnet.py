@@ -253,7 +253,6 @@ class MaskedNorm(nn.BatchNorm2d):
                 return norm_eval(self, x, mask)
             y = super().forward(x)
             return y if ceiling is None else act(y, ceiling)
-        fused = fused and x.is_contiguous(memory_format=torch.channels_last) and mask.shape[1] == 1
         if fused:
             from hexnet_kernels import MaskedBatchNorm
             y, mean, var = MaskedBatchNorm.apply(x, mask, self.weight, self.bias, cells, self.eps, ceiling is not None)

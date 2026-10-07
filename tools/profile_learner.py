@@ -276,7 +276,7 @@ def measure(args):
         learner.device = device
         learner.net_kernels = 'reference' if mode == 'reference' else 'fused'
         raw = hexnet.load_model(checkpoint/'model.pt')
-        learner.memory_format = hexnet.memory_format(raw.config, mode != 'reference')
+        learner.memory_format = hexnet.memory_format(raw.config, mode == 'fused')
         learner.model = learner.place(raw).train()
         learner.ema = learner.place(hexnet.load_model(checkpoint/'ema.pt'))
         if mode == 'shipped':
@@ -538,7 +538,7 @@ def live(args):
         learner = dense_learn.Learner.__new__(dense_learn.Learner)
         learner.settings, learner.device = settings, device
         learner.net_kernels = 'reference' if mode == 'reference' else 'fused'
-        learner.memory_format = hexnet.memory_format(raw.config, mode != 'reference')
+        learner.memory_format = hexnet.memory_format(raw.config, mode == 'fused')
         learner.model = learner.place(raw).train()
         learner.ema = learner.place(raw_ema)
         if mode == 'shipped':

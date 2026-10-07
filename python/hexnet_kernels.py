@@ -417,9 +417,11 @@ def _grad_apply(X,M,G,Dx,Mean,Inv,Weight,Bias,Db,Dw,Cells,N,H,W,MS,
 
 
 class MaskedBatchNorm(torch.autograd.Function):
-    """hexnet._MaskedBatchNorm for channels-last CUDA x and a [B, 1, H, W] mask, with the activation act(y, ceiling) fused when `activate`."""
+    """hexnet._MaskedBatchNorm for CUDA x and a [B, 1, H, W] mask, with the activation act(y, ceiling) fused when
+    `activate`. The kernels run channels-last; x in another layout is copied to it."""
     @staticmethod
     def forward(ctx,x,mask,weight,bias,cells,eps,activate=False):
+        x=x.contiguous(memory_format=torch.channels_last)
         b,c,h,w=x.shape
         n,p=b*h*w,1024
         t=tr.cdiv(n,p)
