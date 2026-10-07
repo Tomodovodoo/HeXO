@@ -1,7 +1,7 @@
 # HeXO search scheduler
 
-Updated 2026-10-07. Merged source baseline: main `df8f8ee`, including PR439 and PR441.
-PR438 also includes the still-unmerged actor launcher from PR433. Draft work
+Updated 2026-10-07. Merged source baseline: main `21623517`, including PR433,
+PR439, PR441 and PR444. PR438 integrates that baseline privately. Draft work
 is identified below; its presence on this branch does not make it deployed.
 This replaces the October 3 proposal.
 
@@ -32,10 +32,11 @@ of that question.
 | Rectangular inference | Full-board rectangular encoding, packing, fused inference and browser paths with existing weights | PR413 |
 | Retarget and actor records | Avoid redundant eviction scans; retain the raw root prediction; incremental prefix keys | PR425, PR428, PR429 |
 | Proof supply | Wake one worker, close unsupported quiet sides, retry only after fresh work and count supply exclusions | PR415, PR427; PR440 sets opt-in proof defaults |
-| Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 is pending, including a queued-shard naming fix |
+| Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 merged, including the queued-shard naming fix |
+| Actor graph allowance | Retain up to 1024 nodes per native actor game by default | PR444 merged; this changes the configured allowance, not proof of a loaded production binary |
 | Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; an actual GPU trial missed second-root work; diagnosis remains open |
 | Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 merged after actual two-model CUDA validation |
-| Shared proof workers | Lend globally bounded workers across producer loops while graph owners install results | Claimed on issue414; not merged or runtime-verified |
+| Shared proof workers | Lend globally bounded workers across producer loops while graph owners install results | Draft PR443; owner benchmarks in progress and a concurrent cooling-retry admission finding remains open |
 
 These are source deliveries. Native actor/continuous-proof modes remain opt-in.
 They do not establish that production has loaded these binaries, that training
@@ -350,7 +351,10 @@ neural evaluations nor an age measurement. An uncredited estimate can already
 include proof exclusions and the improved-policy transform, so it is not labelled
 as a raw network prediction. A matching completed progress candidate remains
 preferred to a later uncredited final estimate. Exact evidence remains usable
-without neural comparison credits. This reporting correction does not resolve
+without neural comparison credits. The changed existing caller behavior passed
+on private `0b9ce02` using immutable mocked frames, without model or CUDA work.
+It checks inherited and uncredited choices, zero fresh credits and exact
+precedence. It does not verify actual GPU timing. This reporting correction does not resolve
 the missed work. Earlier one-searched-stone
 timing failures are also retained. Measure caller return separately from
 post-return neural/proof drainage and trace capture, installation and publication
