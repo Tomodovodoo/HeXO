@@ -12,7 +12,7 @@ import uuid
 from hexo import Game
 from notation import Record, dumps, loads
 from time_control import Clock, TimeControl, milliseconds
-from timed_engine import TimedEngine, legal_turn
+from timed_engine import TimedEngine, legal_turn, proof_settings
 
 
 class Match:
@@ -296,7 +296,7 @@ def side_settings(path):
         return {}
     settings = json.loads(path.read_text(encoding='utf-8'))
     allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'native_scheduler'},
-                   solver={'enabled', 'nodes', 'leaf'})
+                   solver={'enabled', 'nodes', 'leaf', 'workers', 'budget'})
     if not isinstance(settings, dict) or settings.keys()-allowed.keys():
         raise ValueError('Side settings contain only search and solver objects')
     for group, options in settings.items():
@@ -307,6 +307,9 @@ def side_settings(path):
             raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
         if settings.get('solver', {}).get('leaf'):
             raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+        proof_settings(settings.get('solver', {}))
+    elif {'workers', 'budget'} & settings.get('solver', {}).keys():
+        raise ValueError('Proof workers and budget apply to native timed solving only')
     return settings
 
 

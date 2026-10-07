@@ -3345,6 +3345,22 @@ class NativeProofs(unittest.TestCase):
         self.assertGreater(proofs.stats()['submitted'], 4)
         proofs.drain()
 
+    def test_owner_budget_holds_back_admission_under_load(self):
+        import time
+        def run(budget):
+            pool = self.pool([self.graph(self.opening) for _ in range(16)], quantum=16, views=1, work=1 << 30)
+            proofs = pool.enable_proofs(slice_ms=2, table_mb=1, workers=8, owner_budget=budget)
+            end = time.perf_counter() + 1.5
+            while time.perf_counter() < end:
+                pool.step();self.answer(pool);proofs.step()
+            stats = proofs.stats()
+            pool.cancel();proofs.drain();pool.abandon_fenced()
+            return stats
+        free, capped = run(1.), run(1e-4)
+        # Under a sustained proof flow the capped owner keeps installing but stops admitting new jobs.
+        self.assertGreater(capped['supply_owner_exits'], free['supply_owner_exits'])
+        self.assertLess(capped['submitted'], free['submitted'])
+
     def test_shared_idle_time_goes_to_the_producer_held_back(self):
         import time
         workers = self.shared(workers=2, queue=8)

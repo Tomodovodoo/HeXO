@@ -658,13 +658,15 @@ if (job.kind === 'encode') {
       for (const record of job.records) await session.storage.put('evaluations', record);
       await session.persist(); await session.saving; await session.restore({paused: true});
     }
-    const configured = await session.request('/analysis', {engine: 'test', preset: 'custom', auto: false, custom: {
+    const configured = await session.request('/analysis', job.preset ? {engine: 'test', preset: job.preset, auto: false}
+      : {engine: 'test', preset: 'custom', auto: false, custom: {
       simulations: job.simulations, solver_nodes: job.nodes, leaf_nodes: job.leafNodes || 0, leaf_ms: job.leafQueryMs ?? 10}}, 'POST');
     if (configured[0] !== 200) throw Error(JSON.stringify(configured));
     const requested = await session.request('/analyse', {ply: job.history.length}, 'POST');
     if (requested[0] !== 200) throw Error(JSON.stringify(requested));
     while (session.running || session.jobs.some(j => j.status === 'queued')) await new Promise(r => setTimeout(r, 1));
     answer = session.lookup(job.history);
+    if (job.preset && answer) answer = {...answer, analysis: session.state().analysis, solver_frames: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
     if (!answer) throw Error(JSON.stringify(session.state().jobs));
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,

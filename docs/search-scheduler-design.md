@@ -125,6 +125,27 @@ remaining device time can be filled with useful search. Historical batch-32 back
 rates, single-game rates and sustained actor rates have different shapes and
 supply conditions and cannot be substituted for each other.
 
+The proof owner budget (`native_proof_budget`, `ProofLoop` `owner_budget`) was swept on October 7 with the real
+actor: 128 slots, 384 games, 48-ply cap, 12 shared proof workers, frozen main/200000, logical CPUs 0-15, medians
+of four trials per arm in rotating order (receipts `proof-budget-actor-*-20261007.json`).
+
+| Budget | NN rows/s | Placements/s | Fresh solver nodes | Installed proofs | Proven rows/game | Machine CPU | SM |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.0 | 4,882 | 169 | 9.9M | 2,570 | 3.43 | 50% | 76% |
+| 0.3 | 4,924 | 169 | 10.0M | 2,458 | 2.96 | 49% | 76% |
+| 0.2 | 4,817 | 171 | 9.8M | 2,663 | 3.40 | 49% | 74% |
+| 0.1 | 4,951 | 177 | 7.8M | 2,157 | 3.31 | 42% | 75% |
+| 0.05 | 5,109 | 180 | 3.5M | 1,069 | 2.97 | 26% | 78% |
+| 0.02 | 5,206 | 185 | 1.0M | 362 | 2.57 | 19% | 80% |
+
+At 0.2 and above the cap never binds. At 0.1 the actor keeps 96% of its proven rows and 84% of its installed
+proofs while placements rise 4% and machine CPU falls 8 points; below it the proof work collapses faster than rows
+grow. The actor default is 0.1. Native timed play keeps 2 proof workers and budget 1 (`timed_engine.PROOF_BUDGET`);
+with two workers the owner stays far below any cap. The analysis solver preset (docs/play.md) gives the proof
+workers the whole budget, since there the proof is the answer. Out of the box, the Play page's Standard analysis
+proved 46 of the 66 puzzles in Tom's set, all within 2.2 s, and the other 20 never; a 4-million-node root query
+proved one more.
+
 A general 5x improvement has not been established. Neither an assumed
 100 microseconds/row host cost nor four halving rounds supplies a speed forecast.
 Dependency waves, collisions, shape fragmentation, graph updates and shared

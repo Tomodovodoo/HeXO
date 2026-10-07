@@ -4,6 +4,10 @@ export const PRESETS = {lightning: {simulations: 8, solver_nodes: 2048}, quick: 
   standard: {simulations: 128, solver_nodes: 32768}, strong: {simulations: 512, solver_nodes: 131072},
   deep: {simulations: 2048, solver_nodes: 524288}, dangerous: {simulations: 65536, solver_nodes: 4000000}};
 
+/** The proof workers of the analysis solver preset (play-session.mjs SOLVER): the CPU threads left beside the page,
+ * the search and the root solver, from 1 to 8. */
+export const SOLVER_WORKERS = Math.max(1, Math.min(8, (globalThis.navigator?.hardwareConcurrency || 4) - 2));
+
 /**
  * Registers ../coi-sw.js (cross-origin isolation for static hosts that cannot send headers) and reloads once, so
  * ONNX Runtime's WebAssembly backend can use threads. Resolves false when the page is already isolated or cannot be.
@@ -61,6 +65,7 @@ export class BubbleEngine extends EngineWorker {
     * selects the compiled multi-view feeding path. Optional native_proof runs
     * resident CPU solver slices through that owner's native graph frontier.
    * Optional native_capture uses bounded static WebGPU sessions and combined readback with that owner.
+   * Optional solver_ms (the SOLVER preset) spends up to that long on proof work alone before the turn (worker.mjs proveRoot).
    * Optional leaf_nodes adds
    * a per-turn leaf-proof allowance, capped at 2048 nodes and leaf_ms (default 10) per query. Under a clock
    * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
@@ -74,7 +79,8 @@ export class BubbleEngine extends EngineWorker {
       nativeOwner: budget.native_owner ?? false,
       nativeCapture: budget.native_capture ?? false,
       nativeProof: budget.native_proof ?? false,
-      solverWorkers: budget.solver_workers ?? 1, solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4,
+      solverWorkers: budget.solver_workers ?? (budget.solver_ms ? SOLVER_WORKERS : 1), solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4,
+      proveMs: budget.solver_ms ?? 0,
       leafNodes: budget.leaf_nodes ?? 0, leafQueryMs: budget.leaf_ms ?? 10,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,

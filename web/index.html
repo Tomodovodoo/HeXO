@@ -172,6 +172,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .evalbar i::after{content:"";position:absolute;right:-1px;top:0;bottom:0;width:2px;background:#0b1222}
 .evalbar b{position:absolute;top:0;bottom:0;display:flex;align-items:center;padding:0 12px;font:700 13px var(--mono);color:#0b1222;z-index:1}
 .evalbar b:last-child{right:0}
+.solving{min-height:32px;display:flex;align-items:center;gap:8px;font:13px var(--mono);color:var(--muted)}.solving b{color:var(--c,inherit)}
 .evalbar.idle i{transform:scaleX(.5)!important}.evalbar.idle{opacity:.3}.evalbar.stale{opacity:.55}
 .evalbar.pending::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.22),transparent);animation:sweep 1.2s linear infinite}
 @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
@@ -407,6 +408,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
     <div class="part" id="analysis">
       <div class="engine" id="engine-head"></div>
       <div class="evalbar idle" id="evalbar"><i></i><b id="xv"></b><b id="ov"></b></div>
+      <div class="solving" id="solving" hidden></div>
       <div class="busy" style="margin-top:-8px"><div class="bar" id="analysis-progress" style="visibility:hidden"><i></i></div><span class="stage" id="analysis-stage"></span></div>
       <div class="proof"><span id="xproof"></span><span id="oproof"></span></div>
       <div class="top" id="top"></div>
@@ -940,16 +942,30 @@ function renderEngineHead(){
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:entryOf(it.id)?.preset||'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
+  const solving=a.preset==='solver',solver=entryOf(a.engine)?.kind!=='bubble'?null:el('div',{class:'switch'+(solving?' on':''),role:'switch','aria-checked':solving,tabindex:0,title:'Spend the analysis on proof search until a verified proof or two minutes'},'Solver',el('i'));
+  if(solver)solver.onclick=()=>sendAnalysis({preset:solving?'standard':'solver',custom:undefined});
   const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});setIcon(again,S.jobs.some(j=>j.kind==='analyse')?'close':'again');
   const ev=S.evaluations[view],landed=ev?STOPS.findIndex(p=>entryOf(a.engine)?.presets?.[p]?.simulations===ev.simulations):-1;
-  head.replaceChildren(el('div',{class:'head'},pick,auto,again),...seatControls(a,sendAnalysis,'analysis',configButton('analysis',a),landed));
+  head.replaceChildren(el('div',{class:'head'},pick,auto,...(solver?[solver]:[]),again),...seatControls(a,sendAnalysis,'analysis',configButton('analysis',a),landed));
   head.style.setProperty('--c',COLORS[playerAt(view)]);
 }
 function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=view-1&&view-1<t.ply+t.stones.length)||null}
 /* the evaluation shown for ply p: the saved one, else the search of a running move or analysis of that position;
    its top rows without the stones the search never tried (no policy share, not proven), which older saves kept */
-function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live);
+function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live&&!j.live.solver);
   return j?{value:j.live.value,top:j.live.top,refuted:j.live.refuted,threat:[],pv:[],proof:null,live:true}:null}
+/* the solver preset's panel in place of the evaluation bar: the running search's proof progress, then the proof or
+   the work that found none (`solver` of a saved evaluation, python/play.py prove) */
+function renderSolving(ev,job){
+  const box=$('solving'),on=S.analysis?.preset==='solver'&&!finished();box.hidden=!on;$('evalbar').hidden=on;if(!on)return;
+  const live=job?.live?.solver,done=ev?.solver,n=v=>Number(v||0).toLocaleString(),s=ms=>(ms/1000).toFixed(1)+' s';
+  const proof=ev?.proof;
+  box.replaceChildren(...(proof&&!live?[el('b',{style:`--c:${COLORS[proof.winner]}`},(proof.winner?'O':'X')+' wins'),
+      el('span',{},`in ${proof.plies||'+'+proof.turns} placements`+(done?`, ${s(done.elapsed_ms)}, ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`:''))]
+    :live?[el('span',{},`Proving ${s(live.elapsed_ms)}: root ${n(live.root_nodes)} nodes, frontier ${n(live.frontier)} jobs, ${live.busy}/${live.workers} workers busy`)]
+    :done?[el('span',{},`No proof in ${s(done.elapsed_ms)}: ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`)]
+    :[el('span',{},job?'Starting the solver':'Not analysed yet')]));
+}
 function shownEval(p){const saved=S.evaluations[p],e=saved?.proof?saved:liveAt(p)||saved;if(!e)return e;
   const top=(e.top||[]).filter(t=>t[2]>=.00005||t[4]),refuted=!e.proof&&top.length&&top.every(t=>t[4]<0);
   const value=refuted?(e.node_value??(e.value>0&&e.value<1?e.value:null)):e.value;
@@ -957,6 +973,7 @@ function shownEval(p){const saved=S.evaluations[p],e=saved?.proof?saved:liveAt(p
 function finished(){return S.winner>=0&&view===S.history.length}
 function renderAnalysis(){
   const ev=shownEval(view),side=playerAt(view),bar=$('evalbar'),job=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view);
+  renderSolving(S.evaluations[view],S.jobs.find(j=>j.kind==='analyse'&&j.ply===view&&j.status==='running'));
   const over=finished(),near=ev?view:Math.max(-1,...Object.keys(S.evaluations).map(Number).filter(p=>p<view)),seen=over?null:ev||S.evaluations[near];
   const x=over?(S.winner===0?1:0):seen?.value!=null?(playerAt(ev?view:near)===0?seen.value:1-seen.value):null;
   bar.classList.toggle('idle',x==null);bar.classList.toggle('stale',!over&&!!seen&&!ev);bar.classList.toggle('pending',!!job&&!over);
@@ -991,7 +1008,7 @@ function autoAnalyse(){
   if(S.failedJobs?.some(j=>j.kind==='analyse'&&j.ply===view))return;
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
   const short=!ev||(S.stale||[]).includes(view)||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
-  if(!short||!S.analysis||!S.analysis.auto||job||finished())return;
+  if(!short||!S.analysis||!S.analysis.auto||job||finished()||S.analysis.preset==='solver'&&ev?.proof)return;
   const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
   if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}
 }

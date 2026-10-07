@@ -8,6 +8,9 @@ import {Proofs, proven, proofKey} from './proof.mjs';
 import {stageText} from './stages.mjs';
 import {PV_CHECK} from './search.mjs';
 
+/** The analysis solver preset (python/play.py SOLVER): proof work alone for up to `solver_ms`, then the turn. */
+export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000};
+
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
 /** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
@@ -125,7 +128,8 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
+    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
+      : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
       const least = {ms: 10, nodes: 1, visits: 1, leaf_ms: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
@@ -146,10 +150,10 @@ export class BrowserSession extends OfflineSession {
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
   /** The evaluation of the position whose `position()` text is `at`: by `spec` at exactly its budget when `exact`,
-   * else the deepest by its engine. */
+   * else the deepest by its engine; the solver preset only ever shows its own evaluations (python/play.py keys them apart). */
   lookupAt(at, spec = this.analysis, exact = false) {
     if (!spec) return null;
-    if (exact) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
+    if (exact || spec.budget?.solver_ms) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
     return (this.index.get(`${this.engineKey(spec)}|${at}`) || [])
       .sort((a, b) => Boolean(b.proof) - Boolean(a.proof) || b.simulations - a.simulations || b.solver_nodes - a.solver_nodes || (b.budget?.ms || 0) - (a.budget?.ms || 0) || (b.budget?.nodes || 0) - (a.budget?.nodes || 0))[0] || null;
   }
@@ -193,7 +197,7 @@ export class BrowserSession extends OfflineSession {
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply], ply)), review: turns,
-      review_preset: this.analysis?.preset ?? null,
+      review_preset: this.reviewSpec()?.preset ?? null,
       jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live, stage}) => ({id, kind, status, done, total, error, ply: history.length, side, live, stage}))};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
@@ -203,7 +207,12 @@ export class BrowserSession extends OfflineSession {
   }
   changed() { this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
   /** The review's engine, checkpoint and strength: the analysis slot's, so every verdict compares one budget. */
-  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, custom: this.analysis.budget}) : null; }
+  /** The analysis spec a review uses for every position; the solver preset reviews at Standard (python/play.py review_seat). */
+  reviewSpec() {
+    if (!this.analysis || !this.entries.has(this.analysis.engine)) return null;
+    const preset = this.analysis.preset === 'solver' ? 'standard' : this.analysis.preset;
+    return this.spec({...this.analysis, preset, custom: this.analysis.budget});
+  }
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
@@ -339,6 +348,7 @@ export class BrowserSession extends OfflineSession {
       this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
+      if (body.preset === 'solver') throw Error('The solver preset is for analysis');
       const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
       this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.renewLines(body.side); this.seats[body.side] = seat;
@@ -583,7 +593,7 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0, solver_ms: 0}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
@@ -604,7 +614,7 @@ export class BrowserSession extends OfflineSession {
       if (job.controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       // The move came back at `at`; saving it must not run its clock out.
       if (job.kind === 'move') clearTimeout(this.flag);
-      if (job.refresh) result = {...result, threat: job.refresh.threat ?? []};
+      if (job.refresh) result = {...result, threat: job.refresh.threat ?? [], ...(job.refresh.solver ? {solver: job.refresh.solver} : {})};
       const {graph_id: graph, ...answer} = result;
       result = answer;
       if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph, history.length, !job.refresh)}; job.counted = true; }
