@@ -1158,6 +1158,22 @@ class FusedCudaTests(unittest.TestCase):
         torch.manual_seed(3070)
         model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
         runner = ActorGraph(model, max_batch=128)
+        self.assertEqual(runner.prepare((24,), cancelled=lambda: True), 0)
+        self.assertFalse(runner.graphs)
+        prepared = runner.prepare((24, (24, 32), (32, 24), 32))
+        self.assertGreater(prepared, 0)
+        charged = runner.incremental_reserved_bytes
+        self.assertEqual(runner.prepare((24, (24, 32), (32, 24), 32)), 0)
+        self.assertEqual(runner.incremental_reserved_bytes, charged)
+        with unittest.mock.patch.object(runner, '_capture', side_effect=AssertionError('prepared replay recaptured')):
+            for rows, shape in ((3, (24, 24)), (33, (24, 32)), (65, (32, 24))):
+                x = torch.randint(0, 2, (rows, 8, *shape), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
+                x[:, 3] = 1
+                with torch.autocast('cuda', torch.bfloat16):
+                    expected = model(x, x[:, 3:4], aux=False)
+                out = runner(x.to(torch.uint8))
+                for name in expected:
+                    self.assert_bf16_close(expected[name], out[name])
         inputs, outputs, saved = [], [], []
         for rows, shape in ((7, (24, 72)), (3, (72, 24)), (65, (24, 32)), (100, (32, 24)),
                             (2, (25, 41)), (19, 24), (7, 32), (1, 24), (2, 24), (3, 24), (33, 24), (48, 32),
@@ -1479,8 +1495,8 @@ class DenseConfigTests(unittest.TestCase):
     def test_native_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.1']))
-        self.assertEqual(actor.native_proof_budget, .1)
+        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.3']))
+        self.assertEqual(actor.native_proof_budget, .3)
         for budget in (0., 1.5):
             with self.assertRaisesRegex(ValueError, 'native proof'):
                 dense_config.ActorSettings(native_proof_budget=budget)
@@ -10109,7 +10125,7 @@ class DenseTimedWorker(unittest.TestCase):
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
-                    _timed_native=(None, pool, ('fixed', False, False, 0.)))
+                    _timed_native=(None, pool, ('fixed', False, False, 0., 2, 1.)))
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None

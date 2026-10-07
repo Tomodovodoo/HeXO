@@ -94,7 +94,7 @@ First-stone wins and final half-turns retain the behavior merged in [#228](https
 }
 ```
 
-Players can be `human`, `bubble`, `native`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. `search.max_simulations` optionally caps timed search; otherwise it follows measured throughput. Solver node caps remain inside the clock. `solver.leaf` shares the solver allowance with leaf proofs and certificate verification.
+Players can be `human`, `bubble`, `native`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. `search.max_simulations` optionally caps timed search; otherwise it follows measured throughput. Solver node caps remain inside the clock. With `search.native_scheduler`, `solver.workers` (default 2) sets the proof workers of the turn's native proof frontier and `solver.budget` (default `PROOF_BUDGET` in `timed_engine.py`) the share of the graph owner's time proof steps may take; the same keys work in `timed_match.py --a-settings`. `solver.leaf` shares the solver allowance with leaf proofs and certificate verification.
 
 Creation returns HTTP 202, a `match_id` and `preparing` state. Poll until `ready`, then start. The initial history defaults to the origin. An optional `history` supplies an opening; `turn_cap_ms` adds a maximum time per turn.
 

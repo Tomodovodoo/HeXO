@@ -432,6 +432,22 @@ class Jobs(unittest.TestCase):
         self.assertIsNone(self.session.analyse(1))
         self.assertEqual(self.session.state()['evaluations'][1]['simulations'], PRESETS['bubble']['deep']['simulations'])
 
+    def test_the_solver_preset_round_trips_through_the_analysis_state_and_stays_off_the_seats(self):
+        from play import SOLVER
+        self.session.configure_analysis('bubble:fake', preset='solver', auto=False)
+        analysis = self.session.state()['analysis']
+        self.assertEqual((analysis['preset'], analysis['budget']), ('solver', SOLVER))
+        # The page sends back what it was given.
+        self.session.configure_analysis(analysis['engine'], analysis['checkpoint'], analysis['preset'], analysis['budget'],
+                                        analysis['auto'])
+        self.assertEqual(self.session.state()['analysis'], analysis)
+        self.assertEqual(self.session.review_seat()['budget'], STANDARD)
+        self.assertEqual(self.session.state()['review_preset'], 'standard')
+        with self.assertRaisesRegex(ValueError, 'analysis'):
+            self.session.configure_seat(1, 'bubble:fake', preset='solver')
+        self.session.configure_analysis('bubble:fake', preset='standard', auto=False)
+        self.assertEqual(self.session.state()['analysis']['budget'], STANDARD)
+
     def test_an_analysis_refreshes_the_saved_positions_before_it(self):
         self.session.configure_seat(1, 'human')
         for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 1)]:
@@ -2186,6 +2202,30 @@ class TurnTrees(unittest.TestCase):
         model = hexnet.load_model(self.path)
         return SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=64), sha256='tiny',
                                cache=neural_search.EvaluationCache())
+
+    def test_solver_preset_proves_puzzles_with_a_known_forced_win_within_its_clock(self):
+        import re
+        import tactical_proof
+        from notation import loads
+        from play import Bubble, SOLVER, evaluate, replay
+        if not tactical_proof.library().exists():
+            self.skipTest('Build tools/tactical with tools/build_tactical.py first')
+        prover = tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE, priority='below_normal')
+        self.addCleanup(prover.close)
+        bubble = Bubble(self.path, 'cpu')
+        text = (Path(__file__).parent/'fixtures'/'forced-wins.htttx').read_text(encoding='utf-8')
+        for record in re.split(r'(?=version\[1\];)', text)[1:]:
+            history = [tuple(p) for p in loads(record).history]
+            game = replay(history)
+            mover = game.player
+            game.close()
+            found = evaluate(bubble, prover, history, 8, SOLVER['solver_nodes'], solver_ms=SOLVER['solver_ms'])
+            self.assertEqual(found['proof']['winner'], mover)
+            self.assertLess(found['solver']['elapsed_ms'], SOLVER['solver_ms'])
+            self.assertGreater(found['solver']['root_nodes'] + found['solver']['native_nodes'], 0)
+            game = replay(history + [tuple(m) for m in found['moves']])
+            self.assertTrue(game.winner == mover or game.player != mover)
+            game.close()
 
     def test_a_position_after_the_first_stone_ranks_the_second(self):
         import tactical_proof
