@@ -236,6 +236,33 @@ class NativeRules(unittest.TestCase):
         with self.assertRaises(ValueError):
             game.load_table([1]+[0]*728)
 
+    def test_timed_search_across_dense_line_storage_edge(self):
+        # Search stores lines starting within 32 cells of the origin in a
+        # temporary array. Self-play over its edge on every axis must keep
+        # legal complete turns and exact restoration, and end near their allowance.
+        for direction in ((1, 0), (0, 1), (1, -1), (-1, 0), (0, -1), (-1, 1)):
+            game, reference = self.make_game(), Reference()
+            q, r = direction
+            for step in range(5):
+                move = (8*step*q, 8*step*r)
+                game.play(*move)
+                reference.play(*move)
+            for _ in range(10):
+                if game.winner >= 0:
+                    break
+                before = (game.key, game.state(), game.features())
+                result = game.search(30)
+                self.assertEqual((game.key, game.state(), game.features()), before)
+                # A guard against runaway searches, not a timing benchmark.
+                self.assertLess(result["elapsed_ms"], 1000)
+                side = game.player
+                for move in result["moves"]:
+                    self.assertTrue(reference.legal(*move))
+                    game.play(*move)
+                    reference.play(*move)
+                self.assertTrue(game.winner >= 0 or game.player != side)
+                self.assert_state(game, reference)
+
     def test_native_full_turn_win_and_two_cell_defense(self):
         for theirs in ([(0, 2), (2, 2), (3, 2), (5, 2)],
                        [(0, 3), (2, 3), (4, 3), (6, 3)]):
