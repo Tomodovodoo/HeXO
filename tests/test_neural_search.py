@@ -2377,7 +2377,7 @@ class NativeProofs(unittest.TestCase):
         history=[[0,0],[4,0],[7,0],[-1,0],[-2,0]]
         endpoint=history+[[5,0],[6,0],[2,0],[8,0]]
         graph=self.graph(history)
-        winner=self.graph(self.opening)
+        winner=self.graph(self.opening+[[3,0],[4,0],[7,8],[8,8]])
         pool=self.pool([graph,winner],quantum=16,views=8,depth=1,work=1024)
         proofs=pool.enable_proofs(slice_ms=8,table_mb=1,workers=1,queue=2,endpoints=8)
         pool.step();self.answer(pool);proofs.step()
