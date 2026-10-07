@@ -86,7 +86,8 @@ struct Broker {
  // Optional repeated admission observations and owner wall spans, not occupancy.
  bool profile_enabled=false,interleave_feedback=false,progress_enabled=false;std::array<uint64_t,38> schedule{};
  std::vector<std::pair<int,int>> model_rows;
- std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
+ std::atomic<bool> cancelled=false;Clock::time_point cancelled_at{};
+ bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
  std::string error;
  struct Retired {std::unique_ptr<owner::Pool> pool;std::unique_ptr<owner::Owner> game;};
@@ -270,10 +271,14 @@ struct Broker {
   {std::lock_guard lock(mutex);if(error.empty())error=message;}cancel();
  }
  void cancel(){
-  cancelled=true;
-  {std::lock_guard lock(mutex);for(auto& p:producers)if(p && p->pool.proof_owner)hxp_cancel(p->pool.proof_owner);}
+  auto when=Clock::now();
+  {std::lock_guard lock(mutex);
+   if(!cancelled){cancelled_at=when;cancelled=true;}
+   for(auto& p:producers)if(p && p->pool.proof_owner)hxp_cancel(p->pool.proof_owner);
+  }
   wake.notify_all();
  }
+ Clock::time_point stop_time(){std::lock_guard lock(mutex);return cancelled?cancelled_at:Clock::now();}
  void start(double ms){
   std::unique_lock lock(mutex);
   if(started || std::none_of(producers.begin(),producers.end(),[](const auto& p){return bool(p);}) || !std::isfinite(ms) || ms<0)throw std::runtime_error("Invalid inference service start");
@@ -638,7 +643,6 @@ inline void Producer::run()noexcept{
   // before slow proof drainage or device snapshot cleanup, exactly once.
   if(broker.continuous){
     for(size_t i=0;i<active.size();++i)if(active[i]){
-     if(pool.games[i]->expired())pool.games[i]->deadline=true;
      auto token=active[i];auto event=result(int(i),token);
      active[i]=0;broker.publish(*this,int(i),token,std::move(event));
     }
@@ -660,7 +664,7 @@ inline RootEvent Producer::unsearched(const Command& command){
  // This command never became a root. Its completion must carry its own history,
  // not statistics or actions borrowed from the previous generation.
  std::ostringstream out;
- bool expired=command.ms>0 && std::chrono::duration<double,std::milli>(Clock::now()-command.queued).count()>=command.ms;
+ bool expired=command.ms>0 && std::chrono::duration<double,std::milli>(broker.stop_time()-command.queued).count()>=command.ms;
  out<<"{\"producer\":"<<index<<",\"model\":"<<model<<",\"game\":"<<command.game<<",\"token\":"<<command.token<<",\"error\":\""<<(expired?"deadline":"cancelled")<<"\",\"history\":[";
  for(size_t i=0;i<command.cells.size();i+=2){if(i)out<<',';out<<'['<<command.cells[i]<<','<<command.cells[i+1]<<']';}
  out<<"]}";return out.str();
@@ -685,6 +689,10 @@ inline std::vector<Cell> winning_turn(owner::Owner& owner,Cell first){
 inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
  auto build_start=broker.progress_enabled?Clock::now():Clock::time_point{};
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
+ // Only the owner reads root clocks. Late owner work or teardown must not turn
+ // an explicit stop into a deadline, including when cancellation is repeated.
+ if(!sequence && o.stopped && broker.cancelled)
+  o.deadline=o.time_limit_ms>0 && std::chrono::duration<double,std::milli>(broker.stop_time()-o.started).count()>=o.time_limit_ms;
  auto finish=[&](RootEvent result){
   if(broker.progress_enabled){result.built=Clock::now();result.timing("result_build_ms",std::chrono::duration<double,std::milli>(result.built-build_start).count());result.timing("result_ready_elapsed_ms",o.elapsed());}
   return result;
