@@ -441,6 +441,7 @@ class Jobs(unittest.TestCase):
         self.session.configure_analysis(analysis['engine'], analysis['checkpoint'], analysis['preset'], analysis['budget'],
                                         analysis['auto'])
         self.assertEqual(self.session.state()['analysis'], analysis)
+        self.assertEqual(self.session.review_seat()['budget'], STANDARD)
         with self.assertRaisesRegex(ValueError, 'analysis'):
             self.session.configure_seat(1, 'bubble:fake', preset='solver')
         self.session.configure_analysis('bubble:fake', preset='standard', auto=False)

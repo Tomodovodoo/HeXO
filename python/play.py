@@ -2176,11 +2176,13 @@ class Session:
 
     def review_seat(self):
         """The analysis engine, checkpoint and strength (its preset, or its custom budget): a review uses it for every
-        position, so each verdict compares evaluations made with one budget."""
+        position, so each verdict compares evaluations made with one budget. The solver preset reviews at Standard:
+        a review is a pooled search, not a proof hunt per position."""
         if not self.analysis:
             return None
         a = self.analysis
-        return self.seat(a['engine'], a['checkpoint'], a['preset'], a['budget'] if a['preset'] == 'custom' else None)
+        preset = 'standard' if a['preset'] == 'solver' else a['preset']
+        return self.seat(a['engine'], a['checkpoint'], preset, a['budget'] if preset == 'custom' else None)
 
     def review_target(self):
         """(store key, budget) of the review evaluations, the key None without an analysis model."""

@@ -207,7 +207,12 @@ export class BrowserSession extends OfflineSession {
   }
   changed() { this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
   /** The review's engine, checkpoint and strength: the analysis slot's, so every verdict compares one budget. */
-  reviewSpec() { return this.analysis && this.entries.has(this.analysis.engine) ? this.spec({...this.analysis, custom: this.analysis.budget}) : null; }
+  /** The analysis spec a review uses for every position; the solver preset reviews at Standard (python/play.py review_seat). */
+  reviewSpec() {
+    if (!this.analysis || !this.entries.has(this.analysis.engine)) return null;
+    const preset = this.analysis.preset === 'solver' ? 'standard' : this.analysis.preset;
+    return this.spec({...this.analysis, preset, custom: this.analysis.budget});
+  }
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
@@ -588,7 +593,7 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0, solver_ms: 0}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
