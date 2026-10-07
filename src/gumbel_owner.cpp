@@ -82,8 +82,12 @@ struct Owner {
   if(!node.expanded || node.exact_winner>=0 || v.depth>=max_depth)return;
   if(candidates.size()>=14336){
    std::vector<std::pair<double,Key>> victims;for(auto& [key,c]:candidates)if(c.depth && !c.active)victims.push_back({c.relevance/std::sqrt(1.+c.completed),key});
-   std::sort(victims.begin(),victims.end(),[](const auto& a,const auto& b){if(a.first!=b.first)return a.first<b.first;if(a.second.a!=b.second.a)return a.second.a<b.second.a;return a.second.b<b.second.b;});
-   size_t drop=std::min(size_t(2048),victims.size());for(size_t i=0;i<drop;++i){candidates.erase(victims[i].second);++reclaimed;}
+   auto lower=[](const auto& a,const auto& b){if(a.first!=b.first)return a.first<b.first;if(a.second.a!=b.second.a)return a.second.a<b.second.a;return a.second.b<b.second.b;};
+   size_t drop=std::min(size_t(2048),victims.size());auto end=victims.begin()+drop;
+   // Only the lowest-ranked victims need ordering; retain the same removal order.
+   if(drop<victims.size())std::nth_element(victims.begin(),end,victims.end(),lower);
+   std::sort(victims.begin(),end,lower);
+   for(size_t i=0;i<drop;++i){candidates.erase(victims[i].second);++reclaimed;}
   }
   t.current(node);auto q=t.transformed(node);double maximum=-1e300,total=0;int legal=0;
   for(size_t i=0;i<q.size();++i){q[i]=node.edges[i].read().eligible?q[i]+node.edges[i].logit:-std::numeric_limits<double>::infinity();if(node.edges[i].read().eligible){maximum=std::max(maximum,q[i]);++legal;}}

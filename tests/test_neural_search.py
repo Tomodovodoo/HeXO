@@ -1968,6 +1968,26 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(row['root_estimate'], 0.)
             self.assertEqual(row['raw_value'], 0.)
 
+        # Repeated continuations reclaim inactive candidates, then revisit
+        # the same focus and a different focus without losing legal coverage.
+        pool.retarget(0, [(0,0)], work=8192)
+        self.finish(pool)
+        self.assertGreater(pool.games[0].stats()['reclaimed'], 0)
+        for history in ([(0,0)], [(0,0),(1,2),(3,-1)]):
+            pool.retarget(0, history, work=256)
+            self.finish(pool)
+            evidence = pool.games[0].evidence()
+            game = Game(history)
+            try:
+                self.assertEqual(evidence['actions'].tolist(), [list(a) for a in game.legal_moves()])
+                self.assertIn(pool.games[0].choice(), evidence['actions'].tolist())
+            finally:
+                game.close()
+            stats = pool.games[0].stats()
+            self.assertEqual(stats['issued'], stats['completed']+stats['cancelled'])
+            self.assertEqual((stats['pending'], pool.feed.stats()['pending_rows']), (0,0))
+            self.assertEqual(int(evidence['lifetime_credits'].sum()), stats['root_completed'])
+
     def test_new_continuations_skip_positions_proven_after_discovery(self):
         from neural_search import checked
         graph = self.graph()

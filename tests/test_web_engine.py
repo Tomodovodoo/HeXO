@@ -826,8 +826,9 @@ class Bundle(unittest.TestCase):
 
     def test_native_browser_owner_preserves_legal_breadth_and_sampling_credits(self):
         history = [[0,0],[4,0],[7,0]]
-        answer = node(dict(kind='native-owner', history=history, work=512, delay=2, batchSize=4))
+        answer = node(dict(kind='native-owner', history=history, work=8192, delay=2, batchSize=4))
         result, stats = answer['result'], answer['stats']
+        self.assertGreater(stats['reclaimed'], 0)
         game = play.Game(history)
         try: self.assertEqual(sorted(result['actions']), sorted([list(p) for p in game.legal_moves()]))
         finally: game.close()
