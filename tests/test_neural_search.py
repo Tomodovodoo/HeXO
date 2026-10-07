@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 from hexo import Game
 from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, SearchCoordinator, native
+from tests import PATIENCE
 from tests.reference import Reference
 
 class Uniform:
@@ -34,6 +35,15 @@ class Ranked(Uniform):
     """Logit -2k for the k-th legal move in native order, so a move's prior rank is its index."""
     def evaluate(self, histories):
         return [dict(p, logits=-2.*np.arange(len(p['actions']))) for p in super().evaluate(histories)]
+
+def take_owed(service, limit, *out):
+    """hxb_take for a batch the producers owe: retries its 1 s wait until a batch or an error, or PATIENCE runs out."""
+    import time
+    end = time.monotonic()+PATIENCE
+    while not (count := native.hxb_take(service, limit, 1000., *out)) and time.monotonic() < end:
+        pass
+    return count
+
 
 def recorded_position(ply=12):
     """The first `ply` placements of the first game in tests/fixtures/actor_selfplay.npz."""
@@ -1590,7 +1600,7 @@ class NativeScheduler(unittest.TestCase):
             service.retarget(0,0,history,work=16,views=1)
             service.retarget(0,1,[(0,0)],work=16,views=1)
             counts = np.empty(10,np.uint64)
-            until = time.monotonic()+2
+            until = time.monotonic()+PATIENCE
             while time.monotonic()<until:
                 native.hxb_stats(service.ptr,counts.ctypes.data)
                 if counts[0]:break
@@ -1632,7 +1642,7 @@ class NativeScheduler(unittest.TestCase):
             # Requests share a task only while one is queued. Both identical producers ask for their root before any
             # answer, so hold the batches until their requests have met, however the threads are scheduled.
             counters = np.zeros(10, np.uint64)
-            deadline = time.monotonic()+30
+            deadline = time.monotonic()+PATIENCE
             while not counters[1] and time.monotonic() < deadline:
                 time.sleep(.001)
                 native.hxb_stats(service, counters.ctypes.data)
@@ -1691,7 +1701,7 @@ class NativeScheduler(unittest.TestCase):
         try:
             self.assertTrue(native.hxb_attach(service, pool.ptr, 0))
             self.assertTrue(native.hxb_start(service, 1000.))
-            count = native.hxb_take(service,128,1000.,C.byref(token),C.byref(model),C.byref(snapshot))
+            count = take_owed(service,128,C.byref(token),C.byref(model),C.byref(snapshot))
             self.assertGreater(count,0)
             self.assertEqual(native.hxb_join(service),0)
             self.assertEqual(native.hxb_free(service),0)
@@ -1729,13 +1739,13 @@ class NativeScheduler(unittest.TestCase):
                 try:
                     self.assertTrue(native.hxb_attach(service,pool.ptr,0))
                     self.assertTrue(native.hxb_start(service,0.))
-                    until=time.monotonic()+1
+                    until=time.monotonic()+PATIENCE
                     while time.monotonic()<until:
                         native.hxb_stats(service,counters.ctypes.data)
                         if counters[0]>=2:break
                         time.sleep(.001)
                     self.assertEqual(counters[0],2)
-                    count=native.hxb_take(service,1,1000.,C.byref(token),C.byref(model),C.byref(snapshot))
+                    count=take_owed(service,1,C.byref(token),C.byref(model),C.byref(snapshot))
                     self.assertEqual(count,1)
                     for group in range(native.hxgp_groups(snapshot)):
                         info=np.empty(3,np.int64)
@@ -1751,7 +1761,7 @@ class NativeScheduler(unittest.TestCase):
                     token.value=0
                     # The other cold root remains unsent. Its neighbor must
                     # install this result and supply useful continuations.
-                    until=time.monotonic()+1
+                    until=time.monotonic()+PATIENCE
                     while time.monotonic()<until:
                         native.hxb_stats(service,counters.ctypes.data)
                         if counters[0]>2 and native.hxb_installed(service)==1:break
@@ -2276,7 +2286,7 @@ class NativeScheduler(unittest.TestCase):
             service.start(continuous=True)
             for game in range(len(graphs)):
                 service.release(0, game, expected=0)
-            released, end = set(), time.monotonic()+5
+            released, end = set(), time.monotonic()+PATIENCE
             while len(released)<len(graphs) and time.monotonic()<end:
                 event = service.event()
                 if event is None:
@@ -2289,7 +2299,7 @@ class NativeScheduler(unittest.TestCase):
                 graph.close()
             for game in range(len(graphs)):
                 service.replace(0, game, self.graph(), expected=1, views=1)
-            replaced, end = set(), time.monotonic()+5
+            replaced, end = set(), time.monotonic()+PATIENCE
             while len(replaced)<len(graphs) and time.monotonic()<end:
                 stats = service.stats()
                 self.assertLessEqual(stats['reclaim_queued']+stats['reclaim_active']+stats['reclaim_reserved'], 2)
@@ -2319,7 +2329,7 @@ class NativeScheduler(unittest.TestCase):
             service.start(continuous=True)
             for game in range(len(graphs)):
                 service.release(0, game, expected=0)
-            released, end = set(), time.monotonic()+5
+            released, end = set(), time.monotonic()+PATIENCE
             while len(released)<len(graphs) and time.monotonic()<end:
                 event = service.event()
                 if event is None:
@@ -2355,7 +2365,7 @@ class NativeProofs(unittest.TestCase):
     def loop(self, pool, **options):
         return pool.enable_proofs(slice_ms=1000, table_mb=1, **options)
 
-    def wait(self, predicate, seconds=5):
+    def wait(self, predicate, seconds=PATIENCE):
         import time
         end = time.monotonic()+seconds
         while not predicate():
@@ -2905,7 +2915,7 @@ class NativeProofs(unittest.TestCase):
                     @C.CFUNCTYPE(ptr,ptr,C.c_char_p)
                     def query(worker,request):
                         answer=actual(worker,request)
-                        entered.set();release.wait(5)
+                        entered.set();release.wait(PATIENCE)
                         return answer
                     names=('worker_new','worker_free','worker_answer','answer_info','answer_moves',
                            'answer_json','answer_free','free','prepare','cancel','release','worker_busy')
@@ -2920,8 +2930,8 @@ class NativeProofs(unittest.TestCase):
                         checked(native.hxb_feedback(service,feedback))
                         checked(native.hxb_attach(service,pool.ptr,0))
                         checked(native.hxb_start(service,0.))
-                        self.assertTrue(entered.wait(2))
-                        self.assertGreater(native.hxb_take(service,128,1000.,C.byref(token),
+                        self.assertTrue(entered.wait(PATIENCE))
+                        self.assertGreater(take_owed(service,128,C.byref(token),
                                                            C.byref(model),C.byref(snapshot)),0)
                         release.set()
                         counters=np.empty(10,np.uint64)
