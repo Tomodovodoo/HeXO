@@ -79,9 +79,10 @@ export class BubbleEngine extends EngineWorker {
       ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
-  /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */
+  /** Loads network `checkpoint` (a NETWORKS name, the default when null) and starts the PROOF_WORKERS proof workers, so
+   * a timed turn does not spend its clock on either. */
   prepare(checkpoint = null, options = {}) {
-    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model}, options);
+    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model, proofWorkers: PROOF_WORKERS}, options);
   }
 
   /** Network predictions [{actions, logits, q}] for each history, as hexnet.DenseEvaluator gives them (q broadcast). */

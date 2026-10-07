@@ -1,5 +1,5 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
- * In: {type: 'load', options} | {type: 'use', id, model}
+ * In: {type: 'load', options} | {type: 'use', id, model, proofWorkers}
  *     | {type: 'turn', id, history, model, simulations, solverNodes, solverWorkers, batchSize, qRangeFloor, ms, line, known}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats} | {type: 'evaluate', id, histories}.
  * Out: {type: 'progress', id?, fraction, stage?} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
@@ -557,7 +557,12 @@ onmessage = async ({data}) => {
   try {
     if (data.type === 'load') postMessage({type: 'ready', device: await load(data.options)});
     else if (data.type === 'turn') postMessage({type: 'result', id: data.id, result: await turn(data)});
-    else if (data.type === 'use') { await gameTurn; await use(data.model, new Stages(postMessage, data.id)); postMessage({type: 'result', id: data.id, result: null}); }
+    else if (data.type === 'use') {
+      await gameTurn; await use(data.model, new Stages(postMessage, data.id));
+      // A turn reports proof workers that cannot start; here they only start early.
+      if (data.proofWorkers) await unlessCancelled(data.id, proofWorkers(data.proofWorkers).catch(() => null));
+      postMessage({type: 'result', id: data.id, result: null});
+    }
     else if (data.type === 'bench') postMessage({type: 'result', id: data.id, result: await bench(data)});
     else if (data.type === 'evaluate') {
       const leaves = data.histories.map(history => ({history, actions: native.legal(history)}));

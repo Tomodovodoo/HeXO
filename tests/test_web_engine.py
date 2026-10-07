@@ -938,6 +938,11 @@ class Bundle(unittest.TestCase):
         self.assertIn('nested workers are not allowed', result['solver_error'])
         self.assertTrue(all(stats['completed'] >= 32 for stats in result['scheduler']))
 
+    def test_proof_workers_start_before_the_clock_and_serve_the_turn(self):
+        answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, warm=True))
+        self.assertEqual((answer['warmed'], answer['after']), (2, 2))
+        self.assertEqual(len(answer['moves']), 2)
+
     def test_a_refresh_budget_below_one_quantum_still_searches(self):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))
         self.assertEqual(len(result['moves']), 2)

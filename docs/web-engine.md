@@ -18,7 +18,8 @@ during each stone's search; 0 solver nodes means no proof work. There are `PROOF
 (`bubble.mjs`), each a Web Worker: half of `navigator.hardwareConcurrency` less one, from 1 to 8, so the main
 thread and inference keep the other half; ONNX Runtime's WebAssembly build alone asks for up to 8 threads. An
 8-thread laptop gets 3 proof workers, a 16-thread desktop 7, and 18 threads or more get 8. The solver preset uses the
-same count.
+same count. The workers start with the network (`BubbleEngine.prepare`), before a move's clock runs. Bubble's engine
+version starts with `hybrid`, so the page does not reuse evaluations an older page saved with its per-leaf search.
 
 ```sh
 python tools/build_web.py wasm                      # gumbel, native, tactical and six wasm (committed)

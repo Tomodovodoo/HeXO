@@ -482,6 +482,7 @@ if (job.kind === 'encode') {
   const solver = await loadTactical(new URL('../../web/engine/tactical.wasm', import.meta.url).href);
   const messages = [], queries = [], evaluations = [], workerUrl = new URL('../../web/engine/worker.mjs', import.meta.url);
   const glimpsing = job.kind === 'glimpse', mover = native.game(job.history).player;
+  let prepares = 0;
   let graph = null;
   const context = {Native, EvaluationCache, GameGraph, NativeOwner, createModule, principalVariation, topRows,
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
@@ -501,7 +502,7 @@ if (job.kind === 'encode') {
     Worker: class {
       constructor() { if (job.noWorkers) throw new Error('nested workers are not allowed'); }
       postMessage({id, history, options, prepare, request, cancel}) {
-        if (prepare) { if (!job.stallPrepare) queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
+        if (prepare) { prepares++; if (!job.stallPrepare) queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
         if (request) {
           const {history,...options} = request;
           // A worker's answer arrives as a task, so the owner's turn can run between proof slices.
@@ -552,6 +553,12 @@ if (job.kind === 'encode') {
     answer = session.lookup(job.history);
     if (job.preset && answer) answer = {...answer, analysis: session.state().analysis, solver_frames: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
     if (!answer) throw Error(JSON.stringify(session.state().jobs));
+  } else if (job.warm) {
+    // The page's prepare call starts the proof workers before any clock runs; the turn then reuses them.
+    await context.onmessage({data: {type: 'use', id: 1, model: 'test', proofWorkers: 2}});
+    const warmed = prepares;
+    await context.onmessage({data: {type: 'turn', id: 2, history: job.history, simulations: job.simulations, solverNodes: job.nodes, solverWorkers: 2}});
+    answer = {warmed, after: prepares, moves: messages.find(m => m.id === 2 && m.type === 'result')?.result.moves};
   } else if (job.stallPrepare) {
     // The proof workers never answer their preparation; a cancel 50 ms in must still end the turn.
     const started = performance.now();
