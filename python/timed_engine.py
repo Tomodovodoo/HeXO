@@ -510,6 +510,14 @@ def _worker(connection, cancellation, config):
             player.evaluator.evaluate([[(0, 0)]])
             player.batch_seconds = time.monotonic()-t0
             identity = dict(checkpoint=player.checkpoint, model_sha256=player.model_sha256)
+            if player.evaluator.graph is not None:
+                started = time.monotonic()
+                prepared = player.evaluator.graph.prepare((24, (24, 32), (32, 24), 32,
+                    (24, 40), (40, 24), (32, 40), (40, 32), 40), cancelled=cancellation.is_set)
+                identity['capture_preparation'] = dict(captures=prepared,
+                    milliseconds=(time.monotonic()-started)*1000,
+                    incremental_bytes=player.evaluator.graph.incremental_reserved_bytes,
+                    budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
                                  q_range_floor=search.get('q_range_floor', 0.),
