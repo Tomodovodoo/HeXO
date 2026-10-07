@@ -536,7 +536,7 @@ class RestartActorTests(unittest.TestCase):
         model = tiny_model()
         model.cache.capacity = 0
         history = [list(m) for m in winning_game()[:9]]
-        settings = replace(dense_config.ActorSettings(), full_sims=4, cheap_sims=2, root_samples=2,
+        settings = replace(dense_config.ActorSettings(hybrid_scheduler=False), full_sims=4, cheap_sims=2, root_samples=2,
                            max_plies=len(history)+30, full_fraction=1., opening_random_plies=0.,
                            solver_root_nodes=135, solver_fixed_budgets=True, adjudicate_proven=True,
                            proven_line_rows=True)

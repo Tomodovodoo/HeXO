@@ -43,7 +43,7 @@ def tiny_model():
 def settings(**changes):
     base = dict(full_sims=8, cheap_sims=4, root_samples=4, max_plies=40, full_fraction=.5, opening_random_plies=3.,
                 leaf_batch=64)
-    return replace(dense_config.ActorSettings(), **{**base, **changes})
+    return replace(dense_config.ActorSettings(hybrid_scheduler=False), **{**base, **changes})
 
 
 def run(slots, asynchronous=True, schedule=None):

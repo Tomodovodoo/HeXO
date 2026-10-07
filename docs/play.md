@@ -235,7 +235,34 @@ Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Drip 
 A Bubble seat, served or in the browser, keeps one search graph for its game (a `GameGraph`, see
 [neural-search.md](neural-search.md)), adding each turn's simulations to the visits already under the position until
 undo, a new or loaded game or a seat change, so its moves are saved with the kept-tree evaluations and never read
-back from the store. Each of its searches runs the principal-variation check with a quarter of the simulations.
+back from the store.
+
+### How Bubble searches
+
+Every Bubble search on the served page runs on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)):
+analysis, Auto analysis, deepening, refresh, review, engine turns and matches. Each stone of a turn is one search of
+the game graph at that position. A native graph owner spends the preset's simulations there as completed
+simulations over up to eight views: the position itself and positions below it that its own evidence ranks, at most
+eight placements down. Each view searches in quanta of up to 64 simulations (fewer when the budget is smaller), with
+16 sampled root candidates and the round barrier, and the network batches of every view share one queue of up to
+128 rows. A position's simulations therefore mean neural work spent around it, not visits at its root alone.
+
+A preset's solver nodes keep two jobs. They are the budget of the root queries (a forced win for the side to move,
+the opponent's threat if it moved now, and the defence when a threat or a known proof makes one worth asking), and
+when they are above 0 each search also runs a proof frontier: the owner hands the positions its search reaches to
+native proof workers, each answer checked before it enters the graph, and every position the frontier proves joins
+the game's proof table. Each lane (engine moves, and analysis with review) has one set of proof workers, four fewer
+than the machine's threads and between 2 and 12, shared by all of its searches; the frontier may take the owner's
+whole time. Solver nodes 0 turns both off, and so does a missing tactical build.
+
+| Preset | Work per stone | Owner quantum | Root query nodes | Proof frontier |
+|---|---|---|---|---|
+| Lightning | 8 | 8 | 2,048 | on |
+| Quick | 32 | 32 | 2,048 | on |
+| Standard | 128 | 64 | 32,768 | on |
+| Strong | 512 | 64 | 131,072 | on |
+| Deep | 2,048 | 64 | 524,288 | on |
+| Dangerous | 65,536 | 64 | 4,000,000 | on |
 
 ### By hand
 
@@ -285,13 +312,12 @@ The analysis engine is a Bubble checkpoint with its own preset. Analysis and rev
 model, beside the one that plays engine moves, so they keep up during play. With Auto on it evaluates every
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
 position through every preset, Lightning first, showing each as it lands and starting again when the position
-changes. That deepening runs last in the queue, gives way to any other analysis and slows down while an engine
-seat searches. Each preset continues the search of the one before on the same position, adding only the
+changes. That deepening runs last in the queue, gives way to any other analysis and holds its network work while
+an engine seat searches. Each preset continues the search of the one before on the same position, adding only the
 simulations it lacks, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
 (their engine key ends in `:kept`), shown like them, and never used by review. All analysis of one game searches one
 game graph, kept until undo or a new or loaded game: a position reached from several analysed positions is one node,
-and the visits and values a search finds there count for every position before it. Each search runs the
-principal-variation check with a quarter of the simulations. When an analysis lands, the saved analyses of the four
+and the visits and values a search finds there count for every position before it. When an analysis lands, the saved analyses of the four
 placements before it that came from the same graph are searched again with a quarter of their budget, so stepping
 back shows what the later search found; any other position of the game the graph has changed since its analysis is
 searched again the same way when you step to it. That search goes on from the visits the graph holds there. The share of the improved policy saturates at high budgets: its Q weight grows with the visits, so a
@@ -322,9 +348,9 @@ evaluation with a shallow one. It evaluates every position of the game, the ones
 a review costs about twice the turns. The Review button carries that preset's mark and counts the positions done. It evaluates the missing positions from the
 last one backwards, so what a later position proves is already known when an earlier one is searched, in pooled
 steps: the solver queries run on four tactical workers at once, each distinct position solved once and its proof
-added to the game's proof table, then fresh trees, one per position, search together with that table so their
-leaves share network batches (64 on CPU, 256 on CUDA). Between
-steps it gives way to more urgent analysis, and it slows down while an engine seat searches. It labels each turn
+added to the game's proof table, then fresh game graphs, one per position, search together with that table on one
+hybrid scheduler pool, so their owners share network batches and proof workers. Between
+steps it gives way to more urgent analysis, and it holds its network work while an engine seat searches. It labels each turn
 from the mover's win probability before and after it, and each stone the same way on its own. A first stone is
 judged against the engine's stones from the turn start, a second stone against the engine's second stone given
 the first one actually played. A position after a first stone lists the candidates for the second stone and its
@@ -359,8 +385,8 @@ The Solver switch beside Auto analysis sets the analysis to the solver preset, f
 forced win is the answer you want. Each analysis then spends up to two minutes on proof work alone and stops as soon
 as a verified proof for either side arrives. Two provers run side by side: the tactical solver asks the root for a
 win of the side to move with 32,768 nodes and four times as many each round, and a hybrid scheduler search of the
-position feeds the proof workers (up to 12, four fewer than the machine's threads) the positions its neural search
-reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar: time, root nodes,
+position feeds the analysis lane's proof workers (up to 12, four fewer than the machine's threads) the positions its
+neural search reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar: time, root nodes,
 queued and running proof jobs, busy workers, then the winner and distance, or the nodes and certificates spent
 without a proof. The turn and candidates are searched afterwards at the Standard simulations, from the proven turn
 when there is one. Solver evaluations are saved under their own key (`~solver120000`) and their proofs join the

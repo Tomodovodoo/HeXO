@@ -3,11 +3,11 @@
 Bubble can run as a Six engine with its promoted checkpoint:
 
 ```text
-python python/six_engine.py serve --run runs/dense-v1 --device cpu --simulations 128 --solver-nodes 32768
+python python/six_engine.py serve --run runs/dense-v1 --device cpu --simulations 128
 ```
 
 `--model path/to/ema.pt` selects one export directly instead of `--run`. `--device auto` uses CUDA when available;
-`cpu` keeps it off the GPU. The server accepts `position radius 8 moves ...`, `go`, `stop`, and the standard
+`cpu` keeps it off the GPU. `--simulations` caps each turn's search, and `--no-solver` turns off its proofs. The server accepts `position radius 8 moves ...`, `go`, `stop`, and the standard
 handshake and game commands. It rejects `setup`, `tomove`, and other radii. `go movetime` limits the complete
 turn. `xtime`, `otime`, `xinc`, `oinc` supply full clocks; the UCI clock names are also accepted. `stop` and
 `isready` remain responsive during search. See [timed matches and the clock API](time-controls.md).

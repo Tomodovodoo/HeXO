@@ -12,7 +12,7 @@ import uuid
 from hexo import Game
 from notation import Record, dumps, loads
 from time_control import Clock, TimeControl, milliseconds
-from timed_engine import TimedEngine, legal_turn, proof_settings, saved_ids
+from timed_engine import SETTINGS, TimedEngine, check_settings, legal_turn, saved_ids
 
 
 class Match:
@@ -292,24 +292,14 @@ def play_turn(match, engine, *, wait_worker=False, record_engine=False):
 
 
 def side_settings(path):
+    """The search and solver overrides of one Bubble side, read from JSON file `path` and checked as
+    `timed_engine.check_settings`; {} without a path."""
     if path is None:
         return {}
     settings = json.loads(path.read_text(encoding='utf-8'))
-    allowed = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'hybrid_scheduler'},
-                   solver={'enabled', 'nodes', 'leaf', 'workers', 'budget'})
-    if not isinstance(settings, dict) or settings.keys()-allowed.keys():
+    if not isinstance(settings, dict) or settings.keys()-SETTINGS.keys():
         raise ValueError('Side settings contain only search and solver objects')
-    for group, options in settings.items():
-        if not isinstance(options, dict) or options.keys()-allowed[group]:
-            raise ValueError(f'Unsupported {group} settings: {options}')
-    if settings.get('search', {}).get('hybrid_scheduler') and settings.get('search', {}).get('enabled', True) and settings.get('solver', {}).get('enabled', True):
-        if 'nodes' in settings.get('solver', {}):
-            raise ValueError('Hybrid timed solving uses time slices; omit solver.nodes or disable hybrid_scheduler')
-        if settings.get('solver', {}).get('leaf'):
-            raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
-        proof_settings(settings.get('solver', {}))
-    elif {'workers', 'budget'} & settings.get('solver', {}).keys():
-        raise ValueError('Proof workers and budget apply to hybrid timed solving only')
+    check_settings(settings.get('search', {}), settings.get('solver', {}))
     return settings
 
 
@@ -392,7 +382,6 @@ def main(argv=None):
     parser.add_argument('--sprt', action='store_true', help='Stop at a completed pair on SPRT 0 vs +30 Elo')
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
     parser.add_argument('--net-kernels', choices=['fused', 'reference'], default='fused')
-    parser.add_argument('--solver-nodes', type=int, help='Legacy solver nodes per query (default32768);0 disables solving')
     parser.add_argument('--concurrency', type=int, choices=[1], default=1)
     parser.add_argument('--max-placements', type=int, default=512)
     parser.add_argument('--out', type=Path, required=True)
@@ -421,12 +410,9 @@ def main(argv=None):
                 resolved = checkpoint
             checkpoints[checkpoint] = resolved
         checkpoint = checkpoints[checkpoint]
-        solver = dict(enabled=args.solver_nodes is None or args.solver_nodes > 0)
-        if args.solver_nodes is not None:
-            solver['nodes'] = max(1, args.solver_nodes)
         return dict(kind='bubble', run=str(args.run.resolve()), checkpoint=checkpoint,
                     model=str((args.run/'checkpoints'/checkpoint/'ema.pt').resolve()),
-                    device=args.device, net_kernels=args.net_kernels, solver=solver)
+                    device=args.device, net_kernels=args.net_kernels)
     opponent = (dict(kind='six', command=args.b_command) if args.b_command else
                 dict(kind='htttx', url=args.b_url) if args.b_url else config(args.b))
     specs = [config(args.a), opponent]

@@ -170,12 +170,10 @@ class NeuralSearch:
         checked(native.hxg_fulfill(self.ptr, request, actions, logits, q, len(q)))
 
     def search(self, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-               *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy', q_range_floor=None,
-               root_noise=None):
+               *, stop=None, choice='policy', q_range_floor=None, root_noise=None):
         coordinator = SearchCoordinator(self.evaluator, self.model_version, self.cache)
         return coordinator.search_many([self], simulations, root_samples, batch_size, milliseconds,
-                                       stop=stop, anytime=anytime, batch_seconds=batch_seconds,
-                                       priority=priority, choice=choice, q_range_floor=q_range_floor,
+                                       stop=stop, choice=choice, q_range_floor=q_range_floor,
                                        root_noise=root_noise)[0]
 
     def fulfill_proof(self, request, history, certificate, milliseconds=None):
@@ -480,16 +478,14 @@ class SearchCoordinator:
         self.cache = cache if cache is not None else EvaluationCache()
 
     def search_many(self, searches, simulations=128, root_samples=None, batch_size=16, milliseconds=None,
-                    *, stop=None, anytime=False, batch_seconds=0., priority=None, choice='policy', q_range_floor=None,
-                    root_noise=None):
-        """Time-limited play keeps the last completed halving comparison as its fallback.
+                    *, stop=None, choice='policy', q_range_floor=None, root_noise=None):
+        """Search every tree to its simulation budget, its `milliseconds` or until `stop()` returns true.
 
         `q_range_floor` and `root_noise`, when given, become every tree's floor and root noise (NeuralSearch) from
         this search on; None keeps each tree's own.
 
         Play chooses the highest improved policy by default; choice='gumbel' uses the
         final Gumbel score. Actors call result() directly and retain Gumbel exploration.
-        The native hold supplies a comparable snapshot before the final round.
         """
         if choice not in ('policy', 'gumbel'):
             raise ValueError('choice must be policy or gumbel')
@@ -512,8 +508,6 @@ class SearchCoordinator:
         starts, finishes = [], [None]*len(searches)
         evaluated, hits = [0]*len(searches), [0]*len(searches)
         proof_spent = [0.]*len(searches)
-        snapshots = [None]*len(searches)
-        interrupted = [False]*len(searches)
         active = set()
         cursor = 0
         try:
@@ -525,11 +519,6 @@ class SearchCoordinator:
                     checked(native.hxg_root_noise(search.ptr, root_noise))
                 sample = max(2, int(budgets[i]**0.5)) if samples[i] is None else samples[i]
                 checked(native.hxg_begin(search.ptr, budgets[i], sample))
-                if anytime:
-                    native.hxg_hold(search.ptr, 1)
-                if priority is not None:
-                    actions = np.ascontiguousarray(priority, dtype=np.int64).reshape(-1, 2)
-                    native.hxg_priority(search.ptr, actions, len(actions))
                 game = Game(search.history)
                 try:
                     if game.winner < 0:
@@ -546,7 +535,6 @@ class SearchCoordinator:
                     active.discard(i)
                     finishes[i] = now
                     if expired:
-                        interrupted[i] = True
                         native.hxg_cancel(searches[i].ptr)
                     return True
                 return False
@@ -562,11 +550,7 @@ class SearchCoordinator:
                         idle = 0
                     else:
                         request, history = searches[i].request()
-                        if request == HOLD:
-                            snapshots[i] = searches[i].result(starts[i], time.perf_counter(), evaluated[i], hits[i], choice=choice)
-                            native.hxg_hold(searches[i].ptr, 0)
-                            idle = 0
-                        elif request == -1:
+                        if request == -1:
                             idle = 0
                         elif request == 0:
                             idle += 1
@@ -604,26 +588,16 @@ class SearchCoordinator:
                 for i in list(active):
                     finished(i)
                 pending = [item for item in pending if item[0] in active]
-                if anytime and batch_seconds:
-                    for i in {item[0] for item in pending}:
-                        if limits[i] is not None and limits[i]/1000-(time.perf_counter()-starts[i]) < batch_seconds:
-                            active.discard(i)
-                            interrupted[i] = True
-                            finishes[i] = time.perf_counter()
-                            native.hxg_cancel(searches[i].ptr)
-                    pending = [item for item in pending if item[0] in active]
                 if pending:
                     grouped = OrderedDict()
                     for item in pending:
                         grouped.setdefault(item[3], []).append(item)
                     unique = list(grouped.values())
-                    batch_start = time.perf_counter()
                     leaves = [(searches[items[0][0]].ptr, items[0][1], items[0][2]) for items in unique]
                     if hasattr(self.evaluator, 'evaluate_leaves'):
                         predictions = self.evaluator.evaluate_leaves(leaves)
                     else:
                         predictions = self.evaluator.evaluate([items[0][2] for items in unique])
-                    batch_seconds = max(batch_seconds, time.perf_counter()-batch_start)
                     self.last_stats["inference_batches"] += 1
                     self.last_stats["unique_positions"] += len(unique)
                     self.last_stats["largest_batch"] = max(self.last_stats["largest_batch"], len(unique))
@@ -644,20 +618,5 @@ class SearchCoordinator:
         finally:
             for search in searches:
                 native.hxg_cancel(search.ptr)
-        results = []
-        for i, search in enumerate(searches):
-            result = search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i], choice=choice)
-            result['batch_seconds'] = batch_seconds
-            result['stable_choice'] = bool(snapshots[i] and result['action'] == snapshots[i]['action'])
-            if anytime and interrupted[i] and not result['proven']:
-                snapshot = snapshots[i]
-                result['action'] = None
-                if snapshot:
-                    eligible = {tuple(a) for a, p in zip(result['actions'], result['policy']) if p > 0}
-                    ranking = snapshot['policy'] if choice == 'policy' else snapshot['scores']
-                    order = np.argsort(-ranking)
-                    result['action'] = next((snapshot['actions'][j].tolist() for j in order
-                        if (snapshot['policy'][j] > 0 if choice == 'policy' else np.isfinite(snapshot['scores'][j]))
-                        and tuple(snapshot['actions'][j]) in eligible), None)
-            results.append(result)
-        return results
+        return [search.result(starts[i], finishes[i] or time.perf_counter(), evaluated[i], hits[i], choice=choice)
+                for i, search in enumerate(searches)]

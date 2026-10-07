@@ -24,8 +24,8 @@ def play(opening):
     try:
         torch.manual_seed(11)
         model = dense_selfplay.Model(hexnet.HexNet(TINY).eval(), 'tiny', 'test', 'cpu', 64, 256)
-        settings = replace(dense_config.ActorSettings(), full_sims=8, cheap_sims=4, root_samples=4, max_plies=24,
-                           full_fraction=.5, opening_random_plies=3., leaf_batch=64)
+        settings = replace(dense_config.ActorSettings(hybrid_scheduler=False), full_sims=8, cheap_sims=4,
+                           root_samples=4, max_plies=24, full_fraction=.5, opening_random_plies=3., leaf_batch=64)
         engine = dense_selfplay.Engine(settings.leaf_batch)
         game = dense_selfplay.SelfPlayGame([model, model], settings, 1)
         engine.add(game)

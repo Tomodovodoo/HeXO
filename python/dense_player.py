@@ -1,20 +1,14 @@
-"""Dense player shared by browser play, Six and the clocked engine worker."""
+"""The dense model and solver a timed Bubble engine worker plays with (timed_engine)."""
 import json
 from pathlib import Path
 import sys
-import time
-from hexo import Game
 
 
 class DensePlayer:
-    """Play exported dense checkpoints; analysis searches a copy of the browser game."""
-    mode = 'dense'
+    """An exported dense checkpoint on a batched inference evaluator, its tactical solver when built, and the
+    hybrid search graph `timed_engine.hybrid_turn` keeps across turns."""
 
-    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused', hybrid_scheduler=False):
-        if type(hybrid_scheduler) is not bool:
-            raise ValueError('hybrid_scheduler must be on or off')
-        self.hybrid_scheduler = hybrid_scheduler
-        self.solver_nodes_explicit = self.simulations_explicit = False
+    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused'):
         self.run, self.device = run, device
         self.model_path = Path(model).resolve() if model else None
         self.tactical_package = tactical_package
@@ -26,7 +20,7 @@ class DensePlayer:
             self.prover = NativeTactics(**({'package': tactical_package} if tactical_package else {}))
         except (OSError, ValueError, KeyError) as error:
             print(f'solver off: {error}', file=sys.stderr)
-        self.options = dict(search=True, simulations=128, solver=self.prover is not None, solver_nodes=32768)
+        self.options = dict(search=True, simulations=128, solver=self.prover is not None)
         available = self.models()
         if not available:
             raise ValueError('No playable dense exports found')
@@ -73,13 +67,11 @@ class DensePlayer:
             self.close()
             self.checkpoint = None
         model = hexnet.load_model(path, net_kernels=self.net_kernels)
-        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path),
-            max_batch=128 if self.hybrid_scheduler else 16,
-            cuda_graphs=self.hybrid_scheduler and self.net_kernels == 'fused')
-        if self.hybrid_scheduler:
-            self.evaluator.free = []  # Packed forwards own staging until their completion fence.
-            if self.evaluator.graph is not None:
-                self.evaluator.graph.max_batch = 128
+        self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path), max_batch=128,
+                                               cuda_graphs=self.net_kernels == 'fused')
+        self.evaluator.free = []  # Packed forwards own staging until their completion fence.
+        if self.evaluator.graph is not None:
+            self.evaluator.graph.max_batch = 128
         self.checkpoint, self.model_sha256 = checkpoint, digest(path)
         self.set_history()
 
@@ -89,12 +81,9 @@ class DensePlayer:
             raise ValueError('Search and solver must be on or off')
         if updated['solver'] and self.prover is None:
             raise ValueError('The tactical solver is not built; run python tools/build_tactical.py')
-        for key, maximum in (('simulations', 4096), ('solver_nodes', 1000000)):
-            if type(updated[key]) is not int or not 1 <= updated[key] <= maximum:
-                raise ValueError(f'{key} must be 1..{maximum}')
+        if type(updated['simulations']) is not int or not 1 <= updated['simulations'] <= 4096:
+            raise ValueError('simulations must be 1..4096')
         self.options = updated
-        self.solver_nodes_explicit |= 'solver_nodes' in options
-        self.simulations_explicit |= 'simulations' in options
 
     def set_history(self, history=()):
         from neural_search import EvaluationCache
@@ -103,9 +92,6 @@ class DensePlayer:
             pool.close()
             graph.close()
             self._timed_hybrid = None
-        if getattr(self, '_timed_tree', None):
-            self._timed_tree.close()
-            self._timed_tree = None
         self.cache = EvaluationCache(4096)
 
     def close(self):
@@ -113,92 +99,3 @@ class DensePlayer:
         if self.evaluator is not None and self.evaluator.graph is not None:
             self.evaluator.graph.close()
         self.evaluator = None
-
-    def solve(self, history, attacker='mover'):
-        return self.prover.history(history, attacker=attacker, nodes=self.options['solver_nodes'], ms=10000)
-
-    @staticmethod
-    def winning_line(history, result):
-        """One legal continuation of a verified strategy, choosing its first covered defender reply."""
-        from dense_solver import Proof
-        certificate = result.get('certificate') or json.loads(result['certificate_json'])
-        proof = Proof(list(map(tuple, history)), certificate)
-        local, line = Game(history), []
-        try:
-            while local.winner < 0:
-                current = [cell[:2] for cell in local.cells]
-                move = proof.path(current)[1]
-                if move is None:
-                    break
-                actions = move[0] or proof.reply(current) or local.legal_moves()[:local.remaining]
-                for action in actions:
-                    line.append([*action, local.player])
-                    local.play(*action)
-                    if local.winner >= 0:
-                        break
-            return line
-        finally:
-            local.close()
-
-    def turn(self, game, milliseconds=None, analyze=False):
-        """Choose a complete legal turn with an optional whole-turn clock."""
-        if milliseconds is not None:
-            from threading import Event
-            from timed_engine import dense_turn
-            from time_control import allowance
-            limits = allowance(movetime=milliseconds)
-            if self.hybrid_scheduler and self.simulations_explicit:
-                limits['simulations'] = self.options['simulations']
-            return dense_turn(self, [cell[:2] for cell in game.cells], limits, Event(), analyze=analyze)
-        import numpy as np
-        from neural_search import NeuralSearch
-        from dense_selfplay import root_value
-        if game.winner >= 0:
-            raise ValueError('This game has finished')
-        history = [cell[:2] for cell in game.cells]
-        local, moves, suggestions = Game(history), [], []
-        player, start, proof, line, threat = local.player, time.perf_counter(), None, [], None
-        win_probability = tree = None
-        try:
-            if self.options['solver']:
-                proof = self.solve(history)
-                if proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'):
-                    moves = proof['moves']
-                    line = self.winning_line(history, proof)
-                if analyze:
-                    danger = self.solve(history, 'opponent')
-                    if danger['status'] == 'PROVEN_WIN' and danger.get('native_verified'):
-                        threat = dict(moves=danger['moves'], turns=danger['proof_turns'])
-            proven = bool(proof and proof['status'] == 'PROVEN_WIN' and proof.get('native_verified'))
-            while not proven and local.player == player and local.winner < 0:
-                current = [cell[:2] for cell in local.cells]
-                if self.options['search']:
-                    if tree is None:
-                        tree = NeuralSearch(self.evaluator, self.model_sha256, current, seed=1740,
-                                            cache=self.cache, tactics=True)
-                    result = tree.search(self.options['simulations'], root_samples=16, batch_size=16)
-                    action, policy, actions = result['action'], result['policy'], result['actions']
-                    value = root_value(result, local.player)
-                else:
-                    result = self.evaluator.evaluate([current])[0]
-                    actions = result['actions']
-                    policy = np.exp(result['logits']-result['logits'].max()); policy /= policy.sum()
-                    action, value = actions[policy.argmax()].tolist(), float(result['q'][0])
-                if not suggestions:
-                    suggestions = [dict(move=actions[i].tolist(), probability=float(policy[i]))
-                                   for i in np.argsort(-policy)[:5]]
-                    win_probability = (value+1)/2
-                moves.append(action)
-                local.play(*action)
-                if tree is not None:
-                    tree.advance(action)
-            return dict(moves=moves, backend='dense', checkpoint=self.checkpoint,
-                        elapsed_ms=(time.perf_counter()-start)*1000, suggestions=suggestions,
-                        player=player, win_probability=1. if proven else win_probability,
-                        proof_status='PROVEN_WIN' if proven else 'UNKNOWN', winning_line=line, threat=threat,
-                        threat_checked=analyze and self.options['solver'],
-                        solver_status=proof['status'] if proof else 'off', settings=dict(self.options))
-        finally:
-            if tree is not None:
-                tree.close()
-            local.close()
