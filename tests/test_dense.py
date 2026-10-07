@@ -7129,6 +7129,14 @@ class ActorModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pick('latest')
 
+    def test_shard_names_queued_in_one_millisecond_stay_distinct_and_ordered(self):
+        with unittest.mock.patch.object(dense_selfplay.time, 'time_ns', return_value=1791300000000123456):
+            names = [dense_selfplay.shard_name()]
+            for _ in range(3):
+                names.append(dense_selfplay.shard_name(names[-1]))
+        self.assertEqual(names, sorted(set(names)))
+        self.assertEqual(len({len(n) for n in names}), 1)
+
     def test_worker_switches_between_games(self):
         """The pointer moves as the first shard is published: the game started before it keeps the first model, the
         next game plays the second, and the switch is an 'actor_model' event."""
@@ -7144,9 +7152,9 @@ class ActorModelTests(unittest.TestCase):
         pointer('main/000010')
         name = dense_selfplay.shard_name
 
-        def publish():
+        def publish(*args):
             pointer('main/000020')
-            return name()
+            return name(*args)
         with unittest.mock.patch.object(dense_selfplay, 'shard_name', publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
@@ -7174,10 +7182,10 @@ class ActorModelTests(unittest.TestCase):
         dense_config.save(self.run,config)
         (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010',reason='newest',vetoed=[])))
         name = dense_selfplay.shard_name
-        def publish():
+        def publish(*args):
             # The controller rotates the checkpoint as the first shard is published.
             (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020',reason='newest',vetoed=[])))
-            return name()
+            return name(*args)
         with unittest.mock.patch.object(dense_selfplay,'shard_name',publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=6,initial_model=None))
         status = json.loads((self.run/'actor-status.json').read_text())
