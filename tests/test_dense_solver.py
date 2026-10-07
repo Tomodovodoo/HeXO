@@ -26,6 +26,7 @@ import hexnet
 from hexo import Game
 from neural_search import HOLD, NeuralSearch, checked, native
 from tactical_proof import NativeTactics, gated_nodes
+from tests import slow
 from tests.test_dense import episode_rows, winning_game
 from tests.test_tactical_proof import FIXTURE, ONE_TURN, TWO_TURN
 
@@ -243,6 +244,7 @@ class DefenceSearch(unittest.TestCase):
         _, plan, _ = self.search(schedule=schedule)
         self.assertEqual(plan.budget, 32768+6*27000)
 
+    @slow
     def test_enabled_selfplay_shards_repeat(self):
         with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
             self.assertEqual(shards(False, a, defence=True), shards(False, b, defence=True))
@@ -1014,6 +1016,7 @@ class Scheduler(unittest.TestCase):
         finally:
             root_engine.close()
 
+    @slow
     def test_nonblocking_fixed_preserves_seeded_match_results(self):
         try:
             NativeTactics()
@@ -1330,6 +1333,7 @@ def shards(asynchronous, root, defence=False):
     return manifest['files'], manifest['counts']
 
 
+@slow
 class Determinism(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

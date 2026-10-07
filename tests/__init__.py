@@ -2,9 +2,10 @@
 import os
 import unittest
 
-# Classes too slow for the per-PR CI job, which sets HEXO_SKIP_SLOW; local runs and a manual
-# dispatch of the Contracts workflow run them.
-slow = unittest.skipIf(os.environ.get('HEXO_SKIP_SLOW'), 'slow (HEXO_SKIP_SLOW is set)')
+# The slow tier: real games, real solves, exports, spawned engines and load reproduction. It runs only with
+# HEXO_SLOW=1 (locally, and in a manual dispatch of the CI workflows); everything else is the fast tier.
+SLOW = bool(os.environ.get('HEXO_SLOW'))
+slow = unittest.skipUnless(SLOW, 'slow tier (set HEXO_SLOW=1)')
 # Seconds a test waits for a condition (a batch, an event, a finished job) before it fails. Waits end as soon as the
 # condition holds, so only a failing test spends this long; a loaded machine never decides the outcome.
 PATIENCE = 60.

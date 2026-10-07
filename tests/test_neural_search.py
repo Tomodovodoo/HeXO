@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 from hexo import Game
 from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, SearchCoordinator, native
-from tests import PATIENCE
+from tests import PATIENCE, slow
 from tests.reference import Reference
 
 class Uniform:
@@ -3345,6 +3345,7 @@ class NativeProofs(unittest.TestCase):
         self.assertGreater(proofs.stats()['submitted'], 4)
         proofs.drain()
 
+    @slow
     def test_owner_budget_holds_back_admission_under_load(self):
         import time
         def run(budget):

@@ -170,7 +170,7 @@ time budget; check identical moves, scores, nodes and depths before interpreting
 the timing difference. The same report measures complete-turn generation.
 
 ```sh
-python -m unittest discover -s tests -v
+python -m tests        # docs/testing.md has the slow tier and the native test binaries
 ```
 
 `tests/reference.py` is an independent Python implementation of the rules. The engine tests compare native rules and incremental features against it: radius-eight legality, turn phase, both colours, all three axes, first-placement wins, overlines, make and unmake with hash restoration, tactical wins and covers. `tests/gumbel.cpp` checks the search tree's halving schedule, sign handling and proof propagation against an independent enumeration, and CI runs the native subset on Linux.
