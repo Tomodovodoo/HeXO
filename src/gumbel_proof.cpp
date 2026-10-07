@@ -142,8 +142,20 @@ struct Service {
 #endif
 };
 struct Loop {
+ struct Endpoint {
+  size_t game,bytes;uint64_t id,generation;double impact;Clock::time_point queued;
+  std::vector<Cell> history;std::vector<int64_t> neural;std::string context,result;
+ };
  API::Moves endpoint=nullptr;int endpoint_limit=0;uint64_t endpoint_paths=0,endpoint_candidates=0,endpoint_rejected=0,endpoint_bytes=0,endpoint_ns=0;
  std::deque<std::string> endpoint_records;
+ // Only the graph owner accesses this queue. Payloads hold no graph pins,
+ // mutable tasks or solver workers. Each game drains in FIFO order, and games
+ // rotate so one busy proof frontier cannot monopolize continuation admission.
+ std::vector<std::deque<Endpoint>> endpoints;std::deque<size_t> endpoint_games;
+ size_t endpoint_pending=0,endpoint_pending_bytes=0;
+ // Retained payload capacity, excluding container nodes and diagnostic records.
+ static constexpr size_t endpoint_memory=16*1024*1024;
+ uint64_t endpoint_high=0,endpoint_admitted=0,endpoint_dropped=0,endpoint_obsolete=0,endpoint_blocked=0,endpoint_admit_ns=0;
  std::unique_ptr<Service> owned;Service& service;std::mutex& mutex;
  owner::Pool& pool;API& api;std::vector<Frontier> frontiers;std::vector<std::unique_ptr<Worker>>& workers;
  // Jobs wait in their own loop's queue; drain and detach wait on answered.
@@ -158,7 +170,8 @@ struct Loop {
  // Supply census. Idle native-worker time is charged to the reason the last
  // refill stopped: every slot held, retries held back for fresh work, or no
  // dispatchable task, split over the exclusions (pending neural work, closed
- // scope, dormant) or none at all, or the owner over its proof budget. A shared service
+ // scope, dormant) or none at all, or owner pressure (time budget or retained
+ // endpoint backlog). A shared service
  // charges its idle time in equal parts to the loops held back by one of those
  // reasons, or to every loop when none has a candidate at all, so the loops'
  // sums are the service's idle time.
@@ -182,6 +195,7 @@ struct Loop {
  Loop(owner::Pool& source,Service* shared,std::unique_ptr<Service> own,int ms,int mb,int tasks,bool use_stamps):owned(std::move(own)),service(shared?*shared:*owned),mutex(service.mutex),
    pool(source),api(service.api),workers(service.workers),slice(ms),table(mb),stamps(use_stamps),external(service.external){
   if(pool.proof_owner || ms<1 || ms>1000 || mb<1 || mb>64 || tasks<8 || tasks>4096)throw std::runtime_error("Invalid native proof loop limits");
+  endpoints.resize(pool.games.size());
   frontiers.reserve(pool.games.size());for(size_t i=0;i<pool.games.size();++i)frontiers.emplace_back(tasks,stamps);
   {std::lock_guard lock(mutex);if(service.stopping || service.loops.size()>=64)throw std::runtime_error("Proof service cannot take another loop");
    service.account(Clock::now());service.loops.push_back(this);attached=true;}
@@ -294,6 +308,11 @@ struct Loop {
   // every position for each job. Worker completions install on the next step.
   std::vector<Ready> ready;Census refill{};
   for(;;){
+   // Running queries can still return paths. Keep room for their answers, and
+   // stop new CPU admission while retained continuation work catches up.
+   if(endpoint_pending>=service.capacity || endpoint_pending_bytes>=endpoint_memory/2){
+    ++endpoint_blocked;std::lock_guard lock(mutex);publish(refill,Owner,OwnerExits);return;
+   }
    size_t available,spare;
    // One reserved slot covers this job while it is built outside the lock.
    {std::lock_guard lock(mutex);if(stopping || !enabled)return;
@@ -352,10 +371,48 @@ struct Loop {
   view.record(key,outcome);
   if(auto peers=view.positions.find(key);peers!=view.positions.end())for(auto& weak:std::vector(peers->second))if(auto node=weak.lock())if(view.apply(view.outcomes.at(key),*node))view.revise(*node);
  }
- size_t neural(Job& job){
+ void endpoint_record(uint64_t id,size_t game,uint64_t generation,size_t added,const std::string& context,const std::string& result,const char* state){
+  endpoint_records.push_back("{\"id\":"+std::to_string(id)+",\"game\":"+std::to_string(game)+",\"generation\":"+std::to_string(generation)+",\"frontier_candidates\":"+std::to_string(added)+",\"admission\":\""+state+"\",\"request\":"+context+",\"result\":"+(result.empty()?"null":result)+'}');
+  if(endpoint_records.size()>512)endpoint_records.pop_front();
+ }
+ void stage_endpoint(Job& job){
+  if(job.neural.empty())return;
+  if(!endpoint_limit || job.side || !job.info[12] || job.neural.size()>size_t(endpoint_limit*130))throw std::runtime_error("Unexpected neural frontier");
+  size_t cursor=0,paths=0;
+  while(cursor<job.neural.size()){
+   if(job.neural.size()-cursor<2 || ++paths>size_t(endpoint_limit))throw std::runtime_error("Malformed neural frontier");
+   int64_t count=job.neural[cursor++],reason=job.neural[cursor++];
+   if(count<1 || count>64 || reason<0 || reason>1 || job.neural.size()-cursor<size_t(2*count))throw std::runtime_error("Malformed neural path");
+   cursor+=size_t(2*count);
+  }
+  endpoint_bytes+=job.neural.size()*sizeof(int64_t);
+  size_t bytes=job.history.capacity()*sizeof(Cell)+job.neural.capacity()*sizeof(int64_t)+job.context.capacity()+job.result.capacity()+sizeof(Endpoint);
+  if(endpoint_pending>=2*service.capacity || bytes>endpoint_memory-endpoint_pending_bytes){
+   ++endpoint_dropped;endpoint_record(job.id,job.game,job.generation,0,job.context,job.result,"capacity");return;
+  }
+  auto& queue=endpoints[job.game];if(queue.empty())endpoint_games.push_back(job.game);
+  queue.push_back({job.game,bytes,job.id,job.generation,job.task->impact,Clock::now(),std::move(job.history),std::move(job.neural),std::move(job.context),std::move(job.result)});
+  ++endpoint_pending;endpoint_pending_bytes+=bytes;endpoint_high=std::max(endpoint_high,uint64_t(endpoint_pending));
+ }
+ void discard_endpoints(int game=-1){
+  for(size_t i=0;i<endpoints.size();++i)if(game<0 || i==size_t(game)){
+   auto& queue=endpoints[i];for(auto& path:queue){--endpoint_pending;endpoint_pending_bytes-=path.bytes;++endpoint_obsolete;}
+   queue.clear();
+  }
+  std::erase_if(endpoint_games,[&](size_t i){return endpoints[i].empty();});
+ }
+ void prune_endpoints(){
+  for(auto it=endpoint_games.begin();it!=endpoint_games.end();){
+   auto game=*it;auto& o=*pool.games[game];auto& queue=endpoints[game];
+   if(o.stopped || o.expired() || queue.front().generation!=frontiers[game].generation){
+    for(auto& path:queue){--endpoint_pending;endpoint_pending_bytes-=path.bytes;++endpoint_obsolete;}
+    queue.clear();it=endpoint_games.erase(it);
+   }else ++it;
+  }
+ }
+ size_t neural(Endpoint& job){
   if(job.neural.empty())return 0;
   auto start=Clock::now();auto& o=*pool.games[job.game];
-  if(!endpoint_limit || job.side || !job.info[12] || job.neural.size()>size_t(endpoint_limit*130))throw std::runtime_error("Unexpected neural frontier");
   Board base;for(Cell c:job.history){if(!base.legal(c))throw std::runtime_error("Invalid frontier root");base.make(c);}
   size_t cursor=0,paths=0,added=0;
   while(cursor<job.neural.size()){
@@ -369,11 +426,27 @@ struct Loop {
    }
    for(auto [cell,player]:o.views[0].tree->board.cells){auto found=board.cells.find(cell);if(found==board.cells.end() || found->second!=player){valid=false;break;}}
    ++endpoint_paths;
-   if(valid){added+=o.solver_path(history,o.focus.size(),job.task->impact);}
+   if(valid){added+=o.solver_path(history,o.focus.size(),job.impact);}
    else ++endpoint_rejected;
   }
-  endpoint_candidates+=added;endpoint_bytes+=job.neural.size()*sizeof(int64_t);
+  endpoint_candidates+=added;
   endpoint_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();return added;
+ }
+ void admit_endpoints(){
+  if(!endpoint_pending)return;
+  bool allowed;{std::lock_guard lock(mutex);allowed=enabled && !stopping;}
+  if(!allowed){discard_endpoints();return;}
+  if(!pool.neural_requested || (pool.ready_limit && hxgf_queued(pool.feed)>=pool.ready_limit)){++endpoint_blocked;return;}
+  auto start=Clock::now();size_t game=endpoint_games.front();endpoint_games.pop_front();
+  auto& queue=endpoints[game];Endpoint path=std::move(queue.front());queue.pop_front();
+  --endpoint_pending;endpoint_pending_bytes-=path.bytes;if(!queue.empty())endpoint_games.push_back(game);
+  auto& o=*pool.games[game];
+  if(path.generation!=frontiers[game].generation || o.stopped || o.expired()){
+   ++endpoint_obsolete;endpoint_record(path.id,game,path.generation,0,path.context,path.result,"obsolete");
+  }else{
+   auto added=neural(path);++endpoint_admitted;endpoint_record(path.id,game,path.generation,added,path.context,path.result,"admitted");
+  }
+  endpoint_admit_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
  }
  void install(Job& job){
   auto start=Clock::now();auto& o=*pool.games[job.game];auto& f=frontiers[job.game];auto& task=*job.task;
@@ -400,19 +473,20 @@ struct Loop {
    view.trim_archive();f.remember(job.history,*view.root);f.tasks.erase(task.key);++installed;
    if(!job.result.empty()){records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"request\":"+job.context+",\"result\":"+job.result+'}');if(records.size()>512)records.pop_front();}
   }else{
-   size_t added=neural(job);
-   if(!job.neural.empty()){
-    endpoint_records.push_back("{\"id\":"+std::to_string(job.id)+",\"game\":"+std::to_string(job.game)+",\"generation\":"+std::to_string(job.generation)+",\"frontier_candidates\":"+std::to_string(added)+",\"request\":"+job.context+",\"result\":"+(job.result.empty()?"null":job.result)+'}');if(endpoint_records.size()>512)endpoint_records.pop_front();
-   }
    ++unknown;++task.attempts[job.side];task.worker=job.worker;task.cost=.5*task.cost+.5*job.elapsed;task.change=0;
    f.scope(task,stamps);bool same_scope=job.scope==task.scope && (!stamps || job.facts==f.revision);
    if(same_scope && job.info[8] && job.info[6]>=1073741824 && job.info[7]==0)task.closed|=1<<job.side;
    int next_side=1-job.side;task.side=(task.closed&(1<<next_side))?job.side:next_side;
    task.ready=same_scope?Clock::now()+std::chrono::milliseconds(slice*int(uint64_t(1)<<std::min(6u,task.attempts[job.side]))):Clock::time_point{};
+   stage_endpoint(job);
   }
   install_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
  }
- void collect(){for(;;){std::shared_ptr<Job> job;{std::lock_guard lock(mutex);if(done.empty())return;job=done.front();done.pop_front();if(job->wake_owner){--urgent;completion_ready.store(urgent!=0,std::memory_order_release);}live.erase(job->id);}install(*job);}}
+ void collect(){
+  for(;;){std::shared_ptr<Job> job;{std::lock_guard lock(mutex);if(done.empty())break;job=done.front();done.pop_front();if(job->wake_owner){--urgent;completion_ready.store(urgent!=0,std::memory_order_release);}live.erase(job->id);}install(*job);}
+  bool disabled;{std::lock_guard lock(mutex);disabled=stopping || !enabled;}
+  if(disabled)discard_endpoints();else prune_endpoints();
+ }
  void prune(){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}sweep();}
  }
@@ -428,6 +502,7 @@ struct Loop {
  uint64_t feedback(){auto start=Clock::now();auto count=settle();spent(start);return count;}
   void step(){
    auto start=Clock::now();++ticks;settle();
+  admit_endpoints();
   for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;
    for(auto& v:o.views)if(v.active && v.tree->root->expanded)frontiers[i].offer(v.tree->root,v.history,v.relevance,std::abs(v.tree->root->q-v.tree->root->value));
   }
@@ -435,9 +510,10 @@ struct Loop {
   else{std::lock_guard lock(mutex);if(!stopping && enabled)publish({},Owner,OwnerExits);}
   spent(start);
  }
- void retarget(int game){auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);sweep();}
+ void retarget(int game){discard_endpoints(game);auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);sweep();}
  const char* release(int game){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))return nullptr;}
+  discard_endpoints(game);
   auto& f=frontiers[game];released_effort="[";int count=0;
   for(auto [generation,e]:f.effort){if(count++)released_effort+=',';released_effort+='['+std::to_string(generation)+','+std::to_string(e.fresh)+','+std::to_string(e.queries)+','+std::to_string(e.missing)+']';}
   released_effort+=']';f.effort.clear();f.tasks.clear();f.facts.clear();f.fact_order.clear();f.members.clear();f.occupied.reset();f.next=f.offers=0;++f.revision;
@@ -557,7 +633,7 @@ extern "C" HX_API void hxps_stats(void* p,uint64_t* out,double* times){auto& ser
  std::array<uint64_t,5> values{uint64_t(service.workers.size()),busy,uint64_t(service.waiting),live,uint64_t(service.loops.size())};std::copy(values.begin(),values.end(),out);times[0]=work;times[1]=service.idle_ms;}
 extern "C" HX_API int hxp_neural(void* p,uint64_t callback,int limit){try{
  auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);
- if(limit<0 || limit>8 || !loop.live.empty() || (!loop.external && limit && !callback))throw std::runtime_error("Invalid neural frontier configuration");
+ if(limit<0 || limit>8 || !loop.live.empty() || loop.endpoint_pending || (!loop.external && limit && !callback))throw std::runtime_error("Invalid neural frontier configuration");
  loop.endpoint=reinterpret_cast<proving::API::Moves>(callback);loop.endpoint_limit=limit;return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxpe_neural(void* p,int worker,uint64_t id,const int64_t* values,int count){try{
@@ -567,6 +643,9 @@ extern "C" HX_API int hxpe_neural(void* p,int worker,uint64_t id,const int64_t* 
  if(count)job->neural.assign(values,values+count);return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxp_neural_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);std::array<uint64_t,6> values{loop.endpoint_paths,loop.endpoint_candidates,loop.endpoint_rejected,loop.endpoint_bytes,loop.endpoint_ns,uint64_t(loop.endpoint_records.size())};std::copy(values.begin(),values.end(),out);}
+extern "C" HX_API void hxp_endpoint_queue_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t age=0;auto now=proving::Clock::now();
+ for(auto game:loop.endpoint_games)if(!loop.endpoints[game].empty())age=std::max(age,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-loop.endpoints[game].front().queued).count()));
+ std::array<uint64_t,9> values{uint64_t(loop.endpoint_pending),uint64_t(loop.endpoint_pending_bytes),loop.endpoint_high,loop.endpoint_admitted,loop.endpoint_dropped,loop.endpoint_obsolete,loop.endpoint_blocked,loop.endpoint_admit_ns,age};std::copy(values.begin(),values.end(),out);}
 extern "C" HX_API const char* hxp_neural_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->endpoint_records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 extern "C" HX_API int hxpe_cancelled(void* p,int worker){auto& loop=*static_cast<proving::Loop*>(p);if(worker<0 || worker>=int(loop.workers.size()))return 0;auto& active=loop.workers[worker]->active;return active && active->cancelled;}
 extern "C" HX_API uint64_t hxpe_take(void* p,int worker){try{return static_cast<proving::Loop*>(p)->external_take(worker);}catch(const std::exception& e){gumbel::error=e.what();return UINT64_MAX;}}
@@ -588,9 +667,9 @@ extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cas
 // counts: refill scans, candidates seen, eligible, eligible inside a retry delay, excluded by pending neural work,
 // closed scope and dormancy, refills stopped with every slot held, with retries held back, without a dispatchable
 // task, first queries of frontier entries, dispatches inside a retry delay, steps that skipped admission over the
-// owner's proof budget.
+// owner's proof budget or retained endpoint backlog.
 // idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, no candidate at all,
-// and the owner's proof budget.
+// and owner pressure (proof budget or retained endpoint backlog).
 extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.service.account(proving::Clock::now());
  std::copy(loop.census.begin(),loop.census.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
 extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;

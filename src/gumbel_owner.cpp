@@ -110,12 +110,14 @@ struct Owner {
  size_t solver_path(const std::vector<Cell>& history,size_t begin,double relevance){
   if(stopped || expired() || begin>=history.size())return 0;
   size_t added=0;std::vector<Cell> prefix(history.begin(),history.begin()+begin);
+  auto position=gumbel::keys(prefix).first;
   for(size_t i=begin;i<history.size();++i){
+   auto keys=gumbel::child_keys(position,prefix,history[i]);position=keys.first;
    prefix.push_back(history[i]);if(prefix.size()<=focus.size())continue;
    // Automatic neural discovery keeps max_depth. A visited CPU line can end
    // deeper; cap this separate, explicit handoff at 128 placements from focus.
    int depth=int(prefix.size()-focus.size());if(depth>128)break;
-   auto keys=gumbel::keys(prefix);Key key=keys.second;
+   Key key=keys.second;
    if(game->outcomes.contains(keys.first))break;
    if(key==views[0].key || live(key))continue;
    if(auto found=candidates.find(key);found!=candidates.end()){
@@ -270,7 +272,7 @@ struct Signal {
 struct Pool {
  std::unique_ptr<void,FeedDeleter> owned_feed;void* feed;
  std::vector<std::unique_ptr<Owner>> games;std::vector<bool> failed;
- std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false;
+ std::string model;size_t cursor=0;int ready_limit=0,host_workers=1;uint64_t steps=0,retargets=0;bool stopped=false,neural_requested=true;
  void* proof_owner=nullptr;void (*proof_step)(void*)=nullptr;uint64_t (*proof_collect)(void*)=nullptr;void (*proof_retarget)(void*,int)=nullptr;
  void (*proof_bind)(void*,int)=nullptr;
  bool (*proof_ready)(void*)=nullptr;void (*proof_listen)(void*,std::shared_ptr<Signal>)=nullptr;
@@ -301,6 +303,7 @@ struct Pool {
  }
  void stop(){for(auto& o:games)o->stop();stopped=true;}
  int step(bool neural=true){
+  neural_requested=neural;
   if(proof_step)proof_step(proof_owner);
   if(stopped)return 0;int progress=0;++steps;
   // Backpressure pauses new neural selection, not deadlines or proof delivery.
@@ -383,6 +386,7 @@ Pool& caller(void* p){auto& pool=*static_cast<Pool*>(p);if(pool.inference_owner)
 extern "C" HX_API void* hxgm_new(void** sources,int count,int capacity,int quantum,int views,int depth,uint64_t work,const char* version,uint64_t seed){try{return new owner::Pool(sources,count,capacity,quantum,views,depth,work,version,seed);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 extern "C" HX_API int hxgm_free(void* p){auto& pool=*static_cast<owner::Pool*>(p);if(pool.inference_owner){gumbel::error="Close the inference service before freeing its search pool";return 0;}if(pool.proof_owner){gumbel::error="Close the proof loop before freeing its search pool";return 0;}pool.stop();int64_t stats[6];hxgf_stats(pool.feed,stats);if(stats[4]){gumbel::error="Drain or fenced-abandon global tasks before freeing pool";return 0;}delete &pool;return 1;}
 extern "C" HX_API int hxgm_step(void* p){try{return owner::caller(p).step();}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+extern "C" HX_API int hxgm_step_neural(void* p,int neural){try{return owner::caller(p).step(neural!=0);}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 extern "C" HX_API int hxgm_ready_limit(void* p,int rows){try{if(rows<0 || rows>16384)throw std::runtime_error("Invalid neural ready limit");owner::caller(p).ready_limit=rows;return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxgm_workers(void* p,int count){try{
  auto& pool=owner::caller(p);if(pool.steps)throw std::runtime_error("Configure native host workers before the first phase");

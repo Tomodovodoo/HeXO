@@ -724,6 +724,11 @@ class Bundle(unittest.TestCase):
         answer=node(dict(kind='native-proofs',history=history,ms=1000,slice=64,delay=1,views=8,depth=1))
         self.assertNotIn('error',answer)
         self.assertGreater(answer['proof']['neural_frontier']['candidates'],0)
+        queue=answer['proof']['neural_frontier']['queue']
+        self.assertGreater(queue['high_water'],0)
+        self.assertGreater(queue['admitted'],0)
+        self.assertGreater(queue['admission_ns'],0)
+        self.assertEqual((queue['pending'],queue['bytes'],queue['oldest_age_ns']),(0,0,0))
         self.assertIn(endpoint,answer['viewHistories'])
         self.assertTrue(any(r['result']['status']=='UNKNOWN' for r in answer['neuralRecords']))
         self.assertEqual((answer['stats']['pending'],answer['proof']['active'],answer['waits']),(0,0,0))

@@ -36,6 +36,8 @@ for name, result, args in (
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
     ('profile', C.c_int, [ptr, C.c_int]), ('feedback', C.c_int, [ptr, C.c_int]), ('schedule_stats', None, [ptr, ptr]),
+    ('progress', C.c_int, [ptr, C.c_int]),
+    ('progress_rows', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, C.c_uint64, ptr, ptr, ptr]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
     ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
     ('cancel', None, [ptr]), ('take', C.c_int, [ptr, C.c_int, C.c_double, ptr, ptr, ptr]),
@@ -61,6 +63,8 @@ bind('hxps_free', C.c_int, ptr)
 bind('hxps_stats', None, ptr, ptr, ptr)
 bind('hxp_neural', C.c_int, ptr, C.c_uint64, C.c_int)
 bind('hxp_neural_stats', None, ptr, ptr)
+bind('hxp_endpoint_queue_stats', None, ptr, ptr)
+bind('hxgm_step_neural', C.c_int, ptr, C.c_int)
 bind('hxp_neural_record', C.c_char_p, ptr, C.c_int)
 for name, result, args in (
     ('step', C.c_int, [ptr]), ('cancel', None, [ptr]), ('resume', None, [ptr]),
@@ -137,6 +141,16 @@ class ProofLoop:
     `owner_budget` is the share of the graph owner's recent wall time that proof
     steps and installation may take; above it the loop installs answers but admits
     no new jobs, so more workers never take more of that owner's time.
+    Exact answers install immediately. Unfinished CPU paths wait in a retained
+    queue; ordinary neural-enabled steps admit one completed query at a time,
+    rotating between games. A query can contain eight 64-placement paths, so
+    this is a work bound, not a wall-time guarantee. The 16 MiB payload limit
+    excludes container overhead and the separately bounded diagnostic records.
+    `idle_owner_ms` includes backlog pressure; the endpoint queue's blocked
+    counter distinguishes it from owner-time budgeting. `install_ms` now covers
+    completion/staging, while queue `admission_ns` covers endpoint admission;
+    both are already included in `owner_step_ms`, so do not sum nested timings
+    or compare the old installation phase alone as an end-to-end speedup.
     """
     def __init__(self, pool, package=None, *, workers=None, queue=None, slice_ms=8, table_mb=4,
                  tasks=256, stamps=False, endpoints=8, direct=False, shared=None, owner_budget=1.):
@@ -210,6 +224,10 @@ class ProofLoop:
         frontier=np.empty(6, np.uint64)
         native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
         result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
+        backlog=np.empty(9,np.uint64)
+        native.hxp_endpoint_queue_stats(self.ptr,backlog.ctypes.data)
+        result['neural_frontier']['queue']=dict(zip(('pending','bytes','high_water','admitted','dropped','obsolete',
+                                                   'blocked','admission_ns','oldest_age_ns'),map(int,backlog)))
         counts, idle = np.empty(13, np.uint64), np.empty(7, np.float64)
         native.hxp_supply_stats(self.ptr, counts.ctypes.data, idle.ctypes.data)
         result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_deferred', 'supply_pending',
@@ -379,8 +397,9 @@ class SearchPool:
     def clock(self, ms):
         checked(native.hxgm_clock(self.ptr, ms))
 
-    def step(self):
-        status = native.hxgm_step(self.ptr)
+    def step(self, *, neural=True):
+        """Collect proofs and maintain clocks; optionally admit neural work."""
+        status = native.hxgm_step(self.ptr) if neural else native.hxgm_step_neural(self.ptr, False)
         if status < 0:
             checked(False)
         return status
@@ -495,7 +514,7 @@ class InferenceService:
     available with ms=0; interactive comparisons use a common clock.
     """
     def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
-                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False):
+                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False, progress=False):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
@@ -515,6 +534,7 @@ class InferenceService:
             checked(native.hxb_flights(self._ptr, flights))
             checked(native.hxb_profile(self._ptr, bool(profile)))
             checked(native.hxb_feedback(self._ptr, self.interleave_feedback))
+            checked(native.hxb_progress(self._ptr, bool(progress)))
             for pool in pools:
                 self.attach(pool,self.models[versions.index(pool.model_version)])
         except BaseException:
@@ -697,6 +717,25 @@ class InferenceService:
             result['edges'] = np.ctypeslib.as_array(edges,shape=(count.value,9)).copy()
         return result
 
+    def progress(self, producer, game, *, token, after=0):
+        """Copy the latest completed-comparison observation without consuming it.
+
+        This does not acknowledge the root, authorize retargeting, or add visits.
+        The producer retains only one frame per game. Returned arrays are owned.
+        """
+        import json
+        self._raise()
+        text, edges, count = C.c_char_p(), C.POINTER(C.c_double)(), C.c_int()
+        status = native.hxb_progress_rows(self.ptr, producer, game, token, after,
+                                         C.byref(text), C.byref(edges), C.byref(count))
+        if status<0:
+            checked(False)
+        if not status:
+            return None
+        result = json.loads(text.value)
+        result['edges'] = np.ctypeslib.as_array(edges, shape=(count.value, 9)).copy()
+        return result
+
     def pause(self, *, timeout=None):
         """Fence neural forwards and retain queued work; native CPU proofs continue.
 
@@ -855,7 +894,9 @@ class InferenceService:
         finally:
             self.close()
 
-    def close(self):
+    def close(self, *, completions=False):
+        """Fence and join; optionally retain final writer-owned root events."""
+        final = []
         if self._ptr:
             self.cancel()
             if self._launcher is not None:
@@ -879,8 +920,14 @@ class InferenceService:
                 raise ValueError('Complete or abandon_fenced every manually taken service batch before close')
             checked(native.hxb_join(self._ptr))
             self._stats = self.stats()
-            checked(native.hxb_free(self._ptr))
-            self._ptr = None
-            for pool in self.pools:
-                if pool is not None:
-                    pool._service = None
+            try:
+                if completions:
+                    while (event := self.event()) is not None:
+                        final.append(event)
+            finally:
+                checked(native.hxb_free(self._ptr))
+                self._ptr = None
+                for pool in self.pools:
+                    if pool is not None:
+                        pool._service = None
+        return final if completions else None

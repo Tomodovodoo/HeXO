@@ -34,6 +34,7 @@ QUANTUM = 4  # bucket rows are padded to a multiple of this; a padding row costs
 STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 ACTOR_WAIT_SECONDS = 120.
+SURVEY_PROCESSES = 8  # startup shard survey workers (dense_data.survey); they only parse shard files
 # Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
 KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
         'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
@@ -295,9 +296,11 @@ def calibration_report(calibration, games):
                 table=dict(v=list(v), h=list(h), p=np.round(p, 4).tolist()))
 
 
-def validation_sets(run, settings, seed):
-    """The run's dense_data.ValidationSets sized by LearnerSettings validation_rows (limit) and validation_quota."""
-    return dense_data.ValidationSets(run, settings.validation_fraction, seed, settings.validation_rows, settings.validation_quota)
+def validation_sets(run, settings, seed, survey=None):
+    """The run's dense_data.ValidationSets sized by LearnerSettings validation_rows (limit) and validation_quota, starting
+    from a dense_data.survey of the run."""
+    return dense_data.ValidationSets(run, settings.validation_fraction, seed, settings.validation_rows, settings.validation_quota,
+                                     survey)
 
 
 def policy_dir(run, variant):
@@ -554,6 +557,16 @@ def make_optimizer(model, s):
     return torch.optim.AdamW(groups, lr=s.lr, betas=(.9, .98), fused=next(model.parameters()).is_cuda)
 
 
+def match_layout(optimizer):
+    """Give each optimizer state tensor its parameter's memory layout: a checkpoint written by a learner running the
+    other layout loads with the saved strides, and the fused AdamW step needs matching ones."""
+    for inner in getattr(optimizer, 'optimizers', (optimizer,)):
+        for p, state in inner.state.items():
+            for key, value in state.items():
+                if torch.is_tensor(value) and value.shape == p.shape and value.stride() != p.stride():
+                    state[key] = torch.empty_like(p, dtype=value.dtype).copy_(value)
+
+
 def load_future_optimizer(optimizer, model, source, settings, state):
     """Restore shared parameter states when adding/removing the masked future head; new parameters start fresh."""
     previous = make_optimizer(source, settings)
@@ -616,7 +629,7 @@ class Learner:
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.net_kernels = net_kernels
         self.device = torch.device(config.device)
-        self.memory_format = hexnet.memory_format(config.model)
+        self.memory_format = hexnet.memory_format(config.model, self.device.type == 'cuda' and net_kernels == 'fused')
         saved = checkpoints(run, settings.variant)
         manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
         if saved:
@@ -696,6 +709,7 @@ class Learner:
                 load_future_optimizer(self.optimizer, self.model, source, self.settings, state['optimizer'])
             else:
                 self.optimizer.load_state_dict(state['optimizer'])
+            match_layout(self.optimizer)
         adamw = self.optimizer.adamw if self.settings.optimizer == 'muon' else self.optimizer
         for group, decay in zip(adamw.param_groups, (self.settings.weight_decay, 0.)):
             group['weight_decay'] = decay
@@ -1158,13 +1172,14 @@ def main():
     try:
         torch.manual_seed(config.seed+learner.step)
         variant_seed = zlib.crc32(s.variant.encode())
-        def replay():
+        def replay(survey=None):
             s = learner.settings
             return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
                                            s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant),
-                                           s.cheap_row_fraction, config.seed)
-        window = replay()
-        sets = validation_sets(args.run, s, config.seed)
+                                           s.cheap_row_fraction, config.seed, survey)
+        survey = dense_data.survey(args.run, config.seed, s.cheap_row_fraction, SURVEY_PROCESSES)
+        window = replay(survey)
+        sets = validation_sets(args.run, s, config.seed, survey)
         learner.calibrate(window)
         renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
                                                  calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
