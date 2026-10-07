@@ -267,12 +267,35 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     service = None
     def stopped():
         return cancel.is_set() or time.monotonic() >= normal
-    def emit(moves):
+    def emit(moves, candidate=None):
+        output = result if candidate is None else candidate
         if service is not None:
-            result['evaluated'] = service.stats()['launched_rows']
-        result.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
-        publish(dict(result, stones=list(result['stones']),
-                     root_searches=[dict(root) for root in result['root_searches']]))
+            output['evaluated'] = service.stats()['launched_rows']
+        output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
+        publish(dict(output, stones=list(output['stones']),
+                     root_searches=[dict(root) for root in output['root_searches']]))
+    def read_choice(found, current):
+        if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token+1, current):
+            raise ValueError('Native turn completion does not match the current position')
+        edges = np.asarray(found['edges'], np.float64)
+        winner = found['exact_winner']
+        value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
+        probability = (value+1)/2
+        action = found['action']
+        if winner < 0 and edges[:, 5].sum() > 0:
+            action = edges[np.argmax(edges[:, 5]), :2].astype(np.int64).tolist()
+        witness = found.get('winning_turn', [])
+        if witness:
+            if winner != side or witness[0] != action:
+                raise ValueError('Winning turn does not match the exact root action')
+            legal_turn(current, witness)
+        elif winner == side and game.remaining == 2:
+            raise ValueError('Winning root has no complete turn witness')
+        row = dict(history=current, move=action, win_probability=probability,
+                   exact_winner=winner, completed=found['root_completed'],
+                   scheduler_completed=found['completed'],
+                   root_completed=found['root_completed'], context=found['context'])
+        return edges, winner, probability, action, witness, row
     try:
         emit(result['moves'])
         if stopped():
@@ -305,7 +328,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
         pool.retarget(0, history, work=1)
         before = pool.proofs.stats() if pool.proofs is not None else None
         service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=64,
-                                   pending=2, flights=2, interleave_feedback=True)
+                                   pending=2, flights=2, interleave_feedback=True, progress=True)
         service.start(continuous=True)
         # Inference collection may wait for a whole CPU/GPU batch. Keep it off
         # the turn thread so a ready root choice can be published immediately.
@@ -327,11 +350,31 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             result['root_searches'].append(root_search)
             service.retarget(0, 0, current, expected=token, work=work, ms=ms,
                              samples=limits.get('root_samples', 16), views=8)
-            found = None
+            found = progress_candidate = None
+            progress_sequence = 0
+            progress_context = None
             while True:
                 found = service.event()
                 if found is not None:
                     break
+                if selected and game.remaining == 1:
+                    frame = service.progress(0, 0, token=token+1, after=progress_sequence)
+                    if frame is not None:
+                        edges, winner, probability, action, witness, row = read_choice(frame, current)
+                        if frame['kind'] != 'progress' or frame['snapshot_sequence'] <= progress_sequence:
+                            raise ValueError('Native progress sequence did not advance')
+                        if progress_context is not None and frame['context'] != progress_context:
+                            raise ValueError('Native progress context changed within one root')
+                        progress_sequence, progress_context = frame['snapshot_sequence'], frame['context']
+                        row.update(source='search_progress', snapshot_sequence=progress_sequence)
+                        progress_candidate = dict(result, stones=result['stones']+[row],
+                            completed=result['completed']+frame['root_completed'],
+                            scheduler_completed=result['scheduler_completed']+frame['completed'])
+                        if winner == side:
+                            progress_candidate.update(win_probability=1., proof_status='PROVEN_WIN')
+                        root_search.update(snapshot_sequence=progress_sequence,
+                                           progress_received_ms=(time.monotonic()-started)*1000)
+                        emit(selected+[action], progress_candidate)
                 if stopped():
                     # Stop admission, then receive the writer's final choice.
                     # Response time is separate from search time; no graph is
@@ -351,23 +394,27 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 service.wait(max(0., min(1., (normal-time.monotonic())*1000)))
             if found is None:
                 root_search['error'] = 'no_completion'
+                if progress_candidate is not None:
+                    result = progress_candidate
                 break
             root_search['received_ms'] = (time.monotonic()-started)*1000
-            token += 1
-            if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token, current):
+            if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token+1, current):
                 raise ValueError('Native turn completion does not match the current position')
             if 'error' in found:
                 root_search['error'] = found['error']
                 if found['error'] in ('deadline', 'cancelled'):
                     result['stop_reason'] = 'deadline' if found['error'] == 'deadline' else 'stop'
+                    if progress_candidate is not None:
+                        progress_candidate['stop_reason'] = result['stop_reason']
+                        result = progress_candidate
                     break
                 raise ValueError(f"Native turn search failed: {found['error']}")
-            edges = np.asarray(found['edges'], np.float64)
+            if progress_context is not None and found['context'] != progress_context:
+                raise ValueError('Native final context differs from its progress')
+            edges, winner, probability, action, witness, row = read_choice(found, current)
+            token += 1
             root_search.update(elapsed_ms=found.get('elapsed_ms'),
                                issued=found.get('issued'), completed=found['root_completed'])
-            winner = found['exact_winner']
-            value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
-            probability = (value+1)/2
             result['completed'] += found['root_completed']
             result['scheduler_completed'] += found['completed']
             if not selected:
@@ -379,20 +426,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 # One winning same-player continuation proves the original root;
                 # a losing chosen continuation does not cover its alternatives.
                 result.update(win_probability=1., proof_status='PROVEN_WIN')
-            action = found['action']
-            if winner < 0 and edges[:, 5].sum() > 0:
-                action = edges[np.argmax(edges[:, 5]), :2].astype(np.int64).tolist()
-            witness = found.get('winning_turn', [])
-            if witness:
-                if winner != side or witness[0] != action:
-                    raise ValueError('Winning turn does not match the exact root action')
-                legal_turn(current, witness)
-            elif winner == side and game.remaining == 2:
-                raise ValueError('Winning root has no complete turn witness')
-            result['stones'].append(dict(history=current, move=action, win_probability=probability,
-                                         exact_winner=winner, completed=found['root_completed'],
-                                         scheduler_completed=found['completed'],
-                                         root_completed=found['root_completed'], context=found['context']))
+            result['stones'].append(row)
             game.play(*action)
             selected.append(action)
             if witness:

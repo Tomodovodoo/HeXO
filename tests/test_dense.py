@@ -9904,6 +9904,7 @@ class DenseTimedWorker(unittest.TestCase):
                 for winner, status, value in ((1, 'PROVEN_WIN', 1.), (0, 'UNKNOWN', .5)):
                     with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                         service = service_type.return_value
+                        service.progress.return_value = None
                         service.stats.return_value = dict(launched_rows=2)
                         service.event.side_effect = [
                             dict(producer=0, game=0, model=0, token=1, history=[[0, 0]], context='first',
@@ -9922,6 +9923,7 @@ class DenseTimedWorker(unittest.TestCase):
                 # the owner's last halving finalists, and retargets that position.
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
+                    service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=2)
                     service.event.side_effect = [
                         dict(producer=0, game=0, model=0, token=1, history=[[0,0]], context='first',
@@ -9948,6 +9950,7 @@ class DenseTimedWorker(unittest.TestCase):
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
                      unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
                     service = service_type.return_value
+                    service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=2)
                     def completion():
                         if service.event.call_count == 1:
@@ -9965,10 +9968,45 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
                 self.assertEqual(result['completed'], 5)
                 self.assertEqual(result['proof_status'], 'UNKNOWN')
+                # Progress replaces the second row while the final root remains
+                # outstanding. Repeated cumulative counts are never added twice.
+                clock[0] = 0.
+                snapshots = [dict(frames[1], kind='progress', snapshot_sequence=1),
+                             dict(frames[1], kind='progress', snapshot_sequence=2,
+                                  root_completed=7, completed=9,
+                                  action=[2,1], edges=np.array([[2,1,0,0,.8,1,7,7,1]], float))]
+                published = []
+                from timed_engine import native_turn
+                from time_control import allowance
+                import threading
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                     unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda:clock[0]):
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=5)
+                    service.event.side_effect = lambda: frames[0] if service.event.call_count == 1 else None
+                    def progress(*args, **kwargs):
+                        if service.progress.call_count == 1:
+                            return snapshots[0]
+                        clock[0] = 1.
+                        return snapshots[1]
+                    service.progress.side_effect = progress
+                    service.close.side_effect = lambda **kw: [] if kw.get('completions') else None
+                    result = native_turn(player, [[0,0]], allowance(movetime=1000),
+                                         threading.Event(), published.append)
+                    self.assertEqual(service.retarget.call_count, 2)
+                    self.assertEqual(service.progress.call_args.kwargs, dict(token=2, after=1))
+                self.assertEqual(result['moves'], [[1,0],[2,1]])
+                self.assertEqual([s['root_completed'] for s in result['stones']], [2,7])
+                self.assertEqual((result['completed'], result['scheduler_completed']), (9,11))
+                self.assertEqual(result['stones'][1]['snapshot_sequence'], 2)
+                self.assertEqual(result['root_searches'][1]['error'], 'no_completion')
+                self.assertEqual(published[-2]['moves'], [[1,0],[2,0]])
+                self.assertEqual(published[-2]['completed'], 5)
                 # A cold continuation can miss its deadline. Record that
                 # attempted position without counting legal filler as search.
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
+                    service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=1)
                     service.event.side_effect = [frames[0],
                         dict(producer=0, game=0, model=0, token=2,
@@ -10014,6 +10052,7 @@ class DenseTimedWorker(unittest.TestCase):
                 try:
                     with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                         service = service_type.return_value
+                        service.progress.return_value = None
                         service.stats.return_value = dict(launched_rows=0)
                         service.event.return_value = dict(producer=0, game=0, model=0, token=1,
                             history=history, context='witnessed', action=[4,0], winning_turn=[[4,0],[5,0]],
@@ -10031,6 +10070,7 @@ class DenseTimedWorker(unittest.TestCase):
                 # A bare exact value cannot certify an arbitrary second stone.
                 with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
                     service = service_type.return_value
+                    service.progress.return_value = None
                     service.stats.return_value = dict(launched_rows=0)
                     service.event.return_value = dict(producer=0, game=0, model=0, token=1,
                         history=[[0,0]], context='unwitnessed', action=[1,0], exact_winner=1,

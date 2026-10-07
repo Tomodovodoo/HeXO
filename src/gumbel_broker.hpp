@@ -62,9 +62,10 @@ struct Producer:std::enable_shared_from_this<Producer> {
  std::vector<std::shared_ptr<Job>> outstanding;bool done=false;uint64_t pause_ack=0;
  std::deque<Command> commands;std::vector<uint64_t> epochs;size_t retirement_reserved=0;
  std::vector<bool> requested,reported,released;
- Producer(Broker& b,owner::Pool& p,int m,int i):broker(b),pool(p),model(m),index(i),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()){}
+ std::vector<RootEvent> progress;std::vector<uint64_t> progress_sequence;
+ Producer(Broker& b,owner::Pool& p,int m,int i):broker(b),pool(p),model(m),index(i),epochs(p.games.size()),requested(p.games.size()),reported(p.games.size(),true),released(p.games.size()),progress(p.games.size()),progress_sequence(p.games.size()){}
  void run()noexcept;
- RootEvent result(int index,uint64_t token);
+ RootEvent result(int index,uint64_t token,uint64_t sequence=0);
  RootEvent unsearched(const Command& command);
 };
 // The service owns only immutable snapshots and prediction messages. Producers
@@ -81,7 +82,7 @@ struct Broker {
  int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
  uint64_t flight_high_water=0;
  // Optional repeated admission observations and owner wall spans, not occupancy.
- bool profile_enabled=false,interleave_feedback=false;std::array<uint64_t,38> schedule{};
+ bool profile_enabled=false,interleave_feedback=false,progress_enabled=false;std::array<uint64_t,38> schedule{};
  std::vector<std::pair<int,int>> model_rows;
  std::atomic<bool> cancelled=false;bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
@@ -92,7 +93,7 @@ struct Broker {
  bool reclaiming_owner=false;size_t retirement_reserved=0;
  uint64_t reclaimed_owners=0,owner_reclaim_ns=0,retirement_deferred=0;
  struct Event {Producer* producer;int game;RootEvent data;};
- std::deque<Event> events;RootEvent last_data;std::string last_event;
+ std::deque<Event> events;RootEvent last_data,last_progress;std::string last_event;
  Broker(int q,int p,int merge,double latency):quantum(q),pending(p),merge_cells(merge),latency_ms(latency){
   if(q<1 || q>128 || p<1 || p>4 || merge<0 || !std::isfinite(latency) || latency<0 || latency>20)
    throw std::runtime_error("Invalid native inference service limits");
@@ -110,6 +111,10 @@ struct Broker {
  void configure_feedback(bool enabled){
   std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure interleaved solver feedback before starting");
   interleave_feedback=enabled;
+ }
+ void configure_progress(bool enabled){
+  std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure root progress before starting");
+  progress_enabled=enabled;
  }
  void collected(Clock::time_point start,uint64_t proofs){
   if(!profile_enabled)return;
@@ -301,7 +306,7 @@ struct Broker {
    for(int i=0;i<count;++i)if(source->board.history[i].c!=Cell{cells[2*i],cells[2*i+1]})throw std::runtime_error("Replacement history mismatch");
    command.kind=2;command.replacement=source->state;command.tactics=source->tactics;command.range=source->range_floor;command.seed=seed;
   }
-  p.commands.push_back(std::move(command));p.requested[game]=true;
+  p.commands.push_back(std::move(command));p.requested[game]=true;p.progress[game]={};
   // A successful replacement transfers the source Tree. Destroy its caller
   // pin before the producer can mutate the retained store; shared ownership
   // alone would not prevent concurrent unordered_map mutation on close().
@@ -346,7 +351,19 @@ struct Broker {
   return out;
  }
  void publish(Producer& p,int game,uint64_t token,RootEvent event,bool released=false){
-  std::lock_guard lock(mutex);p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
+  std::lock_guard lock(mutex);p.progress[game]={};p.epochs[game]=token;p.reported[game]=false;p.requested[game]=false;p.released[game]=released;events.push_back({&p,game,std::move(event)});wake.notify_all();
+ }
+ void publish_progress(Producer& p,int game,uint64_t sequence,RootEvent event){
+  std::lock_guard lock(mutex);p.progress_sequence[game]=sequence;p.progress[game]=std::move(event);wake.notify_all();
+ }
+ bool progress_rows(int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){
+  std::lock_guard lock(mutex);if(!error.empty())throw std::runtime_error(error);
+  if(producer<0 || producer>=int(producers.size()) || !producers[producer])throw std::runtime_error("Unknown progress producer");
+  auto& p=*producers[producer];if(game<0 || game>=int(p.epochs.size()))throw std::runtime_error("Unknown progress game");
+  if(!p.requested[game] || token!=p.epochs[game]+1 || p.progress_sequence[game]<=after || p.progress[game].text.empty())return false;
+  // Observation cannot acknowledge a completion or permit another command.
+  // Own the copy separately from the final event's borrowed ABI records.
+  last_progress=p.progress[game];*text=last_progress.text.c_str();*edges=last_progress.edges.data();*count=int(last_progress.edges.size()/9);return true;
  }
  // Block a consumer until a root event, a failure or the end of all producers.
  bool wait_event(double ms){
@@ -496,7 +513,7 @@ struct Broker {
 inline void Producer::run()noexcept{
  std::vector<uint64_t> active;
  try{
-  active.resize(pool.games.size());std::vector<uint64_t> retiring(pool.games.size());
+  active.resize(pool.games.size());std::vector<uint64_t> retiring(pool.games.size()),progress_passes(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
    if(int count=broker.worker_request(*this)){
     // The preceding graph/feed phase has joined. Caller threads never resize
@@ -527,7 +544,8 @@ inline void Producer::run()noexcept{
     if(completion.finished)std::erase(outstanding,job);
    }
    broker.installed_burst(completions.size(),burst_start,burst_proof);
-   for(auto& command:broker.commands(*this)){
+    for(auto& command:broker.commands(*this)){
+     progress_passes[command.game]=0;
     if(broker.cancelled){
      if(command.kind!=1 && (command.work || command.ms))
       broker.publish(*this,command.game,command.token,unsearched(command));
@@ -592,6 +610,15 @@ inline void Producer::run()noexcept{
      outstanding.push_back(job);broker.enqueue(job);progress=1;
     }
    }
+   if(broker.progress_enabled)for(size_t i=0;i<active.size();++i)if(active[i]){
+    auto& root=pool.games[i]->views[0];
+    if(root.passes && uint64_t(root.passes)!=progress_passes[i]){
+     uint64_t sequence;
+     {std::lock_guard lock(broker.mutex);sequence=progress_sequence[i]+1;}
+     auto event=result(int(i),active[i],sequence);
+     progress_passes[i]=root.passes;broker.publish_progress(*this,int(i),sequence,std::move(event));
+    }
+   }
    broker.acknowledge(*this,pause_token);
    if(this->retiring && outstanding.empty())break;
    if(!progress)broker.wait(*this);
@@ -617,7 +644,7 @@ inline void Producer::run()noexcept{
   // GPU readers own copied snapshots, never this feed's trees or request table.
   if(!hxgf_abandon_all(pool.feed))throw std::runtime_error(gumbel::error);
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native producer teardown failed");}
- {std::lock_guard lock(broker.mutex);completed.clear();outstanding.clear();
+  {std::lock_guard lock(broker.mutex);completed.clear();outstanding.clear();for(auto& frame:progress)frame={};
   broker.retirement_reserved-=retirement_reserved;retirement_reserved=0;done=true;
  }broker.wake.notify_all();
 }
@@ -647,7 +674,7 @@ inline std::vector<Cell> winning_turn(owner::Owner& owner,Cell first){
  for(auto& e:found->second.edges)if(e.winner==side && after.legal(e.action) && (!second || e.distance<second->distance))second=&e;
  return second?std::vector<Cell>{first,second->action}:std::vector<Cell>{};
 }
-inline RootEvent Producer::result(int index,uint64_t token){
+inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
  auto& o=*pool.games[index];auto& t=*o.views[0].tree;t.proof_root();auto& n=*t.root;
  if(pool.failed[index] || (!n.expanded && o.stopped)){
   int producer=this->index;
@@ -669,7 +696,8 @@ inline RootEvent Producer::result(int index,uint64_t token){
  int producer=this->index;
  std::ostringstream out;out<<std::setprecision(17);
  auto cells=[&](const std::vector<Cell>& h){out<<'[';for(size_t j=0;j<h.size();++j){if(j)out<<',';out<<'['<<h[j].q<<','<<h[j].r<<']';}out<<']';};
- out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
+  out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
+ if(sequence)out<<",\"kind\":\"progress\",\"snapshot_sequence\":"<<sequence<<",\"comparison_passes\":"<<o.views[0].passes<<",\"credit_source\":\"completed_comparisons\"";
  out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.q<<",\"network_value\":";
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
@@ -689,6 +717,8 @@ HX_API void hxb_flight_stats(void* p,uint64_t* out){auto& b=*static_cast<inferen
  std::array<uint64_t,3> values{uint64_t(b.flight_limit),b.flight_high_water,uint64_t(b.pending)};std::copy(values.begin(),values.end(),out);}
 HX_API int hxb_profile(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_profile(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_feedback(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_feedback(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_progress(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_progress(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_progress_rows(void* p,int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){try{return static_cast<inference::Broker*>(p)->progress_rows(producer,game,token,after,text,edges,count)?1:0;}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 HX_API void hxb_schedule_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);out[0]=b.profile_enabled;std::copy(b.schedule.begin(),b.schedule.end(),out+1);}
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

@@ -1535,6 +1535,49 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual((stats['completed'],stats['cancelled']), (4,0))
         self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()), 4)
 
+        # A cached comparison completes while a neighbor occupies the only
+        # snapshot slot. Observation must not wait for that inference reply.
+        import time
+        from types import SimpleNamespace
+        from native_scheduler import InferenceService
+        pool = self.pool([self.graph(history),self.graph(history+[(1,0),(2,0)])],
+                         quantum=4,views=1,work=4096,cache=1024)
+        for cells in [history]+[[*history,tuple(map(int,a))] for a in root['actions']]:
+            child = GameGraph(Uniform(), 'scheduler', cells)
+            try:
+                prediction = Uniform().evaluate([cells])[0]
+                h = np.asarray(cells,np.int64)
+                checked(native.hxgf_begin(pool.feed.ptr,child.ptr,h.ctypes.data,len(h)))
+                checked(native.hxgf_seed(pool.feed.ptr,child.ptr,prediction['actions'].ctypes.data,
+                                        prediction['logits'].ctypes.data,prediction['q'].ctypes.data,
+                                        len(prediction['actions'])))
+                native.hxgf_detach(pool.feed.ptr,child.ptr)
+            finally:
+                child.close()
+        service = InferenceService([pool],[SimpleNamespace(model_version='scheduler')],
+                                   quantum=4,pending=1,progress=True,profile=True)
+        batch = None
+        try:
+            service.start(continuous=True)
+            service.retarget(0,0,history,work=4096,samples=4,views=1)
+            service.retarget(0,1,history+[(1,0),(2,0)],work=4096,samples=2,views=1)
+            batch = service.take(1000.)
+            self.assertIsNotNone(batch)
+            until = time.monotonic()+2
+            frame = None
+            while frame is None and time.monotonic()<until:
+                frame = service.progress(0,0,token=1)
+                time.sleep(.001)
+            self.assertIsNotNone(frame)
+            self.assertGreater(frame['root_completed'],0)
+            self.assertGreater(service.stats()['schedule_snapshot_gate_samples'],0)
+            self.assertEqual(service.stats()['subscriber_deliveries'],0)
+        finally:
+            service.cancel()
+            if batch is not None:
+                service.abandon_fenced(batch[0])
+            service.close()
+
     def test_native_service_delivers_zero_row_root_and_release_without_batch_wait(self):
         import ctypes as C
         import time
@@ -1696,6 +1739,48 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(int(pool.games[0].evidence()['lifetime_credits'].sum()), 16)
             self.assertAlmostEqual(pool.games[0].records()[0]['raw_value'], value)
             self.assertEqual((pool.feed.stats()['pending_rows'],pool.feed.stats()['pending_requests']), (0,0))
+
+        # A writer-owned observation leaves final completion admission intact.
+        from types import SimpleNamespace
+        from native_scheduler import InferenceService
+        pool = self.pool([self.graph([(0,0)])], quantum=4, views=1, work=4096, cache=0)
+        service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')],
+                                   batch_size=1, quantum=4, pending=1, progress=True, profile=True)
+        snapshots = []
+        try:
+            service.start(continuous=True)
+            service.retarget(0,0,[(0,0)],work=4096,samples=2,views=1)
+            until = time.monotonic()+5
+            while len(snapshots)<2 and time.monotonic()<until:
+                frame = service.progress(0,0,token=1,after=snapshots[-1]['snapshot_sequence'] if snapshots else 0)
+                if frame is not None:
+                    self.assertEqual((frame['kind'],frame['token'],frame['history']), ('progress',1,[[0,0]]))
+                    self.assertEqual(frame['credit_source'], 'completed_comparisons')
+                    self.assertGreater(frame['root_completed'],0)
+                    snapshots.append(frame)
+                    with self.assertRaisesRegex(ValueError, 'matching game completion'):
+                        service.retarget(0,0,[(0,0)],expected=0,work=4,views=1)
+                    self.assertIsNone(service.progress(0,0,token=2))
+                    if len(snapshots)==2:break
+                batch = service.take(5.)
+                if batch is not None:
+                    token, _, rows = batch
+                    for index,(shape,count) in enumerate(rows.groups):
+                        h,w = (shape,shape) if isinstance(shape,int) else shape
+                        rows.decode(index,0,np.zeros((count,h*w+2),np.float32))
+                    service.complete(token,rows)
+            self.assertEqual(len(snapshots),2)
+            self.assertGreater(snapshots[1]['snapshot_sequence'],snapshots[0]['snapshot_sequence'])
+            self.assertGreater(service.stats()['schedule_snapshot_gate_samples'],0)
+            saved = snapshots[0]['edges'].copy()
+            service.cancel()
+        finally:
+            final = service.close(completions=True)
+        self.assertEqual(len(final),1)
+        self.assertEqual((final[0]['token'],final[0]['history']), (1,[[0,0]]))
+        np.testing.assert_array_equal(snapshots[0]['edges'],saved)
+        self.assertEqual(service.close(completions=True),[])
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
 
     def test_native_service_refuses_free_until_its_batch_is_fenced(self):
         import ctypes as C

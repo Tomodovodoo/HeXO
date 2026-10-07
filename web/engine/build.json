@@ -6,7 +6,7 @@
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
   "src/gumbel_batch.cpp": "a5defcd282fd94191c9db41ba069ecff5b11ee058f5b91dcb6523ef551bebf28",
   "src/gumbel_parallel.hpp": "123bee0c1cecbd53fc4bed49e3f9d574f40530dcd34579afc34578378e975e4a",
-  "src/gumbel_broker.hpp": "b75132df5e13c72afa623681c4796a3bace235e0ed0a278b45ada616312980f8",
+  "src/gumbel_broker.hpp": "b00062562c238256307755eaccf09e4673a436d632acd2853dead1a6c187fc04",
   "src/hexo.cpp": "93fa7def5fa3196473c9218ea58ecbe6ef796402e674a5a51f4fe8e678d4fe06",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
