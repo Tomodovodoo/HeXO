@@ -331,8 +331,6 @@ class IsolatedTactics:
         self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
         self.replacement, self.aborted, self.busy = None, None, False
-        # Calls are numbered on entry; an abort covers every call numbered up to `abort_upto`.
-        self.issued, self.pending, self.abort_upto = 0, 0, 0
         self._spawn()
 
     def _spawn(self):
@@ -367,10 +365,6 @@ class IsolatedTactics:
         with contextlib.suppress(OSError):  # the next query's write fails and retires it again
             self._spawn()
 
-    def _abort_requested(self, ticket):
-        with self.control_lock:
-            return ticket <= self.abort_upto
-
     def _line(self, deadline):
         try:
             line = self.lines.get(timeout=max(0.0, deadline-time.perf_counter()))
@@ -383,26 +377,22 @@ class IsolatedTactics:
 
     def history(self, history, *, nodes=DEFAULT_NODES, ms=DEFAULT_MS, idtt_nodes=0, depth=8, attacker='mover',
                 certificate=None, root_moves=None, gate=None, table_mb=0, shortest=False, bounds=False, resume=False, known=(),
-                stamps=None, library=None, replay=()):
+                stamps=None, library=None, replay=(), cancel_event=None):
         stamps = self.stamps if stamps is None else stamps
         check_budgets(ms, nodes, idtt_nodes, depth, attacker, gate, table_mb)
         if resume and not table_mb:
             raise ValueError('Solver resume requires a positive table_mb')
         start = time.perf_counter()
+        stopped = lambda: cancel_event is not None and cancel_event.is_set()
         hard = start+(ms+self.grace_ms)/1000
         dispatched = False
         unknown = lambda reason, build_hash=None: dict(unknown_result(reason, start, attacker, build_hash), budget=None,
                                                        gate_score=None, **({'proof_numbers': None} if bounds else {}))
-        with self.control_lock:
-            self.issued += 1
-            ticket = self.issued
-            self.pending += 1
         if not self.lock.acquire(timeout=ms/1000):
-            with self.control_lock:
-                self.pending -= 1
             return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
+            # From here an abort kills the child; a cancellation set before that is seen below.
             with self.control_lock:
                 self.busy = True
             # A finished replacement can itself have been aborted, so check again once it is joined.
@@ -415,13 +405,16 @@ class IsolatedTactics:
                 if self.replacement.is_alive():
                     return unknown('tactical worker restarting')
                 self.replacement = None
-            if self._abort_requested(ticket):
-                return unknown('aborted')
+            if stopped():
+                return unknown('cancelled')
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
-                if self._abort_requested(ticket):
-                    self._retire(killed=True)
-                    return unknown('aborted')
+                if stopped():
+                    if self.aborted is self.process or not isinstance(line, dict) or 'error' in line:
+                        self._retire(killed=True)
+                    else:
+                        self.ready = True
+                    return unknown('cancelled')
                 if line == 'timeout':
                     if time.perf_counter() >= self.started+self.startup_ms/1000:
                         self._retire(killed=True)
@@ -451,17 +444,21 @@ class IsolatedTactics:
             if resume:
                 request['resume'] = True
             with self.control_lock:
-                if ticket <= self.abort_upto:
-                    return unknown('aborted')
-                self.query_id += 1
-                request['query_id'] = self.query_id
-                payload = json.dumps(request, separators=(',', ':'))
-                if len(payload) > REQUEST_LIMIT:
-                    return unknown('request size limit')
-                self.active_query = self.process, self.query_id
-                dispatched = True
-                self.process.stdin.write(payload+'\n')
-                self.process.stdin.flush()
+                cancelled = stopped()
+                if not cancelled:
+                    self.query_id += 1
+                    request['query_id'] = self.query_id
+                    payload = json.dumps(request, separators=(',', ':'))
+                    if len(payload) > REQUEST_LIMIT:
+                        return unknown('request size limit')
+                    self.active_query = self.process, self.query_id
+                    dispatched = True
+                    self.process.stdin.write(payload+'\n')
+                    self.process.stdin.flush()
+            if cancelled:
+                if self.aborted is self.process:
+                    self._retire(killed=True)
+                return unknown('cancelled')
             result = self._line(hard)
             with self.control_lock:
                 self.busy = False
@@ -493,7 +490,6 @@ class IsolatedTactics:
         finally:
             with self.control_lock:
                 self.active_query, self.busy = None, False
-                self.pending -= 1
             self.lock.release()
 
     def cancel(self):
@@ -516,13 +512,10 @@ class IsolatedTactics:
 
     def abort(self):
         """End the running query now: it returns UNKNOWN and the worker restarts in the background. Without a running
-        query it does nothing, so an idle child keeps its tables. A child killed after it answered is replaced before
-        the next query, which waits for it within its own budget. Calls already made and still waiting to run
-        return UNKNOWN 'aborted' without dispatching."""
+        query it does nothing, so an idle child keeps its tables; a caller whose query may not have started yet sets
+        that query's `cancel_event` first. A child killed after it answered is replaced before the next query, which
+        waits for it within its own budget."""
         with self.control_lock:
-            if not self.pending:
-                return
-            self.abort_upto = self.issued
             if self.busy:
                 self.aborted = self.process
                 if self.process is not None:
