@@ -8,6 +8,7 @@ GPU use with the learner. Settings are defined in dense_config.ActorSettings.
 """
 import argparse
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, fields, replace
 import hashlib
 import json
@@ -166,7 +167,11 @@ class Evaluator(hexnet.DenseEvaluator):
         for small, large in zip(sizes, sizes[1:]):
             if all(a <= b for a, b in zip(small, large)) and len(groups[small])*(large[0]*large[1]-small[0]*small[1]) < MERGE_CELLS:
                 groups[large] = groups.pop(small)+groups[large]
-        chunks, staging = [], self.free.pop() if self.free else {}
+        try:  # one pop: a launcher thread may take a staging set concurrently
+            staging = self.free.pop()
+        except IndexError:
+            staging = {}
+        chunks = []
         for shape, indices in groups.items():
             height, width = shape
             size = height if height == width else shape
@@ -1227,8 +1232,13 @@ def unsearched(rows):
     return sum(bool(r.get('line')) for r in rows)
 
 
-def shard_name():
-    return f'{time.time_ns()//1_000_000:013d}{os.getpid() % 1000:03d}'
+def shard_name(after=''):
+    """Millisecond and process name of a new shard, later than `after` (this process's previous shard) so
+    shards queued for the writer within one millisecond never share a directory."""
+    ms = time.time_ns()//1_000_000
+    if after:
+        ms = max(ms, int(after[:13])+1)
+    return f'{ms:013d}{os.getpid() % 1000:03d}'
 
 
 def worker(args):
@@ -1327,7 +1337,7 @@ def worker(args):
 
     def publish():
         now = time.perf_counter()
-        name = shard_name()
+        name = state['last_shard'] = shard_name(state.get('last_shard', ''))
         actors = sorted({e['actor'] for e in episodes})
         opponents = {}
         for e in episodes:
@@ -1337,8 +1347,6 @@ def worker(args):
                         process=args.worker,
                         pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
-        dense_data.write_shard(run/'shards'/name, identity, episodes, rows, 'actor')
-        state['shards_written'] += 1
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
         elapsed = now-since['time']
         fields = dict(shard=name, games=games, rows=len(rows), terminal_fraction=terminal/games,
@@ -1347,11 +1355,25 @@ def worker(args):
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
         fields.update(book_games=sum(e.get('origin') == 'book' for e in episodes),
                       restart_games=sum(e.get('origin') == 'restart' for e in episodes))
-        log_event(run, 'actor', 'shard', f'shard {name}: {games} games, {len(rows)} rows', **fields)
-        print(json.dumps(fields), flush=True)
+        # The writer thread owns these lists; the launcher keeps the GPU busy meanwhile. At most two
+        # shards wait to be written, so a stalled disk holds back the main loop instead of memory.
+        while len(writes) >= 2:
+            written(wait=1)
+        writes.append((writer.submit(dense_data.write_shard, run/'shards'/name, identity, list(episodes), list(rows), 'actor'),
+                       f'shard {name}: {games} games, {len(rows)} rows', fields))
         since.update(time=now, positions=state['positions'], evals=engine.evals)
         episodes.clear(); rows.clear()
         refresh_sources()
+
+    def written(wait=0):
+        """Count and log finished shard writes in order, first waiting for `wait` of them; a failed write raises."""
+        while writes and (wait > 0 or writes[0][0].done()):
+            future, message, fields = writes.popleft()
+            future.result()
+            wait -= 1
+            state['shards_written'] += 1
+            log_event(run, 'actor', 'shard', message, **fields)
+            print(json.dumps(fields), flush=True)
 
     def fill_slots():
         nonlocal started
@@ -1376,6 +1398,7 @@ def worker(args):
                                         native_owner=settings.native_scheduler))
             started += 1
 
+    writer, writes = ThreadPoolExecutor(1, thread_name_prefix='shard-writer'), deque()
     try:
         last = 0.
         while True:
@@ -1402,6 +1425,7 @@ def worker(args):
                     token_pause = True
                 if entered or pending_ack:
                     status('paused'); last = time.perf_counter()
+                written()
                 time.sleep(1.)
                 if time.perf_counter()-last >= 2:
                     status('paused'); last = time.perf_counter()
@@ -1435,10 +1459,12 @@ def worker(args):
                 if len(episodes) >= settings.shard_games:
                     publish()
             state['positions'] += engine.searches-before
+            written()
             if time.perf_counter()-last >= 2:
                 status('playing'); last = time.perf_counter()
         if episodes:
             publish()
+        written(wait=len(writes))
         engine.drain()
         status('finished')
     except BaseException as error:
@@ -1447,6 +1473,7 @@ def worker(args):
         log_event(run, 'actor', 'error', state['error'], process=args.worker)
         raise
     finally:
+        writer.shutdown()
         engine.close()
 
 

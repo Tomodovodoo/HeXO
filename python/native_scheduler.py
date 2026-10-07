@@ -43,7 +43,7 @@ for name, result, args in (
     ('abort', C.c_int, [ptr, C.c_uint64]), ('done', C.c_int, [ptr]),
     ('join', C.c_int, [ptr]), ('free', C.c_int, [ptr]), ('stats', None, [ptr, ptr]),
     ('continuous', C.c_int, [ptr]), ('event', C.c_char_p, [ptr]),
-    ('event_rows', C.c_int, [ptr, ptr, ptr, ptr]),
+    ('event_rows', C.c_int, [ptr, ptr, ptr, ptr]), ('wait_event', C.c_int, [ptr, C.c_double]),
     ('pause', C.c_int, [ptr, C.c_int]), ('paused', C.c_int, [ptr]),
     ('installed', C.c_uint64, [ptr]),
     ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
@@ -438,6 +438,8 @@ class InferenceService:
             raise ValueError('One frozen evaluator is required for every pool model version')
         self.batch_size, self.pending, self.leases, self._stats = batch_size, [], {}, None
         self.flight_limit = flights
+        self._launcher = self._failure = None
+        self._relaunch = False
         self.interleave_feedback = bool(interleave_feedback)
         self._ptr = native.hxb_new(quantum, pending, merge_cells, latency_ms)
         if not self._ptr:
@@ -558,6 +560,56 @@ class InferenceService:
                                     work, ms, samples, views, noise, seed))
         source.ptr = None
 
+    def launch(self):
+        """Run pump() on a launcher thread until pause() or close().
+
+        The caller then never pumps itself: forwards keep launching and
+        collecting while it handles events. A launcher failure cancels the
+        service and is raised by the next event(), wait() or pause().
+        """
+        import threading
+        if self._launcher is not None:
+            raise ValueError('The inference launcher is already running')
+        self.ptr
+        halt = threading.Event()
+        def run():
+            try:
+                while not halt.is_set():
+                    calls = self.calls
+                    self.pump()
+                    if not self.pending and self.calls==calls:
+                        # take() returns at once while root events wait for the
+                        # caller, so an idle pump must not spin.
+                        halt.wait(.01 if self.done() else .001)
+            except BaseException as error:
+                self._failure = error
+                self.cancel()
+        thread = threading.Thread(target=run, name='inference-launcher', daemon=True)
+        self._launcher = thread, halt
+        thread.start()
+
+    def _halt(self):
+        """Join the launcher; True when one was running."""
+        if self._launcher is None:
+            return False
+        thread, halt = self._launcher
+        halt.set()
+        thread.join()
+        self._launcher = None
+        self._raise()
+        return True
+
+    def _raise(self):
+        if self._failure is not None:
+            raise self._failure
+
+    def wait(self, ms):
+        """Block up to `ms` for a root event; True when one is ready."""
+        self._raise()
+        ready = bool(native.hxb_wait_event(self.ptr, ms))
+        self._raise()  # A launcher failure cancels the service and ends the wait.
+        return ready
+
     def event(self):
         """Copy one immutable root/lifecycle completion; None while roots run.
 
@@ -565,6 +617,7 @@ class InferenceService:
         so later events, replacement and service close cannot invalidate them.
         """
         import json
+        self._raise()
         text, edges, count = C.c_char_p(), C.POINTER(C.c_double)(), C.c_int()
         status = native.hxb_event_rows(self.ptr,C.byref(text),C.byref(edges),C.byref(count))
         if status<0:
@@ -587,6 +640,7 @@ class InferenceService:
         in seconds; timing out retains the paused service and active handles.
         """
         import time
+        self._relaunch = self._halt() or self._relaunch
         if set(self.leases)-{token for token, _ in self.pending}:
             raise ValueError('Complete or abandon_fenced manual batches before pausing')
         checked(native.hxb_pause(self.ptr, 1))
@@ -610,6 +664,9 @@ class InferenceService:
 
     def resume(self):
         checked(native.hxb_pause(self.ptr, 0))
+        if self._relaunch:
+            self._relaunch = False
+            self.launch()
 
     def complete(self, token, rows):
         if self.leases.get(token) is not rows:
@@ -734,6 +791,11 @@ class InferenceService:
     def close(self):
         if self._ptr:
             self.cancel()
+            if self._launcher is not None:
+                thread, halt = self._launcher
+                halt.set()
+                thread.join()
+                self._launcher = None
             failure = None
             for token, handle in tuple(self.pending):
                 try:

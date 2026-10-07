@@ -103,8 +103,10 @@ class ActorGraph:
         del warm
 
         graph = torch.cuda.CUDAGraph()
+        # Thread-local capture: an actor's launcher thread may capture while its
+        # main thread evaluates or reads memory statistics on other streams.
         with torch.inference_mode(), torch.autocast('cuda', torch.bfloat16, cache_enabled=False), \
-                torch.cuda.graph(graph, pool=self.pool, stream=self.stream):
+                torch.cuda.graph(graph, pool=self.pool, stream=self.stream, capture_error_mode='thread_local'):
             out = self.model(static_input, static_input[:, 3:4], aux=False)
             static_packed.copy_(torch.cat((out['policy'], out['far'][:, None],
                                            out['value_logit'][:, None]), dim=1))
