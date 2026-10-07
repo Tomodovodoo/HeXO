@@ -523,8 +523,8 @@ def shard_stamp(path):
 
 def index_shard(path):
     """A verified shard as arrays. Per row: game, ply, player, remaining, proven (as stored), known_result, legal
-    (raw sha256 digests [rows, 32]), following (the row of the same game's next ply, else -1), network (the
-    episode's saved network value at the row's ply, NaN when absent) and offsets [rows+1] (policy offsets). Per
+    (raw sha256 digests [rows, 32]), following (the row of the same game's next ply, else -1), network and
+    has_network (the episode's saved network value at the row's ply, and whether it has one) and offsets [rows+1] (policy offsets). Per
     game: start [games+1] (ply offsets), winner, side (trained side, -1 for self-play), has_roots, has_search,
     holdout (holdout_key) and actor (index into `actors`). Per ply: moves [plies, 2], roots (NaN for null) and
     searched. proof_action and search map row indices to those row fields; actors lists the episode actors."""
@@ -541,7 +541,8 @@ def index_shard(path):
         known_result=np.array([known_result(episodes[r['game']], r['ply']) for r in rows], np.int8),
         legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
         following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
-        network=np.array([np.nan if v is None or v[r['ply']] is None else v[r['ply']] for v, r in zip(values, rows)], np.float64),
+        network=np.array([0. if v is None or v[r['ply']] is None else v[r['ply']] for v, r in zip(values, rows)], np.float64),
+        has_network=np.array([v is not None and v[r['ply']] is not None for v, r in zip(values, rows)], bool),
         offsets=load_offsets(path, len(rows)),
         start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
         winner=np.array([e['winner'] for e in episodes], np.int8),
@@ -614,10 +615,10 @@ def label_keys(game, ply, labels):
     return np.isin(game.astype(np.int64)*2**16+ply, [g*2**16+t for g, t in labels])
 
 
-def exact_errors(name, proven, network):
+def exact_errors(name, proven, network, has_network):
     """{row: regret} of the rows with an exact label (proven +1/-1) and a saved network value p with proven*p <= 0.8,
     regret = (1 - proven*p)/2; raises ValueError when such a row's value lies outside [-1, 1]."""
-    rows = np.flatnonzero((np.abs(proven) == 1) & ~np.isnan(network))
+    rows = np.flatnonzero((np.abs(proven) == 1) & has_network)
     signed = proven[rows]*network[rows]
     regret = (1-signed)/2
     bad = ~((regret >= 0) & (regret <= 1))
@@ -818,7 +819,7 @@ class ReplayWindow:
             self.unlabelled.add(name)
         shard = Shard(**{k: x[k] for k in Shard._fields if k != 'held'}, held=held_out(x['holdout'], self.validation_fraction))
         label(shard, labels)
-        self.exact_regret[name] = exact_errors(name, shard.proven, x['network'])
+        self.exact_regret[name] = exact_errors(name, shard.proven, x['network'], x['has_network'])
         return shard
 
     def refresh(self):
@@ -855,8 +856,8 @@ class ReplayWindow:
                 labels, self.deblunders[name] = proof_annotations(self.run_dir/'shards'/name)
                 if labels is not None:
                     label(self.shards[name], labels); self.unlabelled.discard(name)
-                    network = shard_index(self.run_dir/'shards'/name, self.index_dir, ('network',))['network']
-                    self.exact_regret[name] = exact_errors(name, self.shards[name].proven, network)
+                    x = shard_index(self.run_dir/'shards'/name, self.index_dir, ('network', 'has_network'))
+                    self.exact_regret[name] = exact_errors(name, self.shards[name].proven, x['network'], x['has_network'])
                     changed = True
         if not changed:
             return self.rows
