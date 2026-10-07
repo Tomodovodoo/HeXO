@@ -783,6 +783,22 @@ class Bundle(unittest.TestCase):
         self.assertGreater(answer['actual_solver_nodes'], 0)
         self.assertGreater(answer['native_scheduler'][0]['proof']['installed'], 0)
 
+    def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
+        import re
+        from hexo import Game
+        from notation import loads
+        text = (ROOT/'tests'/'fixtures'/'forced-wins.htttx').read_text(encoding='utf-8')
+        history = [list(p) for p in loads(re.split(r'(?=version\[1\];)', text)[1]).history]
+        game = Game(history)
+        mover = game.player
+        game.close()
+        answer = node(dict(kind='worker-turn', adapter=True, history=history, preset='solver'))
+        self.assertEqual(answer['analysis']['preset'], 'solver')
+        self.assertEqual(answer['analysis']['budget']['solver_ms'], 120000)
+        self.assertEqual(answer['proof']['winner'], mover)
+        self.assertLess(answer['solver']['elapsed_ms'], 120000)
+        self.assertGreater(answer['solver']['root_nodes'] + answer['solver']['native_nodes'], 0)
+
     def test_native_proof_frontier_settles_during_inference_and_drains_both_producers(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
         answer = node(dict(kind='native-proofs',history=history,ms=2000,slice=16,delay=30))

@@ -46,7 +46,7 @@ class ActorSettings:
     native_depth: int = 8
     native_proof_workers: int = 12 # CPU proof workers shared by every producer's live games
     native_proof_slice_ms: int = 8
-    native_proof_budget: float = 1. # share of each graph owner's time proof steps may take before it stops admitting jobs
+    native_proof_budget: float = .1 # share of each graph owner's time proof steps may take before it stops admitting jobs (docs/search-scheduler-design.md)
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share

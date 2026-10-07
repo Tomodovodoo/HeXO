@@ -3365,6 +3365,22 @@ class NativeProofs(unittest.TestCase):
         self.assertGreater(proofs.stats()['submitted'], 4)
         proofs.drain()
 
+    def test_owner_budget_holds_back_admission_under_load(self):
+        import time
+        def run(budget):
+            pool = self.pool([self.graph(self.opening) for _ in range(16)], quantum=16, views=1, work=1 << 30)
+            proofs = pool.enable_proofs(slice_ms=2, table_mb=1, workers=8, owner_budget=budget)
+            end = time.perf_counter() + 1.5
+            while time.perf_counter() < end:
+                pool.step();self.answer(pool);proofs.step()
+            stats = proofs.stats()
+            pool.cancel();proofs.drain();pool.abandon_fenced()
+            return stats
+        free, capped = run(1.), run(1e-4)
+        # Under a sustained proof flow the capped owner keeps installing but stops admitting new jobs.
+        self.assertGreater(capped['supply_owner_exits'], free['supply_owner_exits'])
+        self.assertLess(capped['submitted'], free['submitted'])
+
     def test_shared_idle_time_goes_to_the_producer_held_back(self):
         import time
         workers = self.shared(workers=2, queue=8)
@@ -3432,8 +3448,8 @@ class NativeProofs(unittest.TestCase):
             proofs.stats()
 
     def test_native_service_retires_a_neural_lease_when_real_solver_finishes(self):
-        for feedback in (False,True):
-            with self.subTest(feedback=feedback):
+        for feedback,pending in ((False,2),(True,2),(False,4),(True,4)):
+            with self.subTest(feedback=feedback,pending=pending):
                 import ctypes as C
                 import json
                 import threading
@@ -3464,7 +3480,7 @@ class NativeProofs(unittest.TestCase):
                     try:
                         loop=native.hxp_new(pool.ptr,functions.ctypes.data,1,4,1000,1,64,0)
                         self.assertTrue(loop)
-                        service=native.hxb_new(16,2,0,0.)
+                        service=native.hxb_new(16,pending,0,0.)
                         self.assertTrue(service)
                         checked(native.hxb_feedback(service,feedback))
                         checked(native.hxb_attach(service,pool.ptr,0))

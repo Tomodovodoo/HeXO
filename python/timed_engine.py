@@ -12,6 +12,19 @@ from urllib.error import URLError
 from hexo import Game, library
 from time_control import allowance
 
+PROOF_WORKERS = 2   # native timed turns: proof workers of the turn's private loop (solver.workers)
+PROOF_BUDGET = 1.   # share of the graph owner's time proof steps may take (solver.budget, ProofLoop owner_budget)
+
+
+def proof_settings(solver):
+    """The checked proof workers and owner budget of a native timed Bubble's `solver` settings."""
+    workers, budget = solver.get('workers', PROOF_WORKERS), solver.get('budget', PROOF_BUDGET)
+    if type(workers) is not int or not 1 <= workers <= 64:
+        raise ValueError('solver.workers must be an integer from 1 to 64')
+    if type(budget) not in (int, float) or not 0 < budget <= 1:
+        raise ValueError('solver.budget must lie in (0, 1]')
+    return workers, float(budget)
+
 
 class HTTTXEngine:
     """An HTTP opponent using the published per-turn allowance, in seconds."""
@@ -255,6 +268,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     hard = limits.get('response_deadline', started + max(0, limits['hard_ms'])/1000)
     normal = min(hard-limits['reserve_ms']/1000,
                  limits.get('search_deadline', started + limits['normal_ms']/1000))
+    workers, budget = limits.get('proof_workers', PROOF_WORKERS), limits.get('proof_budget', PROOF_BUDGET)
     game = Game(history)
     side, remaining = game.player, game.remaining
     result = dict(moves=legal_turn(history), backend='dense', checkpoint=player.checkpoint,
@@ -262,7 +276,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                   suggestions=[], winning_line=[], threat=None,
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
                   settings=dict(player.options) | dict(native_scheduler=True,
-                      simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8),
+                      simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8,
+                      proof_workers=workers, proof_budget=budget),
                   completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[], root_searches=[])
     service = None
     def stopped():
@@ -306,7 +321,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline'
             return result
         signature = (player.model_sha256, player.options['solver'],
-                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.))
+                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget)
         kept = getattr(player, '_timed_native', None)
         if kept is not None and kept[2] != signature:
             player.set_history(history)
@@ -318,8 +333,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             try:
                 pool = SearchPool([graph], quantum=64, views=8, depth=8, work=1, seed=1740)
                 if player.options['solver']:
-                    pool.enable_proofs(player.tactical_package, workers=2, queue=16,
-                                       slice_ms=8, stamps=signature[2])
+                    pool.enable_proofs(player.tactical_package, workers=workers, queue=8*workers,
+                                       slice_ms=8, stamps=signature[2], owner_budget=budget)
             except BaseException:
                 if pool is not None:
                     pool.close()
@@ -510,10 +525,20 @@ def _worker(connection, cancellation, config):
             player.evaluator.evaluate([[(0, 0)]])
             player.batch_seconds = time.monotonic()-t0
             identity = dict(checkpoint=player.checkpoint, model_sha256=player.model_sha256)
+            if player.evaluator.graph is not None:
+                started = time.monotonic()
+                prepared = player.evaluator.graph.prepare((24, (24, 32), (32, 24), 32,
+                    (24, 40), (40, 24), (32, 40), (40, 32), 40), cancelled=cancellation.is_set)
+                identity['capture_preparation'] = dict(captures=prepared,
+                    milliseconds=(time.monotonic()-started)*1000,
+                    incremental_bytes=player.evaluator.graph.incremental_reserved_bytes,
+                    budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
                                  q_range_floor=search.get('q_range_floor', 0.),
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
+            if search.get('native_scheduler'):
+                search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
         elif kind == 'six':
             from six_engine import SixEngine
             player = SixEngine(config['command'], cancel=cancellation, mirrored=config.get('mirrored', False),
@@ -606,6 +631,9 @@ class TimedEngine:
                 raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
             if solver.get('leaf'):
                 raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+            proof_settings(solver)
+        elif {'workers', 'budget'} & solver.keys():
+            raise ValueError('Proof workers and budget apply to native timed solving only')
         cap = search.get('max_simulations', search.get('simulations'))
         if cap is not None and (type(cap) is not int or cap <= 0):
             raise ValueError('simulation cap must be a positive integer')
