@@ -2435,6 +2435,7 @@ class TurnTrees(unittest.TestCase):
                 game = Game(history)
                 try:
                     for q, r in found['moves']:   # a legal complete turn of the proven winner
+                        self.assertEqual(game.player, 0)
                         game.play(q, r)
                     self.assertEqual(game.player, 1)
                 finally:
