@@ -19,6 +19,16 @@ FORKS = [
      (-3,5),(-4,2),(2,1),(-5,2),(1,2),(-4,3),(-1,3),(-5,3),(1,3)],
 ]
 
+# Native's turns from Seal games seeded 810505, before which Native had not yet
+# lost: the Rust solver proved a Seal win after the turn Native played, and the
+# separate Python certificate checker accepted that proof.
+REFUTED = [
+    ([(0,0),(0,1),(1,2),(-2,1),(-2,2),(0,6)], [(0,2)]),
+    ([(0,0),(-1,0),(0,1),(-2,4),(-1,1),(1,-1),(1,-2)], [(-2,2),(-2,5)]),
+    ([(0,0),(-2,1),(-3,0),(-2,2),(-1,-1),(-1,1),(-3,1),(-4,1),(-3,2),(0,1),(-1,2),
+      (1,1),(-1,3),(1,0),(2,-1),(-2,3),(3,-2),(0,2),(0,3),(-4,2),(-4,0)], [(2,2),(0,4)]),
+]
+
 
 class LeafTactics(unittest.TestCase):
     def position(self, moves):
@@ -87,6 +97,22 @@ class LeafTactics(unittest.TestCase):
         self.assertTrue(threats)
         self.assertTrue(has_cover(threats, 1))
         self.assertEqual(reference.remaining, 2)
+
+    def test_played_turn_avoids_a_proven_opponent_win(self):
+        # The search probes the turn it returns for an opponent forced win
+        # and drops every root that the found strategy also beats.
+        for moves, refuted in REFUTED:
+            with self.subTest(stones=len(moves)):
+                game, reference = self.position(moves)
+                before = (game.key, game.state(), game.features())
+                result = game.search(1000, width=16)
+                self.assertEqual((game.key, game.state(), game.features()), before)
+                self.assertNotEqual(sorted(result["moves"]), sorted(refuted))
+                side = game.player
+                for point in result["moves"]:
+                    self.assertTrue(reference.legal(*point))
+                    reference.play(*point)
+                self.assertTrue(reference.winner >= 0 or reference.player != side)
 
 
 if __name__ == "__main__":
