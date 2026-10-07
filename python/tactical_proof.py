@@ -391,9 +391,12 @@ class IsolatedTactics:
             return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
-            if self.replacement is None and self.aborted is self.process:
-                self._retire(killed=True)
-            if self.replacement:
+            # A finished replacement can itself have been aborted, so check again once it is joined.
+            for _ in range(2):
+                if not self.replacement and self.aborted is self.process:
+                    self._retire(killed=True)
+                if not self.replacement:
+                    break
                 self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
                 if self.replacement.is_alive():
                     return unknown('tactical worker restarting')

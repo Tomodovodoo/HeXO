@@ -92,6 +92,10 @@ class Isolation(unittest.TestCase):
         self.assertEqual(idle['reason'], 'scripted')
         self.assertNotEqual(idle['pid'], starting['pid'])
         self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], idle['pid'])
+        self.assertIn('hard deadline', self.tactics.history([[1, 1]], ms=200)['reason'])
+        self.tactics.replacement.join()  # the replacement child is up, and no query has seen it yet
+        self.tactics.abort()
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['reason'], 'scripted')
 
     def test_abandoned_native_work_replaces_child(self):
         pid = self.tactics.history([[2, 2]], ms=10000)['pid']
