@@ -942,11 +942,11 @@ function renderEngineHead(){
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:entryOf(it.id)?.preset||'standard',custom:undefined}));
   const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
-  const solving=a.preset==='solver',solver=el('div',{class:'switch'+(solving?' on':''),role:'switch','aria-checked':solving,tabindex:0,title:'Spend the analysis on proof search until a verified proof or two minutes'},'Solver',el('i'));
-  solver.onclick=()=>sendAnalysis({preset:solving?'standard':'solver',custom:undefined});
+  const solving=a.preset==='solver',solver=entryOf(a.engine)?.kind!=='bubble'?null:el('div',{class:'switch'+(solving?' on':''),role:'switch','aria-checked':solving,tabindex:0,title:'Spend the analysis on proof search until a verified proof or two minutes'},'Solver',el('i'));
+  if(solver)solver.onclick=()=>sendAnalysis({preset:solving?'standard':'solver',custom:undefined});
   const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});setIcon(again,S.jobs.some(j=>j.kind==='analyse')?'close':'again');
   const ev=S.evaluations[view],landed=ev?STOPS.findIndex(p=>entryOf(a.engine)?.presets?.[p]?.simulations===ev.simulations):-1;
-  head.replaceChildren(el('div',{class:'head'},pick,auto,solver,again),...seatControls(a,sendAnalysis,'analysis',configButton('analysis',a),landed));
+  head.replaceChildren(el('div',{class:'head'},pick,auto,...(solver?[solver]:[]),again),...seatControls(a,sendAnalysis,'analysis',configButton('analysis',a),landed));
   head.style.setProperty('--c',COLORS[playerAt(view)]);
 }
 function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=view-1&&view-1<t.ply+t.stones.length)||null}

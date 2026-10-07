@@ -821,6 +821,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
             service.cancel()
             service.close()
         stats = pool.proofs.stats() if pool.proofs is not None else {}
+        records = pool.proofs.records() if pool.proofs is not None else []
         pool.close()
         graph.close()
         shared.close()
@@ -828,6 +829,17 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
     found['solver'] = dict(elapsed_ms=round((time.monotonic() - start) * 1000), root_nodes=root['nodes'],
                            native_nodes=stats.get('fresh_nodes', 0), certificates=stats.get('records', 0), workers=workers)
     found['used'] = root['nodes'] + stats.get('fresh_nodes', 0)
+    facts = []
+    for record in records:
+        request, answer = record['request'], record['result']
+        if answer.get('status') not in ('PROVEN_WIN', 'PROVEN_LOSS') or not answer.get('native_verified'):
+            continue
+        turns, cert = answer['proof_turns'], answer.get('certificate') or json.loads(answer['certificate_json'])
+        plies = len(answer['moves']) + 4 * (turns - 1) if answer['status'] == 'PROVEN_WIN' else 4 * turns + 2
+        pv, _ = principal_variation(request['history'], cert, attacker=answer['winner'], known=request.get('known', ()))
+        facts.append(dict(history=request['history'], winner=answer['winner'], plies=plies, pv=pv))
+    if facts:
+        found['proofs'] = facts   # the frontier's verified answers join the game's proof table (Session.save)
     if root['result'] is not None:
         found.update(winning_line(history, root['result'], [f for f in known if len(f['history']) != len(history)
                                                                or f['winner'] != player]))
@@ -1383,6 +1395,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         found = turn.record()
         if solved and 'solver' in solved:
             found['solver'] = solved['solver']
+            if solved.get('proofs'):
+                found['proofs'] = found.get('proofs', []) + solved['proofs']
         return found
     finally:
         turn.close()
@@ -1617,8 +1631,8 @@ class Engines:
         return out
 
     def effective(self, budget):
-        """`budget` as it can run here: no solver nodes when the tactical library is not built."""
-        return budget if self.solver_build() != 'none' else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
+        """`budget` as it can run here: no solver work when the tactical library is not built."""
+        return budget if self.solver_build() != 'none' else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes', 'solver_ms') if k in budget}
 
     def solver_build(self):
         """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when the library or its
