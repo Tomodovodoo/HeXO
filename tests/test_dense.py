@@ -10117,7 +10117,9 @@ class DenseTimedWorker(unittest.TestCase):
                      edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
         for winner, visits in ((-1, 200), (-1, 0), (1, 0)):
             with self.subTest(exact_winner=winner, position_edge_visits=visits), \
-                    unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    unittest.mock.patch('native_scheduler.InferenceService') as service_type, \
+                    unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                clock = [0.]
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
@@ -10125,14 +10127,32 @@ class DenseTimedWorker(unittest.TestCase):
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None
-                service.event.side_effect = [first, dict(producer=0, game=0, model=0,
+                frames = [first, dict(producer=0, game=0, model=0,
                     token=2, history=history+[[1, 0]], context='second', action=[2, 0],
                     exact_winner=winner, root_completed=0, completed=200, issued=80,
                     elapsed_ms=476., result_build_ms=2., result_ready_elapsed_ms=478.,
                     publish_delay_ms=1., event_queue_ms=784.,
                     winning_turn=[[2, 0]] if winner == 1 else [],
                     edges=np.array([[2, 0, 0, 0, .8, 1, visits, 0, 1]], float))]
-                result = native_turn(player, history, allowance(movetime=1000), threading.Event())
+                def completion():
+                    clock[0] = .048 if service.event.call_count == 1 else .08
+                    return frames[service.event.call_count-1]
+                service.event.side_effect = completion
+                published = []
+                cancelled = threading.Event()
+                def publish(event):
+                    published.append(event)
+                    if event['turn_complete']:
+                        cancelled.set()
+                limits = allowance(movetime=100, reserve_ms=20) | dict(
+                    hard_deadline=.1, response_deadline=.097, search_deadline=.08)
+                result = native_turn(player, history, limits, cancelled, publish)
+                self.assertAlmostEqual(service.retarget.call_args.kwargs['ms'], 32.)
+            self.assertFalse(published[0]['turn_complete'])
+            self.assertFalse(published[1]['turn_complete'])
+            self.assertTrue(published[-1]['turn_complete'])
+            self.assertEqual(published[-1]['stop_reason'], 'deadline')
+            self.assertEqual(result['stop_reason'], 'deadline')
             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
             self.assertEqual(result['completed'], 2)
             self.assertEqual(result['root_searches'][1]['issued'], 80)

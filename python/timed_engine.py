@@ -16,6 +16,18 @@ PROOF_WORKERS = 2   # native timed turns: proof workers of the turn's private lo
 PROOF_BUDGET = 1.   # share of the graph owner's time proof steps may take (solver.budget, ProofLoop owner_budget)
 
 
+def precise_timer():
+    """Request precise Windows waits in this process; the owner must release it."""
+    import sys
+    if sys.platform != 'win32':
+        return None
+    import ctypes
+    timer = ctypes.WinDLL('winmm')
+    if timer.timeBeginPeriod(1):
+        raise RuntimeError('Could not request 1 ms native search timers')
+    return timer
+
+
 def proof_settings(solver):
     """The checked proof workers and owner budget of a native timed Bubble's `solver` settings."""
     workers, budget = solver.get('workers', PROOF_WORKERS), solver.get('budget', PROOF_BUDGET)
@@ -265,8 +277,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     import numpy as np
     from neural_search import GameGraph
     from native_scheduler import SearchPool, InferenceService
-    hard = limits.get('response_deadline', started + max(0, limits['hard_ms'])/1000)
-    normal = min(hard-limits['reserve_ms']/1000,
+    turn_deadline = limits.get('hard_deadline', started + max(0, limits['hard_ms'])/1000)
+    hard = limits.get('response_deadline', turn_deadline)
+    normal = min(turn_deadline-limits['reserve_ms']/1000,
                  limits.get('search_deadline', started + limits['normal_ms']/1000))
     workers, budget = limits.get('proof_workers', PROOF_WORKERS), limits.get('proof_budget', PROOF_BUDGET)
     game = Game(history)
@@ -282,11 +295,15 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
     service = None
     def stopped():
         return cancel.is_set() or time.monotonic() >= normal
-    def emit(moves, candidate=None):
+    def emit(moves, candidate=None, complete=False):
         output = result if candidate is None else candidate
         if service is not None:
             output['evaluated'] = service.stats()['launched_rows']
-        output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
+        output.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000,
+                      turn_complete=complete)
+        if complete:
+            output.setdefault('stop_reason',
+                'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget')
         publish(dict(output, stones=list(output['stones']),
                      root_searches=[dict(root) for root in output['root_searches']]))
     def read_choice(found, current):
@@ -466,9 +483,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     game.play(*second)
                     selected.append(second)
                 result['winning_turn'] = list(selected)
-                emit(selected)
+                emit(selected, complete=True)
                 break
-            emit(complete_candidate(history, selected))
+            emit(complete_candidate(history, selected), complete=game.player != side or game.winner >= 0)
         result['stop_reason'] = result.get('stop_reason',
             'stop' if cancel.is_set() else 'deadline' if time.monotonic() >= normal else 'budget')
     finally:
@@ -490,10 +507,13 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
 
 def _worker(connection, cancellation, config):
     """Own the model and its mutable tree in one spawned process."""
-    player = None
+    player = timer = None
     try:
         kind = config.get('kind', 'bubble')
         if kind == 'bubble':
+            if (config.get('search', {}).get('native_scheduler')
+                    and config.get('search', {}).get('enabled', True)):
+                timer = precise_timer()
             import torch
             from dense_player import DensePlayer
             torch.set_num_threads(2)
@@ -539,6 +559,16 @@ def _worker(connection, cancellation, config):
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
             if search.get('native_scheduler'):
                 search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
+                if player.options['search'] and player.evaluator.cuda:
+                    # CUDA capture alone does not initialize packed inference,
+                    # its launcher thread or the proof pool. Exercise that path
+                    # before accepting short clocks, then discard its searches.
+                    started = time.monotonic()
+                    prepared = native_turn(player, [[0, 0]], allowance(movetime=1000) |
+                        search_limits | dict(simulations=64), cancellation)
+                    player.set_history()
+                    identity['scheduler_preparation'] = dict(milliseconds=(time.monotonic()-started)*1000,
+                        completed=prepared['completed'], evaluated=prepared['evaluated'])
         elif kind == 'six':
             from six_engine import SixEngine
             player = SixEngine(config['command'], cancel=cancellation, mirrored=config.get('mirrored', False),
@@ -617,9 +647,13 @@ def _worker(connection, cancellation, config):
         except (EOFError, BrokenPipeError):
             pass
     finally:
-        if player and config.get('kind') != 'seal':
-            player.close()
-        connection.close()
+        try:
+            if player and config.get('kind') != 'seal':
+                player.close()
+        finally:
+            if timer is not None:
+                timer.timeEndPeriod(1)
+            connection.close()
 
 
 class TimedEngine:
@@ -645,10 +679,12 @@ class TimedEngine:
         self.lock = threading.Lock()
         self.generation = 0
         self.busy = False
+        self.timer = None
         self.process = context.Process(target=_worker, args=(child, self.cancellation, self.config), daemon=True)
         self.process.start()
         child.close()
         try:
+            self.timer = precise_timer()
             if not self.connection.poll(startup_timeout):
                 raise TimeoutError('Engine initialization timed out')
             status, identity = self.connection.recv()
@@ -704,18 +740,20 @@ class TimedEngine:
     def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
         history = [list(cell[:2]) for cell in game.cells]
         started = time.monotonic()
-        limits = allowance(clock, game.player, milliseconds)
+        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
+                          self.config.get('search', {}).get('native_scheduler') and
+                          self.config.get('search', {}).get('enabled', True))
+        # Leave time to finalize a graph root and transfer its immutable result,
+        # in addition to delivering the turn through the controller.
+        limits = allowance(clock, game.player, milliseconds, reserve_ms=20 if native_clocked else 10)
         if clock and self.config.get('kind') == 'six':
             # A clock-aware external engine owns its allocation, bounded by the host's remaining clock.
             remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
             limits['hard_ms'] = remaining if milliseconds is None else min(remaining, milliseconds)
             limits['clock'] = dict(clock)
-        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
-                          self.config.get('search', {}).get('native_scheduler') and
-                          self.config.get('search', {}).get('enabled', True))
-        # Native search stops before the reserve; its final result is delivered
-        # during it. Keep listening through the inclusive response deadline.
-        response_ms = limits['hard_ms'] if native_clocked else limits['hard_ms']-limits['reserve_ms']
+        # Search stops before the reserve. Listen during finalization, leaving
+        # three milliseconds to validate and deliver the selected turn.
+        response_ms = limits['hard_ms']-min(3., limits['reserve_ms'])
         deadline = started + max(0, response_ms)/1000
         best = dict(moves=legal_turn(history), backend='timed', checkpoint=self.checkpoint,
                     model_sha256=self.model_sha256, stop_reason='deadline', elapsed_ms=0,
@@ -757,7 +795,8 @@ class TimedEngine:
             if native_clocked:
                 # Monotonic time is shared by local processes. Queue/IPC delay
                 # consumes the turn instead of restarting its clock on receipt.
-                worker_limits.update(response_deadline=deadline,
+                worker_limits.update(hard_deadline=started+limits['hard_ms']/1000,
+                                     response_deadline=deadline,
                                      search_deadline=started+limits['normal_ms']/1000)
             self.connection.send((generation, history, worker_limits))
             self.busy = True
@@ -767,9 +806,12 @@ class TimedEngine:
                     if cancel is not None and cancel.is_set():
                         best['stop_reason'] = 'stop'
                         break
-                    if not self.connection.poll(min(.005, max(0, deadline-time.monotonic()))):
+                    # Windows pipe waits can round a short timeout to a much
+                    # coarser timer tick. Python's sleep uses a precise timer.
+                    if not self.connection.poll():
                         if not self.process.is_alive():
                             raise RuntimeError('Engine worker exited')
+                        time.sleep(min(.001, max(0, deadline-time.monotonic())))
                         continue
                     ident, status, result = self.connection.recv()
                     if ident != generation:
@@ -783,7 +825,10 @@ class TimedEngine:
                     best.update(result)
                     if publish:
                         publish(dict(best))
-                    if status == 'done':
+                    if status == 'done' or (native_clocked and result.get('turn_complete')
+                            and deadline-time.monotonic() <= limits['reserve_ms']/1000):
+                        # Both stones are selected. Resource drainage can take
+                        # longer and remains owned by the worker/wait_idle().
                         complete = True
                         best['stop_reason'] = result.get('stop_reason', 'budget')
                         break
@@ -799,17 +844,22 @@ class TimedEngine:
             self.lock.release()
 
     def close(self):
-        self.cancellation.set()
-        if self.process.is_alive():
-            try:
-                self.connection.send(None)
-            except (BrokenPipeError, OSError):
-                pass
-            self.process.join(.2)
+        try:
+            self.cancellation.set()
             if self.process.is_alive():
-                self.process.terminate()
-                self.process.join(2)
-        self.connection.close()
+                try:
+                    self.connection.send(None)
+                except (BrokenPipeError, OSError):
+                    pass
+                self.process.join(.2)
+                if self.process.is_alive():
+                    self.process.terminate()
+                    self.process.join(2)
+            self.connection.close()
+        finally:
+            if self.timer is not None:
+                self.timer.timeEndPeriod(1)
+                self.timer = None
 
     def __enter__(self):
         return self
