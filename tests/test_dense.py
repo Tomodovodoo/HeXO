@@ -4708,7 +4708,7 @@ class EngineTests(unittest.TestCase):
         service.launch()
         def collect(count):
             # The caller only waits for and reads events; it never pumps.
-            events, end = [], time.monotonic()+10
+            events, end = [], time.monotonic()+PATIENCE
             while len(events)<count and time.monotonic()<end:
                 service.wait(100.)
                 while (event:=service.event()) is not None:
@@ -4740,7 +4740,7 @@ class EngineTests(unittest.TestCase):
             token = next(e['token'] for e in events if e['game']==0)
             service.retarget(0,0,histories[0]+[[3,0],[4,0]],expected=token,work=8,views=1)
             with self.assertRaisesRegex(RuntimeError,'forward failed'):
-                end = time.monotonic()+10
+                end = time.monotonic()+PATIENCE
                 while time.monotonic()<end:
                     service.wait(50.)
         service.close()
