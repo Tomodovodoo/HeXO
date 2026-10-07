@@ -330,7 +330,7 @@ class IsolatedTactics:
         self.control_lock, self.query_id, self.active_query = threading.Lock(), 0, None
         self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
-        self.replacement, self.aborted = None, None
+        self.replacement, self.aborted, self.busy, self.abort_requested = None, None, False, False
         self._spawn()
 
     def _spawn(self):
@@ -391,6 +391,8 @@ class IsolatedTactics:
             return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
+            with self.control_lock:
+                self.busy, self.abort_requested = True, False
             # A finished replacement can itself have been aborted, so check again once it is joined.
             for _ in range(2):
                 if not self.replacement and self.aborted is self.process:
@@ -432,6 +434,8 @@ class IsolatedTactics:
             if resume:
                 request['resume'] = True
             with self.control_lock:
+                if self.abort_requested:
+                    return unknown('aborted')
                 self.query_id += 1
                 request['query_id'] = self.query_id
                 payload = json.dumps(request, separators=(',', ':'))
@@ -442,6 +446,8 @@ class IsolatedTactics:
                 self.process.stdin.write(payload+'\n')
                 self.process.stdin.flush()
             result = self._line(hard)
+            with self.control_lock:
+                self.busy = False
             if result == 'timeout':
                 self._retire(killed=True)
                 return unknown('hard deadline; tactical worker killed') | dict(nodes_fresh=None)
@@ -469,7 +475,7 @@ class IsolatedTactics:
             return unknown('tactical worker pipe closed') | dict(nodes_fresh=None if dispatched else 0)
         finally:
             with self.control_lock:
-                self.active_query = None
+                self.active_query, self.busy = None, False
             self.lock.release()
 
     def cancel(self):
@@ -491,12 +497,16 @@ class IsolatedTactics:
             return True
 
     def abort(self):
-        """End the running query now: it returns UNKNOWN and the worker restarts in the background. A child killed
-        while idle or starting is replaced before the next query, which waits for it within its own budget."""
+        """End the running query now: it returns UNKNOWN and the worker restarts in the background. Without a running
+        query it does nothing, so an idle child keeps its tables. A child killed after it answered is replaced before
+        the next query, which waits for it within its own budget."""
         with self.control_lock:
-            process = self.aborted = self.process
-        if process is not None:
-            process.kill()
+            if not self.busy:
+                return
+            self.abort_requested = True
+            self.aborted = self.process
+            if self.process is not None:
+                self.process.kill()
 
     def close(self):
         with self.lock:

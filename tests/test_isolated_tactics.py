@@ -83,19 +83,32 @@ class Isolation(unittest.TestCase):
         self.assertEqual(results[0]['status'], 'UNKNOWN')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
-    def test_abort_of_an_idle_or_starting_child_still_answers_the_next_query(self):
+    def test_abort_without_a_running_query_keeps_the_child(self):
         self.tactics.abort()
-        starting = self.tactics.history([[0, 0]], ms=10000)
-        self.assertEqual(starting['reason'], 'scripted')
+        first = self.tactics.history([[0, 0]], ms=10000)
         self.tactics.abort()
-        idle = self.tactics.history([[0, 0]], ms=10000)
-        self.assertEqual(idle['reason'], 'scripted')
-        self.assertNotEqual(idle['pid'], starting['pid'])
-        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], idle['pid'])
         self.assertIn('hard deadline', self.tactics.history([[1, 1]], ms=200)['reason'])
-        self.tactics.replacement.join()  # the replacement child is up, and no query has seen it yet
+        self.tactics.replacement.join()
         self.tactics.abort()
-        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['reason'], 'scripted')
+        after = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual((first['reason'], after['reason']), ('scripted', 'scripted'))
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], after['pid'])
+        self.assertEqual(self.tactics.stats['spawns'], 2)
+
+    def test_abort_landing_after_the_answer_replaces_the_child_before_the_next_query(self):
+        line = self.tactics._line
+
+        def answered_then_aborted(deadline):
+            value = line(deadline)
+            if isinstance(value, dict) and 'reason' in value:  # the answer, not the ready line
+                self.tactics.abort()
+            return value
+
+        with patch.object(self.tactics, '_line', answered_then_aborted):
+            first = self.tactics.history([[0, 0]], ms=10000)
+        after = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual((first['reason'], after['reason']), ('scripted', 'scripted'))
+        self.assertNotEqual(after['pid'], first['pid'])
 
     def test_abandoned_native_work_replaces_child(self):
         pid = self.tactics.history([[2, 2]], ms=10000)['pid']
