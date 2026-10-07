@@ -440,7 +440,7 @@ class TimedClocks(unittest.TestCase):
                 return 420
         engine = Engine()
         with TemporaryDirectory() as directory:
-            match = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='native')),
+            match = Match(dict(players=dict(cross=dict(kind='drip'), circle=dict(kind='drip')),
                                time_control='1', turn_cap_ms=100, fixed_turn_time=True),
                           now=lambda: clock[0], directory=directory)
             try:
@@ -470,7 +470,7 @@ class TimedClocks(unittest.TestCase):
             def wait_idle(self):
                 clock[0] = 500_000_000
                 raise TimeoutError('still running')
-        match = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='native')),
+        match = Match(dict(players=dict(cross=dict(kind='drip'), circle=dict(kind='drip')),
                            time_control='1', turn_cap_ms=100), now=lambda: clock[0])
         self.addCleanup(match.close)
         match.start()
@@ -494,7 +494,7 @@ class TimedClocks(unittest.TestCase):
                 moves=legal_turn([cell[:2] for cell in game.cells]), evaluated=3, completed=4)
         with TemporaryDirectory() as directory, patch('timed_match.TimedEngine', side_effect=engines):
             output = Path(directory)/'match'
-            args = ['--a', 'native', '--b', 'native', '--pairs', '2', '--turn-ms', '100',
+            args = ['--a', 'drip', '--b', 'drip', '--pairs', '2', '--turn-ms', '100',
                     '--max-placements', '5', '--out', str(output)]
             main(args)
             saved = json.loads((output/'summary.json').read_text())
@@ -556,7 +556,7 @@ class TimedClocks(unittest.TestCase):
                 thinking.set()
                 release.wait(1)
                 return dict(moves=[[1, 0], [2, 0]])
-        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='native')),
+        match = Match(dict(players=dict(cross=dict(kind='human'), circle=dict(kind='drip')),
                            time_control='1'), now=lambda: clock[0])
         self.addCleanup(match.close)
         match.start()
@@ -611,6 +611,31 @@ class TimedClocks(unittest.TestCase):
                 match.close()
                 restored.close()
 
+    def test_restore_reads_older_engine_ids_as_drip(self):
+        from timed_engine import saved_ids
+        from timed_match import Match
+        others = [dict(kind='bubble', checkpoint='native'), dict(engine='six:Native', name='Native'),
+                  dict(checkpoint='native', engine_options=dict(kind='bubble'))]
+        self.assertEqual(saved_ids(others), others)
+        with TemporaryDirectory() as directory:
+            match = Match(dict(players=dict(cross=dict(kind='drip'), circle=dict(kind='human')), time_control='10',
+                               identities=[dict(checkpoint='drip', engine_options=dict(kind='drip')),
+                                           dict(checkpoint='human')]), directory=directory)
+            match.start()
+            match.pause()
+            spec = json.loads((match.directory/'spec.json').read_text(encoding='utf-8'))
+            spec['players']['cross']['kind'] = spec['identities'][0]['checkpoint'] = 'native'
+            spec['identities'][0]['engine_options']['kind'] = 'native'
+            (match.directory/'spec.json').write_text(json.dumps(spec), encoding='utf-8')
+            restored = Match.restore(match.directory)
+            try:
+                self.assertEqual(restored.specification['players'], dict(cross=dict(kind='drip'), circle=dict(kind='human')))
+                self.assertEqual(restored.specification['identities'][0],
+                                 dict(checkpoint='drip', engine_options=dict(kind='drip')))
+            finally:
+                match.close()
+                restored.close()
+
     def test_future_increment_does_not_extend_current_clock(self):
         from time_control import allowance
         budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=10000), 0)
@@ -619,12 +644,12 @@ class TimedClocks(unittest.TestCase):
         budget = allowance(dict(cross_ms=15, circle_ms=1000, increment_ms=0), 0)
         self.assertGreater(budget['hard_ms']-budget['reserve_ms'], 0)
 
-    def test_native_controller_returns_a_complete_turn_by_its_allowance(self):
+    def test_drip_controller_returns_a_complete_turn_by_its_allowance(self):
         from timed_engine import TimedEngine, legal_turn
         for cap in (0, -1):
             with self.assertRaisesRegex(ValueError, 'simulation cap'):
                 TimedEngine(dict(kind='bubble', search=dict(max_simulations=cap)))
-        with TimedEngine(dict(kind='native')) as engine:
+        with TimedEngine(dict(kind='drip')) as engine:
             game = Game([[0, 0]])
             try:
                 started = time.monotonic()
@@ -793,7 +818,7 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(engine.closed for engine in self.engines))
 
     async def test_finished_match_releases_its_engines(self):
-        created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='native'),
+        created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='drip'),
             circle=dict(kind='human')), time_control='10'))
         root = '/matches/'+(await created.json())['match_id']
         for _ in range(50):
@@ -921,7 +946,7 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         from timed_api import create_app
         from timed_match import Match
         with TemporaryDirectory() as folder:
-            original = Match(dict(players=dict(cross=dict(kind='native'), circle=dict(kind='human')),
+            original = Match(dict(players=dict(cross=dict(kind='drip'), circle=dict(kind='human')),
                                   time_control='10', identities=[dict(checkpoint='old'), dict(checkpoint='human')]),
                              directory=folder)
             original.start()
@@ -952,11 +977,11 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(importlib.util.find_spec('aiohttp'), 'API extra not installed')
-class ArenaNative(unittest.IsolatedAsyncioTestCase):
+class ArenaDrip(unittest.IsolatedAsyncioTestCase):
     async def test_gateway_errors_retry_account_and_presence(self):
         from aiohttp import web
         from aiohttp.test_utils import TestServer
-        from arena_bot import NativeArena
+        from arena_bot import DripArena
         calls = dict(account=0, presence=0)
         connected, release = asyncio.Event(), asyncio.Event()
 
@@ -982,7 +1007,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         app.router.add_route('*', '/api/bot/account', account)
         app.router.add_get('/api/bot/stream', presence)
         async with TestServer(app) as server:
-            bot = NativeArena(str(server.make_url('/')), 'private')
+            bot = DripArena(str(server.make_url('/')), 'private')
             task = asyncio.create_task(bot.run())
             try:
                 await asyncio.wait_for(connected.wait(), 4)
@@ -994,7 +1019,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def test_finished_game_cleanup_does_not_delay_the_next_game(self):
-        from arena_bot import NativeArena
+        from arena_bot import DripArena
         started = {game_id: asyncio.Event() for game_id in ('old', 'next')}
         draining, release = asyncio.Event(), asyncio.Event()
 
@@ -1006,7 +1031,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
                 draining.set()
                 await release.wait()
 
-        bot = NativeArena('http://localhost', 'private')
+        bot = DripArena('http://localhost', 'private')
         first = dict(type='gameStart', gameId='old', side='o', opponent=dict(name='local'))
         with patch.object(bot, 'play', side_effect=play):
             try:
@@ -1024,11 +1049,11 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
                     await bot.finish(game_id)
                 await asyncio.gather(*bot.cleanups, return_exceptions=True)
 
-    async def test_dropped_socket_drains_native_before_requesting_a_new_clock(self):
+    async def test_dropped_socket_drains_drip_before_requesting_a_new_clock(self):
         import aiohttp
         from aiohttp import web
         from aiohttp.test_utils import TestServer
-        from arena_bot import NativeArena, answer
+        from arena_bot import DripArena, answer
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
         dials, replies = [], []
 
@@ -1036,7 +1061,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
             if not started.is_set():
                 started.set()
                 if not release.wait(4):
-                    raise TimeoutError('Test did not release Native')
+                    raise TimeoutError('Test did not release Drip')
                 result = answer(*args)
                 finished.set()
                 return result
@@ -1061,7 +1086,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_get('/engine', session)
         async with TestServer(app) as server, aiohttp.ClientSession() as client:
-            bot = NativeArena(str(server.make_url('/')), 'private', ms=20, width=8, depth=1)
+            bot = DripArena(str(server.make_url('/')), 'private', ms=20, width=8, depth=1)
             bot.http = client
             with patch('arena_bot.answer', side_effect=delayed_answer):
                 try:
@@ -1105,7 +1130,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         import aiohttp
         from aiohttp import web
         from aiohttp.test_utils import TestServer
-        from arena_bot import NativeArena, answer
+        from arena_bot import DripArena, answer
         received = []
         threads = []
         started, release = threading.Event(), threading.Event()
@@ -1115,7 +1140,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
             if len(threads) == 1:
                 started.set()
                 if not release.wait(3):
-                    raise TimeoutError('Test did not release Native')
+                    raise TimeoutError('Test did not release Drip')
             return answer(*args)
 
         async def session(request):
@@ -1132,7 +1157,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.03)
             release.set()
             received.append(await ws.receive_json(timeout=3))
-            # The next turn must use the same connection and Native worker.
+            # The next turn must use the same connection and Drip worker.
             own = received[0]['move']['pieces']
             game = Game([(0, 0), *[(p['q'], p['r']) for p in own]])
             try:
@@ -1149,7 +1174,7 @@ class ArenaNative(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_get('/engine', session)
         async with TestServer(app) as server, aiohttp.ClientSession() as client:
-            bot = NativeArena(str(server.make_url('/')), 'private-bot-token', ms=20, width=8, depth=1)
+            bot = DripArena(str(server.make_url('/')), 'private-bot-token', ms=20, width=8, depth=1)
             bot.http = client
             event = dict(type='gameStart', gameId='local', side='o', opponent=dict(name='local'),
                          engine=dict(socketUrl='/engine', token='game-only'))

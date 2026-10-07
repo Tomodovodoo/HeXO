@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT/'web'/'engine'
 NODE = shutil.which('node')
 SITE = 'https://tomodovodoo.github.io/HeXO/engine/'
-LOADERS = ('native-worker.mjs', 'six-worker.mjs', 'strix-worker.mjs', 'shrimp-worker.mjs', 'seal-worker.mjs',
-           'network.mjs', 'shrimp/network.mjs', 'bubble.mjs', 'native.mjs', 'six.mjs', 'strix.mjs', 'shrimp.mjs', 'seal.mjs')
+LOADERS = ('drip-worker.mjs', 'six-worker.mjs', 'strix-worker.mjs', 'shrimp-worker.mjs', 'seal-worker.mjs',
+           'network.mjs', 'shrimp/network.mjs', 'bubble.mjs', 'drip.mjs', 'six.mjs', 'strix.mjs', 'shrimp.mjs', 'seal.mjs')
 
 
 @unittest.skipUnless(NODE, 'needs node')
@@ -81,7 +81,7 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['no_head'], {'here': 'local', 'partial': 'missing'})
 
     def test_every_engine_lists_pinned_files_and_downloads_them_from_the_site(self):
-        self.assertEqual(sorted(self.out['engines']), ['bubble', 'native', 'seal', 'shrimp', 'six', 'strix'])
+        self.assertEqual(sorted(self.out['engines']), ['bubble', 'drip', 'seal', 'shrimp', 'six', 'strix'])
         for name, engine in self.out['engines'].items():
             with self.subTest(engine=name):
                 self.assertTrue(engine['files'])

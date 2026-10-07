@@ -120,7 +120,7 @@ def entries():
     bubble = dict(kind='bubble', presets=PRESETS['bubble'], checkpoints=['main/000002', 'main/000001'], path=Path(RUN.name))
     return {'bubble:fake': dict(bubble, id='bubble:fake', name='fake'),
             'bubble:fake~2': dict(bubble, id='bubble:fake~2', name='fake', checkpoints=['main/000001']),
-            'native:Native': dict(id='native:Native', name='Native', kind='native', presets=PRESETS['native'])}
+            'drip:Drip': dict(id='drip:Drip', name='Drip', kind='drip', presets=PRESETS['drip'])}
 
 
 class Store(unittest.TestCase):
@@ -345,7 +345,7 @@ class Jobs(unittest.TestCase):
             session = Session(entries() | {'six:slow': entry}, engines, Evaluations())
             try:
                 session.configure_analysis('bubble:fake', auto=False)
-                session.configure_seat(1, 'native:Native', preset='quick')
+                session.configure_seat(1, 'drip:Drip', preset='quick')
                 session.configure_seat(0, 'six:slow')
                 self.assertEqual(json.loads(json.dumps(session.state()))['engines'][-1], dict(
                     id='six:slow', name='slow', kind='six', presets=presets_of('six', None), clocks=True, device='Server CPU'))
@@ -395,7 +395,7 @@ class Jobs(unittest.TestCase):
         wait(lambda: len(self.history()) == 3)
 
     def test_bots_play_each_other_until_paused_and_moves_never_apply_to_a_changed_game(self):
-        self.session.configure_seat(0, 'native:Native', preset='quick')
+        self.session.configure_seat(0, 'drip:Drip', preset='quick')
         wait(lambda: len(self.history()) >= 9)
         self.session.pause(True)
         length = len(self.history())
@@ -632,7 +632,7 @@ class Jobs(unittest.TestCase):
             session.play(0, 0)
             wait(lambda: session.paused)
             self.assertIsNone(session.state()['evaluations'].get(1))
-            session.configure_seat(1, 'native:Native', preset='quick')
+            session.configure_seat(1, 'drip:Drip', preset='quick')
             session.pause(False)
             wait(lambda: len(session.history) == 3)
 
@@ -640,7 +640,7 @@ class Jobs(unittest.TestCase):
         self.engines.hold = True
         self.session.play(0, 0)
         wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
-        self.session.configure_seat(0, 'native:Native', preset='quick')
+        self.session.configure_seat(0, 'drip:Drip', preset='quick')
         self.engines.release.set()
         wait(lambda: len(self.history()) >= 3)
 
@@ -832,14 +832,14 @@ class Jobs(unittest.TestCase):
             self.session.rescan()
             self.assertEqual(self.session.state()['seats'][1], dict(engine='human'))
 
-    def test_cancelled_native_searches_end_and_the_next_starts_at_once(self):
+    def test_cancelled_drip_searches_end_and_the_next_starts_at_once(self):
         engines = Engines('cpu')
         try:
-            self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
+            self.assertEqual(len(engines.turn(entries()['drip:Drip'], dict(ms=50), [(0, 0)])), 2)
             started = time.time()
             with self.assertRaises(Cancelled):
-                engines.turn(entries()['native:Native'], dict(ms=20000), [(0, 0)], lambda: time.time() - started > .2)
-            self.assertEqual(len(engines.turn(entries()['native:Native'], dict(ms=50), [(0, 0)])), 2)
+                engines.turn(entries()['drip:Drip'], dict(ms=20000), [(0, 0)], lambda: time.time() - started > .2)
+            self.assertEqual(len(engines.turn(entries()['drip:Drip'], dict(ms=50), [(0, 0)])), 2)
             self.assertLess(time.time() - started, 10)
         finally:
             engines.close()
@@ -934,26 +934,26 @@ class Jobs(unittest.TestCase):
             with self.assertRaises(ValueError):
                 budget_of(bubble, 'custom', extra, 'bubble')
         with self.assertRaises(ValueError):
-            budget_of(PRESETS['native'], 'custom', dict(leaf_nodes=2048), 'native')
+            budget_of(PRESETS['drip'], 'custom', dict(leaf_nodes=2048), 'drip')
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
         for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
                 budget_of(bubble, 'custom', custom)
         with self.assertRaises(ValueError):
-            budget_of(PRESETS['native'], 'heavy')
+            budget_of(PRESETS['drip'], 'heavy')
         self.assertEqual(presets_of('six', dict(quick=dict(args=['--visits', '8'])))['quick'],
                          dict(nodes=960, args=['--visits', '8']))
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
         lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
-        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), native=dict(ms=100),
+        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), drip=dict(ms=100),
                                          seal=dict(ms=100), six=dict(nodes=240), strix=dict(simulations=2)))
         self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
         self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=240))
         self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
-                         dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), native=dict(ms=60000),
+                         dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), drip=dict(ms=60000),
                               seal=dict(ms=60000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
         self.assertEqual(budget_of(PRESETS['bubble'], 'custom', dict(simulations=100_000, solver_nodes=10_000_000)),
                          dict(simulations=100_000, solver_nodes=10_000_000))
@@ -1252,7 +1252,7 @@ class Http(unittest.TestCase):
     def test_match_api_starts_reports_results_and_preserves_live_state(self):
         with tempfile.TemporaryDirectory() as directory:
             try:
-                state = self.post('/match', dict(players=['Native', 'Native'], games=2,
+                state = self.post('/match', dict(players=['Drip', 'Drip'], games=2,
                                                 output=str(Path(directory) / 'match'), max_placements=3))
                 self.assertEqual(state['match']['games'], 2)
                 wait(lambda: not self.session.match_worker.is_alive())
@@ -1304,7 +1304,7 @@ class Http(unittest.TestCase):
         self.assertEqual(caught.exception.code, 409)
         caught.exception.close()
         for path, body in (('/play', dict(q=40, r=0)), ('/import', dict(text='1. [9,9]')), ('/retry', dict(ply=9)),
-                           ('/seat', [1]), ('/seat', dict(side=1, engine='native:Native', preset='custom', custom=[]))):
+                           ('/seat', [1]), ('/seat', dict(side=1, engine='drip:Drip', preset='custom', custom=[]))):
             with self.assertRaises(HTTPError) as caught:
                 self.post(path, body)
             self.assertEqual(caught.exception.code, 400)
@@ -1474,7 +1474,7 @@ class Matches(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.engines = FakeEngines()
         registry = entries()
-        registry['native:Other'] = registry['native:Native'] | dict(id='native:Other', name='Other')
+        registry['drip:Other'] = registry['drip:Drip'] | dict(id='drip:Other', name='Other')
         self.session = Session(registry, self.engines, Evaluations())
         self.session.configure_analysis('bubble:fake', auto=False)
         self.addCleanup(self.session.close)
@@ -1485,7 +1485,7 @@ class Matches(unittest.TestCase):
         opening = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6),
                    (4, 5), (-2, 5), (0, -7), (0, -8)]
         self.engines.turn = lambda *args: [[5, 5]]
-        self.session.start_match(['Native', 'Other'], output=self.output, openings=[opening], max_placements=0)
+        self.session.start_match(['Drip', 'Other'], output=self.output, openings=[opening], max_placements=0)
         wait(lambda: not self.session.match_worker.is_alive())
         summary = json.loads((self.output / 'summary.json').read_text())
         self.assertEqual((summary['completed'], summary['wins'], summary['capped']), (2, [1, 1], 0))
@@ -1504,7 +1504,7 @@ class Matches(unittest.TestCase):
         self.assertFalse(recovered['single'])
 
     def test_pause_holds_the_next_game_and_settings_cannot_change_mid_match(self):
-        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        self.session.start_match(['Drip', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
         self.session.pause(True)
         for change in (lambda: self.session.load([], True), lambda: self.session.undo(),
@@ -1520,7 +1520,7 @@ class Matches(unittest.TestCase):
 
     def test_engine_failure_pauses_without_inventing_a_result_and_stop_saves_position(self):
         self.engines.turn = unittest.mock.Mock(side_effect=ValueError('engine failed'))
-        self.session.start_match(['Native', 'Other'], output=self.output)
+        self.session.start_match(['Drip', 'Other'], output=self.output)
         wait(lambda: self.session.match['error'] is not None)
         self.assertEqual((self.session.paused, self.session.match['completed']), (True, 0))
         self.session.stop_match()
@@ -1545,7 +1545,7 @@ class Matches(unittest.TestCase):
         self.assertEqual(path.read_text(), raw)
         with self.assertRaisesRegex(ValueError, '3 unique openings'):
             book_openings(path, 'wide', 4)
-        self.session.start_match(['Native', 'Other'], output=self.output, book=path,
+        self.session.start_match(['Drip', 'Other'], output=self.output, book=path,
                                  opening_range='narrow', unique_openings=2, max_placements=5)
         wait(lambda: not self.session.match_worker.is_alive())
         self.assertEqual(self.session.match['games'], 4)
@@ -1555,9 +1555,9 @@ class Matches(unittest.TestCase):
         self.assertNotEqual(keys[0], keys[2])
 
     def test_bad_match_specifications_do_not_change_the_board_or_start_jobs(self):
-        for players, kwargs in [(['fake', 'Native'], {}), (['Native', 'Other'], dict(games=0)),
-                                (['Native', 'Other'], dict(unique_openings=2, games=2)),
-                                (['Native', 'Other'], dict(max_placements=1))]:
+        for players, kwargs in [(['fake', 'Drip'], {}), (['Drip', 'Other'], dict(games=0)),
+                                (['Drip', 'Other'], dict(unique_openings=2, games=2)),
+                                (['Drip', 'Other'], dict(max_placements=1))]:
             with self.assertRaises(ValueError):
                 self.session.start_match(players, output=self.output, **kwargs)
         self.assertIsNone(self.session.match)
@@ -1566,7 +1566,7 @@ class Matches(unittest.TestCase):
 
     def test_every_explicit_opening_gets_a_pair_by_default(self):
         openings = [[[0, 0]], [[0, 0], [1, 0], [2, 0]]]
-        self.session.start_match(['Native', 'Other'], output=self.output, openings=openings, max_placements=5)
+        self.session.start_match(['Drip', 'Other'], output=self.output, openings=openings, max_placements=5)
         wait(lambda: not self.session.match_worker.is_alive())
         self.assertEqual(self.session.match['completed'], 4)
         games = [json.loads(p.read_text()) for p in sorted(self.output.glob('game-*.json'))]
@@ -1595,8 +1595,8 @@ class Matches(unittest.TestCase):
             self.session.use_book(True)
         self.session.book = path
         self.session.pause(True)
-        self.session.configure_seat(0, 'native:Native')
-        self.session.configure_seat(1, 'native:Other')
+        self.session.configure_seat(0, 'drip:Drip')
+        self.session.configure_seat(1, 'drip:Other')
         self.session.use_book(True, 'wide')
         opening = self.session.state()['book']['opening']
         i = int(opening['key'][4])
@@ -1668,7 +1668,7 @@ class Matches(unittest.TestCase):
             self.session.match_seat('Six@gen-0009', 'quick')
 
     def test_resume_keeps_completed_games_and_pair_accounting(self):
-        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        self.session.start_match(['Drip', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
         self.session.stop_match()
         wait(lambda: not self.session.match_worker.is_alive())
@@ -1681,6 +1681,24 @@ class Matches(unittest.TestCase):
         self.assertEqual(self.session.match['completed'], 2)
         self.assertEqual(self.session.match['pentanomial'], [0, 0, 1, 0, 0])
         self.assertEqual(len(list(self.output.glob('game-*.json'))), 2)
+
+    def test_a_batch_saved_under_older_engine_ids_resumes_with_drip(self):
+        self.session.start_match(['Drip', 'Other'], output=self.output, max_placements=3)
+        wait(lambda: self.session.match['completed'] == 1)
+        self.session.stop_match()
+        wait(lambda: not self.session.match_worker.is_alive())
+        summary = self.output / 'summary.json'
+        older = json.loads(summary.read_text(encoding='utf-8').replace('"drip:Drip"', '"native:Native"').replace(
+            '"Drip"', '"Native"').replace('"drip"', '"native"'))
+        older['players'][0]['source']['badge'] = 'native'
+        self.assertNotIn('Drip', json.dumps(older))
+        summary.write_text(json.dumps(older), encoding='utf-8')
+        self.session.resume_match(self.output)
+        wait(lambda: not self.session.match_worker.is_alive())
+        self.assertEqual(self.session.match['completed'], 2)
+        self.assertEqual([(p['engine'], p['name'], p['source']['kind']) for p in self.session.match['players']],
+                         [('drip:Drip', 'Drip', 'drip'), ('drip:Other', 'Other', 'drip')])
+        self.assertEqual(self.session.entries['drip:Drip']['badge'], 'drip')
 
     def test_resume_rejects_a_changed_tactical_solver(self):
         self.session.start_match(['bubble:2@quick', 'Other'], output=self.output, max_placements=3)
@@ -1710,7 +1728,7 @@ class Matches(unittest.TestCase):
     def test_saved_games_and_analysis_survive_restart_without_changing_live_play(self):
         self.session.archive = Path(self.directory.name) / 'archive'
         self.session.study_store = Path(self.directory.name) / 'analysis.jsonl'
-        self.session.start_match(['Native', 'Other'], output=self.output, max_placements=3)
+        self.session.start_match(['Drip', 'Other'], output=self.output, max_placements=3)
         wait(lambda: self.session.match['completed'] == 1)
         self.session.pause(True)
         ident = self.session.match_catalogue()[0]['id']
@@ -1788,11 +1806,11 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
-        self.assertEqual(self.session.match_seat('Native@lightning', 'standard')['budget'], dict(ms=100))
+        self.assertEqual(self.session.match_seat('Drip@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
         with self.assertRaisesRegex(ValueError, 'not a budget'):
-            self.session.match_seat('Native{simulations=128}', 'standard')
+            self.session.match_seat('Drip{simulations=128}', 'standard')
 
     def test_clock_deadline_discards_late_moves_and_records_time_result(self):
         late_reply = lambda game, *a, **kw: (
@@ -1802,7 +1820,7 @@ class Matches(unittest.TestCase):
                 engine.return_value.identity = dict(kind='fake')
                 engine.return_value.turn.side_effect = reply
                 output = self.output / name
-                self.session.start_match(['Native', 'Other'], games=1, output=output,
+                self.session.start_match(['Drip', 'Other'], games=1, output=output,
                                          clock=dict(mode='move', ms=20))
                 wait(lambda: not self.session.match_worker.is_alive())
                 result = json.loads((output / 'game-0001.json').read_text())
@@ -1818,9 +1836,9 @@ class Matches(unittest.TestCase):
         self.session.configure_seat(1, 'human')
         self.session.play(0, 0)
         with self.assertRaisesRegex(ValueError, 'human game'):
-            self.session.start_match(['Native', 'Other'], output=self.output)
+            self.session.start_match(['Drip', 'Other'], output=self.output)
         self.assertEqual(self.session.history, [(0, 0)])
-        self.session.start_match(['Native', 'Other'], games=2, output=self.output, max_placements=3, replace=True)
+        self.session.start_match(['Drip', 'Other'], games=2, output=self.output, max_placements=3, replace=True)
         wait(lambda: not self.session.match_worker.is_alive())
         self.assertEqual(self.session.match['completed'], 2)
 
@@ -1828,7 +1846,7 @@ class Matches(unittest.TestCase):
         self.session.entries['strix:Strix'] = dict(id='strix:Strix', name='Strix', kind='strix',
             presets=PRESETS['strix'], model=Path(RUN.name) / 'checkpoints/main/000001/ema.pt')
         with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
-            self.session.start_match(['Native', 'Strix'], output=self.output, clock=dict(mode='game', tc='180+2'))
+            self.session.start_match(['Drip', 'Strix'], output=self.output, clock=dict(mode='game', tc='180+2'))
         self.assertFalse(self.output.exists())
 
 
@@ -1890,7 +1908,7 @@ class FreeplayClock(unittest.TestCase):
             def close(self):
                 pass
         self.session.prepare_timed = lambda sides=(0, 1): setattr(self.session, 'seat_engines', [None, Broken()])
-        self.session.configure_seat(1, 'native:Native')
+        self.session.configure_seat(1, 'drip:Drip')
         wait(lambda: self.session.paused)
         before = self.session.state()['clock']
         time.sleep(.2)
@@ -1900,8 +1918,8 @@ class FreeplayClock(unittest.TestCase):
     def test_changing_one_seat_keeps_the_other_seats_timed_engine(self):
         with unittest.mock.patch('timed_engine.TimedEngine') as engine:
             engine.side_effect = lambda config: unittest.mock.MagicMock(name=config['kind'])
-            self.session.configure_seat(0, 'native:Native')
-            self.session.configure_seat(1, 'native:Native')
+            self.session.configure_seat(0, 'drip:Drip')
+            self.session.configure_seat(1, 'drip:Drip')
             self.session.pause(True)
             self.session.set_clock(dict(mode='game', tc='60'))
             wait(lambda: self.session.clock_preparing is None and all(self.session.seat_engines))
@@ -1941,7 +1959,7 @@ class FreeplayClock(unittest.TestCase):
         from play import device_of
         self.assertEqual([device_of(dict(kind='bubble'), 'cuda'), device_of(dict(kind='bubble'), 'cpu'),
                           device_of(dict(kind='six', backend='TensorRT'), 'cpu'), device_of(dict(kind='six', backend='CPU'), 'cuda'),
-                          device_of(dict(kind='six', badge='shrimp'), 'cuda'), device_of(dict(kind='native'), 'cuda')],
+                          device_of(dict(kind='six', badge='shrimp'), 'cuda'), device_of(dict(kind='drip'), 'cuda')],
                          ['GPU', 'CPU', 'GPU', 'CPU', 'CPU', 'CPU'])
         self.assertEqual({e['device'] for e in self.session.state()['engines']}, {'Server CPU'})
 
@@ -1956,7 +1974,7 @@ class FreeplayClock(unittest.TestCase):
         self.session.set_clock(dict(mode='move', ms=1000))
         with self.assertRaisesRegex(ValueError, 'cannot keep a clock'):
             self.session.configure_seat(1, 'six:shrimp')
-        self.assertEqual([e['clocks'] for e in self.session.models() if e['id'] in ('six:shrimp', 'native:Native')], [True, False])
+        self.assertEqual([e['clocks'] for e in self.session.models() if e['id'] in ('six:shrimp', 'drip:Drip')], [True, False])
 
 
 class Proofs(unittest.TestCase):
@@ -2805,7 +2823,7 @@ class Registry(unittest.TestCase):
             (models / 'spaced.json').write_text(json.dumps(dict(kind='six', command='six --cpu')))
             with unittest.mock.patch('play.six_backend', return_value=('CPU', ['--cpu'], [])):
                 found = scan(models, None, [], None)
-            self.assertEqual(list(found), ['six:Six · CPU', 'six:shrimp', 'strix:Strix', 'native:Native'])
+            self.assertEqual(list(found), ['six:Six · CPU', 'six:shrimp', 'strix:Strix', 'drip:Drip'])
             six = found['six:Six · CPU']
             self.assertEqual((six['label'], six['checkpoints'], found['six:shrimp']['label']),
                              ('CPU', ['gen-0120', 'gen-0100'], 'shrimp'))
@@ -2817,7 +2835,7 @@ class Registry(unittest.TestCase):
             self.assertEqual(shrimp['presets']['quick'], dict(nodes=1, args=['--visits', '32']))
             self.assertEqual(found['strix:Strix']['presets']['deep'], dict(simulations=512))
             self.assertEqual({key: e['badge'] for key, e in found.items()},
-                             {'six:Six · CPU': 'six', 'six:shrimp': 'shrimp', 'strix:Strix': 'strix', 'native:Native': 'native'})
+                             {'six:Six · CPU': 'six', 'six:shrimp': 'shrimp', 'strix:Strix': 'strix', 'drip:Drip': 'drip'})
 
     def test_runs_models_and_entries_are_found(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2836,7 +2854,7 @@ class Registry(unittest.TestCase):
             (root / 'models/gamma.json').write_text(json.dumps(dict(name='gamma', kind='bubble', path='../elsewhere/net.pt')))
             (root / 'models/list.json').write_text('[1, 2]')
             found = scan(root / 'models', root / 'runs', [root / 'runs/alpha'], root / 'missing.dll')
-            self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'native:Native'])
+            self.assertEqual(list(found), ['bubble:alpha', 'bubble:broken', 'bubble:beta', 'bubble:gamma', 'drip:Drip'])
             self.assertEqual(found['bubble:alpha']['checkpoints'], ['play/000150', 'main/000200', 'main/000100'])
             self.assertEqual(found['bubble:beta']['checkpoints'], [''])
             self.assertEqual([found[k]['label'] for k in ('bubble:alpha', 'bubble:broken', 'bubble:gamma')],
@@ -2864,7 +2882,7 @@ class Registry(unittest.TestCase):
                 spec = dict(name=name, kind='bubble', path='../runs/alpha', q_range_floor=floor)
                 (root / f'models/{name}.json').write_text(json.dumps(spec))
             found = scan(root / 'models', root / 'runs', [], None)
-        self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'native:Native'])
+        self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'drip:Drip'])
         self.assertNotIn('q_range_floor', found['bubble:alpha'])
         self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
         self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])

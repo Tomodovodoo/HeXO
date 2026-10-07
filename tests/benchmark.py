@@ -39,7 +39,7 @@ class SealLibrary:
         return result
 
 
-class NativeLibrary:
+class DripLibrary:
     """Independent C ABI handle; no learned evaluator is loaded by this runner."""
     def __init__(self, path):
         self.path = Path(path).resolve()
@@ -57,7 +57,7 @@ class NativeLibrary:
     def position(self, history):
         ptr = self.lib.hx_new()
         if not ptr:
-            raise MemoryError("Native board allocation failed")
+            raise MemoryError("Board allocation failed")
         try:
             for q, r in history:
                 if not self.lib.hx_play(ptr, q, r):
@@ -76,7 +76,7 @@ class NativeLibrary:
             ok = self.lib.hx_search(ptr, ms, depth, width, C.byref(result))
             wall = (time.perf_counter()-start)*1000
             if not ok or self.lib.hx_hash(ptr) != before:
-                raise RuntimeError("Native search failed or changed its input board")
+                raise RuntimeError("Drip search failed or changed its input board")
             moves = [(result.q1, result.r1), (result.q2, result.r2)][:result.count]
             return {"moves": moves, "score": result.score, "nodes": result.nodes,
                     "depth": result.depth, "elapsed_ms": result.elapsed_ms, "wall_ms": wall}
@@ -93,16 +93,16 @@ class NativeLibrary:
             count = self.lib.hx_turns(ptr, width, 0, 0, output, len(output))
             elapsed = (time.perf_counter()-start)*1000
             if count < 0 or count > len(output):
-                raise RuntimeError("Native turn generation failed or exceeded output capacity")
+                raise RuntimeError("Drip turn generation failed or exceeded output capacity")
             return [(t.q1, t.r1, t.q2, t.r2, t.count, t.score) for t in output[:count]], elapsed
         finally:
             self.lib.hx_free(ptr)
 
 
-def native_comparison(args):
+def drip_comparison(args):
     """Paired equal-time games, or alternating fixed-position/fixed-depth searches."""
-    engines = {"candidate": NativeLibrary(library),
-               "baseline": SealLibrary(args.seal_library) if args.seal_library else NativeLibrary(args.compare_library)}
+    engines = {"candidate": DripLibrary(library),
+               "baseline": SealLibrary(args.seal_library) if args.seal_library else DripLibrary(args.compare_library)}
     report = {"config": vars(args), "platform": platform.platform(),
               "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
               "workspace_source_sha256": hashlib.sha256((ROOT/"src/hexo.cpp").read_bytes()).hexdigest(),
@@ -426,8 +426,8 @@ if __name__ == "__main__":
     parser.add_argument("--root-turns", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--output")
-    parser.add_argument("--compare-library", help="Independent pre-change Native DLL/shared library")
-    parser.add_argument("--games", type=int, default=0, help="Even number of paired Native comparison games")
+    parser.add_argument("--compare-library", help="Independent pre-change libhexo build whose Drip plays the candidate")
+    parser.add_argument("--games", type=int, default=0, help="Even number of paired Drip comparison games")
     parser.add_argument("--book", help="Read-only v2 opening book, selected through the player's book selector")
     parser.add_argument("--opening-range", choices=("narrow", "wide", "all"), default="wide")
     parser.add_argument("--max-stones", type=int, default=301)
@@ -452,7 +452,7 @@ if __name__ == "__main__":
     if args.trace and (not max(6, args.width//2) <= args.root_seconds <= 128 or
                        not 2*args.width <= args.root_turns <= 1024):
         parser.error("Require max(6,width/2) <= root-seconds <= 128 and 2*width <= root-turns <= 1024")
-    report = native_comparison(args) if args.compare_library or (args.games and args.seal_library) else pair_admission(args) if args.trace else measure(args)
+    report = drip_comparison(args) if args.compare_library or (args.games and args.seal_library) else pair_admission(args) if args.trace else measure(args)
     if args.output:
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)

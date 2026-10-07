@@ -154,7 +154,7 @@ const manifests = {
 for (const [path, data] of Object.entries(manifests)) site.set(path, JSON.stringify(data));
 const engines = {
   bubble: new (await import('../../web/engine/bubble.mjs')).BubbleEngine(),
-  native: (await import('../../web/engine/native.mjs')).native.engine,
+  drip: (await import('../../web/engine/drip.mjs')).drip.engine,
   six: (await import('../../web/engine/six.mjs')).six.engine,
   strix: (await import('../../web/engine/strix.mjs')).strix.engine,
   shrimp: (await import('../../web/engine/shrimp.mjs')).shrimp.engine,

@@ -1,4 +1,4 @@
-"""Run handcrafted Native on a HeXO Bot API site from this computer."""
+"""Run handcrafted Drip on a HeXO Bot API site from this computer."""
 import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -50,7 +50,7 @@ def retry_delay(headers):
     return max(1, int(headers.get('Retry-After', '1')))
 
 
-class NativeArena:
+class DripArena:
     def __init__(self, url, token, *, ms=100, width=16, depth=12):
         self.url = url.rstrip('/')
         self.token = token
@@ -92,7 +92,7 @@ class NativeArena:
             try:
                 confirmed, reply, result = await asyncio.shield(computation)
             finally:
-                # Cancelling an asyncio wait cannot stop Native. Finish its bounded
+                # Cancelling an asyncio wait cannot stop Drip. Finish its bounded
                 # work before redialling, then receive the server's updated clock.
                 await asyncio.gather(computation, return_exceptions=True)
             await socket.send_json(reply)
@@ -143,8 +143,8 @@ class NativeArena:
             raise ValueError('Engine socket must be on the API origin')
         socket_url = urlunsplit(('wss' if endpoint.scheme == 'https' else 'ws',
                                 endpoint.netloc, endpoint.path, '', ''))
-        # A dedicated thread retains Native's proven continuation for this game.
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='native-game')
+        # A dedicated thread retains Drip's proven continuation for this game.
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='drip-game')
         backoff = 1
         try:
             while True:
@@ -216,11 +216,11 @@ class NativeArena:
             account = await self.call('GET', '/api/bot/account')
             digest = hashlib.sha256(Path(library).read_bytes()).hexdigest()
             await self.call('PATCH', '/api/bot/account', {
-                'about': f'Handcrafted Native, CPU search, {self.ms} ms per turn. No neural model.',
+                'about': f'Handcrafted Drip, CPU search, {self.ms} ms per turn. No neural model.',
                 'version': digest[:12], 'repoUrl': 'https://github.com/Tomodovodoo/HeXO',
                 'accepts': {'turnMs': [5000, 600000], 'match': True, 'unlimited': True}})
             print(f'{account["name"]}: {self.url}/bots/{quote(account["name"])}', flush=True)
-            print(f'Native library {digest}, {self.ms} ms per turn', flush=True)
+            print(f'Drip, library {digest}, {self.ms} ms per turn', flush=True)
             backoff = 1
             try:
                 while True:
@@ -266,13 +266,13 @@ def main():
             or origin.username or origin.password or origin.query or origin.fragment):
         parser.error('Supply an HTTP(S) site origin')
     if not 1 <= args.ms <= 30000 or not 2 <= args.width <= 128 or not 1 <= args.depth <= 64:
-        parser.error('Invalid Native search budget')
+        parser.error('Invalid Drip search budget')
     token = os.environ.get('HEXO_TOKEN') or getpass.getpass('Bot token: ')
     if os.name == 'nt':
         import ctypes
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
     try:
-        asyncio.run(NativeArena(args.url, token, ms=args.ms, width=args.width, depth=args.depth).run())
+        asyncio.run(DripArena(args.url, token, ms=args.ms, width=args.width, depth=args.depth).run())
     except KeyboardInterrupt:
         pass
     except (Refused, aiohttp.ClientError) as error:

@@ -126,8 +126,8 @@ class PlayPage(unittest.TestCase):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
 
     def test_engines_turn_the_book_on(self):
-        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
-        self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
+        answer = self.follow([['/seat', dict(side=0, engine='drip')]], enabled=False)
+        self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='drip')],
                                               ['/book', dict(enabled=True)]])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
@@ -140,7 +140,7 @@ class PlayPage(unittest.TestCase):
     def test_mixed_seats_take_the_server_default(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='six')]])
         self.assertEqual(self.books(answer), [False, True])
-        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='native')]])), [])
+        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='drip')]])), [])
 
     def test_a_browser_seat_counts_as_an_engine(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=1, engine='browser:bubble')],
@@ -149,12 +149,12 @@ class PlayPage(unittest.TestCase):
         self.assertTrue(answer['enabled'])
 
     def test_quick_seat_changes_end_on_the_last_seats(self):
-        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='native')]], together=True)
+        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='drip')]], together=True)
         self.assertEqual(self.books(answer), [False, True])
         self.assertTrue(answer['enabled'])
 
     def test_a_touched_switch_stays(self):
-        answer = self.follow([['/book', dict(enabled=False)], ['/seat', dict(side=0, engine='native')],
+        answer = self.follow([['/book', dict(enabled=False)], ['/seat', dict(side=0, engine='drip')],
                               ['/book', dict(enabled=True, mode='wide')], ['/seat', dict(side=0, engine='human')],
                               ['/seat', dict(side=1, engine='human')]])
         self.assertEqual(self.books(answer), [False, True])
@@ -290,6 +290,34 @@ console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal
         self.assertEqual(result['history'], [[0,0]])
         self.assertTrue(result['equal'] and result['fileEqual'] and result['backupEqual'])
         self.assertEqual((result['oldPreserved'], result['restored']), (40000, 40000))
+
+    def test_saves_under_older_engine_ids_read_back_as_drip(self):
+        source = """import {PlayStorage} from './web/engine/storage.mjs';
+const storage=new PlayStorage(null),key='browser:native|null|abc|';
+await storage.put('sessions',{id:'live',seats:[{engine:'human'},{engine:'browser:native',preset:'quick'}],
+ match:{players:[{engine:'browser:native',name:'Native (browser)',version:key},{engine:'browser:six',name:'Six (browser)'}]}});
+await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine_key:key,note:'native'});
+await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
+await storage.put('evaluations',{id:'browser:drip|null|abc||{}|0,1',engine:'browser:drip',note:'newer'});
+await storage.put('evaluations',{id:'other',engine:'browser:six',name:'Native (browser)',kind:'six'});
+const target=new PlayStorage(null);
+await target.put('evaluations',{id:'browser:drip|x',engine:'browser:drip',note:'present'});
+await target.restore({format:'hexo-browser-save',version:1,sessions:[],games:[],matches:[],coverage:[],
+ evaluations:[{id:'browser:native|x',engine:'browser:native',note:'backup'}]},{game(){}});
+console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluations:await storage.all('evaluations'),
+ restored:await target.all('evaluations')}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertEqual(result['session']['seats'][1], dict(engine='browser:drip', preset='quick'))
+        self.assertEqual(result['session']['match']['players'],
+                         [dict(engine='browser:drip', name='Drip (browser)', version='browser:drip|null|abc|'),
+                          dict(engine='browser:six', name='Six (browser)')])
+        self.assertEqual(sorted(result['evaluations'], key=lambda r: r['id']),
+                         [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip', engine_key='browser:drip|null|abc|',
+                               note='native'), dict(id='browser:drip|null|abc||{}|0,1', engine='browser:drip', note='newer'),
+                          dict(id='other', engine='browser:six', name='Native (browser)', kind='six')])
+        self.assertEqual(result['restored'], [dict(id='browser:drip|x', engine='browser:drip', note='backup')])
 
     def test_matching_replay_precedes_newer_unrelated_records(self):
         source = """import {Proofs} from './web/engine/proof.mjs';
@@ -667,7 +695,7 @@ class Loading(unittest.TestCase):
         self.assertEqual((overlap['result'], len(overlap['starts'])), (['done', 'wasm'], 2))
 
     def test_engines_without_a_chain_still_end_a_silent_stage(self):
-        self.assertEqual(self.out['single'], dict(native='Native (browser): compiling timed out', seal='Seal (browser): compiling timed out',
+        self.assertEqual(self.out['single'], dict(drip='Drip (browser): compiling timed out', seal='Seal (browser): compiling timed out',
                                                   strix='Strix (browser): compiling timed out', reporting='loaded'))
 
     def test_threads_follow_device_memory(self):
