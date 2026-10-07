@@ -992,6 +992,39 @@ class HexNetTests(unittest.TestCase):
         self.assertNotEqual(hexnet.model_digest(hexnet.HexNet(replace(TINY, aux_heads=False))), hexnet.model_digest(
             hexnet.HexNet(TINY)))
 
+    def test_optimizer_resumed_in_the_other_layout_continues_the_same_updates(self):
+        torch.manual_seed(5)
+        _, _, planes = planes_batch(same_bucket(4))
+        base = hexnet.HexNet(TINY)
+
+        def gradients(model):
+            model.zero_grad()
+            sum(v.square().mean() for v in model(planes, planes[:, 3:4]).values()).backward()
+            return [p.grad.clone() for p in model.parameters()]
+        for kind in ('adamw', 'muon'):
+            settings = replace(dense_config.LearnerSettings(), optimizer=kind, lr=.01)
+            nchw = copy.deepcopy(base)
+            optimizer = dense_learn.make_optimizer(nchw, settings)
+            gradients(nchw)
+            optimizer.step()
+            nhwc = copy.deepcopy(nchw).to(memory_format=torch.channels_last)
+            resumed = dense_learn.make_optimizer(nhwc, settings)
+            resumed.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+            dense_learn.match_layout(resumed)
+            for inner in getattr(resumed, 'optimizers', (resumed,)):
+                for p, state in inner.state.items():
+                    for value in state.values():
+                        if value.shape == p.shape:
+                            self.assertEqual(value.stride(), p.stride())
+            # The same gradients, each in its parameter's layout, must give the same update.
+            for p, g in zip(nhwc.parameters(), gradients(nchw)):
+                p.grad = torch.empty_like(p).copy_(g)
+            optimizer.step()
+            resumed.step()
+            for (name, a), b in zip(nchw.named_parameters(), nhwc.parameters()):
+                with self.subTest(optimizer=kind, parameter=name):
+                    torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-5)
+
     def test_checkpoint_without_aux_heads(self):
         plain = hexnet.HexNet(replace(TINY, aux_heads=False)).eval()
         _, _, planes = planes_batch(same_bucket(2))
@@ -1187,13 +1220,14 @@ class FusedCudaTests(unittest.TestCase):
 
     def test_masked_norm_activation_and_gradients(self):
         torch.manual_seed(3070)
-        for fmt in (torch.contiguous_format, torch.channels_last):
-            x = (torch.randn(3, 16, 24, 24, device='cuda')+20).bfloat16().contiguous(memory_format=fmt)
+        for fmt, channels, height, width in ((torch.contiguous_format, 16, 24, 24), (torch.channels_last, 16, 24, 24),
+                                             (torch.channels_last, 40, 25, 27)):
+            x = (torch.randn(3, channels, height, width, device='cuda')+20).bfloat16().contiguous(memory_format=fmt)
             x.requires_grad_()
-            mask = (torch.rand(3, 1, 24, 24, device='cuda') > .3).bfloat16()
+            mask = (torch.rand(3, 1, height, width, device='cuda') > .3).bfloat16()
             ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
             cells = mask.sum(dtype=torch.float32)
-            reference = hexnet.MaskedNorm(16).cuda()
+            reference = hexnet.MaskedNorm(channels).cuda()
             reference.momentum = .7 if fmt == torch.channels_last else .1
             with torch.no_grad():
                 reference.weight.normal_()
@@ -1245,12 +1279,13 @@ class FusedCudaTests(unittest.TestCase):
 
     def test_masked_pool_matches_reference(self):
         torch.manual_seed(3070)
-        x = torch.randn(3, 8, 24, 24, device='cuda', dtype=torch.bfloat16)
+        x = torch.randn(3, 40, 24, 25, device='cuda', dtype=torch.bfloat16)
         x[0, :2] = -x[0, :2].abs()    # all-zero activations: every cell ties for the max
-        mask = (torch.rand(3, 1, 24, 24, device='cuda') > .3).bfloat16()
+        x = x.contiguous(memory_format=torch.channels_last)
+        mask = (torch.rand(3, 1, 24, 25, device='cuda') > .3).bfloat16()
         ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
         count = mask.sum((2, 3), dtype=torch.float32)
-        grad = torch.randn(3, 16, device='cuda')
+        grad = torch.randn(3, 80, device='cuda')
         for limit in (ceiling, None):
             source = x if limit is not None else hexnet.act(x, ceiling)
             outputs, gradients = [], []
@@ -1268,12 +1303,13 @@ class FusedCudaTests(unittest.TestCase):
         from hexnet_kernels import line_train_add
 
         torch.manual_seed(3070)
-        for length, size in ((11, 24), (5, 32), (6, 40)):
-            line = hexnet.LineConv(8, length).cuda()
+        for length, size, channels in ((11, 24, 8), (5, 32, 8), (6, 40, 40), (11, 25, 40)):
+            line = hexnet.LineConv(channels, length).cuda()
             with torch.no_grad():
                 line.weight.normal_(0, .2)
             fused = copy.deepcopy(line)
-            x = torch.randn(3, 8, size, size, device='cuda', dtype=torch.bfloat16).requires_grad_()
+            x = torch.randn(3, channels, size, size+3, device='cuda', dtype=torch.bfloat16)
+            x = x.contiguous(memory_format=torch.channels_last).requires_grad_()
             x_fused = x.detach().clone().requires_grad_()
             grad = torch.randn_like(x)
             with torch.autocast('cuda', torch.bfloat16):
@@ -1301,7 +1337,7 @@ class FusedCudaTests(unittest.TestCase):
             for training in (True, False):
                 results = []
                 for mode in ('reference', 'fused'):
-                    fmt = torch.channels_last if mode == 'fused' and not training else torch.contiguous_format
+                    fmt = torch.channels_last if mode == 'fused' else torch.contiguous_format
                     model = copy.deepcopy(base).set_kernels(mode).cuda().to(memory_format=fmt).train(training)
                     inputs = x.contiguous(memory_format=fmt)
                     with torch.set_grad_enabled(training), torch.autocast('cuda', torch.bfloat16):

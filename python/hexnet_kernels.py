@@ -148,89 +148,6 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
     tl.store(Y+at,line+tl.load(X+at,valid,0).to(tl.float32),valid)
 
 
-# Masked pooling: the mean and max of act(x) per sample and channel, read once forward and twice backward, with
-# the reference rounding of the bf16 sum, of the mean and max gradients and of their sum. Ties for the max share
-# its gradient equally, as amax's does.
-@tr.jit(do_not_specialize=['N', 'CS'])
-def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
-    p=tl.program_id(0)
-    b,c=p//C,p % C
-    i=tl.arange(0,K)
-    total=tl.full((K,),0.,tl.float32)
-    best=tl.full((K,),float('-inf'),tl.float32)
-    for start in range(0,N,K):
-        j=start+i
-        valid=j<N
-        v=tl.load(X+p*N+j,valid,0).to(tl.float32)
-        if ACT:
-            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32))
-        total+=tl.where(valid,v,0.)
-        best=tl.maximum(best,tl.where(valid,v,float('-inf')))
-    top=tl.max(best,0)
-    tl.store(Out+b*2*C+c,tl.sum(total,0).to(X.dtype.element_ty).to(tl.float32)/tl.load(Count+b))
-    tl.store(Out+b*2*C+C+c,top)
-    tl.store(Top+p,top)
-
-
-@tr.jit(do_not_specialize=['N', 'CS'])
-def _pool_grad(X,Ceiling,Count,Top,G,DX,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr):
-    p=tl.program_id(0)
-    b,c=p//C,p % C
-    i=tl.arange(0,K)
-    top=tl.load(Top+p)
-    ties=tl.full((K,),0.,tl.float32)
-    for start in range(0,N,K):
-        j=start+i
-        valid=j<N
-        v=tl.load(X+p*N+j,valid,0).to(tl.float32)
-        if ACT:
-            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32))
-        ties+=tl.where(valid&(v==top),1.,0.)
-    mean=(tl.load(G+b*2*C+c)/tl.load(Count+b)).to(DX.dtype.element_ty).to(tl.float32)
-    peak=tl.load(G+b*2*C+C+c).to(DX.dtype.element_ty).to(tl.float32)
-    peak=(peak/tl.sum(ties,0)).to(DX.dtype.element_ty).to(tl.float32)
-    for start in range(0,N,K):
-        j=start+i
-        valid=j<N
-        x=tl.load(X+p*N+j,valid,0).to(tl.float32)
-        v=x
-        if ACT:
-            ceiling=tl.load(Ceiling+b*CS+j,valid,0).to(tl.float32)
-            v=tl.minimum(tl.maximum(x,0.),ceiling)
-        g=(mean+tl.where(v==top,peak,0.)).to(DX.dtype.element_ty).to(tl.float32)
-        if ACT:
-            g=tl.where((x>=0.)&(x<=ceiling),g,0.)
-        tl.store(DX+p*N+j,g,valid)
-
-
-class _MaskedPool(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx,x,count,ceiling):
-        b,c,h,w=x.shape
-        out=torch.empty((b,2*c),device=x.device,dtype=torch.float32)
-        top=torch.empty(b*c,device=x.device,dtype=torch.float32)
-        act=ceiling is not None
-        source=ceiling if act else x
-        _pool[(b*c,)](x,source,count,out,top,h*w,source.stride(0),c,act,1024)
-        ctx.save_for_backward(x,count,top,source)
-        ctx.act=act
-        return out
-
-    @staticmethod
-    def backward(ctx,grad):
-        x,count,top,source=ctx.saved_tensors
-        b,c,h,w=x.shape
-        dx=torch.empty_like(x)
-        _pool_grad[(b*c,)](x,source,count,top,grad.contiguous(),dx,h*w,source.stride(0),c,ctx.act,1024)
-        return dx,None,None
-
-
-def masked_pool(x,count,ceiling=None):
-    """hexnet.pool for contiguous NCHW CUDA x, count [B, 1] fp32 and an optional ceiling [B, 1, H, W] whose planes are
-    contiguous: [B, 2C] fp32."""
-    return _MaskedPool.apply(x,count,ceiling)
-
-
 def line_add(x,weight):
     out=torch.empty_like(x)
     b,c,h,w=x.shape
@@ -272,37 +189,125 @@ def norm_eval(norm,x,mask):
     return out
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'T'])
-def _reduce(X, M, Mean, Partial, N, H, W,
-            XS, MS, T, VAR: tl.constexpr,
-            K: tl.constexpr):
-    c, t = tl.program_id(0), tl.program_id(1)
-    i = t*K+tl.arange(0, K)
-    x = tl.load(X+_offset(i,c,H,W,XS), i<N, 0).to(tl.float32)
-    m = tl.load(M+_offset(i,c,H,W,MS), i<N, 0).to(tl.float32)
-    if VAR:
-        shift = tl.load(Mean+c).to(X.dtype.element_ty).to(tl.float32)
+# Training kernels take channels-last tensors: element (n, c) of [B, C, H, W] sits at n*C+c for the position
+# n = (b*H+y)*W+x, so a tile of positions by channels reads whole rows. Masks and ceilings are [B, 1, H, W].
+
+# Masked pooling: the mean and max of act(x) per sample and channel, read once forward and twice backward, with
+# the reference rounding of the bf16 sum, of the mean and max gradients and of their sum. Ties for the max share
+# its gradient equally, as amax's does.
+@tr.jit(do_not_specialize=['N', 'CS'])
+def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+    b=tl.program_id(0)
+    c=tl.program_id(1)*CB+tl.arange(0,CB)
+    total=tl.full((K,CB),0.,tl.float32)
+    best=tl.full((K,CB),float('-inf'),tl.float32)
+    for start in range(0,N,K):
+        j=start+tl.arange(0,K)
+        valid=(j<N)[:,None]&(c<C)[None,:]
+        v=tl.load(X+(b*N+j)[:,None]*C+c[None,:],valid,0).to(tl.float32)
+        if ACT:
+            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,j<N,0).to(tl.float32)[:,None])
+        total+=tl.where(valid,v,0.)
+        best=tl.maximum(best,tl.where(valid,v,float('-inf')))
+    top=tl.max(best,0)
+    tl.store(Out+b*2*C+c,tl.sum(total,0).to(X.dtype.element_ty).to(tl.float32)/tl.load(Count+b),c<C)
+    tl.store(Out+b*2*C+C+c,top,c<C)
+    tl.store(Top+b*C+c,top,c<C)
+
+
+@tr.jit(do_not_specialize=['N', 'CS'])
+def _pool_grad(X,Ceiling,Count,Top,G,DX,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+    b=tl.program_id(0)
+    c=tl.program_id(1)*CB+tl.arange(0,CB)
+    top=tl.load(Top+b*C+c,c<C,0)[None,:]
+    ties=tl.full((K,CB),0.,tl.float32)
+    for start in range(0,N,K):
+        j=start+tl.arange(0,K)
+        valid=(j<N)[:,None]&(c<C)[None,:]
+        v=tl.load(X+(b*N+j)[:,None]*C+c[None,:],valid,0).to(tl.float32)
+        if ACT:
+            v=tl.minimum(tl.maximum(v,0.),tl.load(Ceiling+b*CS+j,j<N,0).to(tl.float32)[:,None])
+        ties+=tl.where(valid&(v==top),1.,0.)
+    mean=(tl.load(G+b*2*C+c,c<C,0)/tl.load(Count+b)).to(DX.dtype.element_ty).to(tl.float32)[None,:]
+    peak=tl.load(G+b*2*C+C+c,c<C,0).to(DX.dtype.element_ty).to(tl.float32)
+    peak=(peak/tl.sum(ties,0)).to(DX.dtype.element_ty).to(tl.float32)[None,:]
+    for start in range(0,N,K):
+        j=start+tl.arange(0,K)
+        valid=(j<N)[:,None]&(c<C)[None,:]
+        at=(b*N+j)[:,None]*C+c[None,:]
+        x=tl.load(X+at,valid,0).to(tl.float32)
+        v=x
+        if ACT:
+            ceiling=tl.load(Ceiling+b*CS+j,j<N,0).to(tl.float32)[:,None]
+            v=tl.minimum(tl.maximum(x,0.),ceiling)
+        g=(mean+tl.where(v==top,peak,0.)).to(DX.dtype.element_ty).to(tl.float32)
+        if ACT:
+            g=tl.where((x>=0.)&(x<=ceiling),g,0.)
+        tl.store(DX+at,g,valid)
+
+
+class _MaskedPool(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,x,count,ceiling):
+        b,c,h,w=x.shape
+        out=torch.empty((b,2*c),device=x.device,dtype=torch.float32)
+        top=torch.empty(b*c,device=x.device,dtype=torch.float32)
+        act=ceiling is not None
+        source=ceiling if act else x
+        _pool[(b,tr.cdiv(c,32))](x,source,count,out,top,h*w,source.stride(0),c,act,32,32)
+        ctx.save_for_backward(x,count,top,source)
+        ctx.act=act
+        return out
+
+    @staticmethod
+    def backward(ctx,grad):
+        x,count,top,source=ctx.saved_tensors
+        b,c,h,w=x.shape
+        dx=torch.empty_like(x)
+        _pool_grad[(b,tr.cdiv(c,32))](x,source,count,top,grad.contiguous(),dx,h*w,source.stride(0),c,ctx.act,32,32)
+        return dx,None,None
+
+
+def masked_pool(x,count,ceiling=None):
+    """hexnet.pool for channels-last CUDA x, count [B, 1] fp32 and an optional ceiling [B, 1, H, W] whose planes are
+    contiguous: [B, 2C] fp32."""
+    return _MaskedPool.apply(x,count,ceiling)
+
+
+@tr.jit
+def _cells(i, c, N, H, W, MS, C: tl.constexpr):
+    """Offsets and bounds of a tile of positions i [K] by channels c [CB], and the mask offsets of its positions."""
+    return i[:,None]*C+c[None,:], (i<N)[:,None]&(c<C)[None,:], _offset(i,0,H,W,MS)
+
+
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'MS', 'T'])
+def _reduce(X, M, Mean, Partial, N, H, W, MS, T,
+            C: tl.constexpr, P: tl.constexpr, K: tl.constexpr, CB: tl.constexpr):
+    t = tl.program_id(0)
+    c = tl.program_id(1)*CB+tl.arange(0, CB)
+    shift = tl.load(Mean+c, c<C, 0).to(X.dtype.element_ty).to(tl.float32)[None,:]
+    total = tl.full((K, CB), 0., tl.float32)
+    for start in range(t*P, t*P+P, K):
+        at, valid, ms = _cells(start+tl.arange(0, K), c, N, H, W, MS, C)
+        x = tl.load(X+at, valid, 0).to(tl.float32)
+        m = tl.load(M+ms, start+tl.arange(0, K)<N, 0).to(tl.float32)[:,None]
         centred = (x-shift).to(X.dtype.element_ty).to(tl.float32)
         v = ((centred*m).to(X.dtype.element_ty).to(tl.float32)*centred).to(X.dtype.element_ty).to(tl.float32)
-    else:
-        v = (x*m).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Partial+c*T+t, tl.sum(tl.where(i<N,v,0),0))
+        total += tl.where(valid, v, 0)
+    tl.store(Partial+c*T+t, tl.sum(total, 0), c<C)
 
 
 @tr.jit(do_not_specialize=['T'])
 def _finish(Partial, Mean, Var, Inv, Cells, X, T,
-            EPS: tl.constexpr, VAR: tl.constexpr, K: tl.constexpr):
+            EPS: tl.constexpr, K: tl.constexpr):
     c = tl.program_id(0)
     i = tl.arange(0,K)
     value = tl.sum(tl.load(Partial+c*T+i,i<T,0),0)/tl.load(Cells)
-    if VAR:
-        mean = tl.load(Mean+c)
-        delta = mean-mean.to(X.dtype.element_ty).to(tl.float32)
-        var = tl.maximum(value-delta*delta,0.)
-        tl.store(Var+c,var)
-        tl.store(Inv+c,tl.rsqrt(var+EPS))
-    else:
-        tl.store(Mean+c,value)
+    mean = tl.load(Mean+c)
+    delta = mean-mean.to(X.dtype.element_ty).to(tl.float32)
+    var = tl.maximum(value-delta*delta,0.)
+    tl.store(Var+c,var)
+    tl.store(Inv+c,tl.rsqrt(var+EPS))
 
 
 @tr.jit
@@ -344,19 +349,6 @@ def _normalized(x,mean,inv,weight,bias,D:tl.constexpr):
     return tl.fma(centred,scale.to(D).to(tl.float32),offset).to(D).to(tl.float32)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'YS'])
-def _apply(X,M,Y,Mean,Inv,Weight,Bias,N,H,W,
-           XS,MS,YS,ACT:tl.constexpr,K:tl.constexpr):
-    c=tl.program_id(0)
-    i=tl.program_id(1)*K+tl.arange(0,K)
-    x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
-    y=_normalized(x,tl.load(Mean+c),tl.load(Inv+c),tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
-    if ACT:
-        m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
-        y=tl.where(m>0,tl.maximum(y,0.),0.)
-    tl.store(Y+_offset(i,c,H,W,YS),y,i<N)
-
-
 @tr.jit
 def _xhat(x,mean,inv,D:tl.constexpr):
     shift=mean.to(D).to(tl.float32)
@@ -365,52 +357,72 @@ def _xhat(x,mean,inv,D:tl.constexpr):
     return tl.fma(centred,inv.to(D).to(tl.float32),bias).to(D).to(tl.float32)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'OS', 'PS'])
-def _grad_products(X,M,G,Gated,Product,Mean,Inv,Weight,Bias,N,H,W,
-                   XS,MS,GS,OS,PS,ACT:tl.constexpr,K:tl.constexpr):
-    c=tl.program_id(0)
-    i=tl.program_id(1)*K+tl.arange(0,K)
-    x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
-    g=tl.load(G+_offset(i,c,H,W,GS),i<N,0).to(tl.float32)
-    inv=tl.load(Inv+c)
+@tr.jit
+def _channels(Mean,Inv,Weight,Bias,c,C:tl.constexpr):
+    """Per-channel mean, inverse deviation, weight and bias of the channels c, as [1, CB] rows."""
+    return (tl.load(Mean+c,c<C,0)[None,:],tl.load(Inv+c,c<C,0)[None,:],tl.load(Weight+c,c<C,0)[None,:],
+            tl.load(Bias+c,c<C,0)[None,:])
+
+
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'MS'])
+def _apply(X,M,Y,Mean,Inv,Weight,Bias,N,H,W,MS,
+           ACT:tl.constexpr,C:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    c=tl.program_id(1)*CB+tl.arange(0,CB)
+    at,valid,ms=_cells(i,c,N,H,W,MS,C)
+    mean,inv,weight,bias=_channels(Mean,Inv,Weight,Bias,c,C)
+    y=_normalized(tl.load(X+at,valid,0).to(tl.float32),mean,inv,weight,bias,X.dtype.element_ty)
     if ACT:
-        m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
-        y=_normalized(x,tl.load(Mean+c),inv,tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
+        m=tl.load(M+ms,i<N,0)[:,None]
+        y=tl.where(m>0,tl.maximum(y,0.),0.)
+    tl.store(Y+at,y,valid)
+
+
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'MS'])
+def _grad_products(X,M,G,Gated,Product,Mean,Inv,Weight,Bias,N,H,W,MS,
+                   ACT:tl.constexpr,C:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    c=tl.program_id(1)*CB+tl.arange(0,CB)
+    at,valid,ms=_cells(i,c,N,H,W,MS,C)
+    mean,inv,weight,bias=_channels(Mean,Inv,Weight,Bias,c,C)
+    x=tl.load(X+at,valid,0).to(tl.float32)
+    g=tl.load(G+at,valid,0).to(tl.float32)
+    if ACT:
+        m=tl.load(M+ms,i<N,0)[:,None]
+        y=_normalized(x,mean,inv,weight,bias,X.dtype.element_ty)
         g=tl.where((y>=0)&((m>0)|(y<=0)),g,0.)
     g=g.to(Gated.dtype.element_ty).to(tl.float32)
-    h=_xhat(x,tl.load(Mean+c),inv,X.dtype.element_ty)
-    tl.store(Gated+_offset(i,c,H,W,OS),g,i<N)
-    tl.store(Product+_offset(i,c,H,W,PS),(g*h).to(Product.dtype.element_ty),i<N)
+    tl.store(Gated+at,g,valid)
+    tl.store(Product+at,(g*_xhat(x,mean,inv,X.dtype.element_ty)).to(Product.dtype.element_ty),valid)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'GS', 'DS'])
-def _grad_apply(X,M,G,Dx,Mean,Inv,Weight,Bias,Db,Dw,Cells,N,H,W,
-                XS,MS,GS,DS,ACT:tl.constexpr,K:tl.constexpr):
-    c=tl.program_id(0)
-    i=tl.program_id(1)*K+tl.arange(0,K)
-    x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
-    m=tl.load(M+_offset(i,c,H,W,MS),i<N,0).to(tl.float32)
-    g=tl.load(G+_offset(i,c,H,W,GS),i<N,0).to(tl.float32)
-    inv=tl.load(Inv+c)
-    if ACT:
-        y=_normalized(x,tl.load(Mean+c),inv,tl.load(Weight+c),tl.load(Bias+c),X.dtype.element_ty)
-        g=tl.where((y>=0)&((m>0)|(y<=0)),g,0.)
-    h=_xhat(x,tl.load(Mean+c),inv,X.dtype.element_ty)
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'MS'])
+def _grad_apply(X,M,G,Dx,Mean,Inv,Weight,Bias,Db,Dw,Cells,N,H,W,MS,
+                C:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+    i=tl.program_id(0)*K+tl.arange(0,K)
+    c=tl.program_id(1)*CB+tl.arange(0,CB)
+    at,valid,ms=_cells(i,c,N,H,W,MS,C)
+    mean,inv,weight,_=_channels(Mean,Inv,Weight,Bias,c,C)
+    x=tl.load(X+at,valid,0).to(tl.float32)
+    m=tl.load(M+ms,i<N,0).to(tl.float32)[:,None]
+    g=tl.load(G+at,valid,0).to(tl.float32)
+    h=_xhat(x,mean,inv,X.dtype.element_ty)
     cells=tl.load(Cells)
-    a=(tl.load(Db+c)/cells).to(X.dtype.element_ty).to(tl.float32)
-    b=(tl.load(Dw+c)/cells).to(X.dtype.element_ty).to(tl.float32)
+    a=(tl.load(Db+c,c<C,0)/cells).to(X.dtype.element_ty).to(tl.float32)[None,:]
+    b=(tl.load(Dw+c,c<C,0)/cells).to(X.dtype.element_ty).to(tl.float32)[None,:]
     correction=tl.fma(h,b,a).to(X.dtype.element_ty).to(tl.float32)
     dx=(g-(m*correction).to(X.dtype.element_ty).to(tl.float32)).to(X.dtype.element_ty).to(tl.float32)
-    dx=dx*(tl.load(Weight+c)*inv).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Dx+_offset(i,c,H,W,DS),dx,i<N)
+    dx=dx*(weight*inv).to(X.dtype.element_ty).to(tl.float32)
+    tl.store(Dx+at,dx,valid)
 
 
 class MaskedBatchNorm(torch.autograd.Function):
+    """hexnet._MaskedBatchNorm for channels-last CUDA x and a [B, 1, H, W] mask, with the activation act(y, ceiling) fused when `activate`."""
     @staticmethod
     def forward(ctx,x,mask,weight,bias,cells,eps,activate=False):
         b,c,h,w=x.shape
-        n,k=b*h*w,1024
-        t=tr.cdiv(n,k)
+        n,p=b*h*w,1024
+        t=tr.cdiv(n,p)
         partial=torch.empty((c,t),device=x.device,dtype=torch.float32)
         # Match ATen's reduction order. Sub-ULP mean differences can change
         # BF16 activations enough to exceed the full-model gradient tolerance.
@@ -418,12 +430,10 @@ class MaskedBatchNorm(torch.autograd.Function):
         var=torch.empty_like(weight)
         inv=torch.empty_like(weight)
         y=torch.empty_like(x)
-        ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
-        grid=(c,t)
-        common=dict(N=n,H=h,W=w,XS=x.stride(),MS=ms,T=t,K=k,enable_fp_fusion=False)
-        _reduce[grid](x,mask,mean,partial,VAR=True,**common)
-        _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,True,tr.next_power_of_2(t),enable_fp_fusion=False)
-        _apply[grid](x,mask,y,mean,inv,weight,bias,n,h,w,x.stride(),ms,y.stride(),activate,k,enable_fp_fusion=False)
+        ms=mask.stride()
+        _reduce[(t,tr.cdiv(c,32))](x,mask,mean,partial,n,h,w,ms,t,c,p,64,32,enable_fp_fusion=False)
+        _finish[(c,)](partial,mean,var,inv,cells,x,t,eps,tr.next_power_of_2(t),enable_fp_fusion=False)
+        _apply[(tr.cdiv(n,64),tr.cdiv(c,32))](x,mask,y,mean,inv,weight,bias,n,h,w,ms,activate,c,64,32,enable_fp_fusion=False)
         ctx.save_for_backward(x,mask,weight,bias,mean,inv,cells)
         ctx.activate=activate
         return y,mean,var
@@ -432,78 +442,82 @@ class MaskedBatchNorm(torch.autograd.Function):
     def backward(ctx,grad,_mean,_var):
         x,mask,weight,bias,mean,inv,cells=ctx.saved_tensors
         b,c,h,w=x.shape
-        n,k=b*h*w,1024
-        t=tr.cdiv(n,k)
+        n=b*h*w
+        grad=grad.contiguous(memory_format=torch.channels_last)
         gated=torch.empty_like(grad)
         product=torch.empty_like(grad,dtype=torch.promote_types(grad.dtype,x.dtype))
         dx=torch.empty_like(x)
-        ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
-        _grad_products[(c,t)](x,mask,grad,gated,product,mean,inv,weight,bias,n,h,w,
-                               x.stride(),ms,grad.stride(),gated.stride(),product.stride(),
-                               ctx.activate,k,enable_fp_fusion=False)
+        ms=mask.stride()
+        grid=(tr.cdiv(n,64),tr.cdiv(c,32))
+        _grad_products[grid](x,mask,grad,gated,product,mean,inv,weight,bias,n,h,w,ms,ctx.activate,c,64,32,enable_fp_fusion=False)
         # Preserve the reference reduction order before rounding the correction
         # coefficients to bf16. A different tree can change those coefficients.
         db=gated.sum((0,2,3),dtype=mean.dtype)
         dw=product.sum((0,2,3),dtype=mean.dtype)
-        _grad_apply[(c,t)](x,mask,gated,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,
-                            x.stride(),ms,gated.stride(),dx.stride(),False,k,enable_fp_fusion=False)
+        _grad_apply[grid](x,mask,gated,dx,mean,inv,weight,bias,db,dw,cells,n,h,w,ms,c,64,32,enable_fp_fusion=False)
         return (dx,None,dw.to(weight.dtype),db.to(weight.dtype),None,None,None)[:len(ctx.needs_input_grad)]
 
 
-# Training LineConv: the forward pass is _line_add. The backward pass runs the transposed taps over the gradient
+# Training LineConv: the forward pass is _line_add_nhwc. The backward pass runs the transposed taps over the gradient
 # with the reference bf16 rounding of each axis sum, and reduces the tap gradients in fp32.
-@tr.jit(do_not_specialize=['H', 'W'])
-def _line_grad(G,Weight,DX,C:tl.constexpr,H,W,L:tl.constexpr,K:tl.constexpr):
-    plane,c=tl.program_id(0),tl.program_id(0) % C
-    i=tl.program_id(1)*K+tl.arange(0,K)
-    x,y=i % W,i//W
-    valid=i<H*W
-    g=G+plane*H*W+i
-    horizontal=tl.full((K,),0.,tl.float32)
-    vertical=tl.full((K,),0.,tl.float32)
-    diagonal=tl.full((K,),0.,tl.float32)
+@tr.jit(do_not_specialize=['N', 'H', 'W'])
+def _line_grad(G,Weight,DX,N,C:tl.constexpr,H,W,L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr):
+    p=tl.program_id(0)*P+tl.arange(0,P)
+    c=tl.program_id(1)*CH+tl.arange(0,CH)
+    x,y=p % W,p//W % H
+    at=p[:,None]*C+c[None,:]
+    valid=(p[:,None]<N)&(c[None,:]<C)
+    horizontal=tl.full((P,CH),0.,tl.float32)
+    vertical=tl.full((P,CH),0.,tl.float32)
+    diagonal=tl.full((P,CH),0.,tl.float32)
     for tap in tl.static_range(L):
         d=tap-L//2
         dd=tap-(L-1-L//2)
-        wh=tl.load(Weight+(c*3)*L+tap).to(G.dtype.element_ty).to(tl.float32)
-        wv=tl.load(Weight+(c*3+1)*L+tap).to(G.dtype.element_ty).to(tl.float32)
-        wd=tl.load(Weight+(c*3+2)*L+tap).to(G.dtype.element_ty).to(tl.float32)
-        h=tl.load(g-d,valid&(x-d>=0)&(x-d<W),0).to(tl.float32)
-        v=tl.load(g-d*W,valid&(y-d>=0)&(y-d<H),0).to(tl.float32)
-        a=tl.load(g-dd+dd*W,valid&(x-dd>=0)&(x-dd<W)&(y+dd>=0)&(y+dd<H),0).to(tl.float32)
-        horizontal=tl.fma(h,wh,horizontal)
-        vertical=tl.fma(v,wv,vertical)
-        diagonal=tl.fma(a,wd,diagonal)
+        wh=tl.load(Weight+(c*3)*L+tap,c<C,0).to(G.dtype.element_ty).to(tl.float32)
+        wv=tl.load(Weight+(c*3+1)*L+tap,c<C,0).to(G.dtype.element_ty).to(tl.float32)
+        wd=tl.load(Weight+(c*3+2)*L+tap,c<C,0).to(G.dtype.element_ty).to(tl.float32)
+        h=tl.load(G+at-d*C,valid&((x-d>=0)&(x-d<W))[:,None],0).to(tl.float32)
+        v=tl.load(G+at-d*W*C,valid&((y-d>=0)&(y-d<H))[:,None],0).to(tl.float32)
+        a=tl.load(G+at+dd*(W-1)*C,valid&((x-dd>=0)&(x-dd<W)&(y+dd>=0)&(y+dd<H))[:,None],0).to(tl.float32)
+        horizontal=tl.fma(h,wh[None,:],horizontal)
+        vertical=tl.fma(v,wv[None,:],vertical)
+        diagonal=tl.fma(a,wd[None,:],diagonal)
     hv=(horizontal.to(G.dtype.element_ty).to(tl.float32)+vertical.to(G.dtype.element_ty).to(tl.float32))
     hv=hv.to(G.dtype.element_ty).to(tl.float32)
-    residual=(hv+tl.load(g,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
-    tl.store(DX+plane*H*W+i,residual+diagonal.to(G.dtype.element_ty).to(tl.float32),valid)
+    residual=(hv+tl.load(G+at,valid,0).to(tl.float32)).to(G.dtype.element_ty).to(tl.float32)
+    tl.store(DX+at,residual+diagonal.to(G.dtype.element_ty).to(tl.float32),valid)
 
 
-@tr.jit(do_not_specialize=['B', 'H', 'W', 'T', 'P'])
-def _line_taps(X,G,Partial,B,C:tl.constexpr,H,W,T,P,L:tl.constexpr,LP:tl.constexpr,K:tl.constexpr):
-    c,t=tl.program_id(0),tl.program_id(1)
-    tap=tl.arange(0,LP)
-    d=(tap-L//2)[:,None]
-    dd=(tap-(L-1-L//2))[:,None]
-    horizontal=tl.full((LP,K),0.,tl.float32)
-    vertical=tl.full((LP,K),0.,tl.float32)
-    diagonal=tl.full((LP,K),0.,tl.float32)
-    for start in range(t*P,tl.minimum((t+1)*P,B*H*W),K):
-        j=start+tl.arange(0,K)
-        x,y,b=j % W,j//W % H,j//(H*W)
-        at=(((b*C+c)*H+y)*W+x)[None,:]
-        valid=j<B*H*W
-        g=tl.load(G+at,valid[None,:],0).to(tl.float32)
-        used=(tap<L)[:,None]&valid[None,:]
-        x,y=x[None,:],y[None,:]
-        horizontal+=g*tl.load(X+at+d,used&(x+d>=0)&(x+d<W),0).to(tl.float32)
-        vertical+=g*tl.load(X+at+d*W,used&(y+d>=0)&(y+d<H),0).to(tl.float32)
-        diagonal+=g*tl.load(X+at+dd-dd*W,used&(x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H),0).to(tl.float32)
-    out=Partial+(c*3*L+tap)*T+t
-    tl.store(out,tl.sum(horizontal,1),tap<L)
-    tl.store(out+L*T,tl.sum(vertical,1),tap<L)
-    tl.store(out+2*L*T,tl.sum(diagonal,1),tap<L)
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'T'])
+def _line_taps(X,G,Partial,N,C:tl.constexpr,H,W,T,P:tl.constexpr,L:tl.constexpr,LP:tl.constexpr,
+               K:tl.constexpr,CH:tl.constexpr):
+    c=tl.program_id(0)*CH+tl.arange(0,CH)
+    t=tl.program_id(1)
+    taps=tl.arange(0,LP)[:,None]
+    horizontal=tl.full((LP,CH),0.,tl.float32)
+    vertical=tl.full((LP,CH),0.,tl.float32)
+    diagonal=tl.full((LP,CH),0.,tl.float32)
+    for start in range(t*P,t*P+P,K):
+        p=start+tl.arange(0,K)
+        x,y=p % W,p//W % H
+        at=p[:,None]*C+c[None,:]
+        valid=(p[:,None]<N)&(c[None,:]<C)
+        g=tl.load(G+at,valid,0).to(tl.float32)
+        for tap in tl.static_range(L):
+            d=tap-L//2
+            dd=tap-(L-1-L//2)
+            h=tl.load(X+at+d*C,valid&((x+d>=0)&(x+d<W))[:,None],0).to(tl.float32)
+            v=tl.load(X+at+d*W*C,valid&((y+d>=0)&(y+d<H))[:,None],0).to(tl.float32)
+            a=tl.load(X+at+dd*(1-W)*C,valid&((x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H))[:,None],0).to(tl.float32)
+            row=taps==tap
+            horizontal+=tl.where(row,tl.sum(g*h,0)[None,:],0.)
+            vertical+=tl.where(row,tl.sum(g*v,0)[None,:],0.)
+            diagonal+=tl.where(row,tl.sum(g*a,0)[None,:],0.)
+    out=Partial+(c[None,:]*3*L+taps)*T+t
+    used=(taps<L)&(c[None,:]<C)
+    tl.store(out,horizontal,used)
+    tl.store(out+L*T,vertical,used)
+    tl.store(out+2*L*T,diagonal,used)
 
 
 class _TrainLineAdd(torch.autograd.Function):
@@ -516,21 +530,21 @@ class _TrainLineAdd(torch.autograd.Function):
     def backward(ctx,grad):
         x,weight=ctx.saved_tensors
         b,c,h,w=x.shape
-        length=weight.shape[-1]
-        grad=grad.to(x.dtype).contiguous()
+        n,length=b*h*w,weight.shape[-1]
+        grad=grad.to(x.dtype).contiguous(memory_format=torch.channels_last)
         dx=dw=None
         if ctx.needs_input_grad[0]:
             dx=torch.empty_like(grad)
-            _line_grad[(b*c,tr.cdiv(h*w,256))](grad,weight,dx,c,h,w,length,256)
+            _line_grad[(tr.cdiv(n,16),tr.cdiv(c,32))](grad,weight,dx,n,c,h,w,length,16,32)
         if ctx.needs_input_grad[1]:
-            k,p=64,4096
-            t=tr.cdiv(b*h*w,p)
+            p=4096
+            t=tr.cdiv(n,p)
             partial=torch.empty((c,3,length,t),dtype=torch.float32,device=grad.device)
-            _line_taps[(c,t)](x,grad,partial,b,c,h,w,t,p,length,tr.next_power_of_2(length),k)
+            _line_taps[(tr.cdiv(c,32),t)](x,grad,partial,n,c,h,w,t,p,length,tr.next_power_of_2(length),32,32)
             dw=partial.sum(-1)
         return dx,dw
 
 
 def line_train_add(x,weight):
-    """Residual LineConv x + LineConv(x) for contiguous NCHW CUDA bf16 activations and fp32 taps, with gradients."""
+    """Residual LineConv x + LineConv(x) for channels-last CUDA bf16 activations and fp32 taps, with gradients."""
     return _TrainLineAdd.apply(x,weight)
