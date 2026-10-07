@@ -18,7 +18,7 @@
  * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
  * engine's choices to lightning. */
 import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
-import {native} from './native.mjs';
+import {drip} from './drip.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
 import {turnTime} from './clock.mjs';
@@ -29,6 +29,7 @@ import {strix} from './strix.mjs';
 import {NotOnSite, install as download, json, status} from './assets.mjs';
 import {notices} from './engine-worker.mjs';
 import {stageText} from './stages.mjs';
+import {savedIds} from './storage.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
@@ -36,7 +37,7 @@ const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bu
   record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
     solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
   build: 'python tools/build_web.py ort model'};
-const ENGINES = new Map([bubble, native, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
+const ENGINES = new Map([bubble, drip, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
 const HOOKS = ['accept', 'post', 'shown', 'renderSeat', 'renderEngineHead', 'renderJobs', 'canPlace', 'renderPanels', 'draw',
   'openMenu', 'el', 'toast', 'badge', 'strength', 'pickItems', 'isHuman', 'setupRing', 'clockPicker'];
@@ -58,7 +59,7 @@ let holding = null;
 try {
   const saved = localStorage.getItem(STORE), known = choice => ENGINES.has(choice?.engine) ? pickEngine(choice.engine, choice, choice.checkpoint) : null;
   fresh = saved === null;
-  const stored = {...config, ...JSON.parse(saved)};
+  const stored = {...config, ...savedIds(JSON.parse(saved))};
   config = {seats: stored.seats.map(known), analysis: known(stored.analysis)};
 } catch {}
 const save = () => { failed = null; try { localStorage.setItem(STORE, JSON.stringify(config)); } catch {} };
@@ -78,7 +79,7 @@ const analysisKey = (choice, history) => `${choice.engine}|${choice.preset}|${ch
 
 /**
  * Adds the browser entries to a state's engines and drops browser seats the server has given another engine. A server
- * without an analysis engine (no Bubble model) gets the browser's: Native (browser) at quick unless another was chosen.
+ * without an analysis engine (no Bubble model) gets the browser's: Drip (browser) at quick unless another was chosen.
  */
 function adopt(data) {
   if (data.engines) for (const {entry} of ENGINES.values()) if (!data.engines.some(e => e.id === entry.id)) data.engines.push(entry);
@@ -88,7 +89,7 @@ function adopt(data) {
   }
   if (data.analysis === null) {
     if (!config.analysis) {
-      config.analysis = {engine: native.entry.id, preset: 'quick'};
+      config.analysis = {engine: drip.entry.id, preset: 'quick'};
       save();
     }
     const {engine, preset} = config.analysis;
@@ -533,7 +534,7 @@ async function serverless() {
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
   bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
-  native.entry.version = build.artefacts['native/native.wasm'];
+  drip.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);
   await mountPlay(ENGINES, config);
   for (const {entry, listed} of ENGINES.values()) listed?.then(() => recheck(entry, true));   // the session's own choices

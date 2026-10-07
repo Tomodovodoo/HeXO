@@ -19,8 +19,8 @@ FORKS = [
      (-3,5),(-4,2),(2,1),(-5,2),(1,2),(-4,3),(-1,3),(-5,3),(1,3)],
 ]
 
-# Native's turns from Seal games seeded 810505, before which Native had not yet
-# lost: the Rust solver proved a Seal win after the turn Native played, and the
+# Drip's turns from Seal games seeded 810505, before which Drip had not yet
+# lost: the Rust solver proved a Seal win after the turn Drip played, and the
 # separate Python certificate checker accepted that proof.
 REFUTED = [
     ([(0,0),(0,1),(1,2),(-2,1),(-2,2),(0,6)], [(0,2)]),

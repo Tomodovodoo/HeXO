@@ -1,14 +1,14 @@
-/* Native's search (src/hexo.cpp, built as native.wasm by tools/build_web.py) on placement histories, as
+/* Drip's search (src/hexo.cpp, built as native.wasm by tools/build_web.py) on placement histories, as
  * python/play.py's search child runs it: hx_search with a time budget, depth 12 and width 16. */
 import createModule from './native.mjs';
 
 export const DEPTH = 12, WIDTH = 16;
 const RESULT_BYTES = 64;   // HxResult: q1, r1, q2, r2, nodes (int64), elapsed_ms (double), count, score, depth (int32)
 
-export class NativeSearch {
+export class DripSearch {
   /** An instantiated native.mjs module; `options` go to it (`wasmBinary` supplies the module's bytes). */
   static async create(options = {}) {
-    return new NativeSearch(await createModule(options));
+    return new DripSearch(await createModule(options));
   }
 
   constructor(module) {
@@ -17,7 +17,7 @@ export class NativeSearch {
   }
 
   /**
-   * Native's turn at `history` ([[q, r], ...]) within `ms` milliseconds and `depth` complete turns:
+   * Drip's turn at `history` ([[q, r], ...]) within `ms` milliseconds and `depth` complete turns:
    * {moves: [[q, r], ...], score, depth, nodes, elapsed_ms}. The proven winning plan it finds is kept for the
    * next call, as the server's persistent search child keeps it. Throws on an illegal history or a finished game.
    */

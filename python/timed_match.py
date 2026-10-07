@@ -12,7 +12,7 @@ import uuid
 from hexo import Game
 from notation import Record, dumps, loads
 from time_control import Clock, TimeControl, milliseconds
-from timed_engine import TimedEngine, legal_turn, proof_settings
+from timed_engine import TimedEngine, legal_turn, proof_settings, saved_ids
 
 
 class Match:
@@ -85,7 +85,7 @@ class Match:
         saved = json.loads((path/'state.json').read_text(encoding='utf-8'))
         match = cls.__new__(cls)
         match.id = saved['match_id']
-        match.specification = json.loads((path/'spec.json').read_text(encoding='utf-8'))
+        match.specification = saved_ids(json.loads((path/'spec.json').read_text(encoding='utf-8')))
         match.history = saved['history']
         match.game = Game(match.history)
         match.clock = Clock(match.specification['time_control'], now)
@@ -377,7 +377,7 @@ def main(argv=None):
     parser.add_argument('--run', type=Path, default=Path('runs/dense-v1'))
     parser.add_argument('--a', required=True)
     opponent = parser.add_mutually_exclusive_group(required=True)
-    opponent.add_argument('--b', help='Checkpoint id, or native')
+    opponent.add_argument('--b', help='Checkpoint id, or drip')
     opponent.add_argument('--b-command', help='External Six-protocol command')
     opponent.add_argument('--b-url', help='External HTTTX HTTP API root')
     parser.add_argument('--tc', default='180+2')
@@ -409,8 +409,8 @@ def main(argv=None):
     overrides = [side_settings(args.a_settings), side_settings(args.b_settings)]
     checkpoints = {}
     def config(checkpoint):
-        if checkpoint == 'native':
-            return dict(kind='native')
+        if checkpoint == 'drip':
+            return dict(kind='drip')
         if checkpoint not in checkpoints:
             if checkpoint == 'champion':
                 resolved = json.loads((args.run/'champion.json').read_text(encoding='utf-8'))['checkpoint']

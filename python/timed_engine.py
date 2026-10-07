@@ -38,6 +38,27 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
+SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'), id=('native:Native', 'drip:Drip'),
+                 name=('Native', 'Drip'), checkpoint=('native', 'drip'), badge=('native', 'drip'))
+
+
+def saved_ids(record):
+    """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's ids and name in
+    place of the ones older saved files store for it (SAVED_IDS). Only an object that is Drip's changes: one whose
+    kind, engine or id is the older one, or a timed identity whose engine_options are."""
+    if isinstance(record, list):
+        return [saved_ids(value) for value in record]
+    if not isinstance(record, dict):
+        return record
+    options = record.get('engine_options')
+    drip = any(record.get(key) == SAVED_IDS[key][0] for key in ('kind', 'engine', 'id')) or (
+        isinstance(options, dict) and options.get('kind') == 'native')
+    found = {key: saved_ids(value) for key, value in record.items()}
+    if drip:
+        found.update({key: new for key, (old, new) in SAVED_IDS.items() if found.get(key) == old})
+    return found
+
+
 class HTTTXEngine:
     """An HTTP opponent using the published per-turn allowance, in seconds."""
     def __init__(self, url):
@@ -582,8 +603,8 @@ def _worker(connection, cancellation, config):
             player = HTTTXEngine(config['url'])
             identity = dict(checkpoint='htttx', url=config['url'], capabilities=player.capabilities,
                             clock_allocation='host')
-        elif kind == 'native':
-            identity = dict(checkpoint='native')
+        elif kind == 'drip':
+            identity = dict(checkpoint='drip')
         else:
             raise ValueError(f'Unsupported engine kind {kind}')
         try:
