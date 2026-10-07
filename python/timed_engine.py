@@ -26,19 +26,25 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
-SAVED_IDS = dict(kind={'native': 'drip'}, checkpoint={'native': 'drip'}, engine={'native:Native': 'drip:Drip'},
-                 id={'native:Native': 'drip:Drip'}, name={'Native': 'Drip'})
+SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'), id=('native:Native', 'drip:Drip'),
+                 name=('Native', 'Drip'), checkpoint=('native', 'drip'))
 
 
 def saved_ids(record):
-    """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's engine ids in place
-    of the ids older saved files store for it (SAVED_IDS)."""
+    """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's ids and name in
+    place of the ones older saved files store for it (SAVED_IDS). Only an object that is Drip's changes: one whose
+    kind, engine or id is the older one, or a timed identity whose engine_options are."""
     if isinstance(record, list):
         return [saved_ids(value) for value in record]
-    if isinstance(record, dict):
-        return {key: SAVED_IDS[key].get(value, value) if key in SAVED_IDS and isinstance(value, str) else saved_ids(value)
-                for key, value in record.items()}
-    return record
+    if not isinstance(record, dict):
+        return record
+    options = record.get('engine_options')
+    drip = any(record.get(key) == SAVED_IDS[key][0] for key in ('kind', 'engine', 'id')) or (
+        isinstance(options, dict) and options.get('kind') == 'native')
+    found = {key: saved_ids(value) for key, value in record.items()}
+    if drip:
+        found.update({key: new for key, (old, new) in SAVED_IDS.items() if found.get(key) == old})
+    return found
 
 
 class HTTTXEngine:

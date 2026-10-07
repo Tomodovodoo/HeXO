@@ -509,19 +509,26 @@ class TimedClocks(unittest.TestCase):
                 restored.close()
 
     def test_restore_reads_older_engine_ids_as_drip(self):
+        from timed_engine import saved_ids
         from timed_match import Match
+        others = [dict(kind='bubble', checkpoint='native'), dict(engine='six:Native', name='Native'),
+                  dict(checkpoint='native', engine_options=dict(kind='bubble'))]
+        self.assertEqual(saved_ids(others), others)
         with TemporaryDirectory() as directory:
             match = Match(dict(players=dict(cross=dict(kind='drip'), circle=dict(kind='human')), time_control='10',
-                               identities=[dict(checkpoint='drip'), dict(checkpoint='human')]), directory=directory)
+                               identities=[dict(checkpoint='drip', engine_options=dict(kind='drip')),
+                                           dict(checkpoint='human')]), directory=directory)
             match.start()
             match.pause()
             spec = json.loads((match.directory/'spec.json').read_text(encoding='utf-8'))
             spec['players']['cross']['kind'] = spec['identities'][0]['checkpoint'] = 'native'
+            spec['identities'][0]['engine_options']['kind'] = 'native'
             (match.directory/'spec.json').write_text(json.dumps(spec), encoding='utf-8')
             restored = Match.restore(match.directory)
             try:
                 self.assertEqual(restored.specification['players'], dict(cross=dict(kind='drip'), circle=dict(kind='human')))
-                self.assertEqual(restored.specification['identities'][0]['checkpoint'], 'drip')
+                self.assertEqual(restored.specification['identities'][0],
+                                 dict(checkpoint='drip', engine_options=dict(kind='drip')))
             finally:
                 match.close()
                 restored.close()

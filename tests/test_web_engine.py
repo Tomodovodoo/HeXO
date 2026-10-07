@@ -295,6 +295,9 @@ const storage=new PlayStorage(null),key='browser:native|null|abc|';
 await storage.put('sessions',{id:'live',seats:[{engine:'human'},{engine:'browser:native',preset:'quick'}],
  match:{players:[{engine:'browser:native',name:'Native (browser)',version:key},{engine:'browser:six',name:'Six (browser)'}]}});
 await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine_key:key,note:'native'});
+await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
+await storage.put('evaluations',{id:'browser:drip|null|abc||{}|0,1',engine:'browser:drip',note:'newer'});
+await storage.put('evaluations',{id:'other',engine:'browser:six',name:'Native (browser)',kind:'six'});
 console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluations:await storage.all('evaluations')}));"""
         done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
                               capture_output=True, text=True, check=True)
@@ -303,8 +306,10 @@ console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluat
         self.assertEqual(result['session']['match']['players'],
                          [dict(engine='browser:drip', name='Drip (browser)', version='browser:drip|null|abc|'),
                           dict(engine='browser:six', name='Six (browser)')])
-        self.assertEqual(result['evaluations'], [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip',
-                                                      engine_key='browser:drip|null|abc|', note='native')])
+        self.assertEqual(sorted(result['evaluations'], key=lambda r: r['id']),
+                         [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip', engine_key='browser:drip|null|abc|',
+                               note='native'), dict(id='browser:drip|null|abc||{}|0,1', engine='browser:drip', note='newer'),
+                          dict(id='other', engine='browser:six', name='Native (browser)', kind='six')])
 
     def test_matching_replay_precedes_newer_unrelated_records(self):
         source = """import {Proofs} from './web/engine/proof.mjs';

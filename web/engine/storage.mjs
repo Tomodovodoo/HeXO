@@ -2,15 +2,21 @@
 import {compressFile, readGameFile} from './notation.mjs';
 
 const OLDER = 'browser:native', DRIP = 'browser:drip';
-const savedId = (key, text) => text === OLDER || text.startsWith(OLDER + '|') ? DRIP + text.slice(OLDER.length)
-  : key === 'name' && text === 'Native (browser)' ? 'Drip (browser)' : key === 'kind' && text === 'native' ? 'drip' : text;
+/** `text` with Drip's id in place of the older one at its start (an engine id, or an engine key, evaluation id or version). */
+const currentId = text => text === OLDER || text.startsWith(OLDER + '|') ? DRIP + text.slice(OLDER.length) : text;
 
 /** `value` read back from this browser's saved sessions, games, matches, evaluations or engine choices, with Drip's ids
- * and name in place of the ones older saves store for it. */
+ * and name in place of the ones older saves store for it. The name and kind change only in an object that is Drip's:
+ * one whose engine or id is the older id, or whose kind is the older kind. */
 export function savedIds(value) {
   if (Array.isArray(value)) return value.map(savedIds);
   if (!value || Object.getPrototypeOf(value) !== Object.prototype) return value;
-  return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, typeof v === 'string' ? savedId(key, v) : savedIds(v)]));
+  const found = Object.fromEntries(Object.entries(value).map(([key, v]) => [key, typeof v === 'string' ? currentId(v) : savedIds(v)]));
+  if (value.engine === OLDER || value.id === OLDER || value.kind === 'native') {
+    if (found.kind === 'native') found.kind = 'drip';
+    if (found.name === 'Native (browser)') found.name = 'Drip (browser)';
+  }
+  return found;
 }
 
 export class PlayStorage {
@@ -82,7 +88,12 @@ export class PlayStorage {
     });
   }
   async get(store, id) { return this.decode(store, await this.request(store, 'readonly', s => s ? s.get(id) : {result: this.memory.get(`${store}:${id}`)})); }
-  async all(store) { return Promise.all((await this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)})).map(row => this.decode(store, row))); }
+  /** Every row of `store`, decoded; a row stored under an older id is left out once a row holds its current id. */
+  async all(store) {
+    const rows = await this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)});
+    const ids = new Set(rows.map(row => row.id));
+    return Promise.all(rows.filter(row => currentId(row.id) === row.id || !ids.has(currentId(row.id))).map(row => this.decode(store, row)));
+  }
   async put(store, value) {
     value = await this.encode(store, value);
     return this.request(store, 'readwrite', s => { if (s) return s.put(value); this.memory.set(`${store}:${value.id}`, structuredClone(value)); return {result: value.id}; });
