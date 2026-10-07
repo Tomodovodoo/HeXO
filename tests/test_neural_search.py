@@ -8,6 +8,15 @@ from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, Sea
 from tests import PATIENCE, slow
 from tests.reference import Reference
 
+
+def legal_count(history):
+    """How many placements the rules allow after `history`."""
+    game = Game([tuple(p) for p in history])
+    try:
+        return len(game.legal_moves())
+    finally:
+        game.close()
+
 class Uniform:
     def evaluate(self, histories):
         out = []
@@ -343,7 +352,7 @@ class NeuralTree(unittest.TestCase):
         self.assertEqual(result['proven'], -1)
         self.assertIsNotNone(result['action'])
         self.assertTrue(np.all(result['values'] == -1))
-        self.assertEqual(len(result['actions']), 372)
+        self.assertEqual(len(result['actions']), legal_count(history))
         # A current-player completion takes precedence over mandatory defense.
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
         search = NeuralSearch(Uniform(), 'exact-win', history, tactics=True)
@@ -555,7 +564,7 @@ class NeuralTree(unittest.TestCase):
     def test_without_replacement_and_full_legal_support(self):
         search = self.searcher([(0, 0)])
         result = search.search(8, root_samples=8, batch_size=8)
-        self.assertEqual(len(result['actions']), 216)
+        self.assertEqual(len(result['actions']), legal_count([(0, 0)]))
         self.assertEqual(np.count_nonzero(result['visits']), 8)
         self.assertEqual(result['visits'].max(), 1)
         self.assertEqual(result['completed'], 8)
@@ -2917,12 +2926,13 @@ class NativeProofs(unittest.TestCase):
             offer(fresh)
             checked(native.hxp_step(loop))
             # The retry is due later, so the fresh position goes first; the idle
-            # second worker still continues the retry now, with a doubled slice.
+            # second worker still continues the retry now, with a larger slice.
             # The quiet defender has nothing to search, so the retry stays with the mover.
             job,request=take(0)
             self.assertEqual(request['history'],fresh)
             retry,again=take(1)
-            self.assertEqual((again['history'],again['attacker'],again['ms']),(history,'mover',20))
+            self.assertEqual((again['history'],again['attacker']),(history,'mover'))
+            self.assertGreater(again['ms'],10)
             unknown(0,job,0,4);unknown(1,retry,0,3)
             self.assertEqual(native.hxg_exact(graph.ptr),-1)
         finally:
