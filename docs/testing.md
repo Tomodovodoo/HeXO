@@ -103,7 +103,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_leaf_tactics.LeafTactics` | 5 | Depth-1 search finds forced wins and avoids forced losses on development positions, checked by the reference | 3.0 | 0.0 | 1 s searches | tt_injection.cpp development positions | keep |
 | `test_neural_search.NeuralTree` | 40 | Native Gumbel tree: noise, Q floor, choice, exact wins and losses, proof install, reuse, cache keys, batching, deadlines, input checks | 1.4 | 0.0 | 8 to 128 uniform-evaluator simulations | gumbel.cpp (shared turn node, shortest win, round barrier) | keep; legal-count pins rewritten (#458) |
 | `test_neural_search.SharedGraph` | 25 | Shared game graph across views: archive, reconvergence, credits, eviction, proofs reaching earlier roots, PV recheck | 6.7 | 0.0 | one 2048-simulation search | gumbel.cpp archive and eviction blocks | keep |
-| `test_neural_search.NativeScheduler` | 42 | SearchPool and InferenceService: batching, coalescing, retargeting, cancellation, watermarks, fenced teardown, GPU launcher overlap | 6.1 | 0.0 | service threads with condition waits | - | keep |
+| `test_neural_search.HybridScheduler` | 42 | SearchPool and InferenceService: batching, coalescing, retargeting, cancellation, watermarks, fenced teardown, GPU launcher overlap | 6.1 | 0.0 | service threads with condition waits | - | keep |
 | `test_neural_search.NativeProofs` | 36 (1 slow) | Proof loop over the real solver: admission, scope closing, facts, shared workers, owner budget, cancellation, verified certificates | 7.1 | 3.1 | real solver, condition waits | Rust token tests | keep; the 1.5 s owner-budget load comparison is slow; slice pin rewritten (#458) |
 | `test_proof.ForcingProof` | 6 | Python proof.solve/verify: certificates verify, mutations are rejected, timeouts stop | 0.1 | 0.0 | 1 s deadlines | Rust checker tests | keep |
 | `test_tactical_proof.NativeStrategy` | 32 (1 slow) | Rust solver through ctypes: replay evidence, stamps, worker isolation, cancellation, certificate checks, shortest proofs, deadlines | 8.2 | 7.3 | 5000 to 1M node solves | Rust lib.rs tests; free-filler enumeration also in check.rs | keep; free-second filler enumeration slow; shortest and cap pins rewritten (#458) |
@@ -129,17 +129,17 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_dense.MaskedFutureLearnerTests` | 2 | Switching future_target on resume keeps step, optimizer and model state | 2.0 | 0.0 | three exports per test | LearnerPipelineTests | keep |
 | `test_dense.ValidationSourceTests` | 27 (1 slow) | Per-source validation subsets; export reports per-source metrics, curves and regret; EMA recalibration; VRAM cap | 6.2 | 6.5 | Learner.export | - | keep; full-count EMA recalibration slow |
 | `test_dense.EvaluatorSearchTests` | 12 | Match games finish legally and propagate failures; evaluator logits equal a model forward | 0.5 | 0.0 | tiny-model searches | - | keep |
-| `test_dense.EngineTests` | 67 | Actor engines produce legal, labelled rows; pause, fence, retire and failure without leaks; solver proofs label rows | 14.1 | 0.0 | native self-play with a tiny model | - | keep |
+| `test_dense.EngineTests` | 67 | Actor engines produce legal, labelled rows; pause, fence, retire and failure without leaks; solver proofs label rows | 14.1 | 0.0 | hybrid self-play with a tiny model | - | keep |
 | `test_dense.YieldTests` | 17 | The actor pause gate follows learner heartbeats on a fake clock; phase tokens are acknowledged after a drain | 0.1 | 0.0 | - | - | keep |
 | `test_dense.LearnerPipelineTests` | 4 | Muon/AdamW split covers every parameter; both train on CPU and reset on a kind change | 0.7 | 0.0 | two exports | MaskedFutureLearnerTests | keep |
 | `test_dense.PhaseTests` | 13 | Backlog and pacing base; phased training; the learner waits for every actor's acknowledgement | 2.0 | 0.0 | exports, dense_learn.main in process | CheapRowTests rebase | keep |
-| `test_dense.ActorModelTests` | 6 | The model pointer resolves; workers switch checkpoints between games; native workers publish rows the learner reads | 3.5 | 0.0 | native workers, 6 games | EngineTests | keep |
+| `test_dense.ActorModelTests` | 6 | The model pointer resolves; workers switch checkpoints between games; hybrid workers publish rows the learner reads | 3.5 | 0.0 | hybrid workers, 6 games | EngineTests | keep |
 | `test_dense.PacerTests` | 3 | Evaluator busy and share pacing on fake clocks | 0.0 | 0.0 | - | - | keep |
 | `test_dense.PosteriorTests` | 9 | Rating posterior: direct and pooled evidence, sweeps, value of information | 0.0 | 0.0 | 128-sample posteriors | - | keep |
 | `test_dense.OpponentSchedulerTests` | 8 | Report reload, payoff matrix, panel and veto, PFSP weights, opponent plies masked from training | 0.6 | 0.0 | one 4-game engine run | - | keep |
 | `test_dense.EvaluatorLoopTests` | 96 | League evaluator: SPRT and posterior trials, anchors, variants, panels, fills, rematches, supersession, restarts, reports | 20.0 | 0.0 | tiny-model games (Seal ones need the library) | openings EvaluatorBookTests | keep |
 | `test_dense.SlowDenseTests` | 2 (slow) | Window memory per row stays under budget; the learner CLI heartbeat reports its target | 0.0 | 26.9 | a 50,000-row window; two subprocesses | - | slow |
-| `test_dense.DenseTimedWorker` | 2 (1 slow) | Timed native turns are legal and complete, report proofs, honour deadlines and swap models | 0.0 | 7.6 | 64-simulation turns with 30 s clocks | - | keep; the clocked CPU turn is slow |
+| `test_dense.DenseTimedWorker` | 2 (1 slow) | Timed hybrid turns are legal and complete, report proofs, honour deadlines and swap models | 0.0 | 7.6 | 64-simulation turns with 30 s clocks | - | keep; the clocked CPU turn is slow |
 | `test_dense.DenseBrowser` | 8 | play.evaluate returns complete legal turns, keeps proven second stones, reloads changed weights, cancels promptly | 0.7 | 0.0 | tiny model, one solve | - | keep |
 | `test_dense_solve.PassTests` | 10 (1 slow) | Offline proof pass: windows, lookback, buffer entries, gate, verification events | 13.8 | 4.7 | real solves; worker processes | - | keep; worker processes slow |
 | `test_dense_solve.WorkerCountTests` | 3 | Book prefixes are excluded; worker count follows the learner phase | 0.1 | 0.0 | - | - | keep |
@@ -168,7 +168,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_evaluation.PairedEvaluation` | 1 | Paired match statistics rate only complete colour pairs | 0.0 | 0.0 | - | - | keep; the legacy evaluate checks were deleted (#457) |
 | `test_notation_api.OfficialNotation` | 3 | htttx parse and dump round trip, strict turns, bounds, first-stone terminal | 0.0 | 0.0 | - | - | keep |
 | `test_notation_api.OfficialAPI` | 7 | Stateless HTTP API: board reconstruction, 400/408/409/503, request deadlines | 1.9 | 0.0 | HTTP server, 1 ms searches | - | keep |
-| `test_notation_api.TimedClocks` | 15 | Side settings, paired openings, clock arithmetic, the native controller's allowance, HTTP opponent failures | 2.4 | 0.0 | native timed turn; a handler that sleeps 1 s | six_engine opponent failure | keep |
+| `test_notation_api.TimedClocks` | 15 | Side settings, paired openings, clock arithmetic, the hybrid controller's allowance, HTTP opponent failures | 2.4 | 0.0 | hybrid timed turn; a handler that sleeps 1 s | six_engine opponent failure | keep |
 | `test_notation_api.TimedAPI` | 8 | Match REST and websocket: clock stream, interrupt, shutdown, engine release, resume | 1.8 | 0.0 | aiohttp server | - | keep; the shutdown test found a session engine left open, fixed in #460 and #462 |
 | `test_notation_api.ArenaDrip` | 6 | Arena bot: gateway retries, cleanup, socket redial, replay without duplicate moves | 4.7 | 0.0 | real searches, a 1.2 s retry | - | keep |
 | `test_openings.CanonicalTests` | 5 | Canonical keys over symmetries and turn orders; parents; tempered weights; reach | 0.1 | 0.0 | - | - | keep |
@@ -246,5 +246,5 @@ fixed:
 These failed once each and are not explained yet:
 - `test_play.Jobs.test_rescans_cancel_work_for_a_vanished_analysis_model` waited the full 60 s for the old analysis
   job to report `cancelled` (CI run 37663090184).
-- `test_neural_search.NativeScheduler.test_replaced_slots_finish_cleanup_and_keep_retirement_bounded` failed once in
+- `test_neural_search.HybridScheduler.test_replaced_slots_finish_cleanup_and_keep_retirement_bounded` failed once in
   a local parallel fast-tier run. 40 repeats beside three other modules passed.

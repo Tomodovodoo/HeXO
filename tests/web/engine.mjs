@@ -274,7 +274,7 @@ if (job.kind === 'encode') {
   globalThis.fetch = fetch;
   const engine = new BubbleEngine({model:'test'});engine.call = async request => request;
   answer = [await engine.turn([[0,0]], {simulations:128,solver_nodes:0}),
-    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,native_owner:true,native_capture:true})];
+    await engine.turn([[0,0]], {simulations:128,solver_nodes:0,hybrid_scheduler:true,hybrid_capture:true})];
 } else if (job.kind === 'worker-model-cache') {
   const messages=[],created=[],live=new Set(),attempts=[],workerUrl=new URL('../../web/engine/worker.mjs',import.meta.url);
   let fail=true,largest=0;
@@ -671,8 +671,8 @@ if (job.kind === 'encode') {
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, leafNodes: job.leafNodes || 0, leafQueryMs: job.leafQueryMs ?? 10,
-      nativeOwner: job.nativeOwner ?? false,
-      nativeProof: job.nativeProof ?? false, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,
+      hybridScheduler: job.hybridScheduler ?? false,
+      hybridProof: job.hybridProof ?? false, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,
       known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');

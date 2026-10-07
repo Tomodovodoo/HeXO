@@ -702,14 +702,14 @@ class SelfPlayGame:
     move and ends the game there (`adjudicate`). With proven_line_rows, an applicable two-stone winning
     certificate may start with either legal stone so its continuation teaches both conditional complements."""
 
-    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, native_owner=False):
-        self.native_owner = native_owner
-        if native_owner and (settings.game_graph <= 0 or settings.pv_check or settings.proven_line_rows):
-            raise ValueError('Native self-play requires game_graph, uses native depth views, and has no certificate line rows')
+    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, hybrid=False):
+        self.hybrid = hybrid
+        if hybrid and (settings.game_graph <= 0 or settings.pv_check or settings.proven_line_rows):
+            raise ValueError('Hybrid self-play requires game_graph, uses native depth views, and has no certificate line rows')
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
         self.solver, self.schedule = dense_solver.Budgets.of(settings), dense_solver.Schedule.of(settings)
-        if native_owner and (dense_solver.active(self.solver, self.schedule) or settings.solver_leaf_nodes):
-            raise ValueError('Native self-play uses frontier slice settings, not legacy solver query budgets')
+        if hybrid and (dense_solver.active(self.solver, self.schedule) or settings.solver_leaf_nodes):
+            raise ValueError('Hybrid self-play uses frontier slice settings, not legacy solver query budgets')
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
         if restart is not None and book is not None:
@@ -724,7 +724,7 @@ class SelfPlayGame:
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
                                         settings.q_range_floor, settings.game_graph)
                       for k, model in enumerate(dict.fromkeys(sides))}
-        if settings.native_round_barrier:
+        if settings.hybrid_round_barrier:
             for tree in self.trees.values():
                 checked(native.hxg_round_barrier(tree.ptr, 1))
         self.check = None
@@ -756,7 +756,7 @@ class SelfPlayGame:
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
-        if s.root_noise and not getattr(self, 'native_owner', False):
+        if s.root_noise and not getattr(self, 'hybrid', False):
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
 
     @property
@@ -823,11 +823,11 @@ class SelfPlayGame:
                 action = stones[int(self.rng.integers(2))]
         q, r = int(action[0]), int(action[1])
         game.play(q, r)
-        if not self.native_owner:
+        if not self.hybrid:
             for tree in self.trees.values():
                 tree.advance((q, r))
         self.moves.append([q, r])
-        if result.get('proven') and not self.native_owner:
+        if result.get('proven') and not self.hybrid:
             action = (row.get('proof_action') or [[q, r]]) if result['proven'] > 0 else None
             self.label(ply, result['proven'], result['proof_turns'], action)
         if game.winner >= 0:
@@ -1261,8 +1261,8 @@ def worker(args):
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
-    if settings.native_scheduler:
-        from native_selfplay import ActorEngine
+    if settings.hybrid_scheduler:
+        from hybrid_selfplay import ActorEngine
         engine = ActorEngine(settings)
     else:
         engine = Engine(settings.leaf_batch, settings.solver_async, dense_solver.Schedule.of(settings), settings.solver_leaf_nodes,
@@ -1305,8 +1305,8 @@ def worker(args):
             solver=engine.solver.summary(now-began) if engine.solver else None)
         fields.update(book_fraction=settings.book_fraction, restart_fraction=settings.restart_fraction,
                       off_policy_openings=len(book_starts.nodes) if book_starts else 0)
-        if settings.native_scheduler:
-            fields['native_scheduler'] = engine.summary()
+        if settings.hybrid_scheduler:
+            fields['hybrid_scheduler'] = engine.summary()
         write_json(status_path, fields)
         if fields['solver'] and fields['solver']['failures'] > solver_failures:
             solver_failures = fields['solver']['failures']
@@ -1320,7 +1320,7 @@ def worker(args):
         nonlocal model
         if resolve(run, args.initial_model, settings.model_source, config.learner.variant)[0] != model.checkpoint:
             graph = model.evaluator.graph
-            if graph is not None and not settings.native_scheduler:
+            if graph is not None and not settings.hybrid_scheduler:
                 graph.close()
                 model.evaluator.graph = None
                 del graph
@@ -1392,10 +1392,10 @@ def worker(args):
                 opponent, learner = historical.next()
                 sides = [model, opponent] if learner == 0 else [opponent, model]
                 engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book,
-                                        native_owner=settings.native_scheduler))
+                                        hybrid=settings.hybrid_scheduler))
             else:
                 engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book,
-                                        native_owner=settings.native_scheduler))
+                                        hybrid=settings.hybrid_scheduler))
             started += 1
 
     writer, writes = ThreadPoolExecutor(1, thread_name_prefix='shard-writer'), deque()
@@ -1415,8 +1415,8 @@ def worker(args):
                 if entered:
                     paused_since = time.perf_counter()
                     log_event(run, 'actor', 'info', f'worker {args.worker} paused: {gate.reason}', process=args.worker)
-                if pending_ack or entered and settings.native_scheduler:
-                    if settings.native_scheduler:
+                if pending_ack or entered and settings.hybrid_scheduler:
+                    if settings.hybrid_scheduler:
                         engine.synchronize_inflight([model,*(historical.models.values() if historical else [])])
                     else:
                         engine.synchronize_inflight()
@@ -1436,7 +1436,7 @@ def worker(args):
                 if token_pause:
                     refresh_sources()
                     token_pause = False
-                if settings.native_scheduler:
+                if settings.hybrid_scheduler:
                     engine.resume()
                 log_event(run, 'actor', 'info', f'worker {args.worker} resumed: {gate.reason}', process=args.worker)
                 status('playing'); last = time.perf_counter()

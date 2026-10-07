@@ -5,13 +5,18 @@ const OLDER = 'browser:native', DRIP = 'browser:drip';
 /** `text` with Drip's id in place of the older one at its start (an engine id, or an engine key, evaluation id or version). */
 const currentId = text => text === OLDER || text.startsWith(OLDER + '|') ? DRIP + text.slice(OLDER.length) : text;
 
+/** Hybrid scheduler budget keys and result field under the names older saves store them. */
+const RENAMED = {native_owner: 'hybrid_scheduler', native_capture: 'hybrid_capture', native_proof: 'hybrid_proof',
+  native_scheduler: 'hybrid_scheduler'};
+
 /** `value` read back from this browser's saved sessions, games, matches, evaluations or engine choices, with Drip's ids
- * and name in place of the ones older saves store for it. The name and kind change only in an object that is Drip's:
- * one whose engine or id is the older id, or whose kind is the older kind. */
+ * and name in place of the ones older saves store for it, and RENAMED keys under their current names. The name and
+ * kind change only in an object that is Drip's: one whose engine or id is the older id, or whose kind is the older kind. */
 export function savedIds(value) {
   if (Array.isArray(value)) return value.map(savedIds);
   if (!value || Object.getPrototypeOf(value) !== Object.prototype) return value;
-  const found = Object.fromEntries(Object.entries(value).map(([key, v]) => [key, typeof v === 'string' ? currentId(v) : savedIds(v)]));
+  const found = Object.fromEntries(Object.entries(value).map(([key, v]) =>
+    [RENAMED[key] ?? key, typeof v === 'string' ? currentId(v) : savedIds(v)]));
   if (value.engine === OLDER || value.id === OLDER || value.kind === 'native') {
     if (found.kind === 'native') found.kind = 'drip';
     if (found.name === 'Native (browser)') found.name = 'Drip (browser)';

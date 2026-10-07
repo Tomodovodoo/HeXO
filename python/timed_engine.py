@@ -12,7 +12,7 @@ from urllib.error import URLError
 from hexo import Game, library
 from time_control import allowance
 
-PROOF_WORKERS = 2   # native timed turns: proof workers of the turn's private loop (solver.workers)
+PROOF_WORKERS = 2   # hybrid timed turns: proof workers of the turn's private loop (solver.workers)
 PROOF_BUDGET = 1.   # share of the graph owner's time proof steps may take (solver.budget, ProofLoop owner_budget)
 
 
@@ -29,7 +29,7 @@ def precise_timer():
 
 
 def proof_settings(solver):
-    """The checked proof workers and owner budget of a native timed Bubble's `solver` settings."""
+    """The checked proof workers and owner budget of a hybrid timed Bubble's `solver` settings."""
     workers, budget = solver.get('workers', PROOF_WORKERS), solver.get('budget', PROOF_BUDGET)
     if type(workers) is not int or not 1 <= workers <= 64:
         raise ValueError('solver.workers must be an integer from 1 to 64')
@@ -45,7 +45,8 @@ SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'),
 def saved_ids(record):
     """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's ids and name in
     place of the ones older saved files store for it (SAVED_IDS). Only an object that is Drip's changes: one whose
-    kind, engine or id is the older one, or a timed identity whose engine_options are."""
+    kind, engine or id is the older one, or a timed identity whose engine_options are. A search setting stored as
+    native_scheduler reads as hybrid_scheduler."""
     if isinstance(record, list):
         return [saved_ids(value) for value in record]
     if not isinstance(record, dict):
@@ -56,6 +57,8 @@ def saved_ids(record):
     found = {key: saved_ids(value) for key, value in record.items()}
     if drip:
         found.update({key: new for key, (old, new) in SAVED_IDS.items() if found.get(key) == old})
+    if 'native_scheduler' in found:
+        found['hybrid_scheduler'] = found.pop('native_scheduler')
     return found
 
 
@@ -141,8 +144,8 @@ def complete_candidate(history, prefix):
 
 def dense_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
     """One allowance for proofs and both stones; publish only complete legal turns."""
-    if getattr(player, 'native_scheduler', False) and player.options['search']:
-        return native_turn(player, history, limits, cancel, publish, analyze)
+    if getattr(player, 'hybrid_scheduler', False) and player.options['search']:
+        return hybrid_turn(player, history, limits, cancel, publish, analyze)
     import numpy as np
     from neural_search import NeuralSearch
     from dense_selfplay import root_value
@@ -288,16 +291,16 @@ def dense_turn(player, history, limits, cancel, publish=lambda result: None, ana
         game.close()
 
 
-def native_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
-    """Clocked native graph owner, batched inference and concurrent proof slices."""
+def hybrid_turn(player, history, limits, cancel, publish=lambda result: None, analyze=False):
+    """A clocked hybrid turn: native graph owner, batched inference and concurrent proof slices."""
     started = time.monotonic()
     if player.options['solver'] and player.solver_nodes_explicit:
-        raise ValueError('Native timed solving uses time slices; omit solver_nodes or disable native_scheduler')
+        raise ValueError('Hybrid timed solving uses time slices; omit solver_nodes or disable hybrid_scheduler')
     if limits.get('leaf_solver'):
-        raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+        raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
     import numpy as np
     from neural_search import GameGraph
-    from native_scheduler import SearchPool, InferenceService
+    from hybrid_scheduler import SearchPool, InferenceService
     turn_deadline = limits.get('hard_deadline', started + max(0, limits['hard_ms'])/1000)
     hard = limits.get('response_deadline', turn_deadline)
     normal = min(turn_deadline-limits['reserve_ms']/1000,
@@ -309,7 +312,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                   model_sha256=player.model_sha256, player=side, win_probability=None,
                   suggestions=[], winning_line=[], threat=None,
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
-                  settings=dict(player.options) | dict(native_scheduler=True,
+                  settings=dict(player.options) | dict(hybrid_scheduler=True,
                       simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8,
                       proof_workers=workers, proof_budget=budget),
                   completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[], root_searches=[])
@@ -329,7 +332,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                      root_searches=[dict(root) for root in output['root_searches']]))
     def read_choice(found, current):
         if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token+1, current):
-            raise ValueError('Native turn completion does not match the current position')
+            raise ValueError('Hybrid turn completion does not match the current position')
         edges = np.asarray(found['edges'], np.float64)
         winner = found['exact_winner']
         value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
@@ -360,7 +363,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             return result
         signature = (player.model_sha256, player.options['solver'],
                      bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget)
-        kept = getattr(player, '_timed_native', None)
+        kept = getattr(player, '_timed_hybrid', None)
         if kept is not None and kept[2] != signature:
             player.set_history(history)
             kept = None
@@ -378,7 +381,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     pool.close()
                 graph.close()
                 raise
-            kept = player._timed_native = graph, pool, signature
+            kept = player._timed_hybrid = graph, pool, signature
         _, pool, _ = kept
         # The preceding service stopped the pool. Re-arm its retained graph only
         # while detached, before a new service takes exclusive ownership.
@@ -419,9 +422,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     if frame is not None:
                         edges, winner, probability, action, witness, row = read_choice(frame, current)
                         if frame['kind'] != 'progress' or frame['snapshot_sequence'] <= progress_sequence:
-                            raise ValueError('Native progress sequence did not advance')
+                            raise ValueError('Hybrid progress sequence did not advance')
                         if progress_context is not None and frame['context'] != progress_context:
-                            raise ValueError('Native progress context changed within one root')
+                            raise ValueError('Hybrid progress context changed within one root')
                         progress_sequence, progress_context = frame['snapshot_sequence'], frame['context']
                         row.update(source='search_progress', snapshot_sequence=progress_sequence)
                         progress_candidate = dict(result, stones=result['stones']+[row],
@@ -445,7 +448,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     if found is None:
                         finals = service.close(completions=True)
                         if len(finals) > 1:
-                            raise ValueError('Multiple final completions for one native turn root')
+                            raise ValueError('Multiple final completions for one hybrid turn root')
                         found = finals[0] if finals else None
                     break
                 service.wait(max(0., min(1., (normal-time.monotonic())*1000)))
@@ -456,7 +459,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 break
             root_search['received_ms'] = (time.monotonic()-started)*1000
             if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token+1, current):
-                raise ValueError('Native turn completion does not match the current position')
+                raise ValueError('Hybrid turn completion does not match the current position')
             for key in ('result_build_ms', 'result_ready_elapsed_ms', 'publish_delay_ms', 'event_queue_ms'):
                 if key in found:
                     root_search[key] = found[key]
@@ -468,9 +471,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                         progress_candidate['stop_reason'] = result['stop_reason']
                         result = progress_candidate
                     break
-                raise ValueError(f"Native turn search failed: {found['error']}")
+                raise ValueError(f"Hybrid turn search failed: {found['error']}")
             if progress_context is not None and found['context'] != progress_context:
-                raise ValueError('Native final context differs from its progress')
+                raise ValueError('Hybrid final context differs from its progress')
             root_search.update(elapsed_ms=found.get('elapsed_ms'),
                                issued=found.get('issued'), completed=found['root_completed'])
             if found['exact_winner'] < 0 and not found['root_completed']:
@@ -532,7 +535,7 @@ def _worker(connection, cancellation, config):
     try:
         kind = config.get('kind', 'bubble')
         if kind == 'bubble':
-            if (config.get('search', {}).get('native_scheduler')
+            if (config.get('search', {}).get('hybrid_scheduler')
                     and config.get('search', {}).get('enabled', True)):
                 timer = precise_timer()
             import torch
@@ -553,7 +556,7 @@ def _worker(connection, cancellation, config):
             player = DensePlayer(run, config.get('device', 'cpu'), model=model,
                                  tactical_package=Path(config['tactical_package']) if config.get('tactical_package') else None,
                                  net_kernels=config.get('net_kernels', 'fused'),
-                                 native_scheduler=search.get('native_scheduler', False))
+                                 hybrid_scheduler=search.get('hybrid_scheduler', False))
             if player.prover is not None:
                 player.prover.stamps = bool(solver.get('stamps', False))
             options = dict(search=search.get('enabled', True), solver=solver.get('enabled', player.prover is not None))
@@ -578,14 +581,14 @@ def _worker(connection, cancellation, config):
                                  root_samples=search.get('root_samples', 16),
                                  q_range_floor=search.get('q_range_floor', 0.),
                                  leaf_solver=solver.get('leaf', False) and player.options['solver'])
-            if search.get('native_scheduler'):
+            if search.get('hybrid_scheduler'):
                 search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
                 if player.options['search'] and player.evaluator.cuda:
                     # CUDA capture alone does not initialize packed inference,
                     # its launcher thread or the proof pool. Exercise that path
                     # before accepting short clocks, then discard its searches.
                     started = time.monotonic()
-                    prepared = native_turn(player, [[0, 0]], allowance(movetime=1000) |
+                    prepared = hybrid_turn(player, [[0, 0]], allowance(movetime=1000) |
                         search_limits | dict(simulations=64), cancellation)
                     player.set_history()
                     identity['scheduler_preparation'] = dict(milliseconds=(time.monotonic()-started)*1000,
@@ -681,14 +684,14 @@ class TimedEngine:
     """Return a completed legal candidate by the controller deadline, including on stop."""
     def __init__(self, config, *, startup_timeout=120):
         search, solver = config.get('search', {}), config.get('solver', {})
-        if config.get('kind') == 'bubble' and search.get('native_scheduler') and search.get('enabled', True) and solver.get('enabled', True):
+        if config.get('kind') == 'bubble' and search.get('hybrid_scheduler') and search.get('enabled', True) and solver.get('enabled', True):
             if 'nodes' in solver:
-                raise ValueError('Native timed solving uses time slices; omit solver.nodes or disable native_scheduler')
+                raise ValueError('Hybrid timed solving uses time slices; omit solver.nodes or disable hybrid_scheduler')
             if solver.get('leaf'):
-                raise ValueError('Native timed solving uses a proof frontier; disable leaf solver queries')
+                raise ValueError('Hybrid timed solving uses a proof frontier; disable leaf solver queries')
             proof_settings(solver)
         elif {'workers', 'budget'} & solver.keys():
-            raise ValueError('Proof workers and budget apply to native timed solving only')
+            raise ValueError('Proof workers and budget apply to hybrid timed solving only')
         cap = search.get('max_simulations', search.get('simulations'))
         if cap is not None and (type(cap) is not int or cap <= 0):
             raise ValueError('simulation cap must be a positive integer')
@@ -761,12 +764,12 @@ class TimedEngine:
     def turn(self, game, milliseconds=None, *, clock=None, cancel=None, publish=None):
         history = [list(cell[:2]) for cell in game.cells]
         started = time.monotonic()
-        native_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
-                          self.config.get('search', {}).get('native_scheduler') and
+        hybrid_clocked = (self.config.get('kind', 'bubble') == 'bubble' and
+                          self.config.get('search', {}).get('hybrid_scheduler') and
                           self.config.get('search', {}).get('enabled', True))
         # Leave time to finalize a graph root and transfer its immutable result,
         # in addition to delivering the turn through the controller.
-        limits = allowance(clock, game.player, milliseconds, reserve_ms=20 if native_clocked else 10)
+        limits = allowance(clock, game.player, milliseconds, reserve_ms=20 if hybrid_clocked else 10)
         if clock and self.config.get('kind') == 'six':
             # A clock-aware external engine owns its allocation, bounded by the host's remaining clock.
             remaining = clock['cross_ms' if game.player == 0 else 'circle_ms']
@@ -813,7 +816,7 @@ class TimedEngine:
             elapsed = (time.monotonic()-started)*1000
             worker_limits = limits | dict(hard_ms=max(0, limits['hard_ms']-elapsed),
                                          normal_ms=max(0, limits['normal_ms']-elapsed))
-            if native_clocked:
+            if hybrid_clocked:
                 # Monotonic time is shared by local processes. Queue/IPC delay
                 # consumes the turn instead of restarting its clock on receipt.
                 worker_limits.update(hard_deadline=started+limits['hard_ms']/1000,
@@ -846,7 +849,7 @@ class TimedEngine:
                     best.update(result)
                     if publish:
                         publish(dict(best))
-                    if status == 'done' or (native_clocked and result.get('turn_complete')
+                    if status == 'done' or (hybrid_clocked and result.get('turn_complete')
                             and deadline-time.monotonic() <= limits['reserve_ms']/1000):
                         # Both stones are selected. Resource drainage can take
                         # longer and remains owned by the worker/wait_idle().
