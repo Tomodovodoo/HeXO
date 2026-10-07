@@ -790,7 +790,7 @@ class TimedAPI(unittest.IsolatedAsyncioTestCase):
         end = time.monotonic()+PATIENCE
         while not all(engine.closed for engine in self.engines) and time.monotonic() < end:
             await asyncio.sleep(.01)
-        self.assertTrue(all(engine.closed for engine in self.engines))
+        self.assertTrue(all(engine.closed for engine in self.engines), [engine.closed for engine in self.engines])
 
     async def test_finished_match_releases_its_engines(self):
         created = await self.client.post('/matches', json=dict(players=dict(cross=dict(kind='native'),
