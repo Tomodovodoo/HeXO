@@ -626,10 +626,12 @@ class TimedClocks(unittest.TestCase):
             spec = json.loads((match.directory/'spec.json').read_text(encoding='utf-8'))
             spec['players']['cross']['kind'] = spec['identities'][0]['checkpoint'] = 'native'
             spec['identities'][0]['engine_options']['kind'] = 'native'
+            spec['players']['circle'] = dict(kind='bubble', search=dict(native_scheduler=True))
             (match.directory/'spec.json').write_text(json.dumps(spec), encoding='utf-8')
             restored = Match.restore(match.directory)
             try:
-                self.assertEqual(restored.specification['players'], dict(cross=dict(kind='drip'), circle=dict(kind='human')))
+                self.assertEqual(restored.specification['players'], dict(cross=dict(kind='drip'),
+                                 circle=dict(kind='bubble', search=dict(hybrid_scheduler=True))))
                 self.assertEqual(restored.specification['identities'][0],
                                  dict(checkpoint='drip', engine_options=dict(kind='drip')))
             finally:

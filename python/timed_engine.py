@@ -45,7 +45,8 @@ SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'),
 def saved_ids(record):
     """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's ids and name in
     place of the ones older saved files store for it (SAVED_IDS). Only an object that is Drip's changes: one whose
-    kind, engine or id is the older one, or a timed identity whose engine_options are."""
+    kind, engine or id is the older one, or a timed identity whose engine_options are. A search setting stored as
+    native_scheduler reads as hybrid_scheduler."""
     if isinstance(record, list):
         return [saved_ids(value) for value in record]
     if not isinstance(record, dict):
@@ -56,6 +57,8 @@ def saved_ids(record):
     found = {key: saved_ids(value) for key, value in record.items()}
     if drip:
         found.update({key: new for key, (old, new) in SAVED_IDS.items() if found.get(key) == old})
+    if 'native_scheduler' in found:
+        found['hybrid_scheduler'] = found.pop('native_scheduler')
     return found
 
 
