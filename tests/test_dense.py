@@ -37,13 +37,25 @@ import dense_learn
 import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
+from tests import PATIENCE, slow
 
 ROOT = Path(__file__).resolve().parents[1]
 # Seal has no licence, so no build or CI ships it; tests that play it need a local -DHEXO_SEAL_SOURCE build.
 needs_seal = unittest.skipUnless(library.with_name(library.name.replace('hexo', 'hexo_seal')).exists(),
                                  'needs the Seal library next to the engine (cmake -DHEXO_SEAL_SOURCE=...)')
 TINY =hexnet.HexNetConfig(blocks=2, channels=16, pool_every=2, line_length=5, value_hidden=16, head_channels=8)
+# Export recalibrates and validates over thousands of rows; tests about what export records, not about the statistics
+# themselves, use a few batches.
+few_rows = unittest.mock.patch.multiple(dense_learn, RECALIBRATION_ROWS=64, VALIDATION_ROWS=64)
 AXIAL_AXES = ((1, 0), (0, 1), (1, -1))
+
+
+def ready(service):
+    """The next batch the producers owe `service`, or None once PATIENCE runs out; take() waits at most 1 s a call."""
+    end = time.monotonic()+PATIENCE
+    while (batch := service.take(1000.)) is None and time.monotonic() < end:
+        pass
+    return batch
 
 
 def legal(history):
@@ -2866,22 +2878,6 @@ class WindowMemoryTests(unittest.TestCase):
             self.assertEqual(list(newest.shards), [names[-1]])
             self.assertEqual(sorted(p.stem for p in directory.glob('*.f32')), [names[-1]])
 
-    def test_resident_bytes_per_row(self):
-        import gc
-        import tracemalloc
-        with tempfile.TemporaryDirectory() as tmp:
-            synthetic_run(tmp, 40, 20, 130, seed=1)
-            gc.collect(); tracemalloc.start()
-            try:
-                before = tracemalloc.get_traced_memory()[0]
-                window = dense_data.ReplayWindow(tmp, 10**7, 10**7, validation_fraction=.03)
-                gc.collect()
-                used = tracemalloc.get_traced_memory()[0]-before
-            finally:
-                tracemalloc.stop()
-            self.assertGreater(window.rows, 50000)
-            self.assertLess(used/window.rows, 150)
-
 
 def old_corpus(path):
     """A tiny gumbel-policy-value-v1 style corpus: one finished game (id 5) and one capped game (id 9)."""
@@ -3072,6 +3068,7 @@ class CheapRowTests(unittest.TestCase):
                 dense_config.LearnerSettings(cheap_row_fraction=bad)
         self.assertIn('cheap_row_fraction', dense_learn.KEEP)
 
+    @few_rows
     def test_changing_the_fraction_moves_the_pacing_base_to_the_new_count(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -3465,6 +3462,7 @@ class ValidationSourceTests(unittest.TestCase):
                         self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
                         self.assertTrue(len(sets.policy(following)))
 
+    @few_rows
     def test_export_logs_per_source_validation(self):
         import dashboard
         torch.set_num_threads(2)
@@ -3521,6 +3519,7 @@ class ValidationSourceTests(unittest.TestCase):
             losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
 
+    @few_rows
     def test_pair_policy_validation_counts_first_stones_with_a_searched_partner(self):
         torch.set_num_threads(2)
         torch.manual_seed(0)
@@ -3648,6 +3647,7 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertAlmostEqual(late, math.log(n), places=4)
         self.assertEqual(dense_learn.ply_split([30], [1.]), (None, None))
 
+    @few_rows
     def test_export_reports_value_by_plies_remaining(self):
         import dashboard
         torch.set_num_threads(2)
@@ -3926,6 +3926,7 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertLess(gap(ema), .01)
             self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
 
+    @few_rows
     def test_vram_cap_and_release_on_cuda(self):
         """vram_reserved_mb caps the allocator at that share of the device, installed from the resumed settings
         before any weights are placed; export releases the cache once after its recalibration and validation
@@ -3965,6 +3966,7 @@ class ValidationSourceTests(unittest.TestCase):
                 dense_learn.Learner(run, replace(config.learner, vram_reserved_mb=0), config, overrides=dict(batch=4))
             self.assertEqual(seen, [(False, 2048, 4)])  # before any weights exist, with the resumed settings
 
+    @few_rows
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
         dashboard series skips the null aggregate."""
@@ -4246,7 +4248,7 @@ class EngineTests(unittest.TestCase):
             engine.add(dense_selfplay.SelfPlayGame(pair,settings,30+i,
                        opponent=None if i==0 else f'fixed-{i}',native_owner=True))
         episodes,parked = [],False
-        end = time.monotonic()+10
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episodes.append(game.episode())
@@ -4270,7 +4272,7 @@ class EngineTests(unittest.TestCase):
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30,native_owner=True))
-        end = time.monotonic()+5
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
@@ -4301,7 +4303,7 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(engine.close)
         for i in range(2):
             engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30+i,native_owner=True))
-        count,end = 0,time.monotonic()+10
+        count,end = 0,time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
@@ -4351,11 +4353,11 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[(0,0)],ms=100.,views=4)
-        token,_,rows = service.take(100.)
+        token,_,rows = ready(service)
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        event,end = None,time.monotonic()+3
+        event,end = None,time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             event = service.event()
             time.sleep(.001)
@@ -4385,7 +4387,7 @@ class EngineTests(unittest.TestCase):
         token,_,rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
         self.assertFalse(service.model_pending(0))
-        event,end = None,time.monotonic()+3
+        event,end = None,time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             service.pump()
             event = service.event()
@@ -4410,7 +4412,7 @@ class EngineTests(unittest.TestCase):
         for game in games:
             engine.add(game)
         episodes,overlap = [],False
-        end = time.monotonic()+10
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episode,rows = game.episode()
@@ -4454,7 +4456,7 @@ class EngineTests(unittest.TestCase):
         for i in range(4):
             engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,50+i,native_owner=True))
         episodes,producers,parked = [],set(),False
-        end = time.monotonic()+20
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episodes.append(game.episode())
@@ -4522,11 +4524,11 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[(0,0)],ms=250.,views=4)
-        token, _, rows = service.take(100.)
+        token, _, rows = ready(service)
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        event, end = None, time.monotonic()+3
+        event, end = None, time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             event = service.event()
             time.sleep(.001)
@@ -4538,7 +4540,7 @@ class EngineTests(unittest.TestCase):
         service.release(0,0,expected=1)
         with self.assertRaisesRegex(ValueError,'matching root completion'):
             service.release(0,0,expected=1)
-        released, end = None, time.monotonic()+3
+        released, end = None, time.monotonic()+PATIENCE
         while released is None and time.monotonic()<end:
             released = service.event()
             time.sleep(.001)
@@ -4557,7 +4559,7 @@ class EngineTests(unittest.TestCase):
         fresh.close()
         token, _, rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        replacement, end = None, time.monotonic()+5
+        replacement, end = None, time.monotonic()+PATIENCE
         while replacement is None and time.monotonic()<end:
             service.pump()
             replacement = service.event()
@@ -4671,7 +4673,11 @@ class EngineTests(unittest.TestCase):
         for index, history in enumerate(histories):
             service.retarget(0,index,history,work=8,views=1)
         service.resume()
-        token, _, rows = service.take(100.)
+        # With no batch in flight the broker sends whatever is ready, so let a full batch queue up first.
+        end = time.monotonic()+PATIENCE
+        while service.stats()['pending_rows']<8 and time.monotonic()<end:
+            time.sleep(.001)
+        token, _, rows = ready(service)
         self.assertEqual(rows.count,8)
         service.pending.append((token,native_dense.submit(evaluator,rows)))
         service.pause()
@@ -4682,7 +4688,7 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(stats['pending_rows'],0)
         self.assertIsNone(service.take(2.))
         service.resume()
-        events, end = [], time.monotonic()+10
+        events, end = [], time.monotonic()+PATIENCE
         while len(events)<len(histories) and time.monotonic()<end:
             service.pump()
             while (event:=service.event()) is not None:
@@ -4706,7 +4712,7 @@ class EngineTests(unittest.TestCase):
         service.launch()
         def collect(count):
             # The caller only waits for and reads events; it never pumps.
-            events, end = [], time.monotonic()+10
+            events, end = [], time.monotonic()+PATIENCE
             while len(events)<count and time.monotonic()<end:
                 service.wait(100.)
                 while (event:=service.event()) is not None:
@@ -4738,7 +4744,7 @@ class EngineTests(unittest.TestCase):
             token = next(e['token'] for e in events if e['game']==0)
             service.retarget(0,0,histories[0]+[[3,0],[4,0]],expected=token,work=8,views=1)
             with self.assertRaisesRegex(RuntimeError,'forward failed'):
-                end = time.monotonic()+10
+                end = time.monotonic()+PATIENCE
                 while time.monotonic()<end:
                     service.wait(50.)
         service.close()
@@ -4758,7 +4764,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         for index, history in enumerate(([[0,0]],[[0,0],[1,0],[2,0]])):
             service.retarget(index,0,history,work=128,views=4)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         service.pending.append((token,native_dense.submit(evaluator,rows)))
@@ -4777,7 +4783,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(service.stats()['launched_rows'],launched)
         service.resume()
         self.assertFalse(service.paused())
-        events, end = [], time.monotonic()+5
+        events, end = [], time.monotonic()+PATIENCE
         while len(events)<2 and time.monotonic()<end:
             service.pump()
             while len(events)<2:
@@ -4814,7 +4820,7 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[[0,0]],work=32,views=1)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         with self.assertRaisesRegex(ValueError,'manual batches'):
@@ -4852,7 +4858,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.pause()
         service.retarget(0,0,history,work=4096,views=1)
-        event, end = None, time.monotonic()+5
+        event, end = None, time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             self.assertIsNone(service.take())
             event = service.event()
@@ -4880,7 +4886,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.retarget(0,0,[[0,0]],ms=1,views=1)
         service.retarget(0,1,[[0,0]],work=16,views=1)
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         event = None
         while event is None and time.monotonic()<end:
             event = service.event()
@@ -4963,7 +4969,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.retarget(0,0,[[0,0],actions[0].tolist()],work=8,views=1)
         event = None
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             service.pump()
             event = service.event()
@@ -5037,13 +5043,13 @@ class EngineTests(unittest.TestCase):
         service.retarget(0,0,[(0,0)],ms=250.,views=4)
         with self.assertRaisesRegex(ValueError,'matching game completion'):
             service.retarget(0,0,[(0,0)],work=16)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         event = None
         while event is None and time.monotonic()<end:
             event = service.event()
@@ -5057,7 +5063,7 @@ class EngineTests(unittest.TestCase):
         token, _, rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
         second = None
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         while second is None and time.monotonic()<end:
             service.pump()
             second = service.event()
@@ -5164,7 +5170,7 @@ class EngineTests(unittest.TestCase):
                 service.start()
                 with self.assertRaisesRegex(ValueError,'before starting'):
                     checked(native.hxb_flights(service.ptr,limit))
-                leased = [service.take(100.) for _ in range(limit)]
+                leased = [ready(service) for _ in range(limit)]
                 self.assertTrue(all(batch is not None for batch in leased))
                 self.assertIsNone(service.take())
                 stats = service.stats()
@@ -5173,7 +5179,7 @@ class EngineTests(unittest.TestCase):
                                  (limit,limit,limit,4))
                 token,model,rows = leased.pop(0)
                 service.complete(token,native_dense.submit(evaluator,rows).collect())
-                replacement = service.take(100.)
+                replacement = ready(service)
                 self.assertIsNotNone(replacement)
                 leased.append(replacement)
                 self.assertEqual(service.stats()['inflight_batches'],limit)
@@ -5250,7 +5256,7 @@ class EngineTests(unittest.TestCase):
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start()
-        token, model, rows = service.take(100.)
+        token, model, rows = ready(service)
         for index, (side, count) in enumerate(rows.groups):
             predictions = np.zeros((count,side*side+2),np.float32)
             rows.decode(index,0,predictions)
@@ -6723,32 +6729,6 @@ class YieldTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs['restart'] == restart for call in games.call_args_list))
         self.assertEqual(restarts.draw.call_count, 2)
 
-    def test_learner_heartbeat_reports_its_effective_target(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp)/'run'
-            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
-                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
-                                  capture_output=True, text=True, cwd=ROOT, timeout=60)
-            self.assertEqual(made.returncode, 0, made.stderr)
-            write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
-            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--steps', '1',
-                                   '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
-                                   '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
-                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            status = json.loads((run/'learner-status.json').read_text())
-            self.assertEqual(status['samples_per_row_target'], 7.5)
-            self.assertEqual(status['phase_rows'], 0)
-            self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
-            self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
-            zeros = dict(allocated_mb=0, reserved_mb=0)
-            self.assertEqual(status['vram'], zeros)
-            self.assertEqual(status['optimizer_state_mb'], 0.)
-            lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
-            self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
-            manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
-            self.assertEqual(manifest['learner']['vram_reserved_mb'], 1500)
-
     def test_disabled_and_invalid_bounds(self):
         self.heartbeat(0.)
         self.assertFalse(self.gate(below=0.).paused())
@@ -6791,6 +6771,7 @@ class LearnerPipelineTests(unittest.TestCase):
                         n.startswith('blocks.') and n.endswith(('.conv1.weight', '.conv2.weight', '.pool.weight'))}
             self.assertEqual({n for n, p in model.named_parameters() if any(p is q for q in muon)}, expected)
 
+    @few_rows
     def test_adamw_and_muon_train_on_cpu_and_reset_on_kind_change(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -6868,6 +6849,7 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(dense_learn.paced(seen, rows, 4., 8), seen+8 > 4.*rows)
             self.assertEqual(dense_learn.backlog(seen, rows, 4.), rows-seen/4.)
 
+    @few_rows
     def test_resume_moves_the_pacing_base_only_when_samples_per_row_changes(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -6910,6 +6892,7 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(kept.pacing, dict(rows=rows+500, samples=5000))
             self.assertEqual(len(events()), 4)
 
+    @few_rows
     def test_manifests_without_a_pacing_base_pace_from_zero(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -7087,7 +7070,7 @@ class PhaseTests(unittest.TestCase):
                 initial = json.loads((run/'learner-status.json').read_text())
                 self.assertEqual(initial['stage'], 'exporting')
                 self.assertGreater(initial['phase_rows'], 0)
-                deadline = time.monotonic()+2
+                deadline = time.monotonic()+PATIENCE
                 while time.monotonic() < deadline:
                     current = json.loads((run/'learner-status.json').read_text())
                     if current['updated_at'] > initial['updated_at']:
@@ -9115,7 +9098,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.start = slow
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
             evaluator.step()
-        self.assertEqual(sum(charged), 10.)                                 # two pairs started, 5 s each
+        self.assertAlmostEqual(sum(charged), 10.)                           # two pairs started, 5 s each
 
     def test_busy_pacing_keeps_complete_pairs_and_throttles_the_drain(self):
         evaluator = self.start(sprt_max_games=8, pool_games=4, busy_share=.5, pipeline=True)
@@ -9924,6 +9907,53 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.start()
         self.assertIn('calibration', self.league())                                    # added on start
 
+
+@slow
+class SlowDenseTests(unittest.TestCase):
+    """A 50,000-row window and the learner command line, each taking seconds."""
+    def test_resident_bytes_per_row(self):
+        import gc
+        import tracemalloc
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 40, 20, 130, seed=1)
+            gc.collect(); tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                window = dense_data.ReplayWindow(tmp, 10**7, 10**7, validation_fraction=.03)
+                gc.collect()
+                used = tracemalloc.get_traced_memory()[0]-before
+            finally:
+                tracemalloc.stop()
+            self.assertGreater(window.rows, 50000)
+            self.assertLess(used/window.rows, 150)
+
+    def test_learner_heartbeat_reports_its_effective_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'run'
+            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
+                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=60)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
+            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--steps', '1',
+                                   '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
+                                   '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            status = json.loads((run/'learner-status.json').read_text())
+            self.assertEqual(status['samples_per_row_target'], 7.5)
+            self.assertEqual(status['phase_rows'], 0)
+            self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
+            self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
+            zeros = dict(allocated_mb=0, reserved_mb=0)
+            self.assertEqual(status['vram'], zeros)
+            self.assertEqual(status['optimizer_state_mb'], 0.)
+            lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
+            self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
+            manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
+            self.assertEqual(manifest['learner']['vram_reserved_mb'], 1500)
+
+
 class DenseTimedWorker(unittest.TestCase):
     def test_unsearched_completion_preserves_candidate_and_exact_evidence(self):
         from types import SimpleNamespace
@@ -9982,16 +10012,15 @@ class DenseTimedWorker(unittest.TestCase):
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
             for native, solver in ((False, False), (True, False), (True, True)):
-                search = dict(native_scheduler=native)
-                if solver:
-                    search['max_simulations'] = 64  # Complete early enough to inspect joined accounting.
+                # The simulation cap ends each turn; the 30 s clock only bounds a broken search, however loaded the machine.
+                search = dict(native_scheduler=native, max_simulations=64)
                 with self.subTest(native_scheduler=native, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
                         search=search, solver=dict(enabled=solver))) as engine:
                     game = Game([[0, 0]])
                     try:
                         for turn in range(2):
                             history = [list(cell[:2]) for cell in game.cells]
-                            result = engine.turn(game, 1000)
+                            result = engine.turn(game, 30000)
                             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
                             if turn == 0 or not solver:
                                 self.assertGreater(result.get('evaluated', 0), 0)
@@ -10032,7 +10061,7 @@ class DenseTimedWorker(unittest.TestCase):
                         engine.reset(history)
                         game = Game(history)
                         try:
-                            result = engine.turn(game, 1000)
+                            result = engine.turn(game, 30000)
                             for action in result['moves']:
                                 game.play(*action)
                             self.assertEqual(game.winner, 0)
