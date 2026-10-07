@@ -372,6 +372,9 @@ class RunConfig:
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
 # Settings of earlier versions, ignored when a config or a checkpoint manifest is read.
 RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'), learner=('policy_cache_mb',))
+# Settings older configs and manifests store under another name, read as their current one.
+RENAMED = dict(actor={'native_'+key: 'hybrid_'+key for key in ('scheduler', 'round_barrier', 'producers', 'model_producers',
+               'quantum', 'views', 'depth', 'proof_workers', 'proof_slice_ms', 'proof_budget')})
 
 
 def append_line(path, record):
@@ -400,10 +403,11 @@ def from_dict(data):
 
 
 def section(name, values):
-    """The SECTIONS[name] settings of dict `values`, without its RETIRED keys."""
+    """The SECTIONS[name] settings of dict `values`, without its RETIRED keys and with its RENAMED keys current."""
     if name == 'evaluation' and 'search_choice' not in values:
         values = dict(values, search_choice='gumbel')
-    return SECTIONS[name](**{k: v for k, v in values.items() if k not in RETIRED.get(name, ())})
+    renamed = RENAMED.get(name, {})
+    return SECTIONS[name](**{renamed.get(k, k): v for k, v in values.items() if k not in RETIRED.get(name, ())})
 
 
 def load(run):

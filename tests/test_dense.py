@@ -1503,7 +1503,10 @@ class DenseConfigTests(unittest.TestCase):
         hybrid = dense_config.ActorSettings(hybrid_scheduler=True, hybrid_producers=6, hybrid_model_producers=2,
                                             hybrid_proof_workers=4, hybrid_proof_budget=.25, hybrid_views=4)
         config = dense_config.RunConfig(actor=hybrid)
-        self.assertEqual(dense_config.from_dict(json.loads(json.dumps(dataclasses.asdict(config)))), config)
+        saved = dataclasses.asdict(config)
+        self.assertEqual(dense_config.from_dict(json.loads(json.dumps(saved))), config)
+        saved['actor'] = {key.replace('hybrid_', 'native_'): value for key, value in saved['actor'].items()}
+        self.assertEqual(dense_config.from_dict(saved), config)
 
     def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
         with tempfile.TemporaryDirectory() as tmp:
