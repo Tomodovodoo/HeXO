@@ -1438,6 +1438,15 @@ class DenseConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'per-leaf'):
             dense_config.ActorSettings(native_feed=True, solver_leaf_nodes=32)
 
+    def test_native_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.ActorSettings)
+        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.1']))
+        self.assertEqual(actor.native_proof_budget, .1)
+        for budget in (0., 1.5):
+            with self.assertRaisesRegex(ValueError, 'native proof'):
+                dense_config.ActorSettings(native_proof_budget=budget)
+
     def test_fused_actor_cache_warms_before_workers_and_isolates_compiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
