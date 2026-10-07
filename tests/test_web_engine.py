@@ -931,6 +931,12 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['replies'], ['cancelled'])
         self.assertLess(answer['ms'], 2000)
 
+    def test_a_browser_without_nested_workers_still_searches(self):
+        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, noWorkers=True))
+        self.assertEqual(len(result['moves']), 2)
+        self.assertIn('nested workers are not allowed', result['solver_error'])
+        self.assertTrue(all(stats['completed'] >= 32 for stats in result['scheduler']))
+
     def test_a_refresh_budget_below_one_quantum_still_searches(self):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))
         self.assertEqual(len(result['moves']), 2)

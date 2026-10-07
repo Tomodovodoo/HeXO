@@ -123,7 +123,12 @@ function settle(id, result) {
 
 function send(id) {
   if (!solver) {
-    solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
+    try {
+      solver = new Worker(new URL('solver-worker.mjs', import.meta.url), {type: 'module'});
+    } catch (error) {   // a browser that forbids nested workers: the query has no answer
+      settle(id, unknown(`${FAILED}: ${error.message}`));
+      return;
+    }
     solver.onmessage = ({data}) => settle(data.id, data.result);
     solver.onerror = event => {
       for (const id of [...solverWaits.keys()]) settle(id, unknown(`${FAILED}: ${event.message || 'error'}`));

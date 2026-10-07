@@ -499,6 +499,7 @@ if (job.kind === 'encode') {
         return {logits: actions.map((_, i) => glimpsing ? -2 * i : 0), q: actions.map(() => value)};
       })})},
     Worker: class {
+      constructor() { if (job.noWorkers) throw new Error('nested workers are not allowed'); }
       postMessage({id, history, options, prepare, request, cancel}) {
         if (prepare) { if (!job.stallPrepare) queueMicrotask(() => this.onmessage({data:{id,ready:true}})); return; }
         if (request) {
