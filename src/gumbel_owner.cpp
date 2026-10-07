@@ -110,12 +110,14 @@ struct Owner {
  size_t solver_path(const std::vector<Cell>& history,size_t begin,double relevance){
   if(stopped || expired() || begin>=history.size())return 0;
   size_t added=0;std::vector<Cell> prefix(history.begin(),history.begin()+begin);
+  auto position=gumbel::keys(prefix).first;
   for(size_t i=begin;i<history.size();++i){
+   auto keys=gumbel::child_keys(position,prefix,history[i]);position=keys.first;
    prefix.push_back(history[i]);if(prefix.size()<=focus.size())continue;
    // Automatic neural discovery keeps max_depth. A visited CPU line can end
    // deeper; cap this separate, explicit handoff at 128 placements from focus.
    int depth=int(prefix.size()-focus.size());if(depth>128)break;
-   auto keys=gumbel::keys(prefix);Key key=keys.second;
+   Key key=keys.second;
    if(game->outcomes.contains(keys.first))break;
    if(key==views[0].key || live(key))continue;
    if(auto found=candidates.find(key);found!=candidates.end()){
