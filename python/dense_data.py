@@ -559,15 +559,17 @@ def index_shard(path):
 
 def shard_index(path, cache, fields=None):
     """index_shard(path) restricted to `fields` (default all). Read from `cache`/<shard name>.npz while the stamp saved
-    there equals shard_stamp(path); otherwise built from the shard, which verifies its hashes, and saved there under a
-    temporary name and linked into place. A stale file is removed first; when another process holds it open, or links
-    its own file first, that file stands and the next read compares its stamp again."""
+    there equals shard_stamp(path) and the file hashes saved there equal those of the shard's manifest; otherwise built
+    from the shard, which verifies its hashes, and saved there under a temporary name and linked into place. A stale
+    file is removed first; when another process holds it open, or links its own file first, that file stands and the
+    next read compares it again."""
     path, cache = Path(path), Path(cache)
     file, stamp = cache/f'{path.name}.npz', shard_stamp(path)
+    files = json.dumps(manifest(path)['files'], sort_keys=True)
     try:
         with np.load(file) as data:
-            if np.array_equal(data['stamp'], stamp):
-                return {k: _unpack(k, data[k]) for k in fields or [k for k in data.files if k != 'stamp']}
+            if np.array_equal(data['stamp'], stamp) and str(data['files']) == files:
+                return {k: _unpack(k, data[k]) for k in fields or [k for k in data.files if k not in ('stamp', 'files')]}
         with contextlib.suppress(FileNotFoundError, PermissionError):    # Windows: another process is reading it
             file.unlink()
     except FileNotFoundError:
@@ -576,7 +578,7 @@ def shard_index(path, cache, fields=None):
     cache.mkdir(parents=True, exist_ok=True)
     staged = cache/f'.{path.name}.{os.getpid()}.{threading.get_ident()}.npz'
     try:
-        np.savez(staged, stamp=stamp, **{k: _pack(k, v) for k, v in index.items()})
+        np.savez(staged, stamp=stamp, files=np.array(files), **{k: _pack(k, v) for k, v in index.items()})
         os.link(staged, file)
     except FileExistsError:
         pass

@@ -3450,6 +3450,17 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual(len(refs), sum(dense_data.trained(episodes[r['game']], r['ply']) for r in rows))
             for ref in refs:
                 self.assertEqual(ref.episode['moves'], episodes[ref.row['game']]['moves'])
+            # A replacement that keeps every file's size and mtime is still caught by its manifest's hashes.
+            stamp = dense_data.shard_stamp(run/'shards'/'1000000000002')
+            shutil.rmtree(run/'shards'/'1000000000002')
+            source_shard(run/'shards'/'1000000000002', 8, 'x', games=9)
+            with unittest.mock.patch.object(dense_data, 'shard_stamp', lambda path: stamp):
+                restored = dense_data.ReplayWindow(run, 10**6, 10**6)
+            episodes, _ = dense_data.read_shard(run/'shards'/'1000000000002', policies=False)
+            for n, i in restored.index:
+                if n == '1000000000002':
+                    ref = restored.ref(n, i)
+                    self.assertEqual(ref.episode['moves'], episodes[ref.row['game']]['moves'])
             path = run/'shards'/'1000000000001'/'rows.json'
             path.write_text(path.read_text().replace('"ply": 0', '"ply": 1', 1))
             with self.assertRaisesRegex(ValueError, 'Shard changed'):
