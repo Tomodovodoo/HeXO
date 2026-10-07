@@ -148,47 +148,6 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
     tl.store(Y+at,line+tl.load(X+at,valid,0).to(tl.float32),valid)
 
 
-def line_add(x,weight):
-    out=torch.empty_like(x)
-    b,c,h,w=x.shape
-    if x.is_contiguous(memory_format=torch.channels_last):
-        _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32)
-    else:
-        _line_add[(b*c,tr.cdiv(h*w,256))](x,weight,out,c,h,w,x.stride(),weight.shape[-1],256)
-    return out
-
-
-@tr.jit(do_not_specialize=['H', 'W', 'S'])
-def _offset(i, c, H, W, S):
-    return i//(H*W)*S[0]+c*S[1]+(i//W % H)*S[2]+(i % W)*S[3]
-
-
-@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'YS'])
-def _eval(X,M,Y,Mean,Var,Weight,Bias,N,H,W,
-          XS,MS,YS,EPS:tl.constexpr,K:tl.constexpr,C:tl.constexpr,NHWC:tl.constexpr):
-    if NHWC:
-        at=tl.program_id(0)*K+tl.arange(0,K)
-        c,i=at % C,at//C
-    else:
-        c=tl.program_id(0)
-        i=tl.program_id(1)*K+tl.arange(0,K)
-    x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
-    m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
-    y=((x-tl.load(Mean+c))*tl.rsqrt(tl.load(Var+c)+EPS))*tl.load(Weight+c)+tl.load(Bias+c)
-    y=y.to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Y+_offset(i,c,H,W,YS),tl.where(m>0,tl.maximum(y,0.),0.),i<N)
-
-
-def norm_eval(norm,x,mask):
-    b,c,h,w=x.shape
-    out=torch.empty_like(x)
-    ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
-    grid=(tr.cdiv(x.numel(),1024),) if x.stride(1)==1 else (c,tr.cdiv(b*h*w,1024))
-    _eval[grid](x,mask,out,norm.running_mean,norm.running_var,norm.weight,norm.bias,
-                b*h*w,h,w,x.stride(),ms,out.stride(),norm.eps,1024,c,x.stride(1)==1,enable_fp_fusion=False)
-    return out
-
-
 # Training kernels take channels-last tensors: element (n, c) of [B, C, H, W] sits at n*C+c for the position
 # n = (b*H+y)*W+x, so a tile of positions by channels reads whole rows. Masks and ceilings are [B, 1, H, W].
 
@@ -272,6 +231,47 @@ def masked_pool(x,count,ceiling=None):
     """hexnet.pool for channels-last CUDA x, count [B, 1] fp32 and an optional ceiling [B, 1, H, W] whose planes are
     contiguous: [B, 2C] fp32."""
     return _MaskedPool.apply(x,count,ceiling)
+
+
+def line_add(x,weight):
+    out=torch.empty_like(x)
+    b,c,h,w=x.shape
+    if x.is_contiguous(memory_format=torch.channels_last):
+        _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32)
+    else:
+        _line_add[(b*c,tr.cdiv(h*w,256))](x,weight,out,c,h,w,x.stride(),weight.shape[-1],256)
+    return out
+
+
+@tr.jit(do_not_specialize=['H', 'W', 'S'])
+def _offset(i, c, H, W, S):
+    return i//(H*W)*S[0]+c*S[1]+(i//W % H)*S[2]+(i % W)*S[3]
+
+
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'XS', 'MS', 'YS'])
+def _eval(X,M,Y,Mean,Var,Weight,Bias,N,H,W,
+          XS,MS,YS,EPS:tl.constexpr,K:tl.constexpr,C:tl.constexpr,NHWC:tl.constexpr):
+    if NHWC:
+        at=tl.program_id(0)*K+tl.arange(0,K)
+        c,i=at % C,at//C
+    else:
+        c=tl.program_id(0)
+        i=tl.program_id(1)*K+tl.arange(0,K)
+    x=tl.load(X+_offset(i,c,H,W,XS),i<N,0).to(tl.float32)
+    m=tl.load(M+_offset(i,c,H,W,MS),i<N,0)
+    y=((x-tl.load(Mean+c))*tl.rsqrt(tl.load(Var+c)+EPS))*tl.load(Weight+c)+tl.load(Bias+c)
+    y=y.to(X.dtype.element_ty).to(tl.float32)
+    tl.store(Y+_offset(i,c,H,W,YS),tl.where(m>0,tl.maximum(y,0.),0.),i<N)
+
+
+def norm_eval(norm,x,mask):
+    b,c,h,w=x.shape
+    out=torch.empty_like(x)
+    ms=mask.stride() if mask.shape[1]==c else (mask.stride(0),0,*mask.stride()[2:])
+    grid=(tr.cdiv(x.numel(),1024),) if x.stride(1)==1 else (c,tr.cdiv(b*h*w,1024))
+    _eval[grid](x,mask,out,norm.running_mean,norm.running_var,norm.weight,norm.bias,
+                b*h*w,h,w,x.stride(),ms,out.stride(),norm.eps,1024,c,x.stride(1)==1,enable_fp_fusion=False)
+    return out
 
 
 @tr.jit
@@ -491,33 +491,23 @@ def _line_grad(G,Weight,DX,N,C:tl.constexpr,H,W,L:tl.constexpr,P:tl.constexpr,CH
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'T'])
 def _line_taps(X,G,Partial,N,C:tl.constexpr,H,W,T,P:tl.constexpr,L:tl.constexpr,LP:tl.constexpr,
                K:tl.constexpr,CH:tl.constexpr):
+    """Partial[c, axis, tap, t]: sum over the t-th P positions p of g[p, c]*x[p+shift(axis, tap), c]."""
     c=tl.program_id(0)*CH+tl.arange(0,CH)
-    t=tl.program_id(1)
-    taps=tl.arange(0,LP)[:,None]
-    horizontal=tl.full((LP,CH),0.,tl.float32)
-    vertical=tl.full((LP,CH),0.,tl.float32)
-    diagonal=tl.full((LP,CH),0.,tl.float32)
+    t,axis=tl.program_id(1),tl.program_id(2)
+    taps=tl.arange(0,LP)
+    d=taps-L//2
+    dd=taps-(L-1-L//2)
+    dx=tl.where(axis==0,d,tl.where(axis==1,0,dd))[:,None]
+    dy=tl.where(axis==0,0,tl.where(axis==1,d,-dd))[:,None]
+    total=tl.full((LP,K,CH),0.,tl.float32)
     for start in range(t*P,t*P+P,K):
         p=start+tl.arange(0,K)
-        x,y=p % W,p//W % H
-        at=p[:,None]*C+c[None,:]
-        valid=(p[:,None]<N)&(c[None,:]<C)
-        g=tl.load(G+at,valid,0).to(tl.float32)
-        for tap in tl.static_range(L):
-            d=tap-L//2
-            dd=tap-(L-1-L//2)
-            h=tl.load(X+at+d*C,valid&((x+d>=0)&(x+d<W))[:,None],0).to(tl.float32)
-            v=tl.load(X+at+d*W*C,valid&((y+d>=0)&(y+d<H))[:,None],0).to(tl.float32)
-            a=tl.load(X+at+dd*(1-W)*C,valid&((x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H))[:,None],0).to(tl.float32)
-            row=taps==tap
-            horizontal+=tl.where(row,tl.sum(g*h,0)[None,:],0.)
-            vertical+=tl.where(row,tl.sum(g*v,0)[None,:],0.)
-            diagonal+=tl.where(row,tl.sum(g*a,0)[None,:],0.)
-    out=Partial+(c[None,:]*3*L+taps)*T+t
-    used=(taps<L)&(c[None,:]<C)
-    tl.store(out,horizontal,used)
-    tl.store(out+L*T,vertical,used)
-    tl.store(out+2*L*T,diagonal,used)
+        x,y=(p % W)[None,:]+dx,(p//W % H)[None,:]+dy
+        inside=(taps<L)[:,None]&(p<N)[None,:]&(x>=0)&(x<W)&(y>=0)&(y<H)
+        g=tl.load(G+p[:,None]*C+c[None,:],((p<N)[:,None])&(c<C)[None,:],0).to(tl.float32)
+        shifted=(p[None,:]+dy*W+dx)[:,:,None]*C+c[None,None,:]
+        total+=g[None,:,:]*tl.load(X+shifted,inside[:,:,None]&(c<C)[None,None,:],0).to(tl.float32)
+    tl.store(Partial+((c[None,:]*3+axis)*L+taps[:,None])*T+t,tl.sum(total,1),(taps<L)[:,None]&(c<C)[None,:])
 
 
 class _TrainLineAdd(torch.autograd.Function):
@@ -537,10 +527,10 @@ class _TrainLineAdd(torch.autograd.Function):
             dx=torch.empty_like(grad)
             _line_grad[(tr.cdiv(n,16),tr.cdiv(c,32))](grad,weight,dx,n,c,h,w,length,16,32)
         if ctx.needs_input_grad[1]:
-            p=4096
+            p=1024
             t=tr.cdiv(n,p)
             partial=torch.empty((c,3,length,t),dtype=torch.float32,device=grad.device)
-            _line_taps[(tr.cdiv(c,32),t)](x,grad,partial,n,c,h,w,t,p,length,tr.next_power_of_2(length),32,32)
+            _line_taps[(tr.cdiv(c,32),t,3)](x,grad,partial,n,c,h,w,t,p,length,tr.next_power_of_2(length),16,32)
             dw=partial.sum(-1)
         return dx,dw
 

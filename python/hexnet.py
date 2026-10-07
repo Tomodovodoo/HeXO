@@ -393,12 +393,18 @@ class HexNet(nn.Module):
         out = dict(policy=self.policy(hidden).flatten(1).float(), far=self.far(pooled)[:, 0].float(),
                    value_logit=self.value(value)[:, 0].float())
         if aux and self.config.aux_heads:
-            spatial = self.aux_spatial(hidden).float()
+            spatial = pointwise(self.aux_spatial, hidden).float()
             out.update(short_value_logit=self.short_value(value)[:, 0].float(), future=spatial[:, 1:],
                        opponent_policy=spatial[:, 0].flatten(1))
             if self.future_target == 'masked':
-                out['future_masked'] = self.future_masked(hidden).float()
+                out['future_masked'] = pointwise(self.future_masked, hidden).float()
         return out
+
+
+def pointwise(conv, x):
+    """The 1x1 Conv2d `conv` of x, run NCHW with NCHW weight strides: channels-last strides on either operand select
+    cuDNN's NHWC kernels, whose weight gradient for three output channels is several times slower."""
+    return F.conv2d(x.contiguous(), conv.weight.flatten(1)[:, :, None, None], conv.bias)
 
 
 def action_logits(policy, far, cells, counts):

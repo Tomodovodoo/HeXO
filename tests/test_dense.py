@@ -1337,7 +1337,8 @@ class FusedCudaTests(unittest.TestCase):
             for training in (True, False):
                 results = []
                 for mode in ('reference', 'fused'):
-                    fmt = torch.channels_last if mode == 'fused' else torch.contiguous_format
+                    # Training compares within one layout: cuDNN rounds NCHW and NHWC convolutions differently.
+                    fmt = torch.channels_last if mode == 'fused' or training else torch.contiguous_format
                     model = copy.deepcopy(base).set_kernels(mode).cuda().to(memory_format=fmt).train(training)
                     inputs = x.contiguous(memory_format=fmt)
                     with torch.set_grad_enabled(training), torch.autocast('cuda', torch.bfloat16):
