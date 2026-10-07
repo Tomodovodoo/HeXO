@@ -8,6 +8,9 @@ import {Proofs, proven, proofKey} from './proof.mjs';
 import {stageText} from './stages.mjs';
 import {PV_CHECK} from './search.mjs';
 
+/** The analysis solver preset (python/play.py SOLVER): proof work alone for up to `solver_ms`, then the turn. */
+export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000};
+
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
 /** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
@@ -125,7 +128,8 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget} : entry.presets[preset];
+    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
+      : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
       const least = {ms: 10, nodes: 1, visits: 1, leaf_ms: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
@@ -339,6 +343,7 @@ export class BrowserSession extends OfflineSession {
       this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
+      if (body.preset === 'solver') throw Error('The solver preset is for analysis');
       const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
       this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.renewLines(body.side); this.seats[body.side] = seat;

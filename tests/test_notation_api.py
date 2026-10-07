@@ -289,6 +289,17 @@ class TimedClocks(unittest.TestCase):
             self.assertEqual(side_settings(path)['solver']['nodes'], 512)
             path.write_text(json.dumps(dict(search=dict(native_scheduler=True, enabled=False), solver=dict(nodes=512))), encoding='utf-8')
             self.assertEqual(side_settings(path)['solver']['nodes'], 512)
+            path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=dict(workers=12, budget=.1))), encoding='utf-8')
+            self.assertEqual(side_settings(path)['solver'], dict(workers=12, budget=.1))
+            for solver in (dict(budget=0), dict(budget=1.5), dict(workers=0)):
+                path.write_text(json.dumps(dict(search=dict(native_scheduler=True), solver=solver)), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'solver'):
+                    side_settings(path)
+            path.write_text(json.dumps(dict(solver=dict(budget=.1))), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'native timed solving only'):
+                side_settings(path)
+            with self.assertRaisesRegex(ValueError, 'native timed solving only'):
+                TimedEngine(dict(kind='bubble', solver=dict(workers=4)))
             path.write_text(json.dumps(dict(search=dict(native_feed=True))), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'Unsupported search'):
                 side_settings(path)

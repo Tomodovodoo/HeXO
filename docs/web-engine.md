@@ -4,6 +4,9 @@ Bubble runs entirely in the browser: the network under ONNX Runtime Web (WebGPU,
 Gumbel search (`src/gumbel.cpp`) and the tactical solver (`tools/tactical`) compiled to WebAssembly, in Web Workers.
 On the play page pick **Bubble (browser)** for a seat or for analysis; presets are lightning 8/2048, quick 32/2048,
 standard 128/32768, strong 512/131072, deep 2048/524288 and dangerous 65536/4000000 (simulations / solver nodes).
+Analysis also has the solver preset (`SOLVER` in `play-session.mjs`, docs/play.md): up to two minutes of proof work
+before the turn, the root solver beside a native owner whose frontier feeds `SOLVER_WORKERS` solver workers (the
+browser's threads less two, one to eight), stopping at the first verified proof (`proveRoot` in `worker.mjs`).
 
 ```sh
 python tools/build_web.py wasm                      # gumbel, native, tactical and six wasm (committed)

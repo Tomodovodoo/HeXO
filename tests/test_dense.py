@@ -1479,8 +1479,8 @@ class DenseConfigTests(unittest.TestCase):
     def test_native_proof_budget_parses_and_rejects_shares_outside_zero_to_one(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.1']))
-        self.assertEqual(actor.native_proof_budget, .1)
+        actor = dense_config.override(dense_config.ActorSettings(), parser.parse_args(['--native-proof-budget', '0.3']))
+        self.assertEqual(actor.native_proof_budget, .3)
         for budget in (0., 1.5):
             with self.assertRaisesRegex(ValueError, 'native proof'):
                 dense_config.ActorSettings(native_proof_budget=budget)
@@ -10109,7 +10109,7 @@ class DenseTimedWorker(unittest.TestCase):
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
-                    _timed_native=(None, pool, ('fixed', False, False, 0.)))
+                    _timed_native=(None, pool, ('fixed', False, False, 0., 2, 1.)))
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None
