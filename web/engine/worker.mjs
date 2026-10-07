@@ -264,17 +264,17 @@ async function turn(request) {
  * search's result (proof.mjs settled). */
 async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
   await use(model, new Stages(postMessage, id));
-  let failure = null, proofPool = null;
-  // A browser that cannot start the proof workers still searches; the turn reports why it has no frontier proofs.
-  if (solverNodes || proveMs) {
-    proofPool = await unlessCancelled(id, proofWorkers(solverWorkers).catch(error => { failure = error.message; return null; }));
-  }
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
   const state = native.game(history), player = state.player;
   if (state.winner >= 0) throw new Error('The game has finished');
   const table = new Proofs(known || []), given = answered(native, history, table), frontier = new Map();
   if (given) return {...given, ms: Math.round(performance.now() - start)};
+  let failure = null, proofPool = null;
+  // A browser that cannot start the proof workers still searches; the turn reports why it has no frontier proofs.
+  if (solverNodes || proveMs) {
+    proofPool = await unlessCancelled(id, proofWorkers(solverWorkers).catch(error => { failure = error.message; return null; }));
+  }
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   let solverStats = null;
   const scheduler = [], graphOptions = {seed: 1740, tactics: true, qRangeFloor, model: network.version, roundBarrier: true};
@@ -425,9 +425,9 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
           }
         } finally { owner.close(); }
         const result = settled(searchedResult, unmarked, local.player);
-        if (line != null && result.completed) touched = tree.id;
+        if (line != null && searchedResult.all_view_completed) touched = tree.id;
         check();
-        completed += result.completed;
+        completed += searchedResult.all_view_completed;
         if (result.action) {
           ({action, policy, actions, completed_q: values} = result);
           if (!moves.length) nodeValue = (result.node_value + 1) / 2;

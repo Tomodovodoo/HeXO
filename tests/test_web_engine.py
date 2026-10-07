@@ -915,6 +915,7 @@ class Bundle(unittest.TestCase):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0))
         self.assertEqual(len(result['moves']), 2)
         self.assertEqual(len(result['scheduler']), 2)
+        self.assertEqual(result['actual_completed'], sum(stats['completed'] for stats in result['scheduler']))
         game = play.Game([[0,0]])
         try:
             for move in result['moves']:
