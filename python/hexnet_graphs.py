@@ -38,11 +38,19 @@ class ActorGraph:
             self.stream.wait_stream(torch.cuda.current_stream(device))
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs = {}
-        self.before_reserved = torch.cuda.memory_reserved(device)
         self.max_incremental_bytes = max_incremental_bytes
+        self.pool_reserved_bytes = 0
+        self.staging_bytes = 0
+        self.process_reserved_bytes = torch.cuda.memory_reserved(device)
+        # Graph admission is model-local. Process growth includes other models,
+        # caller outputs and unrelated clients of this CUDA allocator.
         self.incremental_reserved_bytes = 0
-        self.budget_exhausted = False
-        self.capture_memory_error = None
+        self.memory_accounting_valid = torch.cuda.get_allocator_backend() == 'native'
+        self.budget_exhausted = not self.memory_accounting_valid
+        self.capture_memory_error = None if self.memory_accounting_valid else \
+            'bounded CUDA graph pool accounting requires the native allocator'
+        if self.budget_exhausted:
+            warnings.warn(self.capture_memory_error+'; using eager inference', RuntimeWarning, stacklevel=2)
 
     @staticmethod
     def shape(canvas):
@@ -53,6 +61,26 @@ class ActorGraph:
         height, width = cls.shape(canvas)
         return canvas in cls.CANVASES or (min(height, width) >= 24
                 and max(height, width) <= 256 and height % 8 == width % 8 == 0)
+
+    def _measure_memory(self, candidate=()):
+        """Own pool reservation plus unique external staging; only on capture/close."""
+        self.process_reserved_bytes = torch.cuda.memory_reserved(self.device)
+        try:
+            segments = torch.cuda.memory_snapshot(mempool_id=self.pool, include_traces=False)
+        except RuntimeError as error:
+            self.memory_accounting_valid = False
+            raise MemoryError('cannot measure bounded CUDA graph pool storage') from error
+        reserved = sum(segment['total_size'] for segment in segments
+                       if segment['device'] == self.device.index)
+        storages = {}
+        for tensors in [record[1:] for record in self.graphs.values()]+[candidate]:
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                storages[storage.data_ptr()] = storage.nbytes()
+        self.pool_reserved_bytes = reserved
+        self.staging_bytes = sum(storages.values())
+        self.incremental_reserved_bytes = reserved+self.staging_bytes
+        self.memory_accounting_valid = True
 
     def _capture(self, side, capacity):
         if self.incremental_reserved_bytes >= self.max_incremental_bytes:
@@ -75,17 +103,27 @@ class ActorGraph:
         del warm
 
         graph = torch.cuda.CUDAGraph()
+        # Thread-local capture: an actor's launcher thread may capture while its
+        # main thread evaluates or reads memory statistics on other streams.
         with torch.inference_mode(), torch.autocast('cuda', torch.bfloat16, cache_enabled=False), \
-                torch.cuda.graph(graph, pool=self.pool, stream=self.stream):
+                torch.cuda.graph(graph, pool=self.pool, stream=self.stream, capture_error_mode='thread_local'):
             out = self.model(static_input, static_input[:, 3:4], aux=False)
             static_packed.copy_(torch.cat((out['policy'], out['far'][:, None],
                                            out['value_logit'][:, None]), dim=1))
         del out
-        incremental = torch.cuda.memory_reserved(self.device)-self.before_reserved
+        try:
+            self._measure_memory((template, static_input, static_packed))
+        except MemoryError:
+            del graph, static_packed, static_input, template
+            raise
+        incremental = self.incremental_reserved_bytes
         if incremental > self.max_incremental_bytes:
             del graph, static_packed, static_input, template
-            raise MemoryError(f'actor graphs reserved {incremental/2**20:.1f} MiB; '
-                              f'budget is {self.max_incremental_bytes/2**20:.1f} MiB')
+            # A rejected capture can leave reservation in a pool still held by
+            # accepted graphs. Report retained usage, not the previous count.
+            self._measure_memory()
+            raise MemoryError(f'actor graph pool and staging need {incremental/2**20:.1f} MiB; '
+                               f'budget is {self.max_incremental_bytes/2**20:.1f} MiB')
         self.graphs[key] = graph, template, static_input, static_packed
         self.incremental_reserved_bytes = incremental
         return self.graphs[key]
@@ -222,3 +260,7 @@ class ActorGraph:
             self.stream.synchronize()
             self.graphs.clear()
             torch.cuda.empty_cache()
+            if self.memory_accounting_valid:
+                self._measure_memory()
+            else:
+                self.process_reserved_bytes = torch.cuda.memory_reserved(self.device)

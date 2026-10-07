@@ -11,6 +11,7 @@ import time
 import unittest
 from proof import VerificationTimeout
 from tactical_proof import IsolatedTactics, NativeTactics, independent_verify, threat_cells
+from tests import QUERY_MS, slow
 
 
 OPEN_THREE = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
@@ -20,6 +21,10 @@ IMMEDIATE = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[4,0],[4,3],[5,4]]
 ONE_TURN = [[0,0],[1,2],[2,2],[0,-2],[-2,0],[3,2],[4,2]]
 TWO_TURN = [[0,0],[1,2],[2,2],[0,-3],[-3,0],[3,2],[8,0],[-3,3],[3,-3],[8,1],[8,2]]
 NO_THREAT = [[0,0],[1,2],[3,-1]]
+# The defender of a quiet turn against an unstoppable shape. Proving that loss with stamps takes tens of
+# seconds, so tests can watch and cancel the search while it runs.
+QUIET_LOSS = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8]]
+LONG_SEARCH = dict(attacker='defender', stamps=True, nodes=10000000, ms=20000)
 # Side 0 to move with a forced win in four turns; the first certificate PDS-PN finds takes five.
 LATE_WIN = [[0,0],[1,-2],[-1,-1],[2,-1],[0,-2],[0,-3],[1,-4],[1,-3],[2,-5],[-4,0],[-1,0],[-3,0],[-1,1],[-4,-1],
             [-4,-2],[-3,-1],[-4,-3],[2,-2],[-3,1],[-2,3],[-4,3],[-3,3],[-6,1],[-2,4],[-5,0],[-2,5],[-7,1],[-2,1],
@@ -299,13 +304,12 @@ class NativeStrategy(unittest.TestCase):
             self.assertNotIn('busy',after['reason'])
 
     def test_independent_workers_overlap_and_cancel_only_their_query(self):
-        history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
         with NativeTactics(independent=True) as first, NativeTactics(independent=True) as second:
             results = [None, None]
             start = threading.Barrier(3)
             def query(i, engine):
                 start.wait()
-                results[i] = engine.history(history, nodes=10000000, ms=20000)
+                results[i] = engine.history(QUIET_LOSS, **LONG_SEARCH)
             threads = [threading.Thread(target=query, args=(i, engine))
                        for i, engine in enumerate((first, second))]
             for thread in threads:
@@ -336,9 +340,8 @@ class NativeStrategy(unittest.TestCase):
 
     def test_independent_close_stops_work_and_rejects_new_queries(self):
         engine = NativeTactics(independent=True)
-        history = [[0,0],[4,0],[7,0],[-1,0],[-2,0],[1,0],[5,0],[6,0],[-2,1]]
         results = []
-        thread = threading.Thread(target=lambda: results.append(engine.history(history, nodes=10000000, ms=20000)))
+        thread = threading.Thread(target=lambda: results.append(engine.history(QUIET_LOSS, **LONG_SEARCH)))
         thread.start()
         try:
             deadline = time.perf_counter()+2
@@ -518,13 +521,6 @@ class NativeStrategy(unittest.TestCase):
         with self.assertRaises(ValueError):
             independent_verify(certificate, history, attacker='defender')
 
-    def test_unstoppable_shape_covers_a_complete_quiet_turn(self):
-        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8]]
-        result = self.engine.history(history, attacker='defender', stamps=True, nodes=50000, ms=60000)
-        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
-        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender',
-                                           deadline_seconds=120), 'PROVEN_LOSS')
-
     def test_open_three_wide_builder_full_strategy(self):
         result = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
         self.assertEqual(result['status'], 'PROVEN_WIN', result)
@@ -638,8 +634,7 @@ class NativeStrategy(unittest.TestCase):
         engine = NativeTactics()
         self.assertFalse(engine.cancel())
         results = []
-        history = [[0, 0], [4, 0], [7, 0], [-1, 0], [-2, 0], [1, 0], [5, 0], [6, 0], [-2, 1]]
-        query = threading.Thread(target=lambda: results.append(engine.history(history, nodes=10000000, ms=20000)))
+        query = threading.Thread(target=lambda: results.append(engine.history(QUIET_LOSS, **LONG_SEARCH)))
         query.start()
         deadline = time.perf_counter()+2
         while not engine.cancel() and query.is_alive() and time.perf_counter() < deadline:
@@ -792,6 +787,23 @@ class NativeStrategy(unittest.TestCase):
         time.sleep(0.05)
 
 
+@slow
+class SlowStrategy(unittest.TestCase):
+    """Proofs that search for a minute."""
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+
+    def test_unstoppable_shape_covers_a_complete_quiet_turn(self):
+        result = self.engine.history(QUIET_LOSS, attacker='defender', stamps=True, nodes=50000, ms=60000)
+        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
+        self.assertEqual(independent_verify(result['certificate'], QUIET_LOSS, attacker='defender',
+                                           deadline_seconds=120), 'PROVEN_LOSS')
+
+
 class NodeBudget(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -932,7 +944,7 @@ class FlippedTurnThreats(unittest.TestCase):
     def test_isolated_worker_carries_budget_fields(self):
         tactics = IsolatedTactics()
         try:
-            result = tactics.history(TWO_TURN, nodes=2000, attacker='opponent')
+            result = tactics.history(TWO_TURN, nodes=2000, ms=QUERY_MS, attacker='opponent')
             self.assertEqual((result['status'], result['proof_turns']), ('PROVEN_WIN', 2))
             self.assertEqual(result['build_hash'], self.engine.metadata['binary_sha256'])
             self.assertLessEqual(result['nodes_used'], 2000)
@@ -984,7 +996,7 @@ class Gate(unittest.TestCase):
     def test_isolated_worker_gates_and_runs_at_its_priority(self):
         tactics = IsolatedTactics(priority='idle')
         try:
-            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, gate=self.GATE)
+            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, ms=QUERY_MS, gate=self.GATE)
             self.assertEqual((result['status'], result['budget'], result['gate_score']), ('PROVEN_WIN', 540, 19.5))
         finally:
             tactics.close()
