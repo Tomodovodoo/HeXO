@@ -21,6 +21,7 @@ from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARI
                   model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review,
                   review_plies, scan, six_backend)
 from process_tree import TreeProcess
+from tests import PATIENCE
 
 STANDARD = PRESETS['bubble']['standard']
 SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
@@ -52,7 +53,7 @@ for raw in sys.stdin:
 """
 
 
-def wait(condition, timeout=10):
+def wait(condition, timeout=PATIENCE):
     end = time.time() + timeout
     while time.time() < end:
         if condition():

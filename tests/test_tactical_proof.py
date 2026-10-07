@@ -11,7 +11,7 @@ import time
 import unittest
 from proof import VerificationTimeout
 from tactical_proof import IsolatedTactics, NativeTactics, independent_verify, threat_cells
-from tests import slow
+from tests import QUERY_MS, slow
 
 
 OPEN_THREE = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
@@ -944,7 +944,7 @@ class FlippedTurnThreats(unittest.TestCase):
     def test_isolated_worker_carries_budget_fields(self):
         tactics = IsolatedTactics()
         try:
-            result = tactics.history(TWO_TURN, nodes=2000, attacker='opponent')
+            result = tactics.history(TWO_TURN, nodes=2000, ms=QUERY_MS, attacker='opponent')
             self.assertEqual((result['status'], result['proof_turns']), ('PROVEN_WIN', 2))
             self.assertEqual(result['build_hash'], self.engine.metadata['binary_sha256'])
             self.assertLessEqual(result['nodes_used'], 2000)
@@ -996,7 +996,7 @@ class Gate(unittest.TestCase):
     def test_isolated_worker_gates_and_runs_at_its_priority(self):
         tactics = IsolatedTactics(priority='idle')
         try:
-            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, gate=self.GATE)
+            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, ms=QUERY_MS, gate=self.GATE)
             self.assertEqual((result['status'], result['budget'], result['gate_score']), ('PROVEN_WIN', 540, 19.5))
         finally:
             tactics.close()

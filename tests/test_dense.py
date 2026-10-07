@@ -37,7 +37,7 @@ import dense_learn
 import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
-from tests import slow
+from tests import PATIENCE, slow
 
 ROOT = Path(__file__).resolve().parents[1]
 # Seal has no licence, so no build or CI ships it; tests that play it need a local -DHEXO_SEAL_SOURCE build.
@@ -48,6 +48,14 @@ TINY =hexnet.HexNetConfig(blocks=2, channels=16, pool_every=2, line_length=5, va
 # themselves, use a few batches.
 few_rows = unittest.mock.patch.multiple(dense_learn, RECALIBRATION_ROWS=64, VALIDATION_ROWS=64)
 AXIAL_AXES = ((1, 0), (0, 1), (1, -1))
+
+
+def ready(service):
+    """The next batch the producers owe `service`, or None once PATIENCE runs out; take() waits at most 1 s a call."""
+    end = time.monotonic()+PATIENCE
+    while (batch := service.take(1000.)) is None and time.monotonic() < end:
+        pass
+    return batch
 
 
 def legal(history):
@@ -4142,7 +4150,7 @@ class EngineTests(unittest.TestCase):
             engine.add(dense_selfplay.SelfPlayGame(pair,settings,30+i,
                        opponent=None if i==0 else f'fixed-{i}',native_owner=True))
         episodes,parked = [],False
-        end = time.monotonic()+10
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episodes.append(game.episode())
@@ -4166,7 +4174,7 @@ class EngineTests(unittest.TestCase):
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30,native_owner=True))
-        end = time.monotonic()+5
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
@@ -4197,7 +4205,7 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(engine.close)
         for i in range(2):
             engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,30+i,native_owner=True))
-        count,end = 0,time.monotonic()+10
+        count,end = 0,time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 game.episode()
@@ -4247,11 +4255,11 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[(0,0)],ms=100.,views=4)
-        token,_,rows = service.take(100.)
+        token,_,rows = ready(service)
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        event,end = None,time.monotonic()+3
+        event,end = None,time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             event = service.event()
             time.sleep(.001)
@@ -4281,7 +4289,7 @@ class EngineTests(unittest.TestCase):
         token,_,rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
         self.assertFalse(service.model_pending(0))
-        event,end = None,time.monotonic()+3
+        event,end = None,time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             service.pump()
             event = service.event()
@@ -4306,7 +4314,7 @@ class EngineTests(unittest.TestCase):
         for game in games:
             engine.add(game)
         episodes,overlap = [],False
-        end = time.monotonic()+10
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episode,rows = game.episode()
@@ -4350,7 +4358,7 @@ class EngineTests(unittest.TestCase):
         for i in range(4):
             engine.add(dense_selfplay.SelfPlayGame([models[0]]*2,settings,50+i,native_owner=True))
         episodes,producers,parked = [],set(),False
-        end = time.monotonic()+20
+        end = time.monotonic()+PATIENCE
         while engine.slots and time.monotonic()<end:
             for game in engine.step():
                 episodes.append(game.episode())
@@ -4418,11 +4426,11 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[(0,0)],ms=250.,views=4)
-        token, _, rows = service.take(100.)
+        token, _, rows = ready(service)
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        event, end = None, time.monotonic()+3
+        event, end = None, time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             event = service.event()
             time.sleep(.001)
@@ -4434,7 +4442,7 @@ class EngineTests(unittest.TestCase):
         service.release(0,0,expected=1)
         with self.assertRaisesRegex(ValueError,'matching root completion'):
             service.release(0,0,expected=1)
-        released, end = None, time.monotonic()+3
+        released, end = None, time.monotonic()+PATIENCE
         while released is None and time.monotonic()<end:
             released = service.event()
             time.sleep(.001)
@@ -4453,7 +4461,7 @@ class EngineTests(unittest.TestCase):
         fresh.close()
         token, _, rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        replacement, end = None, time.monotonic()+5
+        replacement, end = None, time.monotonic()+PATIENCE
         while replacement is None and time.monotonic()<end:
             service.pump()
             replacement = service.event()
@@ -4567,7 +4575,7 @@ class EngineTests(unittest.TestCase):
         for index, history in enumerate(histories):
             service.retarget(0,index,history,work=8,views=1)
         service.resume()
-        token, _, rows = service.take(100.)
+        token, _, rows = ready(service)
         self.assertEqual(rows.count,8)
         service.pending.append((token,native_dense.submit(evaluator,rows)))
         service.pause()
@@ -4578,7 +4586,7 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(stats['pending_rows'],0)
         self.assertIsNone(service.take(2.))
         service.resume()
-        events, end = [], time.monotonic()+10
+        events, end = [], time.monotonic()+PATIENCE
         while len(events)<len(histories) and time.monotonic()<end:
             service.pump()
             while (event:=service.event()) is not None:
@@ -4602,7 +4610,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         for index, history in enumerate(([[0,0]],[[0,0],[1,0],[2,0]])):
             service.retarget(index,0,history,work=128,views=4)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         service.pending.append((token,native_dense.submit(evaluator,rows)))
@@ -4621,7 +4629,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(service.stats()['launched_rows'],launched)
         service.resume()
         self.assertFalse(service.paused())
-        events, end = [], time.monotonic()+5
+        events, end = [], time.monotonic()+PATIENCE
         while len(events)<2 and time.monotonic()<end:
             service.pump()
             while len(events)<2:
@@ -4658,7 +4666,7 @@ class EngineTests(unittest.TestCase):
         self.addCleanup(service.close)
         service.start(continuous=True)
         service.retarget(0,0,[[0,0]],work=32,views=1)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         with self.assertRaisesRegex(ValueError,'manual batches'):
@@ -4696,7 +4704,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.pause()
         service.retarget(0,0,history,work=4096,views=1)
-        event, end = None, time.monotonic()+5
+        event, end = None, time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             self.assertIsNone(service.take())
             event = service.event()
@@ -4724,7 +4732,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.retarget(0,0,[[0,0]],ms=1,views=1)
         service.retarget(0,1,[[0,0]],work=16,views=1)
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         event = None
         while event is None and time.monotonic()<end:
             event = service.event()
@@ -4807,7 +4815,7 @@ class EngineTests(unittest.TestCase):
         service.start(continuous=True)
         service.retarget(0,0,[[0,0],actions[0].tolist()],work=8,views=1)
         event = None
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         while event is None and time.monotonic()<end:
             service.pump()
             event = service.event()
@@ -4881,13 +4889,13 @@ class EngineTests(unittest.TestCase):
         service.retarget(0,0,[(0,0)],ms=250.,views=4)
         with self.assertRaisesRegex(ValueError,'matching game completion'):
             service.retarget(0,0,[(0,0)],work=16)
-        batch = service.take(100.)
+        batch = ready(service)
         self.assertIsNotNone(batch)
         token, _, rows = batch
         service.complete(token,native_dense.submit(evaluator,rows).collect())
-        held = service.take(100.)
+        held = ready(service)
         self.assertIsNotNone(held)
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         event = None
         while event is None and time.monotonic()<end:
             event = service.event()
@@ -4901,7 +4909,7 @@ class EngineTests(unittest.TestCase):
         token, _, rows = held
         service.complete(token,native_dense.submit(evaluator,rows).collect())
         second = None
-        end = time.monotonic()+2
+        end = time.monotonic()+PATIENCE
         while second is None and time.monotonic()<end:
             service.pump()
             second = service.event()
@@ -5008,7 +5016,7 @@ class EngineTests(unittest.TestCase):
                 service.start()
                 with self.assertRaisesRegex(ValueError,'before starting'):
                     checked(native.hxb_flights(service.ptr,limit))
-                leased = [service.take(100.) for _ in range(limit)]
+                leased = [ready(service) for _ in range(limit)]
                 self.assertTrue(all(batch is not None for batch in leased))
                 self.assertIsNone(service.take())
                 stats = service.stats()
@@ -5017,7 +5025,7 @@ class EngineTests(unittest.TestCase):
                                  (limit,limit,limit,4))
                 token,model,rows = leased.pop(0)
                 service.complete(token,native_dense.submit(evaluator,rows).collect())
-                replacement = service.take(100.)
+                replacement = ready(service)
                 self.assertIsNotNone(replacement)
                 leased.append(replacement)
                 self.assertEqual(service.stats()['inflight_batches'],limit)
@@ -5094,7 +5102,7 @@ class EngineTests(unittest.TestCase):
         service = InferenceService([pool],[evaluator])
         self.addCleanup(service.close)
         service.start()
-        token, model, rows = service.take(100.)
+        token, model, rows = ready(service)
         for index, (side, count) in enumerate(rows.groups):
             predictions = np.zeros((count,side*side+2),np.float32)
             rows.decode(index,0,predictions)
@@ -6908,7 +6916,7 @@ class PhaseTests(unittest.TestCase):
                 initial = json.loads((run/'learner-status.json').read_text())
                 self.assertEqual(initial['stage'], 'exporting')
                 self.assertGreater(initial['phase_rows'], 0)
-                deadline = time.monotonic()+2
+                deadline = time.monotonic()+PATIENCE
                 while time.monotonic() < deadline:
                     current = json.loads((run/'learner-status.json').read_text())
                     if current['updated_at'] > initial['updated_at']:
@@ -9792,16 +9800,15 @@ class DenseTimedWorker(unittest.TestCase):
                                 line_length=5, value_hidden=8, head_channels=4))
             hexnet.save_model(path, model)
             for native, solver in ((False, False), (True, False), (True, True)):
-                search = dict(native_scheduler=native)
-                if solver:
-                    search['max_simulations'] = 64  # Complete early enough to inspect joined accounting.
+                # The simulation cap ends each turn; the 30 s clock only bounds a broken search, however loaded the machine.
+                search = dict(native_scheduler=native, max_simulations=64)
                 with self.subTest(native_scheduler=native, solver=solver), TimedEngine(dict(kind='bubble', model=str(path), device='cpu',
                         search=search, solver=dict(enabled=solver))) as engine:
                     game = Game([[0, 0]])
                     try:
                         for turn in range(2):
                             history = [list(cell[:2]) for cell in game.cells]
-                            result = engine.turn(game, 1000)
+                            result = engine.turn(game, 30000)
                             self.assertEqual(legal_turn(history, result['moves']), result['moves'])
                             if turn == 0 or not solver:
                                 self.assertGreater(result.get('evaluated', 0), 0)
@@ -9839,7 +9846,7 @@ class DenseTimedWorker(unittest.TestCase):
                         engine.reset(history)
                         game = Game(history)
                         try:
-                            result = engine.turn(game, 1000)
+                            result = engine.turn(game, 30000)
                             for action in result['moves']:
                                 game.play(*action)
                             self.assertEqual(game.winner, 0)
