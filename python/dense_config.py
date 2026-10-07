@@ -44,7 +44,7 @@ class ActorSettings:
     native_quantum: int = 32
     native_views: int = 8
     native_depth: int = 8
-    native_proof_workers: int = 0 # CPU workers per frozen-model producer
+    native_proof_workers: int = 12 # CPU proof workers per producer pool; about 12 per model, so 3 each at four producers
     native_proof_slice_ms: int = 8
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row

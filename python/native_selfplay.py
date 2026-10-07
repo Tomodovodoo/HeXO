@@ -76,8 +76,7 @@ class NativeGames:
                             workers=max(1,producers//len(self.models)))
         self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
         self.split = min(model_producers,len(self.games))
-        self.proof_options = dict(package=proof_package,workers=proof_workers,
-                                  queue=max(4,proof_workers*2),slice_ms=slice_ms,table_mb=4)
+        self.proof_options = dict(package=proof_package,workers=proof_workers,slice_ms=slice_ms,table_mb=4)
         if dynamic:
             try:
                 if any(not self.fits({m.sha for m in g.trees}) for g in games):
@@ -127,8 +126,7 @@ class NativeGames:
                         self.lookup[producer,owner] = slot,model
                         self.epochs[producer,owner] = 0
                     self.proof_loops.append(pool.enable_proofs(proof_package,workers=proof_workers,
-                                            queue=max(4,proof_workers*2),slice_ms=slice_ms,table_mb=4)
-                                            if proof_workers else None)
+                                            slice_ms=slice_ms,table_mb=4) if proof_workers else None)
             self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size)
             self.service.start(continuous=True)
             for index in range(len(games)):
