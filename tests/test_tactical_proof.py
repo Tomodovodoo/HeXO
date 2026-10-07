@@ -11,6 +11,7 @@ import time
 import unittest
 from proof import VerificationTimeout
 from tactical_proof import IsolatedTactics, NativeTactics, independent_verify, threat_cells
+from tests import QUERY_MS, slow
 
 
 OPEN_THREE = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
@@ -518,13 +519,6 @@ class NativeStrategy(unittest.TestCase):
         with self.assertRaises(ValueError):
             independent_verify(certificate, history, attacker='defender')
 
-    def test_unstoppable_shape_covers_a_complete_quiet_turn(self):
-        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8]]
-        result = self.engine.history(history, attacker='defender', stamps=True, nodes=50000, ms=60000)
-        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
-        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender',
-                                           deadline_seconds=120), 'PROVEN_LOSS')
-
     def test_open_three_wide_builder_full_strategy(self):
         result = self.engine.history(OPEN_THREE, nodes=100000, ms=5000, idtt_nodes=1000)
         self.assertEqual(result['status'], 'PROVEN_WIN', result)
@@ -792,6 +786,24 @@ class NativeStrategy(unittest.TestCase):
         time.sleep(0.05)
 
 
+@slow
+class SlowStrategy(unittest.TestCase):
+    """Proofs that search for a minute."""
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.engine = NativeTactics()
+        except FileNotFoundError:
+            raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
+
+    def test_unstoppable_shape_covers_a_complete_quiet_turn(self):
+        history = [[0,0],[0,8],[8,0],[1,0],[0,1],[-8,0],[0,-8],[1,1],[12,-8]]
+        result = self.engine.history(history, attacker='defender', stamps=True, nodes=50000, ms=60000)
+        self.assertEqual(result['status'], 'PROVEN_LOSS', result['reason'])
+        self.assertEqual(independent_verify(result['certificate'], history, attacker='defender',
+                                           deadline_seconds=120), 'PROVEN_LOSS')
+
+
 class NodeBudget(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -932,7 +944,7 @@ class FlippedTurnThreats(unittest.TestCase):
     def test_isolated_worker_carries_budget_fields(self):
         tactics = IsolatedTactics()
         try:
-            result = tactics.history(TWO_TURN, nodes=2000, attacker='opponent')
+            result = tactics.history(TWO_TURN, nodes=2000, ms=QUERY_MS, attacker='opponent')
             self.assertEqual((result['status'], result['proof_turns']), ('PROVEN_WIN', 2))
             self.assertEqual(result['build_hash'], self.engine.metadata['binary_sha256'])
             self.assertLessEqual(result['nodes_used'], 2000)
@@ -984,7 +996,7 @@ class Gate(unittest.TestCase):
     def test_isolated_worker_gates_and_runs_at_its_priority(self):
         tactics = IsolatedTactics(priority='idle')
         try:
-            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, gate=self.GATE)
+            result = tactics.history(FIXTURE['positions']['1790600149713752:2:253'], nodes=135, ms=QUERY_MS, gate=self.GATE)
             self.assertEqual((result['status'], result['budget'], result['gate_score']), ('PROVEN_WIN', 540, 19.5))
         finally:
             tactics.close()

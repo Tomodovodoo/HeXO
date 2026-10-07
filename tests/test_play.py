@@ -21,6 +21,7 @@ from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARI
                   model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review,
                   review_plies, scan, six_backend)
 from process_tree import TreeProcess
+from tests import PATIENCE
 
 STANDARD = PRESETS['bubble']['standard']
 SITE = Path(__file__).parent / 'fixtures' / 'hexo-site'
@@ -52,7 +53,7 @@ for raw in sys.stdin:
 """
 
 
-def wait(condition, timeout=10):
+def wait(condition, timeout=PATIENCE):
     end = time.time() + timeout
     while time.time() < end:
         if condition():
@@ -2502,6 +2503,15 @@ class GameProofs(unittest.TestCase):
         # depends on its search, so the tests hold any route of four or five turns and relate the other positions to it.
         self.start = [tuple(p) for p in LATE_WIN]
         self.session.load(self.start + [(-1, -11)], True)
+        # Every solver answer of the test, for the failure message when a proof is missing.
+        self.answers, history = [], tactical_proof.IsolatedTactics.history
+        def answer(prover, *args, **options):
+            result = history(prover, *args, **options)
+            self.answers.append({k: result.get(k) for k in ('status', 'reason', 'nodes_used', 'elapsed_ms')})
+            return result
+        patcher = unittest.mock.patch.object(tactical_proof.IsolatedTactics, 'history', answer)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def analyse(self, ply, solver_nodes, preset='custom', force=False):
         self.session.configure_analysis('bubble:tiny', preset=preset, auto=False,
@@ -2522,6 +2532,7 @@ class GameProofs(unittest.TestCase):
     def found_win(self):
         """The solver's win for side 0 at ply 80, checked against the position's known length and its own line."""
         found = self.analyse(80, 32768)
+        self.assertIsNotNone(found['proof'], (found, self.answers))
         plies = found['proof']['plies']
         self.assertEqual(found['proof'], self.label(self.start + [(-1, -11)], plies))
         self.assertIn(found['proof']['turns'], (4, 5))
@@ -2537,6 +2548,7 @@ class GameProofs(unittest.TestCase):
         session.analyse(80)
         wait(lambda: not session.state()['jobs'], 60)
         saved = session.lookup(session.history)
+        self.assertIsNotNone(saved['proof'], (saved, self.answers))
         self.assertEqual(saved['proof']['winner'], 0)
         self.assertGreater(len(saved['pv']), 5)
         self.assertEqual(saved['pv'], saved['proofs'][0]['pv'])
