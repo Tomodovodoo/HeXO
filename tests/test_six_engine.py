@@ -10,6 +10,7 @@ import threading
 import time
 
 from hexo import Game
+from tests import PATIENCE
 from six_engine import ProtocolError, SixEngine, serve
 import dense_config
 from dense_eval import MatchGame, make_report, report_path, write_league
@@ -137,8 +138,15 @@ class SixProtocolTests(unittest.TestCase):
                 self.clocks.append(clock)
                 return dict(moves=legal_turn([c[:2] for c in game.cells]))
         player, out = Player(), io.StringIO()
-        serve(player, io.StringIO('position radius 8 moves 0 0\n'
-              'go xtime 60000 otime 50000 xinc 1000 oinc 500\nquit\n'), out)
+        def commands():
+            yield 'position radius 8 moves 0 0\n'
+            yield 'go xtime 60000 otime 50000 xinc 1000 oinc 500\n'
+            # The search runs beside the command loop; quit only once it has answered.
+            end = time.monotonic()+PATIENCE
+            while 'bestmove' not in out.getvalue() and time.monotonic() < end:
+                time.sleep(.01)
+            yield 'quit\n'
+        serve(player, commands(), out)
         self.assertEqual(player.clocks, [dict(cross_ms=60000, circle_ms=50000, increment_ms=500)])
         self.assertIn('bestmove', out.getvalue())
 

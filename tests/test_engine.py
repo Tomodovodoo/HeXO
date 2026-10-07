@@ -34,7 +34,7 @@ class NativeRules(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import Mock, patch
         from hexo import library
-        from tests.benchmark import native_comparison
+        from tests.benchmark import drip_comparison
 
         history = [(0,0),(1,0),(0,-8),(-1,0),(-2,0),(-2,-8),(-4,-8),
                    (-3,0),(-4,0),(-6,-8),(-8,-8)]
@@ -45,11 +45,11 @@ class NativeRules(unittest.TestCase):
             submitted = [(-5,0) if wins_first else (-2,1), (56,0)]
             engine = Mock(path=Path(library))
             engine.search.side_effect = [dict(moves=submitted.copy()) for _ in range(2)]
-            with patch("tests.benchmark.NativeLibrary", return_value=engine), \
+            with patch("tests.benchmark.DripLibrary", return_value=engine), \
                  patch("tests.benchmark.SealLibrary", return_value=engine), \
                  patch("play.book_openings", return_value={"nodes": [{"moves": history}]}), \
                  contextlib.redirect_stdout(io.StringIO()):
-                report = native_comparison(args)
+                report = drip_comparison(args)
             self.assertEqual(report["summary"]["invalid_pairs"], 0 if wins_first else 1)
             if wins_first:
                 self.assertEqual((report["summary"]["wins"], report["summary"]["losses"]), (1, 1))
@@ -273,7 +273,7 @@ class NativeRules(unittest.TestCase):
                 self.assertTrue(game.winner >= 0 or game.player != side)
                 self.assert_state(game, reference)
 
-    def test_native_full_turn_win_and_two_cell_defense(self):
+    def test_drip_full_turn_win_and_two_cell_defense(self):
         for theirs in ([(0, 2), (2, 2), (3, 2), (5, 2)],
                        [(0, 3), (2, 3), (4, 3), (6, 3)]):
             history = interleave([[(q, 0) for q in range(5)], theirs])

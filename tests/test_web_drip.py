@@ -1,4 +1,4 @@
-"""Native as WebAssembly (web/engine/native) plays the turns of the native library that python/play.py serves."""
+"""Drip as WebAssembly (web/engine/native) plays the turns of the native library that python/play.py serves."""
 import json
 from pathlib import Path
 import shutil
@@ -15,7 +15,7 @@ UNREACHED_MS = 600_000
 
 
 def wasm_turns(cases):
-    done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'native.mjs')], input=json.dumps(cases), capture_output=True,
+    done = subprocess.run([NODE, str(ROOT/'tests'/'web'/'drip.mjs')], input=json.dumps(cases), capture_output=True,
                           text=True, encoding='utf-8')
     if done.returncode:
         raise RuntimeError(done.stderr)
@@ -35,7 +35,7 @@ def positions():
 
 
 @unittest.skipUnless(NODE and WASM.exists(), 'needs node and a built web/engine (python tools/build_web.py wasm)')
-class WebNativeParity(unittest.TestCase):
+class WebDripParity(unittest.TestCase):
     def test_turns_match_the_library_at_a_fixed_depth(self):
         """Depth-bounded searches with a deadline neither side reaches choose the same turn with the same score and
         completed depth. Each side searches the positions in order in one process, as the server's search child does,

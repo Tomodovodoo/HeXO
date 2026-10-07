@@ -1383,12 +1383,12 @@ class SharedGraph(unittest.TestCase):
         late.abandon()   # out of time before the check's search
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
-class NativeScheduler(unittest.TestCase):
+class HybridScheduler(unittest.TestCase):
     def test_launcher_feeds_arriving_rows_during_gpu_wait_and_before_return(self):
         import sys
         from types import SimpleNamespace
         from unittest.mock import patch
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         service = InferenceService.__new__(InferenceService)
         service.pending = []
         service.flight_limit = 2
@@ -1418,7 +1418,7 @@ class NativeScheduler(unittest.TestCase):
         import sys
         from types import SimpleNamespace
         from unittest.mock import patch
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         for limit in (1,2,4):
             with self.subTest(limit=limit):
                 service = InferenceService.__new__(InferenceService)
@@ -1443,7 +1443,7 @@ class NativeScheduler(unittest.TestCase):
         import sys
         from types import SimpleNamespace
         from unittest.mock import patch
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         service = InferenceService.__new__(InferenceService)
         service.pending = []
         service.flight_limit = 2
@@ -1558,7 +1558,7 @@ class NativeScheduler(unittest.TestCase):
         # snapshot slot. Observation must not wait for that inference reply.
         import time
         from types import SimpleNamespace
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         pool = self.pool([self.graph(history),self.graph(history+[(1,0),(2,0)])],
                          quantum=4,views=1,work=4096,cache=1024)
         for cells in [history]+[[*history,tuple(map(int,a))] for a in root['actions']]:
@@ -1602,7 +1602,7 @@ class NativeScheduler(unittest.TestCase):
         import time
         from types import SimpleNamespace
         from neural_search import checked, ptr
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
         graph = self.graph(history)
         checked(native.hxg_tactics(graph.ptr, True))
@@ -1640,7 +1640,7 @@ class NativeScheduler(unittest.TestCase):
         import time
         from types import SimpleNamespace
         from neural_search import checked, ptr
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]
         graph = self.graph(history)
         checked(native.hxg_tactics(graph.ptr, True))
@@ -1761,7 +1761,7 @@ class NativeScheduler(unittest.TestCase):
 
         # A writer-owned observation leaves final completion admission intact.
         from types import SimpleNamespace
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         pool = self.pool([self.graph([(0,0)])], quantum=4, views=1, work=4096, cache=0)
         service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')],
                                    batch_size=1, quantum=4, pending=1, progress=True, profile=True)
@@ -1928,7 +1928,7 @@ class NativeScheduler(unittest.TestCase):
         return graph
 
     def pool(self, graphs, **options):
-        from native_scheduler import SearchPool
+        from hybrid_scheduler import SearchPool
         pool = SearchPool(graphs, **options)
         # These checks launch no GPU, so every taken row is already fenced.
         self.addCleanup(lambda: pool._ptr and (pool.abandon_fenced(), pool.close()))
@@ -2034,7 +2034,7 @@ class NativeScheduler(unittest.TestCase):
             self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), 16)
 
     def test_source_closure_is_safe_and_external_search_cannot_steal_the_graph(self):
-        from native_scheduler import SearchPool
+        from hybrid_scheduler import SearchPool
         source = self.graph()
         pool = self.pool([source], quantum=16, work=32)
         with self.assertRaisesRegex(ValueError, 'already has a native owner'):
@@ -2105,7 +2105,7 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual(pool.games[0].stats()['completed'], 16)
 
     def test_model_and_illegal_retarget_rejection_do_not_change_existing_search(self):
-        from native_scheduler import SearchPool
+        from hybrid_scheduler import SearchPool
         a, b = self.graph(version='a'), self.graph(version='b')
         with self.assertRaisesRegex(ValueError, 'one fixed model'):
             SearchPool([a, b])
@@ -2293,7 +2293,7 @@ class NativeScheduler(unittest.TestCase):
         self.assertEqual((pool.feed.stats()['pending_rows'], pool.feed.stats()['pending_requests']), (0, 0))
 
     def test_invalid_host_worker_configuration_releases_graph_ownership(self):
-        from native_scheduler import SearchPool
+        from hybrid_scheduler import SearchPool
         graph = self.graph()
         for workers in (0, 17):
             with self.assertRaisesRegex(ValueError, 'host worker count'):
@@ -2418,7 +2418,7 @@ class NativeScheduler(unittest.TestCase):
     def test_replaced_slots_finish_cleanup_and_keep_retirement_bounded(self):
         import time
         from types import SimpleNamespace
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         graphs = [self.graph() for _ in range(8)]
         pool = self.pool(graphs, quantum=8, views=1, work=8, cache=0)
         service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')])
@@ -2461,7 +2461,7 @@ class NativeScheduler(unittest.TestCase):
     def test_cancelling_queued_replacements_drains_cleanup_reservations(self):
         import time
         from types import SimpleNamespace
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         graphs = [self.graph() for _ in range(8)]
         pool = self.pool(graphs, quantum=8, views=1, work=8, cache=0)
         service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')])
@@ -2503,7 +2503,7 @@ class NativeScheduler(unittest.TestCase):
         import time
         from types import SimpleNamespace
         from neural_search import checked
-        from native_scheduler import InferenceService
+        from hybrid_scheduler import InferenceService
         from tactical_proof import library
         if not library().is_file():
             self.skipTest('Build the tactical library first')
@@ -2577,9 +2577,9 @@ class NativeProofs(unittest.TestCase):
         if not library().is_file():
             raise unittest.SkipTest('Build tools/tactical with tools/build_tactical.py first')
 
-    graph = NativeScheduler.graph
-    pool = NativeScheduler.pool
-    answer = NativeScheduler.answer
+    graph = HybridScheduler.graph
+    pool = HybridScheduler.pool
+    answer = HybridScheduler.answer
     opening = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
 
     def loop(self, pool, **options):
@@ -3123,7 +3123,7 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(pending_pool.games[0].stats()['pending'],0)
 
     def shared(self, **options):
-        from native_scheduler import ProofWorkers
+        from hybrid_scheduler import ProofWorkers
         workers = ProofWorkers(**options)
         self.addCleanup(workers.close)  # Registered before any pool, so it closes last.
         return workers
@@ -3414,7 +3414,7 @@ class NativeProofs(unittest.TestCase):
 
     def test_shared_workers_close_after_their_loops_and_split_idle_time(self):
         import time
-        from native_scheduler import ProofWorkers
+        from hybrid_scheduler import ProofWorkers
         workers = ProofWorkers(workers=2, queue=4)
         pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
         with self.assertRaisesRegex(ValueError, 'fix the package'):

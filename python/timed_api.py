@@ -17,7 +17,7 @@ from time_control import milliseconds
 
 
 def create_app(default_config=None, *, run=None, directory=None, engine_factory=TimedEngine):
-    default_config = dict(default_config or dict(kind='native'))
+    default_config = dict(default_config or dict(kind='drip'))
     matches, engines, tasks = {}, {}, set()
     sockets = set()
     shutting_down = asyncio.Event()
@@ -310,9 +310,10 @@ def create_app(default_config=None, *, run=None, directory=None, engine_factory=
                     with suppress(Exception):
                         await pending
             finally:
-                # Server shutdown can cancel this handler while it waits for its last answer; the engine still closes.
+                # Server shutdown can cancel this handler, also while the close waits for a worker thread; the shield
+                # keeps that close from being dropped.
                 if engine:
-                    await asyncio.to_thread(engine.close)
+                    await asyncio.shield(asyncio.to_thread(engine.close))
         return ws
 
     async def create(request):
@@ -458,7 +459,7 @@ def main():
     parser.add_argument('--port', type=int, default=8790)
     parser.add_argument('--out', type=Path, default=Path('artifacts/timed-matches'))
     args = parser.parse_args()
-    config = dict(kind='native')
+    config = dict(kind='drip')
     if args.run or args.model:
         config = dict(kind='bubble', run=str((args.run or Path('.')).resolve()),
                       device=args.device, net_kernels=args.net_kernels)

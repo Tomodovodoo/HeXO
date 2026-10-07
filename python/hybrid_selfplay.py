@@ -1,7 +1,7 @@
-"""Played-root self-play through persistent native graph owners and one GPU queue."""
+"""Hybrid-scheduler self-play: played roots through persistent native graph owners and one GPU queue."""
 from collections import deque
 import numpy as np
-from native_scheduler import SearchPool, InferenceService, ProofWorkers
+from hybrid_scheduler import SearchPool, InferenceService, ProofWorkers
 from dense_selfplay import record_network_values
 from neural_search import checked, native
 
@@ -42,7 +42,7 @@ def label_prefixes(game, prefixes):
             pending.append((ply-1,exact,bound+1 if bound>0 else 0,[game.moves[ply-1]]))
 
 
-class NativeGames:
+class HybridGames:
     """Replenishable fixed-model slots with native graph ownership and proof retirement.
 
     `step` exposes a finished game only after every one of its model owners has
@@ -56,8 +56,8 @@ class NativeGames:
     def __init__(self, games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                  batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0, progress=None,
                  dynamic=False, model_producers=1, proof_budget=1.):
-        if not games or any(not g.native_owner for g in games) or producers<1:
-            raise ValueError('A nonempty cohort of native-owner games is required')
+        if not games or any(not g.hybrid for g in games) or producers<1:
+            raise ValueError('A nonempty cohort of hybrid games is required')
         if not 1<=model_producers<=producers:
             raise ValueError('Producers per model must lie between one and the host allocation')
         self.games = list(games)
@@ -167,7 +167,7 @@ class NativeGames:
         for index,game in enumerate(self.games):
             s = game.settings
             source = model.tree([],game.seed+index,s.tactics,s.search_graph,s.q_range_floor,s.game_graph)
-            if s.native_round_barrier:
+            if s.hybrid_round_barrier:
                 checked(native.hxg_round_barrier(source.ptr, 1))
             placeholders[index] = source
         workers = self.allocate(model.sha).get(model.sha,self.split) if self.service else max(self.split,self.options['workers'])
@@ -317,7 +317,7 @@ class NativeGames:
 
     def replace(self, index, game):
         """Start a fresh game in a fully retired slot, retaining model predictions."""
-        if index not in self.finished or not game.native_owner or (not self.dynamic and set(game.trees)!=self.slot_models[index]):
+        if index not in self.finished or not game.hybrid or (not self.dynamic and set(game.trees)!=self.slot_models[index]):
             raise ValueError('Replacement needs a retired slot and its frozen model set')
         if any(tree.ptr for tree in self.games[index].trees.values()):
             raise ValueError('Publish and close the retired game before replacing its slot')
@@ -495,14 +495,14 @@ class ActorEngine:
 
     def step(self):
         if self.paused:
-            raise ValueError('Resume the native actor before stepping')
+            raise ValueError('Resume the hybrid actor before stepping')
         if self.engine is None:
             s = self.settings
-            self.engine = NativeGames(self.slots,dynamic=True,producers=s.native_producers,
-                quantum=s.native_quantum,views=s.native_views,depth=s.native_depth,
-                cache=s.cache_positions,batch_size=s.leaf_batch,proof_workers=s.native_proof_workers,
-                slice_ms=s.native_proof_slice_ms,progress=self.progress,model_producers=s.native_model_producers,
-                proof_budget=s.native_proof_budget)
+            self.engine = HybridGames(self.slots,dynamic=True,producers=s.hybrid_producers,
+                quantum=s.hybrid_quantum,views=s.hybrid_views,depth=s.hybrid_depth,
+                cache=s.cache_positions,batch_size=s.leaf_batch,proof_workers=s.hybrid_proof_workers,
+                slice_ms=s.hybrid_proof_slice_ms,progress=self.progress,model_producers=s.hybrid_model_producers,
+                proof_budget=s.hybrid_proof_budget)
         finished = self.engine.step()
         self.account()
         for index,game in finished:
@@ -561,11 +561,11 @@ class ActorEngine:
 def play_stream(games, next_game=None, **options):
     """Complete games and refill retired slots via `next_game(slot, finished_game)`.
 
-    Returning None leaves a slot retired. The factory returns fresh native-owner
-    SelfPlayGames with that slot's frozen model set. NativeGames exposes the same
+    Returning None leaves a slot retired. The factory returns fresh hybrid
+    SelfPlayGames with that slot's frozen model set. HybridGames exposes the same
     lifecycle incrementally for a daemon that publishes bounded shards.
     """
-    engine = NativeGames(games,**options)
+    engine = HybridGames(games,**options)
     finished = []
     try:
         while not engine.done:
@@ -589,5 +589,5 @@ def play_stream(games, next_game=None, **options):
 
 
 def play_cohort(games, **options):
-    """Complete a fixed cohort through the same replenishable native lifecycle."""
+    """Complete a fixed cohort through the same replenishable hybrid lifecycle."""
     return play_stream(games,**options)

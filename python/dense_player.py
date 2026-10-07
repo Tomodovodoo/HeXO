@@ -10,10 +10,10 @@ class DensePlayer:
     """Play exported dense checkpoints; analysis searches a copy of the browser game."""
     mode = 'dense'
 
-    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused', native_scheduler=False):
-        if type(native_scheduler) is not bool:
-            raise ValueError('native_scheduler must be on or off')
-        self.native_scheduler = native_scheduler
+    def __init__(self, run, device, tactical_package=None, model=None, net_kernels='fused', hybrid_scheduler=False):
+        if type(hybrid_scheduler) is not bool:
+            raise ValueError('hybrid_scheduler must be on or off')
+        self.hybrid_scheduler = hybrid_scheduler
         self.solver_nodes_explicit = self.simulations_explicit = False
         self.run, self.device = run, device
         self.model_path = Path(model).resolve() if model else None
@@ -74,9 +74,9 @@ class DensePlayer:
             self.checkpoint = None
         model = hexnet.load_model(path, net_kernels=self.net_kernels)
         self.evaluator = hexnet.DenseEvaluator(model, self.device, digest(path),
-            max_batch=128 if self.native_scheduler else 16,
-            cuda_graphs=self.native_scheduler and self.net_kernels == 'fused')
-        if self.native_scheduler:
+            max_batch=128 if self.hybrid_scheduler else 16,
+            cuda_graphs=self.hybrid_scheduler and self.net_kernels == 'fused')
+        if self.hybrid_scheduler:
             self.evaluator.free = []  # Packed forwards own staging until their completion fence.
             if self.evaluator.graph is not None:
                 self.evaluator.graph.max_batch = 128
@@ -98,11 +98,11 @@ class DensePlayer:
 
     def set_history(self, history=()):
         from neural_search import EvaluationCache
-        if getattr(self, '_timed_native', None):
-            graph, pool, _ = self._timed_native
+        if getattr(self, '_timed_hybrid', None):
+            graph, pool, _ = self._timed_hybrid
             pool.close()
             graph.close()
-            self._timed_native = None
+            self._timed_hybrid = None
         if getattr(self, '_timed_tree', None):
             self._timed_tree.close()
             self._timed_tree = None
@@ -147,7 +147,7 @@ class DensePlayer:
             from timed_engine import dense_turn
             from time_control import allowance
             limits = allowance(movetime=milliseconds)
-            if self.native_scheduler and self.simulations_explicit:
+            if self.hybrid_scheduler and self.simulations_explicit:
                 limits['simulations'] = self.options['simulations']
             return dense_turn(self, [cell[:2] for cell in game.cells], limits, Event(), analyze=analyze)
         import numpy as np

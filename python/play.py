@@ -37,14 +37,15 @@ from hexo import Game
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
 from time_control import Clock, TimeControl, duration, milliseconds
+from timed_engine import saved_ids
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESETS = dict(
     bubble=dict(lightning=dict(simulations=8, solver_nodes=2048), quick=dict(simulations=32, solver_nodes=2048),
                 standard=dict(simulations=128, solver_nodes=32768), strong=dict(simulations=512, solver_nodes=131072),
                 deep=dict(simulations=2048, solver_nodes=524288), dangerous=dict(simulations=65536, solver_nodes=4_000_000)),
-    native=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000),
-                deep=dict(ms=10000), dangerous=dict(ms=60000)),
+    drip=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000),
+              deep=dict(ms=10000), dangerous=dict(ms=60000)),
     seal=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000),
               dangerous=dict(ms=60000)),
     six=dict(lightning=dict(nodes=240), quick=dict(nodes=960), standard=dict(nodes=3840), strong=dict(nodes=15360),
@@ -396,7 +397,7 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
                     add('seal', name, spec.get('presets'), library=(path.parent / spec['library']).resolve())
             except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
                 continue
-    add('native', 'Native')
+    add('drip', 'Drip')
     if seal is not None and Path(seal).exists():
         add('seal', 'Seal', library=Path(seal))
     bases = [f"{e['kind']}:{e['name']}" for e in found]
@@ -506,7 +507,7 @@ class Bubble:
         self.native = None
 
     def scheduler(self):
-        """The same weights for the native scheduler's packed batches (see `prove`), made on first use."""
+        """The same weights for the hybrid scheduler's packed batches (see `prove`), made on first use."""
         import hexnet
         if self.native is None:
             self.native = hexnet.DenseEvaluator(self.evaluator.model, self.evaluator.device, self.sha256, max_batch=128)
@@ -758,7 +759,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
     `native_nodes` and `certificates` of the native frontier."""
     from neural_search import GameGraph
     import tactical_proof
-    from native_scheduler import SearchPool, InferenceService, ProofWorkers
+    from hybrid_scheduler import SearchPool, InferenceService, ProofWorkers
     history = [tuple(map(int, p)) for p in history]
     game = replay(history)
     player, remaining = game.player, game.remaining
@@ -1663,7 +1664,7 @@ class Engines:
     def turn(self, entry, budget, history, stop=lambda: False, checkpoint=None):
         """A turn from a non-Bubble engine, a Six folder's at network `checkpoint`. A Six-protocol engine's search
         is stopped when `stop()` turns true.
-        Native, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
+        Drip, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
         when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
         turn. Both raise Cancelled."""
         self.last_turn = {}
@@ -1788,7 +1789,7 @@ def clock_spec(clock):
 
 def device_of(entry, device):
     """'GPU' or 'CPU': where the server runs `entry`'s network, a Bubble on the player's `device` and Six on the backend
-    its catalogue entry names; engines without a network (Native, Seal) and other bots' drivers run on the CPU."""
+    its catalogue entry names; engines without a network (Drip, Seal) and other bots' drivers run on the CPU."""
     if entry['kind'] == 'bubble':
         return 'GPU' if str(device).startswith('cuda') else 'CPU'
     if entry['kind'] == 'six' and entry.get('badge', 'six') == 'six':
@@ -1797,9 +1798,9 @@ def device_of(entry, device):
 
 
 def keeps_clock(entry):
-    """Whether an engine plays to a clock through `timed_engine`: Bubble, Native, Seal and Six itself. Strix's adapter
+    """Whether an engine plays to a clock through `timed_engine`: Bubble, Drip, Seal and Six itself. Strix's adapter
     and the Six-protocol drivers of other bots (Shrimp) play a fixed budget."""
-    return entry['kind'] in ('bubble', 'native', 'seal') or entry['kind'] == 'six' and entry.get('badge', 'six') == 'six'
+    return entry['kind'] in ('bubble', 'drip', 'seal') or entry['kind'] == 'six' and entry.get('badge', 'six') == 'six'
 
 
 def well_formed(record):
@@ -2135,7 +2136,7 @@ class Session:
         self.retries = {}
         self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
-        opponent = bubble or entries['native:Native']
+        opponent = bubble or entries['drip:Drip']
         self.seats = [dict(engine='human'), self.seat(opponent['id'], None, 'standard')]
         self.analysis = self.seat(bubble['id'], None, 'standard') | dict(auto=True) if bubble else None
         if save_initial:
@@ -2766,7 +2767,7 @@ class Session:
         rows = []
         for ident, directory in list(self.saved_matches.items()):
             try:
-                match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
+                match = saved_ids(json.loads((directory / 'summary.json').read_text(encoding='utf-8')))
             except FileNotFoundError:
                 continue
             # A replay is committed before the summary. Recover only that trailing suffix,
@@ -2797,7 +2798,7 @@ class Session:
         if ident not in self.saved_matches or type(number) is not int or number < 1:
             raise ValueError('No such saved game')
         directory = self.saved_matches[ident]
-        game = json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8'))
+        game = saved_ids(json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8')))
         return directory, game
 
     def open_saved_game(self, ident, number):
@@ -3172,7 +3173,7 @@ class Session:
             directory = Path(self.saved_matches.get(str(directory), directory)).resolve()
             handle = lock_match(directory)
             try:
-                match = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
+                match = saved_ids(json.loads((directory / 'summary.json').read_text(encoding='utf-8')))
                 if match['schema'] != 'bubble-match-v1':
                     raise ValueError('Not a saved player batch')
                 # Completed replay files are the commits; summary/current may lag one file after a crash.
@@ -4131,7 +4132,7 @@ def search_child(kind):
             measurements = {}
             game = replay(request['history'])
             try:
-                if kind == 'native':
+                if kind == 'drip':
                     found = game.search(request['ms'])
                     moves, measurements = found['moves'], dict(nodes=found.get('nodes'))
                 elif kind == 'seal':

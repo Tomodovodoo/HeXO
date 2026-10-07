@@ -1,22 +1,22 @@
-/* "Native (browser)": Native (src/hexo.cpp) as WebAssembly in native-worker.mjs, for the play page's browser engines
- * (seat.mjs). It plays as python/play.py's Native: the same presets in ms, depth 12, width 16. */
+/* "Drip (browser)": Drip (src/hexo.cpp) as WebAssembly in drip-worker.mjs, for the play page's browser engines
+ * (seat.mjs). It plays as python/play.py's Drip: the same presets in ms, depth 12, width 16. */
 import {DEPTH} from './native/search.mjs';
 import {json, workerUrl} from './assets.mjs';
 import {watchdog, workerError} from './stages.mjs';
 
 export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000},
   deep: {ms: 10000}, dangerous: {ms: 60000}};
-const ID = 'browser:native', LABEL = 'Native (browser)', MATE = 10000000;
-const SCALE = 1000;   // score units per factor e of the shown odds; Native's score is a heuristic, not a probability
+const ID = 'browser:drip', LABEL = 'Drip (browser)', MATE = 10000000;
+const SCALE = 1000;   // score units per factor e of the shown odds; Drip's score is a heuristic, not a probability
 const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 
-/** Native's files (assets.mjs records): native.wasm as web/engine/build.json pins it. */
+/** Drip's files (assets.mjs records): native.wasm as web/engine/build.json pins it. */
 export async function files() {
   const {data, local} = await json('build.json');
   return [{path: 'native/native.wasm', sha256: data.artefacts['native/native.wasm'], lines: true, local}];
 }
 
-export class NativeEngine {
+export class DripEngine {
   constructor() {
     this.worker = null;
     this.ready = null;
@@ -28,7 +28,7 @@ export class NativeEngine {
    * stage that stays silent for its stages.mjs LIMITS entry fails the load. */
   load(progress = () => {}) {
     if (this.ready) return this.ready;
-    const worker = this.worker = new Worker(workerUrl('native-worker.mjs'), {type: 'module'});
+    const worker = this.worker = new Worker(workerUrl('drip-worker.mjs'), {type: 'module'});
     const ready = this.ready = new Promise((resolve, reject) => {
       const dog = watchdog(LABEL, reject);
       this.waits.set(0, {resolve: value => { dog.stop(); resolve(value); }, reject: error => { dog.stop(); reject(error); }});
@@ -39,7 +39,7 @@ export class NativeEngine {
         if (data.type === 'error') wait?.reject(workerError(LABEL, data));
         else wait?.resolve(data.result);
       };
-      worker.onerror = event => this.fail(new Error(event.message || 'Native worker failed'));
+      worker.onerror = event => this.fail(new Error(event.message || 'Drip worker failed'));
       worker.postMessage({type: 'load'});
     });
     ready.catch(error => { if (this.ready === ready) this.fail(error); });
@@ -47,7 +47,7 @@ export class NativeEngine {
   }
 
   /**
-   * Native's turn at `history` ([[q, r], ...]) with `budget` {ms, depth?} (a PRESETS entry; depth defaults to the
+   * Drip's turn at `history` ([[q, r], ...]) with `budget` {ms, depth?} (a PRESETS entry; depth defaults to the
    * server's 12): {moves, score, depth, nodes, elapsed_ms}. Under a clock `ms` caps the budget's time. `progress(fraction)`
    * follows the clock. Aborting `signal` ends the worker (a search cannot be interrupted inside it) and rejects with an
    * AbortError; the next call starts a new one.
@@ -90,7 +90,7 @@ export class NativeEngine {
 }
 
 /**
- * The evaluation record of Native's turn `result` at `history` for the analysis panel: its first stone as the only
+ * The evaluation record of Drip's turn `result` at `history` for the analysis panel: its first stone as the only
  * candidate, both stones as the line, and as the value the mover's odds logistic(score / SCALE), 1 or 0 for a proven
  * win or loss.
  */
@@ -102,5 +102,5 @@ export function record(result, history, preset) {
     score: result.score, depth: result.depth, nodes: result.nodes, engine: ID};
 }
 
-export const native = {entry: {id: ID, kind: 'native', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
-  engine: new NativeEngine(), record, build: 'python tools/build_web.py wasm'};
+export const drip = {entry: {id: ID, kind: 'drip', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
+  engine: new DripEngine(), record, build: 'python tools/build_web.py wasm'};

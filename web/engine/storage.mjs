@@ -1,6 +1,29 @@
 /* Games and evaluations belong to this browser. Model downloads use the versioned Cache API in network.mjs. */
 import {compressFile, readGameFile} from './notation.mjs';
 
+const OLDER = 'browser:native', DRIP = 'browser:drip';
+/** `text` with Drip's id in place of the older one at its start (an engine id, or an engine key, evaluation id or version). */
+const currentId = text => text === OLDER || text.startsWith(OLDER + '|') ? DRIP + text.slice(OLDER.length) : text;
+
+/** Hybrid scheduler budget keys and result field under the names older saves store them. */
+const RENAMED = {native_owner: 'hybrid_scheduler', native_capture: 'hybrid_capture', native_proof: 'hybrid_proof',
+  native_scheduler: 'hybrid_scheduler'};
+
+/** `value` read back from this browser's saved sessions, games, matches, evaluations or engine choices, with Drip's ids
+ * and name in place of the ones older saves store for it, and RENAMED keys under their current names. The name and
+ * kind change only in an object that is Drip's: one whose engine or id is the older id, or whose kind is the older kind. */
+export function savedIds(value) {
+  if (Array.isArray(value)) return value.map(savedIds);
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) return value;
+  const found = Object.fromEntries(Object.entries(value).map(([key, v]) =>
+    [RENAMED[key] ?? key, typeof v === 'string' ? currentId(v) : savedIds(v)]));
+  if (value.engine === OLDER || value.id === OLDER || value.kind === 'native') {
+    if (found.kind === 'native') found.kind = 'drip';
+    if (found.name === 'Native (browser)') found.name = 'Drip (browser)';
+  }
+  return found;
+}
+
 export class PlayStorage {
   static async open() {
     if (!globalThis.indexedDB) return new PlayStorage(null);
@@ -60,7 +83,7 @@ export class PlayStorage {
     return out;
   }
   encode(store, row) { return store === 'evaluations' ? this.packRecord(row) : this.records(row, true); }
-  decode(store, row) { return store === 'evaluations' ? this.unpackRecord(row) : this.records(row, false); }
+  async decode(store, row) { return savedIds(await (store === 'evaluations' ? this.unpackRecord(row) : this.records(row, false))); }
   request(store, mode, operation) {
     if (!this.db) return Promise.resolve(operation(null).result);
     return new Promise((resolve, reject) => {
@@ -70,7 +93,12 @@ export class PlayStorage {
     });
   }
   async get(store, id) { return this.decode(store, await this.request(store, 'readonly', s => s ? s.get(id) : {result: this.memory.get(`${store}:${id}`)})); }
-  async all(store) { return Promise.all((await this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)})).map(row => this.decode(store, row))); }
+  /** Every row of `store`, decoded; a row stored under an older id is left out once a row holds its current id. */
+  async all(store) {
+    const rows = await this.request(store, 'readonly', s => s ? s.getAll() : {result: [...this.memory].filter(([k]) => k.startsWith(store + ':')).map(([, v]) => v)});
+    const ids = new Set(rows.map(row => row.id));
+    return Promise.all(rows.filter(row => currentId(row.id) === row.id || !ids.has(currentId(row.id))).map(row => this.decode(store, row)));
+  }
   async put(store, value) {
     value = await this.encode(store, value);
     return this.request(store, 'readwrite', s => { if (s) return s.put(value); this.memory.set(`${store}:${value.id}`, structuredClone(value)); return {result: value.id}; });
@@ -110,6 +138,6 @@ export class PlayStorage {
       }
     }
     for (const name of ['sessions', 'games', 'matches', 'evaluations', 'coverage']) for (const row of data[name])
-      await this.put(name, name === 'sessions' ? {...row, _write_token: crypto.randomUUID()} : row);
+      await this.put(name, savedIds(name === 'sessions' ? {...row, _write_token: crypto.randomUUID()} : row));
   }
 }

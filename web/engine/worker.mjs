@@ -246,12 +246,12 @@ async function turn(request) {
  * position it proves won for the mover without solver or search, gives a position it proves lost for the mover its
  * proof and line, and marks the proven stones of each search root exact before it searches (NeuralSearch.settle); a
  * stone the tree does not take is applied to the search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, nativeOwner = false, nativeCapture = false, nativeProof = false, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
-  if (nativeCapture && !nativeOwner) throw new Error('Native captures require the native graph owner');
-  if (nativeProof && !nativeOwner) throw new Error('Native proof frontier requires the native graph owner');
-  if (nativeOwner && leafBudget) throw new Error('Native owner uses frontier proofs instead of per-leaf queries');
+async function playTurn({id, history, model, simulations, solverNodes, leafNodes: leafBudget = 0, leafQueryMs = 10, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, hybridScheduler = false, hybridCapture = false, hybridProof = false, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
+  if (hybridCapture && !hybridScheduler) throw new Error('Hybrid captures require the hybrid scheduler');
+  if (hybridProof && !hybridScheduler) throw new Error('Hybrid proofs require the hybrid scheduler');
+  if (hybridScheduler && leafBudget) throw new Error('The hybrid scheduler uses frontier proofs instead of per-leaf queries');
   await use(model, new Stages(postMessage, id));
-  const proofPool = nativeProof || proveMs ? await proofWorkers(solverWorkers) : null;
+  const proofPool = hybridProof || proveMs ? await proofWorkers(solverWorkers) : null;
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
   const state = native.game(history), player = state.player;
@@ -260,7 +260,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
   if (given) return {...given, ms: Math.round(performance.now() - start)};
   let moves = [], top = [], value = null, proof = null, pv = [], threat = [], solved = true, completed = 0, solverUsed = 0, tree = null, touched = null;
   let solverStats = null;
-  const scheduler = [], graphOptions = {seed: 1740, tactics: true, qRangeFloor, model: network.version, roundBarrier: nativeOwner};
+  const scheduler = [], graphOptions = {seed: 1740, tactics: true, qRangeFloor, model: network.version, roundBarrier: hybridScheduler};
   if (line != null) tree = games.graph(line, history, graphOptions);
   const merged = new Map((tree?.facts() || []).map(f => [proofKey(f.history), f]));
   for (const fact of table?.facts(history) || []) {
@@ -323,7 +323,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         table.add(history, record);
         ({pv, proof} = record);
       } else if (found.proof) proof = found.proof;
-    } else if (solverNodes && !nativeProof) {
+    } else if (solverNodes && !hybridProof) {
       postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
       if (!timed) {
         const actions = native.legal(history), prediction = await predict(history, actions);
@@ -394,7 +394,7 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         stoneValue = prediction.q[0];
       };
       if (simulations) {
-        tree ??= line == null ? new (nativeOwner ? GameGraph : NeuralSearch)(native, {...graphOptions, history: current})
+        tree ??= line == null ? new (hybridScheduler ? GameGraph : NeuralSearch)(native, {...graphOptions, history: current})
           : games.graph(line, current, graphOptions);
         if (proof && proof.winner !== player) {
           tree.proveLoss(proof.winner, Math.max(1, proof.plies - moves.length));
@@ -406,11 +406,11 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
         if (line != null && edges.size) touched = tree.id;
         check();
         let searchedResult;
-        if (nativeOwner) {
+        if (hybridScheduler) {
           const owner = new NativeOwner(tree, {work: timed ? 0 : simulations, ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
           try {
-            searchedResult = await owner.search({network, batchSize, choice, capture: nativeCapture,
-              proofs: nativeProof ? {workers: solverWorkers, slice: solverSlice, table: solverTable, stamps: proofStamps,
+            searchedResult = await owner.search({network, batchSize, choice, capture: hybridCapture,
+              proofs: hybridProof ? {workers: solverWorkers, slice: solverSlice, table: solverTable, stamps: proofStamps,
                 cancel: proofPool.cooperative ? worker => proofPool.cancel(worker) : null,
                 query: (worker, request, cancelled) => proofPool.query(worker, request, cancelled)} : null,
               stop: () => cancelled.has(id), onBatch: stats => {
@@ -420,9 +420,9 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
                 ...(stone ? {} : {live: rootRows(owner.root, choice)})});
             }});
             scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference,
-              ...(nativeCapture ? {capture_pool: searchedResult.capture_pool} : {}),
-              ...(nativeProof ? {proof: searchedResult.proof_scheduler} : {})});
-            if (nativeProof) {
+              ...(hybridCapture ? {capture_pool: searchedResult.capture_pool} : {}),
+              ...(hybridProof ? {proof: searchedResult.proof_scheduler} : {})});
+            if (hybridProof) {
               solverUsed += searchedResult.proof_scheduler.fresh_nodes;
               failure ||= searchedResult.solver_error;
               frontierProofs(searchedResult.proof_records, table, leafProofs);
@@ -476,10 +476,10 @@ async function playTurn({id, history, model, simulations, solverNodes, leafNodes
     const knownTurn = answered(native, history, table);
     if (knownTurn && (!proof || knownTurn.proof.plies <= proof.plies)) ({moves, value, top, proof, pv} = knownTurn);
     else if (proof) pv = table.line(history, {winner: proof.winner, plies: proof.plies, pv});
-    if (nativeProof) solved = proof !== null;
+    if (hybridProof) solved = proof !== null;
     return proven(table, history, {moves, value: Math.round(value * 1e4) / 1e4, node_value: nodeValue, top, proof, pv, threat, solved, ms: Math.round(performance.now() - start),
       actual_completed: completed, actual_solver_nodes: solverUsed, graph_id: touched,
-      ...(nativeOwner ? {native_scheduler: scheduler} : {}),
+      ...(hybridScheduler ? {hybrid_scheduler: scheduler} : {}),
       ...(leafProofs.size ? {proofs: [...leafProofs.values()]} : {}),
       ...(solverStats ? {solver: {...solverStats, proof}} : {}),
       ...(failure ? {solver_error: failure} : {})}, state.remaining);

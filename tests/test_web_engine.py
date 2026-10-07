@@ -126,8 +126,8 @@ class PlayPage(unittest.TestCase):
         return [body['enabled'] for path, body in answer['requests'] if path == '/book']
 
     def test_engines_turn_the_book_on(self):
-        answer = self.follow([['/seat', dict(side=0, engine='native')]], enabled=False)
-        self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='native')],
+        answer = self.follow([['/seat', dict(side=0, engine='drip')]], enabled=False)
+        self.assertEqual(answer['requests'], [['/pause', dict(paused=True)], ['/seat', dict(side=0, engine='drip')],
                                               ['/book', dict(enabled=True)]])
         self.assertTrue(answer['enabled'])
         self.assertFalse(answer['paused'])
@@ -140,7 +140,7 @@ class PlayPage(unittest.TestCase):
     def test_mixed_seats_take_the_server_default(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='six')]])
         self.assertEqual(self.books(answer), [False, True])
-        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='native')]])), [])
+        self.assertEqual(self.books(self.follow([['/seat', dict(side=1, engine='drip')]])), [])
 
     def test_a_browser_seat_counts_as_an_engine(self):
         answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=1, engine='browser:bubble')],
@@ -149,12 +149,12 @@ class PlayPage(unittest.TestCase):
         self.assertTrue(answer['enabled'])
 
     def test_quick_seat_changes_end_on_the_last_seats(self):
-        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='native')]], together=True)
+        answer = self.follow([['/seat', dict(side=1, engine='human')], ['/seat', dict(side=0, engine='drip')]], together=True)
         self.assertEqual(self.books(answer), [False, True])
         self.assertTrue(answer['enabled'])
 
     def test_a_touched_switch_stays(self):
-        answer = self.follow([['/book', dict(enabled=False)], ['/seat', dict(side=0, engine='native')],
+        answer = self.follow([['/book', dict(enabled=False)], ['/seat', dict(side=0, engine='drip')],
                               ['/book', dict(enabled=True, mode='wide')], ['/seat', dict(side=0, engine='human')],
                               ['/seat', dict(side=1, engine='human')]])
         self.assertEqual(self.books(answer), [False, True])
@@ -290,6 +290,36 @@ console.log(JSON.stringify({bytes:json.length,compressed:file.size,history,equal
         self.assertEqual(result['history'], [[0,0]])
         self.assertTrue(result['equal'] and result['fileEqual'] and result['backupEqual'])
         self.assertEqual((result['oldPreserved'], result['restored']), (40000, 40000))
+
+    def test_saves_under_older_engine_ids_read_back_as_drip(self):
+        source = """import {PlayStorage} from './web/engine/storage.mjs';
+const storage=new PlayStorage(null),key='browser:native|null|abc|';
+await storage.put('sessions',{id:'live',seats:[{engine:'browser:bubble',preset:'custom',budget:{simulations:64,native_owner:true,native_proof:true,native_capture:false}},{engine:'browser:native',preset:'quick'}],
+ match:{players:[{engine:'browser:native',name:'Native (browser)',version:key},{engine:'browser:six',name:'Six (browser)'}]}});
+await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine_key:key,note:'native'});
+await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
+await storage.put('evaluations',{id:'browser:drip|null|abc||{}|0,1',engine:'browser:drip',note:'newer'});
+await storage.put('evaluations',{id:'other',engine:'browser:six',name:'Native (browser)',kind:'six'});
+const target=new PlayStorage(null);
+await target.put('evaluations',{id:'browser:drip|x',engine:'browser:drip',note:'present'});
+await target.restore({format:'hexo-browser-save',version:1,sessions:[],games:[],matches:[],coverage:[],
+ evaluations:[{id:'browser:native|x',engine:'browser:native',note:'backup'}]},{game(){}});
+console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluations:await storage.all('evaluations'),
+ restored:await target.all('evaluations')}));"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+        result = json.loads(done.stdout)
+        self.assertEqual(result['session']['seats'][1], dict(engine='browser:drip', preset='quick'))
+        self.assertEqual(result['session']['seats'][0]['budget'],
+                         dict(simulations=64, hybrid_scheduler=True, hybrid_proof=True, hybrid_capture=False))
+        self.assertEqual(result['session']['match']['players'],
+                         [dict(engine='browser:drip', name='Drip (browser)', version='browser:drip|null|abc|'),
+                          dict(engine='browser:six', name='Six (browser)')])
+        self.assertEqual(sorted(result['evaluations'], key=lambda r: r['id']),
+                         [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip', engine_key='browser:drip|null|abc|',
+                               note='native'), dict(id='browser:drip|null|abc||{}|0,1', engine='browser:drip', note='newer'),
+                          dict(id='other', engine='browser:six', name='Native (browser)', kind='six')])
+        self.assertEqual(result['restored'], [dict(id='browser:drip|x', engine='browser:drip', note='backup')])
 
     def test_matching_replay_precedes_newer_unrelated_records(self):
         source = """import {Proofs} from './web/engine/proof.mjs';
@@ -667,7 +697,7 @@ class Loading(unittest.TestCase):
         self.assertEqual((overlap['result'], len(overlap['starts'])), (['done', 'wasm'], 2))
 
     def test_engines_without_a_chain_still_end_a_silent_stage(self):
-        self.assertEqual(self.out['single'], dict(native='Native (browser): compiling timed out', seal='Seal (browser): compiling timed out',
+        self.assertEqual(self.out['single'], dict(drip='Drip (browser): compiling timed out', seal='Seal (browser): compiling timed out',
                                                   strix='Strix (browser): compiling timed out', reporting='loaded'))
 
     def test_threads_follow_device_memory(self):
@@ -778,12 +808,12 @@ class Bundle(unittest.TestCase):
 
     def test_browser_worker_native_proofs_return_checked_evidence(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
-        answer = node(dict(kind='worker-turn',history=history,simulations=4096,nodes=32768,ms=2000,nativeOwner=True,nativeProof=True,solverSlice=128,proofStamps=False))
+        answer = node(dict(kind='worker-turn',history=history,simulations=4096,nodes=32768,ms=2000,hybridScheduler=True,hybridProof=True,solverSlice=128,proofStamps=False))
         self.assertTrue(answer['proofs'])
         self.assertTrue(answer['proof'])
         self.assertTrue(answer['solved'])
         self.assertGreater(answer['actual_solver_nodes'], 0)
-        self.assertGreater(answer['native_scheduler'][0]['proof']['installed'], 0)
+        self.assertGreater(answer['hybrid_scheduler'][0]['proof']['installed'], 0)
 
     def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
         import re
@@ -881,16 +911,16 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(answer['result']['node_value'], -1.)
 
     def test_native_browser_owner_turn_uses_shared_graph_and_releases_views(self):
-        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0, nativeOwner=True))
+        result = node(dict(kind='worker-turn', history=[[0,0]], simulations=256, nodes=0, hybridScheduler=True))
         self.assertEqual(len(result['moves']), 2)
-        self.assertEqual(len(result['native_scheduler']), 2)
+        self.assertEqual(len(result['hybrid_scheduler']), 2)
         game = play.Game([[0,0]])
         try:
             for move in result['moves']:
                 self.assertTrue(game.legal(*move))
                 game.play(*move)
         finally: game.close()
-        for stats in result['native_scheduler']:
+        for stats in result['hybrid_scheduler']:
             self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
 
     def test_native_browser_owner_stops_split_forwards_at_cancellation_or_proof(self):
@@ -939,12 +969,12 @@ class Bundle(unittest.TestCase):
         result = answer['result']
         self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])
 
-    def test_browser_adapter_keeps_native_owner_opt_in(self):
+    def test_browser_adapter_keeps_the_hybrid_scheduler_opt_in(self):
         ordinary, compiled = node(dict(kind='owner-adapter'))
-        self.assertFalse(ordinary['nativeOwner'])
-        self.assertTrue(compiled['nativeOwner'])
-        self.assertFalse(ordinary['nativeCapture'])
-        self.assertTrue(compiled['nativeCapture'])
+        self.assertFalse(ordinary['hybridScheduler'])
+        self.assertTrue(compiled['hybridScheduler'])
+        self.assertFalse(ordinary['hybridCapture'])
+        self.assertTrue(compiled['hybridCapture'])
 
     def test_worker_does_not_admit_models_while_cached_session_cleanup_fails(self):
         answer = node(dict(kind='worker-model-cache'))

@@ -45,7 +45,7 @@ python python/bubble.py match "dense-v1@150000{simulations=512,solver_nodes=1310
 
 `@lightning`, `@quick`, `@standard`, `@strong`, `@deep` and `@dangerous` use the UI's presets; `--preset` supplies the default for both seats.
 Custom keys are the engine's own: Bubble has `simulations` and `solver_nodes`, Six has `nodes` (positions),
-Strix/Pulsatrix has `simulations`, and Native/Seal has `ms`. Unknown keys are rejected. `--a-device` and
+Strix/Pulsatrix has `simulations`, and Drip/Seal has `ms`. Unknown keys are rejected. `--a-device` and
 `--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
 
 The clock belongs to the match and applies to both seats:
@@ -58,7 +58,7 @@ The clock belongs to the match and applies to both seats:
 
 Engines warm before clocks start. Under a clock, search budgets are ceilings: Bubble caps simulations
 across the whole turn and keeps solver work inside the allowance; Six receives nodes plus movetime or
-both clocks and increments; Native and Seal receive the smaller of their ms ceiling and the allocated time.
+both clocks and increments; Drip and Seal receive the smaller of their ms ceiling and the allocated time.
 Strix/Pulsatrix and Six-protocol drivers of other bots (Shrimp) are refused under a clock: their adapters play a
 fixed budget and cannot return an interrupted search's best move. Fixed-budget games remain supported. Timing uses the clock/controller from the existing
 timed engine; CPU/GPU and backend identities are saved, since they affect clocked strength.
@@ -97,7 +97,7 @@ An engine seat's strength panel holds the same four clock choices under its slid
 Fischer, with the base time and the increment in seconds. The clock belongs to the game and covers both sides,
 people included; each seat head shows its remaining time and the side to move counts down. Choosing a clock
 starts both balances full at the shown position; New, Undo, Retry and Import start them again. Engine seats play
-through the timed engines above, which warm before their clock runs, so Bubble, Native, Seal and Six spend the turn's
+through the timed engines above, which warm before their clock runs, so Bubble, Drip, Seal and Six spend the turn's
 allowance with their budget as a ceiling. A seat whose engine cannot keep a clock (Strix, Shrimp) is refused while a
 clock is on, and a clock is refused while such an engine plays. A side whose time runs out loses on time, also while a
 person thinks. The saved game records the control (`clock`) and, after each complete turn, the time spent and both
@@ -163,13 +163,13 @@ The API is loopback-only. Each player port holds one visible game; use a separat
 
 ## Engines
 
-Native always plays, and Native (browser) runs the same engine as WebAssembly in the page
+Drip always plays, and Drip (browser) runs the same engine as WebAssembly in the page
 (docs/web-engine.md). The engine picker also lists every engine below; one that is not installed yet has a download
 button. Click it and the server installs the engine into the models folder (`models/` in the checkout, or the folder
 given with `--models`). The row fills as files download, turns while something compiles, and becomes the engine
 once it is registered. A failure shows its error for a few seconds and the button comes back.
 
-The browser engines (Bubble, Native, Six, Strix, Shrimp and Seal, each marked "(browser)") install themselves. When
+The browser engines (Bubble, Drip, Six, Strix, Shrimp and Seal, each marked "(browser)") install themselves. When
 this checkout lacks their build outputs, the picker shows a download button with the size; it fetches the files from
 the public site, checks them against their SHA-256 and keeps them in the browser's cache, so only the first use
 downloads ([Running a local copy](web-engine.md#running-a-local-copy)). An engine the public site does not serve
@@ -214,7 +214,7 @@ server, so the page names the sides people play (`people`) when it asks for a ne
 Until the switch or its set is changed in this browser session, each seat change sets the book from who plays
 the seats: off when both are Human, on otherwise (a seat a browser engine plays is an engine).
 
-| Preset | Bubble simulations per stone | Bubble solver nodes | Native and Seal ms | Six positions | Strix simulations |
+| Preset | Bubble simulations per stone | Bubble solver nodes | Drip and Seal ms | Six positions | Strix simulations |
 |---|---|---|---|---|---|
 | Lightning | 8 | 2,048 | 100 | 240 | 2 |
 | Quick | 32 | 2,048 | 250 | 960 | 8 |
@@ -230,7 +230,7 @@ On a Ryzen 9 5900X with two threads, Bubble takes about 2, 3, 13 and 75 seconds 
 Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
 the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
 (simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
-Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Native and Seal. Any larger whole number up to
+Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Drip and Seal. Any larger whole number up to
 2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes longer.
 A Bubble seat, served or in the browser, keeps one search graph for its game (a `GameGraph`, see
 [neural-search.md](neural-search.md)), adding each turn's simulations to the visits already under the position until
@@ -358,7 +358,7 @@ Changing the analysis engine, checkpoint or strength evaluates the shown positio
 The Solver switch beside Auto analysis sets the analysis to the solver preset, for puzzles and positions where a
 forced win is the answer you want. Each analysis then spends up to two minutes on proof work alone and stops as soon
 as a verified proof for either side arrives. Two provers run side by side: the tactical solver asks the root for a
-win of the side to move with 32,768 nodes and four times as many each round, and a native scheduler search of the
+win of the side to move with 32,768 nodes and four times as many each round, and a hybrid scheduler search of the
 position feeds the proof workers (up to 12, four fewer than the machine's threads) the positions its neural search
 reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar: time, root nodes,
 queued and running proof jobs, busy workers, then the winner and distance, or the nodes and certificates spent
@@ -423,7 +423,7 @@ Shrimp's play deck from its repository, and the official HeXO client for the sto
 | Stones | filled hex | inset hex with glow | filled hex | filled hex | filled hex, landing animation |
 | Engine runs | in the browser | browser worker (WASM, ONNX on WebGPU) or native process | Python server | inside the HTTP request | background worker thread with job ids |
 | Page while thinking | usable | usable, progress in positions per second | usable, stale reads dropped | frozen, every control disabled | usable, progress per job, cancel |
-| Engines per side | Strix versions against a human | Six levels, bot against bot | random, checkpoints, SealBot | human against Bubble or native | Bubble, native, Seal, Six, Strix or Shrimp per side, found in `runs/` and `models/`, bot against bot live |
+| Engines per side | Strix versions against a human | Six levels, bot against bot | random, checkpoints, SealBot | human against Bubble or Drip | Bubble, Drip, Seal, Six, Strix or Shrimp per side, found in `runs/` and `models/`, bot against bot live |
 | Strength | Instant, Quick, Standard, Strong, Deep | levels by positions per turn (6k to 135k) or time | argmax, sample, improved policy | simulations and proof nodes lists | Quick, Standard, Strong, Deep, custom, per side |
 | Analysis | vertical eval bar, top 5 moves with scores, shaded candidates | win-chance bar, best turn as ghost stones | value, entropy, candidate table, heat maps | on click: win chance, top 5, proof, threat | continuous: eval bar, top moves, best turn, proof and threat, saved |
 | Forced wins | check on request, winning line overlay | proven scores, threat outlines | none | solver proof and threat | solver proof and threat, winning line |

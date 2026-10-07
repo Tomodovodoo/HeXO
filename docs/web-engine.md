@@ -75,7 +75,7 @@ Once an engine's probe has finished, the seat and the analysis head tag it with 
 | Bubble (browser) | yes, fp32 or fp16 | WASM, threads when isolated | turn time: solver at most a quarter, first stone 60% of the rest, simulations a ceiling |
 | Six (browser) | yes, fp32 | WASM | Six's movetime, nodes a ceiling |
 | Shrimp (browser) | yes, fp32 | WASM | none, fixed visits |
-| Native (browser) | no | CPU, one thread | ms capped to the turn time |
+| Drip (browser) | no | CPU, one thread | ms capped to the turn time |
 | Seal (browser) | no | CPU, one thread | ms capped to the turn time |
 | Strix (browser) | no | CPU, one thread | none, fixed simulations |
 
@@ -119,7 +119,7 @@ changes engine.
 |---|---|
 | Bubble, Six, Shrimp | WebGPU, then WebAssembly with threads, then WebAssembly on one thread, then an error |
 | Bubble, Six, Shrimp without WebGPU | WebAssembly with threads, then one thread, then an error |
-| Native, Seal, Strix | WebAssembly on one thread; a stage that stalls or fails ends in an error naming it |
+| Drip, Seal, Strix | WebAssembly on one thread; a stage that stalls or fails ends in an error naming it |
 
 A probe whose adapter request fails or times out counts as no WebGPU and shows the same toast ("checking GPU timed
 out, running on CPU"). An engine that falls back from WebGPU to WebAssembly starts at Lightning from then on, and the
@@ -184,8 +184,8 @@ the choice on their script URL.
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
 | `web/engine/seat.mjs` | Play page hook: the browser engines (`ENGINES`) as seats and analysis |
-| `web/engine/native.mjs`, `native-worker.mjs` | Native (browser): page API and worker |
-| `web/engine/native/` | `native.wasm` and its loader, built from `src/hexo.cpp`; `search.mjs` runs a turn |
+| `web/engine/drip.mjs`, `drip-worker.mjs` | Drip (browser): page API and worker |
+| `web/engine/native/` | `native.wasm` and its loader, built from `src/hexo.cpp`; `search.mjs` runs a Drip turn |
 | `web/engine/shrimp.mjs`, `shrimp-worker.mjs` | Shrimp (browser): page API and worker |
 | `web/engine/shrimp/` | `shrimp.wasm` (built from `tools/shrimp_web`), `search.mjs` (the driver's turn), `network.mjs` (the graph's inputs) |
 | `web/engine/seal.mjs`, `seal-worker.mjs` | Seal (browser): page API and worker; `seal/` holds its build |
@@ -254,23 +254,23 @@ a one-operator graph already takes 6 ms, so a batch costs mostly dispatch and ti
 capture saved 15% at batch 16 and is not used. WebAssembly with one thread is what a page without cross-origin
 isolation gets.
 
-## Native (browser)
+## Drip (browser)
 
-Native, the handwritten engine in `src/hexo.cpp`, also runs in the page. Pick **Native (browser)** for a seat or
+Drip, the handwritten engine in `src/hexo.cpp`, also runs in the page. Pick **Drip (browser)** for a seat or
 the analysis. `build_web.py wasm` compiles `hexo.cpp` with the same em++ flags as `gumbel.wasm` into
 `web/engine/native/native.wasm` (204 KB) and its loader `native.mjs` (10 KB). `build.json` records both. A worker
-(`native-worker.mjs`) keeps the module between turns, as the server keeps its search child, so a proven winning plan
+(`drip-worker.mjs`) keeps the module between turns, as the server keeps its search child, so a proven winning plan
 carries over to the next turn. The worker fetches `native.wasm` once and keeps it in the Cache API under the digest
 `build.json` records for it.
 
 A turn is `hx_search` with the server's settings: depth 12, width 16, and the preset's milliseconds (lightning 100,
 quick 250, standard 1,000, strong 3,000, deep 10,000, dangerous 60,000). The C++ clock is `performance.now()` in
 the worker. The search cannot stop part way inside the module, so cancelling a move ends the worker and the next
-turn starts a fresh one. The server kills its search child the same way. As analysis, Native shows its turn as the
+turn starts a fresh one. The server kills its search child the same way. As analysis, Drip shows its turn as the
 top move and the line. It is the analysis engine when the play server has none (no Bubble model). The bar shows the mover's odds as logistic(score / 1000), and 1 or 0 once the search proves a
 win or a loss. The score is a heuristic, not a probability.
 
-Parity (`tests/test_web_native.py`): with the deadline out of reach, the wasm build and the native library pick the
+Parity (`tests/test_web_drip.py`): with the deadline out of reach, the wasm build and the native library pick the
 same turn with the same score and completed depth in 169 depth-bounded searches (depth 2, 3 and 4) of 75 recorded
 positions. Node counts differ in 4 of them, by at most 1.2%. `std::sort` orders equal-scored turns differently in
 libc++ (Emscripten) and libstdc++ (MinGW); with two `std::sort` calls in `turns()` replaced by `std::stable_sort`
@@ -338,7 +338,7 @@ included: it has no licence and no published weights.
 Seal is the alpha-beta bot by Ramora0 ([HexTicTacToe](https://github.com/Ramora0/HexTicTacToe), revision `3474edb`),
 the community's reference bot. **Seal (browser)** in the picker plays a seat or the analysis with the server's
 presets: lightning 100, quick 250, standard 1000, strong 3000, deep 10000 and dangerous 60000 ms per turn, the same
-ladder as Native.
+ladder as Drip.
 
 ```sh
 python tools/build_web.py seal --emxx path/to/em++   # seal/engine.mjs, engine.wasm, manifest.json (ignored)
