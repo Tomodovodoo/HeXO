@@ -2460,6 +2460,7 @@ class TurnTrees(unittest.TestCase):
                     self.assertEqual(game.player, 1)
                 finally:
                     game.close()
+                self.assertEqual([p[:2] for p in found['pv'][:len(found['moves'])]], found['moves'])  # the proven line
                 self.assertEqual(found['actual_solver_nodes'], 1)
             finally:
                 if hasattr(prover, 'close'):
