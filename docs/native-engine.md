@@ -2,12 +2,12 @@
 
 `src/hexo.cpp` is the rules engine every other part uses, exposed to Python through `python/hexo.py` as `Game`. The board is a sparse axial grid with 64-bit coordinates and no edge. Each placement updates the counts of the 18 six-cell windows it touches, which is what the one-turn tactics read: immediate wins, and the covers that block every opponent completion.
 
-`Game.search(ms)` is the handwritten player: iterative deepening over complete turns with principal variation search, a window evaluator and an optional learned pattern table. It is what `python python/play.py` and the bot API serve when no checkpoint is given. Its bounded tactical search proves continuous-threat wins and retains their winning continuations between turns. Ordinary heuristic scores are not certificates.
+`Game.search(ms)` is Drip, the handwritten player: iterative deepening over complete turns with principal variation search, a window evaluator and an optional learned pattern table. It is what `python python/play.py` and the bot API serve when no checkpoint is given. Its bounded tactical search proves continuous-threat wins and retains their winning continuations between turns. Ordinary heuristic scores are not certificates.
 
-Native updates candidate scores only along the lines changed by a placement. It
+Drip updates candidate scores only along the lines changed by a placement. It
 ranks the second stone from an exact evaluation delta, avoiding a full make/unmake
 for every proposed pair. The candidate cache lasts for one search. Ordinary
-Native search uses no transposition table. The experimental Python
+Drip search uses no transposition table. The experimental Python
 `tt_injection=True` option keeps its separate previous-iteration move hints;
 it is off by default and never caches score bounds.
 The existing line-count arithmetic is precomputed into 1 KiB of immutable
@@ -31,7 +31,7 @@ also beats. Iterative deepening stops with a quarter of the allowance left, or
 earlier when the next iteration would likely not finish. Until then, a root that
 beats the earlier scores of an unfinished iteration, and is not a proven loss,
 replaces the choice. The turn
-Native is about to play is then probed if no iteration probed it, and any time
+Drip is about to play is then probed if no iteration probed it, and any time
 left continues the search without replacing the choice from an unfinished
 iteration.
 
@@ -69,22 +69,22 @@ GCC platforms, use the local CMake generator and library filename.
 `HEXO_NATIVE_DIR` then selects this build for the player, API client or benchmark.
 A CPU-tuned library requires a compatible CPU. GCC 15.2 on Windows is built
 with a 128-bit vector preference because unrestricted host tuning produced a
-misaligned stack store during Native's prover in our tests.
+misaligned stack store during Drip's prover in our tests.
 
 On a Ryzen 9 5900X with GCC 15.2, a profile from 58 real game positions made
 16 separate fixed-depth searches **1.33 times as fast**, with identical moves,
-scores, depths and node counts. At 100 ms per turn, the resulting Native scored
+scores, depths and node counts. At 100 ms per turn, the resulting Drip scored
 **86 wins, 41 losses and one capped game against Seal** across 64 new openings
 with swapped colours: 67.6%, paired 95% interval 55.4–77.8%. The ordinary build
 scored 79–49 on the same openings, interleaved with the optimized build. This
-establishes a win over Seal in that test; the smaller difference between Native
+establishes a win over Seal in that test; the smaller difference between Drip
 builds is not conclusive. Workload profiles and CPU load affect the gain.
 
 ## Play on HeXO Arena
 
-Native can play through the [HeXO Bot API](https://github.com/TimmyBurn2/Hexo-Bot-Api).
+Drip can play through the [HeXO Bot API](https://github.com/TimmyBurn2/Hexo-Bot-Api).
 The engine runs on your computer; the site hosts the games and their live boards.
-Build Native as above and install the existing API extra with
+Build the library as above and install the existing API extra with
 `python -m pip install -e ".[api]"`, then run:
 
 ```sh
@@ -95,12 +95,12 @@ Enter the bot token at the hidden prompt, or supply it in `HEXO_TOKEN`.
 The client declares its supported clocks, opens its presence stream, accepts
 challenges and plays games started from its bot page. It uses CPU only, with
 100 ms per complete turn by default, leaving time for transport when the server
-supplies a smaller allowance. `--width` and `--depth` set Native's search limits.
-Each game's worker retains Native's proven continuations. Keep the client running
+supplies a smaller allowance. `--width` and `--depth` set Drip's search limits.
+Each game's worker retains Drip's proven continuations. Keep the client running
 to stay online; Ctrl+C disconnects it. `HEXO_NATIVE_DIR` selects a particular build.
 The client prints game IDs and results; the site keeps the games for viewing.
 
-Native values immediate pressure by the placements needed to block it. Several
+Drip values immediate pressure by the placements needed to block it. Several
 four- or five-stone windows that share a blocking cell count as one obligation;
 otherwise the heuristic counts two. Search checks unavoidable wins separately.
 The score also rewards the mover's three-stone setups, limited by the placements
@@ -109,7 +109,7 @@ attack the mover has no time to develop. These are positional estimates, not
 proofs. The tactical prover and the public `Game.turns` and `Game.evaluation`
 APIs keep their previous feature/table scores.
 
-At the search horizon, if defending consumes both stones, Native scores the best
+At the search horizon, if defending consumes both stones, Drip scores the best
 complete defensive reply before evaluating the position. It updates only the
 affected window scores in temporary scalars. Final-layer move ranking and beta
 cutoffs use these corrected values. This evaluates the defender's
@@ -143,14 +143,14 @@ This compiles `libhexo_seal` next to the engine without vendoring Seal. Then sta
 
 ## Tests
 
-Compare independently built Native versions in one process, with equal time per
+Compare Drip from two independently built libraries in one process, with equal time per
 turn and swapped colours on each opening:
 
 ```sh
 PYTHONPATH=python:. HEXO_NATIVE_DIR=build python -m tests.benchmark \
   --compare-library ../old-native/build/libhexo.so \
   --games 64 --ms 25 --width 16 --seed 810223 \
-  --output artifacts/native-comparison.json
+  --output artifacts/drip-comparison.json
 ```
 
 Use `--seal-library path/to/libhexo_seal.so` instead for Seal. On Windows set

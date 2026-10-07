@@ -26,6 +26,21 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
+SAVED_IDS = dict(kind={'native': 'drip'}, checkpoint={'native': 'drip'}, engine={'native:Native': 'drip:Drip'},
+                 id={'native:Native': 'drip:Drip'}, name={'Native': 'Drip'})
+
+
+def saved_ids(record):
+    """`record`, JSON read back from a saved match, game or timed-match specification, with Drip's engine ids in place
+    of the ids older saved files store for it (SAVED_IDS)."""
+    if isinstance(record, list):
+        return [saved_ids(value) for value in record]
+    if isinstance(record, dict):
+        return {key: SAVED_IDS[key].get(value, value) if key in SAVED_IDS and isinstance(value, str) else saved_ids(value)
+                for key, value in record.items()}
+    return record
+
+
 class HTTTXEngine:
     """An HTTP opponent using the published per-turn allowance, in seconds."""
     def __init__(self, url):
@@ -552,8 +567,8 @@ def _worker(connection, cancellation, config):
             player = HTTTXEngine(config['url'])
             identity = dict(checkpoint='htttx', url=config['url'], capabilities=player.capabilities,
                             clock_allocation='host')
-        elif kind == 'native':
-            identity = dict(checkpoint='native')
+        elif kind == 'drip':
+            identity = dict(checkpoint='drip')
         else:
             raise ValueError(f'Unsupported engine kind {kind}')
         try:

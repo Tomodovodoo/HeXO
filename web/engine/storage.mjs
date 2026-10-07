@@ -1,6 +1,18 @@
 /* Games and evaluations belong to this browser. Model downloads use the versioned Cache API in network.mjs. */
 import {compressFile, readGameFile} from './notation.mjs';
 
+const OLDER = 'browser:native', DRIP = 'browser:drip';
+const savedId = (key, text) => text === OLDER || text.startsWith(OLDER + '|') ? DRIP + text.slice(OLDER.length)
+  : key === 'name' && text === 'Native (browser)' ? 'Drip (browser)' : key === 'kind' && text === 'native' ? 'drip' : text;
+
+/** `value` read back from this browser's saved sessions, games, matches, evaluations or engine choices, with Drip's ids
+ * and name in place of the ones older saves store for it. */
+export function savedIds(value) {
+  if (Array.isArray(value)) return value.map(savedIds);
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, typeof v === 'string' ? savedId(key, v) : savedIds(v)]));
+}
+
 export class PlayStorage {
   static async open() {
     if (!globalThis.indexedDB) return new PlayStorage(null);
@@ -60,7 +72,7 @@ export class PlayStorage {
     return out;
   }
   encode(store, row) { return store === 'evaluations' ? this.packRecord(row) : this.records(row, true); }
-  decode(store, row) { return store === 'evaluations' ? this.unpackRecord(row) : this.records(row, false); }
+  async decode(store, row) { return savedIds(await (store === 'evaluations' ? this.unpackRecord(row) : this.records(row, false))); }
   request(store, mode, operation) {
     if (!this.db) return Promise.resolve(operation(null).result);
     return new Promise((resolve, reject) => {

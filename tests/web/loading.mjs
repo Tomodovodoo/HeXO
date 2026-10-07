@@ -113,11 +113,11 @@ out.calls_overlap = await observe(loader(gpu('use')), {}, async engine => {
   return [await engine.call({type: 'evaluate'}), await use];
 });
 
-// Native, Seal and Strix have no fallback, but a load that goes silent in a stage still ends with an error naming it.
+// Drip, Seal and Strix have no fallback, but a load that goes silent in a stage still ends with an error naming it.
 script = {load(options, post) { const stages = new Stages(post); stages.enter('download'); stages.enter('compile'); }, call() {}};
 const silent = async engine => engine.load().then(() => 'loaded', error => error.message);
 out.single = {
-  native: await silent((await import('../../web/engine/native.mjs')).native.engine),
+  drip: await silent((await import('../../web/engine/drip.mjs')).drip.engine),
   seal: await silent((await import('../../web/engine/seal.mjs')).seal.engine),
   strix: await silent(new (await import('../../web/engine/strix.mjs')).StrixEngine([{id: 'net', path: 'strix/net.safetensors', sha256: 'x', size: 1}])),
 };

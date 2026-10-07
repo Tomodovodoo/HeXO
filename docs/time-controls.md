@@ -11,7 +11,7 @@ python -m pip install -e ".[learning,api]"
 python python/timed_api.py --run runs/dense-v1 --checkpoint champion --device cuda --net-kernels fused --port 8790
 ```
 
-`--model path/to/ema.pt` selects a file. `--device cpu` avoids GPU inference. Without a model or run, the handwritten native engine plays. Engines load and warm before game clocks start. The service binds to localhost. `GET /models` lists the existing play picker selections. Records go to `artifacts/timed-matches`, selectable with `--out`; run data is read only.
+`--model path/to/ema.pt` selects a file. `--device cpu` avoids GPU inference. Without a model or run, Drip, the handwritten engine, plays. Engines load and warm before game clocks start. The service binds to localhost. `GET /models` lists the existing play picker selections. Records go to `artifacts/timed-matches`, selectable with `--out`; run data is read only.
 
 For shared prebuilt libraries, `HEXO_NATIVE_DIR` selects the C++ library directory and `HEXO_TACTICAL_PACKAGE` selects the complete tactical package. The solver still verifies its library and source hashes. An older search ABI cannot validate current search code.
 
@@ -94,7 +94,7 @@ First-stone wins and final half-turns retain the behavior merged in [#228](https
 }
 ```
 
-Players can be `human`, `bubble`, `native`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. `search.max_simulations` optionally caps timed search; otherwise it follows measured throughput. Solver node caps remain inside the clock. With `search.native_scheduler`, `solver.workers` (default 2) sets the proof workers of the turn's native proof frontier and `solver.budget` (default `PROOF_BUDGET` in `timed_engine.py`) the share of the graph owner's time proof steps may take; the same keys work in `timed_match.py --a-settings`. `solver.leaf` shares the solver allowance with leaf proofs and certificate verification.
+Players can be `human`, `bubble`, `drip`, `six` with `command`, or `htttx` with `url`. The HTTP opponent requires a stateless capability and receives a host-allocated limit. Bubble gets full balances. `champion` and `newest` resolve to a model hash before play. `search.max_simulations` optionally caps timed search; otherwise it follows measured throughput. Solver node caps remain inside the clock. With `search.native_scheduler`, `solver.workers` (default 2) sets the proof workers of the turn's native proof frontier and `solver.budget` (default `PROOF_BUDGET` in `timed_engine.py`) the share of the graph owner's time proof steps may take; the same keys work in `timed_match.py --a-settings`. `solver.leaf` shares the solver allowance with leaf proofs and certificate verification.
 
 Creation returns HTTP 202, a `match_id` and `preparing` state. Poll until `ready`, then start. The initial history defaults to the origin. An optional `history` supplies an opening; `turn_cap_ms` adds a maximum time per turn.
 
@@ -118,7 +118,7 @@ Events include `cross_ms`, `circle_ms`, `increment_ms`, `running`, request ident
 
 The play page (docs/play.md) uses these clocks for a single game and for tournaments: Turn is `{"mode": "move"}`,
 Absolute and Fischer are `{"mode": "game"}` without and with an increment. On the static page the browser session
-keeps the same clock and gives Bubble, Native, Seal and Six (browser) the same allowance; Strix and Shrimp play a
+keeps the same clock and gives Bubble, Drip, Seal and Six (browser) the same allowance; Strix and Shrimp play a
 fixed budget and are refused.
 
 ## Timed comparisons and records

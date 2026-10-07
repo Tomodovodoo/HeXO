@@ -42,7 +42,7 @@ cmake --build build --config Release --parallel 2
 python python/bubble.py play
 ```
 
-The last command downloads the newest [released weights](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` on first use and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. Either side can be a person, Bubble, the native engine or Seal, so engines can also play each other. The page shows the win estimate and candidate moves, saves evaluations, grades each turn, and imports and exports HTTTX, Rectilinear notation and links from hexo.did.science, hexo.mineking.dev and hexo.tyto.cc. Six, Strix, Shrimp and Seal appear in the engine picker with a one-click download. Details in [docs/play.md](docs/play.md).
+The last command downloads the newest [released weights](https://github.com/Tomodovodoo/HeXO/releases) (4.4 MB) into `runs/play` on first use and opens the game at <http://127.0.0.1:8765>. Click a cell to place a stone, drag to pan, scroll to zoom. Either side can be a person, Bubble, Drip or Seal, so engines can also play each other. The page shows the win estimate and candidate moves, saves evaluations, grades each turn, and imports and exports HTTTX, Rectilinear notation and links from hexo.did.science, hexo.mineking.dev and hexo.tyto.cc. Six, Strix, Shrimp and Seal appear in the engine picker with a one-click download. Details in [docs/play.md](docs/play.md).
 
 To play a particular checkpoint or a run you trained:
 
@@ -51,7 +51,7 @@ python python/bubble.py play --model path/to/ema.pt
 python python/bubble.py play --run runs/dense-v1
 ```
 
-The engine picker lists every run under `runs/` and every model under `models/`, champion first. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver needs the Rust build described below; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves the handwritten native engine.
+The engine picker lists every run under `runs/` and every model under `models/`, champion first. A GPU is used when PyTorch sees one; add `--device cpu` otherwise. The solver needs the Rust build described below; without it Bubble plays on search alone. Without any weights, `python python/play.py` serves Drip, the handwritten engine.
 
 Other engines go in `models/` (or `--models`), then use the rescan button in the picker: a Six folder with `sixengine.exe` and its `gen-*.onnx` networks, or a JSON entry such as `{"name": "Strix", "kind": "strix", "model": "strix.safetensors"}` next to its model file. [docs/play.md#engines](docs/play.md#engines) lists the files per engine and the entry format for Strix, Shrimp and other Six-protocol engines. Timed games, bot connections and the HTTTX HTTP and WebSocket routes are in [docs/time-controls.md](docs/time-controls.md).
 
@@ -108,7 +108,7 @@ A final turn may hold one stone, whether it won or the turn is still open, and t
 - [Tactical solver and its scheduling](docs/tactical-solver.md)
 - [Six: Bubble as a Six engine, Six as an opponent](docs/six-engine.md)
 - [GPU kernels](docs/gpu-kernels.md)
-- [Native engine, Seal adapter, tests](docs/native-engine.md)
+- [Native engine and Drip, Seal adapter, tests](docs/native-engine.md)
 - [Browser engine: WebGPU, WebAssembly search and solver](docs/web-engine.md)
 - [Timed matches and the API](docs/time-controls.md)
 - [Notation and bot API](docs/notation-api.md)
