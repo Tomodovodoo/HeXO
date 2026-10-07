@@ -6,13 +6,13 @@ import {readGame, exportGame, htttx} from './notation.mjs';
 import {clockSpec, turnTime} from './clock.mjs';
 import {Proofs, proven, proofKey} from './proof.mjs';
 import {stageText} from './stages.mjs';
-import {PV_CHECK} from './search.mjs';
 
 /** The analysis solver preset (python/play.py SOLVER): proof work alone for up to `solver_ms`, then the turn. */
 export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000};
 
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
+const REFRESH_SHARE = .25;  // the share of a saved evaluation's simulations that a refresh searches again
 /** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
 const moved = (found, before) => JSON.stringify((found.moves || []).map(p => p.join(',')).sort()) !== JSON.stringify((before.moves || []).map(p => p.join(',')).sort()) || Math.abs(found.value - before.value) > REFRESH_MOVE;
 
@@ -24,7 +24,7 @@ const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human
 const MAX_TIMER = 2 ** 31 - 1;
 /** The engines take budgets as 32-bit signed integers. */
 const MAX_BUDGET = 2 ** 31 - 1;
-const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions', leaf_nodes: 'Leaf solver', leaf_ms: 'Leaf query ms'};
+const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
@@ -132,10 +132,7 @@ export class BrowserSession extends OfflineSession {
       : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
-      const least = {ms: 10, nodes: 1, visits: 1, leaf_ms: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
-      if (name === 'leaf_nodes' || name === 'leaf_ms') {
-        if (entry.kind !== 'bubble' || typeof value !== 'number') throw Error(`${name} is a numeric Bubble budget`);
-      }
+      const least = {ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
       if (typeof value === 'number' && (!Number.isInteger(value) || value < least || value > MAX_BUDGET)) throw Error(`${FIELD_NAMES[name] || name} must be a whole number from ${least} to ${MAX_BUDGET}`);
     }
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
@@ -460,7 +457,7 @@ export class BrowserSession extends OfflineSession {
   }
   /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation by `spec`'s
    * engine (the deepest, a tier included) is stale and holds no proof, nearest first, at that evaluation's budget: the search on the game graph `line` moved the values those positions reach
-   * (python/play.py Session.refresh). A refresh searches that graph again with the PV_CHECK share of the simulations
+   * (python/play.py Session.refresh). A refresh searches that graph again with the REFRESH_SHARE of the simulations
    * and no solver query, keeps the saved threat and replaces the saved evaluation. */
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
@@ -593,7 +590,7 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(PV_CHECK * job.spec.budget.simulations)), solver_nodes: 0, leaf_nodes: 0, solver_ms: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,

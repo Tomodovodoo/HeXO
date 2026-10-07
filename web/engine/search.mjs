@@ -1,9 +1,8 @@
-/* Native Gumbel search (gumbel.wasm, the hxg_* ABI of src/gumbel.cpp) driven like python/neural_search.py. */
+/* Native Gumbel search (gumbel.wasm): trees and game graphs (the hxg_* ABI of src/gumbel.cpp), and the native graph
+ * owner (src/gumbel_owner.cpp, the hybrid scheduler) that schedules their searches and proof frontier. */
 import {nextTask} from './tasks.mjs';
 
 export const GRAPH_LIMIT = 4096;  // expanded nodes a GameGraph keeps between searches (neural_search.GRAPH_LIMIT)
-export const PV_DROP = .05;       // completed-Q fall that sends a checked search back (neural_search.PV_DROP)
-export const PV_CHECK = .25;      // principal-variation check share of play and analysis searches (play.PV_CHECK)
 
 export class Native {
   /** Wraps an instantiated gumbel.mjs module. */
@@ -88,8 +87,7 @@ export class EvaluationCache {
 }
 
 /**
- * One persistent search tree. `evaluate(requests)` takes [{history, actions}] (actions in native legal order) and
- * resolves to [{logits, q}] per request (array-likes of the action count; q is V(s) broadcast). `qRangeFloor` is
+ * One persistent search tree, read and settled from JavaScript and searched by a NativeOwner. `qRangeFloor` is
  * the least Q range of the completed-Q rescale (0 keeps mctx's) and `rootNoise` the uniform share of the root's
  * candidate sampling (0 samples by the prior), as python/neural_search.py's q_range_floor and root_noise. `limit`,
  * when given, makes the tree a shared game graph keeping at most that many expanded nodes (see GameGraph).
@@ -150,22 +148,11 @@ export class NeuralSearch {
       this.m._free(a); this.m._free(l); this.m._free(q);
     }
   }
-  /** Installs a native-verified mover certificate at its pending leaf before exact backup. */
-  fulfillProof(id, leaf, proof) {
-    if (proof.attacker !== 'mover') throw new Error('A leaf proof must belong to the side to move');
-    const state = this.n.game(leaf.history), history = this.n.cells(leaf.history), moves = this.n.cells(proof.moves);
-    try {
-      this.n.checked(this.m._hxg_prove(this.ptr, id, history, leaf.history.length, state.player, state.remaining,
-        moves, proof.moves.length, proof.proof_turns));
-    } finally {
-      this.m._free(history); this.m._free(moves);
-    }
-  }
   /**
    * Settles the root's stones `edges` (proof.mjs Proofs.edges) before a search, as python/play.py TurnSearch.request:
-   * evaluates the root through `cache` (else `evaluate`, as in search) when it has no edges yet, then marks each edge
-   * exact for its winner within its distance, the stone itself included (hxg_mark_exact): the mover's losses first,
-   * then its wins from the shortest. Later marks can tighten an already proven root and its stored parents.
+   * evaluates the root through `cache` (else `evaluate([{history, actions}])`, resolving to [{logits, q}]) when it has no
+   * edges yet, then marks each edge exact for its winner within its distance, the stone itself included
+   * (hxg_mark_exact): the mover's losses first, then its wins from the shortest. Later marks can tighten an already proven root and its stored parents.
    * Resolves to the edges the tree did not take, keyed as `edges`: those that are not root edges.
    */
   async settle(edges, {evaluate, cache = new EvaluationCache(), version = 'web'}) {
@@ -195,93 +182,6 @@ export class NeuralSearch {
       if (this.m._hxg_mark_exact(this.ptr, BigInt(q), BigInt(r), winner, distance)) unmarked.delete(key);
     }
     return unmarked;
-  }
-  /**
-   * Runs one search like SearchCoordinator.search_many for a single tree; `stop()` true cancels it (the result is
-   * then the partial search). `prove(history)`, when supplied, returns a native-verified mover certificate or
-   * UNKNOWN before cache lookup and neural evaluation. Resolves to the result fields of NeuralSearch.result.
-   */
-  async search({simulations = 128, rootSamples = null, batchSize = 16, evaluate, cache = new EvaluationCache(), version = 'web',
-    stop = () => false, onBatch = () => {}, choice = 'policy', prove = null} = {}) {
-    if (this.nativeOwner) throw new Error('Graph already has a native owner');
-    if (batchSize < 1 || simulations < 1) throw new Error('Positive search budgets required');
-    if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
-    const start = performance.now(), stats = {evaluated: 0, hits: 0, batches: 0, largest: 0, network_ms: 0};
-    const sample = rootSamples ?? Math.max(2, Math.floor(Math.sqrt(simulations)));
-    this.n.checked(this.m._hxg_begin(this.ptr, simulations, sample));
-    let active = this.n.game(this.history).winner < 0, stopped = false, yielded = start;
-    const finished = () => {
-      const expired = stop();
-      if (this.m._hxg_done(this.ptr) || expired) {
-        active = false;
-        if (expired) { stopped = true; this.m._hxg_cancel(this.ptr); }
-        return true;
-      }
-      return false;
-    };
-    try {
-      while (active) {
-        let pending = [], idle = 0;
-        while (active && pending.length < batchSize) {
-          // Cached and exact leaves need no inference await, but must still receive cancellation messages.
-          if (performance.now() - yielded >= 8) {
-            onBatch({...stats, completed: this.m._hxg_completed(this.ptr)});
-            await nextTask();
-            yielded = performance.now();
-          }
-          if (finished()) idle = 0;
-          else {
-            const [id, leaf] = this.request();
-            if (id === -1) idle = 0;
-            else if (id === 0) idle += 1;
-            else {
-              idle = 0;
-              if (prove) {
-                const proof = await prove(leaf.history);
-                if (finished()) continue;
-                if (proof?.status === 'PROVEN_WIN' && proof.native_verified) {
-                  this.fulfillProof(id, leaf, proof);
-                  continue;
-                }
-              }
-              const key = cache.key(leaf.history, version), cached = cache.get(key);
-              if (cached === undefined) pending.push({id, leaf, key});
-              else { this.fulfill(id, leaf.actions, cached); stats.hits++; }
-            }
-          }
-          if (idle >= 1) break;
-        }
-        if (active) finished();
-        if (!active) pending = [];
-        if (pending.length) {
-          const groups = new Map();
-          for (const item of pending) {
-            if (!groups.has(item.key)) groups.set(item.key, []);
-            groups.get(item.key).push(item);
-          }
-          const unique = [...groups.values()];
-          const asked = performance.now(), predictions = await evaluate(unique.map(items => items[0].leaf));
-          stats.network_ms += performance.now() - asked;
-          stats.batches++;
-          stats.largest = Math.max(stats.largest, unique.length);
-          if (predictions.length !== unique.length) throw new Error('Evaluator returned the wrong batch size');
-          unique.forEach((items, i) => {
-            for (const item of items) { this.fulfill(item.id, item.leaf.actions, predictions[i]); stats.evaluated++; }
-            cache.put(items[0].key, {logits: Float64Array.from(predictions[i].logits), q: Float64Array.from(predictions[i].q)});
-          });
-          onBatch({...stats, completed: this.m._hxg_completed(this.ptr)});
-          await nextTask();
-          yielded = performance.now();
-        } else if (active) {
-          finished();
-          if (active && idle >= 1) throw new Error('Native scheduler stalled without pending evaluations');
-        }
-      }
-    } finally {
-      if (this.ptr) this.m._hxg_cancel(this.ptr);
-    }
-    return {...this.result(choice), evaluated: stats.evaluated, cache_hits: stats.hits, inference_batches: stats.batches,
-      largest_batch: stats.largest, network_ms: stats.network_ms, stopped, elapsed_ms: performance.now() - start};
   }
   /** Root statistics as NeuralSearch.result: action, actions, visits, values, completed_q, policy, scores, exact fields. */
   facts() {
@@ -330,7 +230,7 @@ export class NeuralSearch {
 /**
  * One game's shared search graph (python/neural_search.py GameGraph): the store keeps every node the game's searches
  * expanded, a search reads each stored child's visits and value as its edge's, and `at(history)` moves the root to any
- * position. `search({..., pvCheck})` adds the principal-variation check (neural_search.Recheck).
+ * position.
  */
 export class GameGraph extends NeuralSearch {
   /** `id` is unique to this graph, across reloads, so a session can tell a rebuilt graph from the one it searched. */
@@ -388,48 +288,6 @@ export class GameGraph extends NeuralSearch {
       this.m._free(cells);
     }
     this.history = history.map(([q, r]) => [q, r]);
-  }
-  /** The history after the turn `result` chooses at this root (GameGraph.after_turn), or null; the root stays. */
-  afterTurn(result) {
-    if (!result.action || result.proven) return null;
-    const root = this.history.map(p => [...p]), line = [...root, [...result.action]], mover = ((root.length + 1) >> 1) % 2;
-    const state = this.n.game(line);
-    if (state.winner >= 0) return null;
-    if (state.player === mover) {
-      this.at(line);
-      const {actions, policy} = this.result();
-      this.at(root);
-      if (!policy.length || !(Math.max(...policy) > 0)) return null;
-      line.push([...actions[policy.indexOf(Math.max(...policy))]]);
-      if (this.n.game(line).winner >= 0) return null;
-    }
-    return line;
-  }
-  /** NeuralSearch.search with the principal-variation check of share `pvCheck` (python/neural_search.py Recheck): with a
-   * check the result is the root's after it, its counts summed over every pass, and `pv_check`. */
-  async search({pvCheck = 0, ...options} = {}) {
-    const simulations = options.simulations ?? 128, reserve = Math.round(pvCheck * simulations);
-    if (!(pvCheck > 0 && reserve && simulations - 2 * reserve >= 1)) return super.search(options);
-    let completed = 0;
-    const onBatch = stats => options.onBatch?.({...stats, completed: completed + stats.completed});
-    const root = this.history.map(p => [...p]), first = await super.search({...options, onBatch, simulations: simulations - 2 * reserve});
-    completed += first.completed;
-    const line = first.stopped ? null : this.afterTurn(first);
-    if (!line) return first;
-    const index = first.actions.findIndex(([q, r]) => q === first.action[0] && r === first.action[1]), before = first.completed_q[index];
-    const passes = [first];
-    this.at(line);
-    try {
-      passes.push(await super.search({...options, onBatch, simulations: reserve}));
-      completed += passes[1].completed;
-    } finally {
-      this.at(root);
-    }
-    const after = this.result().completed_q[index], searched = before - after > PV_DROP && !passes[1].stopped;
-    if (searched) passes.push(await super.search({...options, onBatch, simulations: reserve}));
-    const result = searched ? passes[2] : {...passes[1], ...this.result(options.choice ?? 'policy')};
-    for (const key of ['completed', 'evaluated', 'cache_hits', 'elapsed_ms']) result[key] = passes.reduce((sum, p) => sum + p[key], 0);
-    return {...result, stopped: passes.some(p => p.stopped), pv_check: {line: line.slice(root.length), before, after, searched}};
   }
 }
 
@@ -592,7 +450,7 @@ export class NativeOwner {
     // advances, so permanent colour conflicts follow the played position.
     this.graph.at(this.graph.history);
   }
-  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel', capture = false, proofs = null}) {
+  async search({network, batchSize = 64, stop = () => false, onBatch = () => {}, choice = 'gumbel', proofs = null}) {
     if (this.busy || !this.ptr) throw new Error('Native owner is closed or already running');
     if (!(batchSize > 0)) throw new Error('Positive native batch size required');
     const frontier = proofs ? new NativeProofs(this, {...proofs, stop}) : null;
@@ -607,7 +465,7 @@ export class NativeOwner {
         if (batch) {
           const begin = performance.now();
           let settled = false;
-          flight = network.evaluateNative(batch, {capture, stop: () => {
+          flight = network.evaluateNative(batch, {stop: () => {
             if (stop()) this.cancel();
             return !this.admit();
           }});
@@ -640,7 +498,7 @@ export class NativeOwner {
       if (frontier) await frontier.close();
       return {...this.result(choice), scheduler: this.stats(), elapsed_ms: performance.now() - started,
         ...(frontier ? {proof_scheduler: frontier.finalStats, proof_records: frontier.records, neural_records: frontier.neuralRecords, solver_error: frontier.workerError} : {}),
-        batches, largest, network_ms: networkMs, inference, ...(capture ? {capture_pool: network.captureStats()} : {})};
+        batches, largest, network_ms: networkMs, inference};
     } catch (error) {
       this.cancel(); throw error;
     } finally {

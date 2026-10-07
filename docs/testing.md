@@ -225,7 +225,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_web_engine.Overlay` | 2 | Candidate ranking and the proven-line display | 0.1 | 0.0 | - | - | keep |
 | `test_web_engine.BrowserProofs` | 16 | The browser proof table, storage and replay match play.Proofs and verified certificates | 4.1 | 0.0 | native solves | web_tactical parity | keep |
 | `test_web_engine.Loading` | 16 | Load stages, watchdogs and the GPU, WASM and one-thread fallbacks | 0.0 | 0.0 | fake workers | - | keep |
-| `test_web_engine.Bundle` | 64 (1 slow) | The browser bundle: native owner, proofs, sessions, matches, clocks and search parity with the native library | 44.2 | 367.4 | node per test, wasm searches | play TurnTrees, web_tactical | keep; wasm solver-leaves test slow; parity uses a small network, one position of each kind in the fast tier (#457) |
+| `test_web_engine.Bundle` | 63 | The browser bundle: hybrid scheduler turns, native owner, proof frontier, sessions, matches, clocks and per-leaf search parity with the native library | 27.3 | 15.0 | node per test, wasm searches | play TurnTrees, web_tactical | keep; parity uses a small network, one position of each kind in the fast tier (#457) |
 | `test_web_seal.WebSealParity` | 3 | Both Seal backends play legal turns, take the immediate win and enforce the range | 0.0 | 0.0 | needs Seal; 11 positions at 1 s | - | keep (CI builds Seal) |
 | `test_web_shrimp.Export` | 2 (slow) | The Shrimp ONNX graph matches the evaluator forward; profile constants | 0.0 | 2.9 | ONNX export | - | slow |
 | `test_web_shrimp.Presets` | 1 | Browser Shrimp presets equal engines.json | 0.1 | 0.0 | - | - | keep |
