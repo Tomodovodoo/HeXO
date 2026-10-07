@@ -766,8 +766,13 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
     start, workers = time.monotonic(), workers or SOLVER_WORKERS
     end = start + ms / 1000
     found = dict(moves=[], pv=[], proof=None, threat=[], solved=True, used=0)
-    premises = [{k: f[k] for k in ('history', 'winner', 'plies')} for f in known
-                if len(f['history']) != len(history) or f['winner'] != player][:4096]
+    premises, cells = [], 0
+    for f in known:   # the tactical solver takes at most 4,096 premises of 200,000 cells in all (see `solve`)
+        if len(premises) >= 4096 or cells + len(f['history']) > 200_000:
+            break
+        if len(f['history']) != len(history) or f['winner'] != player:
+            premises.append({k: f[k] for k in ('history', 'winner', 'plies')})
+            cells += len(f['history'])
     root, stop = dict(nodes=0, result=None), threading.Event()
 
     def ask():
