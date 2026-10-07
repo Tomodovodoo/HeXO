@@ -1,7 +1,7 @@
 """Played-root self-play through persistent native graph owners and one GPU queue."""
 from collections import deque
 import numpy as np
-from native_scheduler import SearchPool, InferenceService
+from native_scheduler import SearchPool, InferenceService, ProofWorkers
 from dense_selfplay import record_network_values
 from neural_search import checked, native
 
@@ -50,6 +50,7 @@ class NativeGames:
     older games continue; fixed cohorts retain their original model set.
     In dynamic mode `producers` bounds producer threads plus host workers, and
     each model's slots are split over `model_producers` independent producers.
+    `proof_workers` native proof workers serve every producer's live games.
     """
     def __init__(self, games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                  batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0, progress=None,
@@ -76,7 +77,8 @@ class NativeGames:
                             workers=max(1,producers//len(self.models)))
         self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
         self.split = min(model_producers,len(self.games))
-        self.proof_options = dict(package=proof_package,workers=proof_workers,slice_ms=slice_ms,table_mb=4)
+        self.proof_workers = ProofWorkers(proof_package,workers=proof_workers) if proof_workers else None
+        self.proof_options = dict(slice_ms=slice_ms,table_mb=4,shared=self.proof_workers)
         if dynamic:
             try:
                 if any(not self.fits({m.sha for m in g.trees}) for g in games):
@@ -126,8 +128,7 @@ class NativeGames:
                         self.mapping[slot,model] = producer,owner
                         self.lookup[producer,owner] = slot,model
                         self.epochs[producer,owner] = 0
-                    self.proof_loops.append(pool.enable_proofs(proof_package,workers=proof_workers,
-                                            slice_ms=slice_ms,table_mb=4) if proof_workers else None)
+                    self.proof_loops.append(pool.enable_proofs(**self.proof_options) if proof_workers else None)
             self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size)
             self.service.start(continuous=True)
             self.service.launch()
@@ -175,7 +176,7 @@ class NativeGames:
                 slots = range(part,len(self.games),self.split)
                 pool = SearchPool([placeholders[i] for i in slots],seed=self.games[0].seed+part,**dict(self.options,workers=share))
                 pools.append(pool)
-                proof = pool.enable_proofs(**self.proof_options) if self.proof_options['workers'] else None
+                proof = pool.enable_proofs(**self.proof_options) if self.proof_workers else None
                 if self.service is None:
                     producer,model_id = len(self.pools),len(self.models)
                     self.pools.append(pool);self.proof_loops.append(proof)
@@ -447,6 +448,8 @@ class NativeGames:
         for tree in self.idle.values():
             tree.close()
         self.idle.clear()
+        if self.proof_workers is not None:
+            self.proof_workers.close()
 
 
 class ActorEngine:
