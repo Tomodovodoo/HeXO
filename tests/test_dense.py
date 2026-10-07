@@ -37,12 +37,16 @@ import dense_learn
 import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
+from tests import slow
 
 ROOT = Path(__file__).resolve().parents[1]
 # Seal has no licence, so no build or CI ships it; tests that play it need a local -DHEXO_SEAL_SOURCE build.
 needs_seal = unittest.skipUnless(library.with_name(library.name.replace('hexo', 'hexo_seal')).exists(),
                                  'needs the Seal library next to the engine (cmake -DHEXO_SEAL_SOURCE=...)')
 TINY =hexnet.HexNetConfig(blocks=2, channels=16, pool_every=2, line_length=5, value_hidden=16, head_channels=8)
+# Export recalibrates and validates over thousands of rows; tests about what export records, not about the statistics
+# themselves, use a few batches.
+few_rows = unittest.mock.patch.multiple(dense_learn, RECALIBRATION_ROWS=64, VALIDATION_ROWS=64)
 AXIAL_AXES = ((1, 0), (0, 1), (1, -1))
 
 
@@ -2768,22 +2772,6 @@ class WindowMemoryTests(unittest.TestCase):
             self.assertEqual(list(newest.shards), [names[-1]])
             self.assertEqual(sorted(p.stem for p in directory.glob('*.f32')), [names[-1]])
 
-    def test_resident_bytes_per_row(self):
-        import gc
-        import tracemalloc
-        with tempfile.TemporaryDirectory() as tmp:
-            synthetic_run(tmp, 40, 20, 130, seed=1)
-            gc.collect(); tracemalloc.start()
-            try:
-                before = tracemalloc.get_traced_memory()[0]
-                window = dense_data.ReplayWindow(tmp, 10**7, 10**7, validation_fraction=.03)
-                gc.collect()
-                used = tracemalloc.get_traced_memory()[0]-before
-            finally:
-                tracemalloc.stop()
-            self.assertGreater(window.rows, 50000)
-            self.assertLess(used/window.rows, 150)
-
 
 def old_corpus(path):
     """A tiny gumbel-policy-value-v1 style corpus: one finished game (id 5) and one capped game (id 9)."""
@@ -2974,6 +2962,7 @@ class CheapRowTests(unittest.TestCase):
                 dense_config.LearnerSettings(cheap_row_fraction=bad)
         self.assertIn('cheap_row_fraction', dense_learn.KEEP)
 
+    @few_rows
     def test_changing_the_fraction_moves_the_pacing_base_to_the_new_count(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -3367,6 +3356,7 @@ class ValidationSourceTests(unittest.TestCase):
                         self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
                         self.assertTrue(len(sets.policy(following)))
 
+    @few_rows
     def test_export_logs_per_source_validation(self):
         import dashboard
         torch.set_num_threads(2)
@@ -3423,6 +3413,7 @@ class ValidationSourceTests(unittest.TestCase):
             losses = learner.train_step(dense_data.collate(*dense_data.examples(window, refs, np.random.default_rng(0))))
             self.assertTrue(math.isnan(losses[2]) and math.isnan(losses[5]) and torch.isfinite(losses[:2]).all())
 
+    @few_rows
     def test_pair_policy_validation_counts_first_stones_with_a_searched_partner(self):
         torch.set_num_threads(2)
         torch.manual_seed(0)
@@ -3550,6 +3541,7 @@ class ValidationSourceTests(unittest.TestCase):
         self.assertAlmostEqual(late, math.log(n), places=4)
         self.assertEqual(dense_learn.ply_split([30], [1.]), (None, None))
 
+    @few_rows
     def test_export_reports_value_by_plies_remaining(self):
         import dashboard
         torch.set_num_threads(2)
@@ -3828,6 +3820,7 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertLess(gap(ema), .01)
             self.assertEqual(learner.ema.blocks[0].norm1.momentum, .1)
 
+    @few_rows
     def test_vram_cap_and_release_on_cuda(self):
         """vram_reserved_mb caps the allocator at that share of the device, installed from the resumed settings
         before any weights are placed; export releases the cache once after its recalibration and validation
@@ -3867,6 +3860,7 @@ class ValidationSourceTests(unittest.TestCase):
                 dense_learn.Learner(run, replace(config.learner, vram_reserved_mb=0), config, overrides=dict(batch=4))
             self.assertEqual(seen, [(False, 2048, 4)])  # before any weights exist, with the resumed settings
 
+    @few_rows
     def test_export_without_held_out_games(self):
         """No held-out game in the window: metrics.validation stays null, the sources are still reported, and the
         dashboard series skips the null aggregate."""
@@ -6573,32 +6567,6 @@ class YieldTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs['restart'] == restart for call in games.call_args_list))
         self.assertEqual(restarts.draw.call_count, 2)
 
-    def test_learner_heartbeat_reports_its_effective_target(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp)/'run'
-            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
-                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
-                                  capture_output=True, text=True, cwd=ROOT, timeout=60)
-            self.assertEqual(made.returncode, 0, made.stderr)
-            write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
-            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--steps', '1',
-                                   '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
-                                   '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
-                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            status = json.loads((run/'learner-status.json').read_text())
-            self.assertEqual(status['samples_per_row_target'], 7.5)
-            self.assertEqual(status['phase_rows'], 0)
-            self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
-            self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
-            zeros = dict(allocated_mb=0, reserved_mb=0)
-            self.assertEqual(status['vram'], zeros)
-            self.assertEqual(status['optimizer_state_mb'], 0.)
-            lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
-            self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
-            manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
-            self.assertEqual(manifest['learner']['vram_reserved_mb'], 1500)
-
     def test_disabled_and_invalid_bounds(self):
         self.heartbeat(0.)
         self.assertFalse(self.gate(below=0.).paused())
@@ -6641,6 +6609,7 @@ class LearnerPipelineTests(unittest.TestCase):
                         n.startswith('blocks.') and n.endswith(('.conv1.weight', '.conv2.weight', '.pool.weight'))}
             self.assertEqual({n for n, p in model.named_parameters() if any(p is q for q in muon)}, expected)
 
+    @few_rows
     def test_adamw_and_muon_train_on_cpu_and_reset_on_kind_change(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -6718,6 +6687,7 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(dense_learn.paced(seen, rows, 4., 8), seen+8 > 4.*rows)
             self.assertEqual(dense_learn.backlog(seen, rows, 4.), rows-seen/4.)
 
+    @few_rows
     def test_resume_moves_the_pacing_base_only_when_samples_per_row_changes(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -6760,6 +6730,7 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(kept.pacing, dict(rows=rows+500, samples=5000))
             self.assertEqual(len(events()), 4)
 
+    @few_rows
     def test_manifests_without_a_pacing_base_pace_from_zero(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -9764,6 +9735,53 @@ class EvaluatorLoopTests(unittest.TestCase):
         (self.run/'league.json').write_text(json.dumps(league))
         self.start()
         self.assertIn('calibration', self.league())                                    # added on start
+
+
+@slow
+class SlowDenseTests(unittest.TestCase):
+    """A 50,000-row window and the learner command line, each taking seconds."""
+    def test_resident_bytes_per_row(self):
+        import gc
+        import tracemalloc
+        with tempfile.TemporaryDirectory() as tmp:
+            synthetic_run(tmp, 40, 20, 130, seed=1)
+            gc.collect(); tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                window = dense_data.ReplayWindow(tmp, 10**7, 10**7, validation_fraction=.03)
+                gc.collect()
+                used = tracemalloc.get_traced_memory()[0]-before
+            finally:
+                tracemalloc.stop()
+            self.assertGreater(window.rows, 50000)
+            self.assertLess(used/window.rows, 150)
+
+    def test_learner_heartbeat_reports_its_effective_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'run'
+            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
+                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=60)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            write_games(run/'shards'/'000001', [(winning_game(), 0, None)]*8)
+            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--steps', '1',
+                                   '--workers', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '7.5',
+                                   '--validation-fraction', '0', '--log-every', '1', '--vram-reserved-mb', '1500'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            status = json.loads((run/'learner-status.json').read_text())
+            self.assertEqual(status['samples_per_row_target'], 7.5)
+            self.assertEqual(status['phase_rows'], 0)
+            self.assertAlmostEqual(status['backlog_rows'], status['rows_available']-status['samples_seen']/7.5)
+            self.assertEqual((status['pacing_rows'], status['pacing_samples']), (0, 0))
+            zeros = dict(allocated_mb=0, reserved_mb=0)
+            self.assertEqual(status['vram'], zeros)
+            self.assertEqual(status['optimizer_state_mb'], 0.)
+            lines = [json.loads(line) for line in (run/'metrics'/'learner-main.jsonl').read_text().splitlines()]
+            self.assertEqual([(r.get('validation', False), r['vram']) for r in lines], [(False, zeros), (True, zeros)])
+            manifest = json.loads((run/'checkpoints'/'main'/'000001'/'manifest.json').read_text())
+            self.assertEqual(manifest['learner']['vram_reserved_mb'], 1500)
+
 
 class DenseTimedWorker(unittest.TestCase):
     def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
