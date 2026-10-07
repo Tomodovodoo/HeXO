@@ -15,7 +15,9 @@ const VERDICTS = new Set(['no verified strategy', 'quiet defender unsupported', 
   'candidate has unproved defender continuation', 'candidate defense expansion budget', 'candidate certificate size limit',
   'free-second coverage work limit', 'no fallback strategy', 'zone proof budget', 'zone certificate byte limit', 'proof zone size limit']);
 let native, ort, network, cache, games, device, solver = null, solverCalls = 0;
-let frontierWorkers = null;
+/** The proof workers, and the error that kept them from starting: a browser that cannot start them once is not asked
+ * again, so no later turn waits on their startup. */
+let frontierWorkers = null, frontierFailure = null;
 /** The latest game-tree turn: they run one at a time, so a cancelled turn still awaiting the network settles before
  * another turn advances, searches or evicts a game tree. */
 let gameTurn = Promise.resolve();
@@ -93,10 +95,17 @@ class SolverWorkers {
 
 async function proofWorkers(count) {
   if (!Number.isInteger(count) || count < 1 || count > 16) throw new Error('Invalid solver worker count');
+  if (frontierFailure) throw frontierFailure;
   if (frontierWorkers && frontierWorkers.count !== count) { frontierWorkers.close(); frontierWorkers = null; }
-  frontierWorkers ??= new SolverWorkers(count);
-  await Promise.all(Array.from({length: count}, (_, i) => frontierWorkers.prepare(i)));
-  return frontierWorkers;
+  const pool = frontierWorkers ??= new SolverWorkers(count);
+  try {
+    await Promise.all(Array.from({length: count}, (_, i) => pool.prepare(i)));
+  } catch (error) {
+    frontierFailure = error; pool.close();
+    if (frontierWorkers === pool) frontierWorkers = null;
+    throw error;
+  }
+  return pool;
 }
 
 /**
