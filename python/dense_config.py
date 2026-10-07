@@ -25,6 +25,12 @@ class ModelSettings:
     aux_heads: bool = True
 
 
+# Expanded nodes a native actor game keeps. Forward self-play never revisits
+# positions it has played past, so least-recently-used eviction drops those first;
+# at 128 slots 1024 cut peak memory from 10.6 to 7.8 GB and raised placements/s.
+NATIVE_GAME_GRAPH = 1024
+
+
 @dataclass(frozen=True)
 class ActorSettings:
     games_in_flight: int = 128
@@ -38,8 +44,9 @@ class ActorSettings:
     native_quantum: int = 32
     native_views: int = 8
     native_depth: int = 8
-    native_proof_workers: int = 12 # CPU proof workers per producer pool; about 12 per model, so 3 each at four producers
+    native_proof_workers: int = 12 # CPU proof workers shared by every producer's live games
     native_proof_slice_ms: int = 8
+    native_proof_budget: float = 1. # share of each graph owner's time proof steps may take before it stops admitting jobs
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
@@ -55,6 +62,7 @@ class ActorSettings:
     # game_graph > 0: each game's trees are shared game graphs (neural_search.GameGraph) keeping at most that many
     # expanded nodes between searches; 0 keeps one tree per model, pruned on every advance. pv_check (needs a game
     # graph): share of a full search's simulations its principal-variation check takes (neural_search.Recheck).
+    # With native_scheduler, 0 takes NATIVE_GAME_GRAPH.
     game_graph: int = 0
     pv_check: float = 0.
     cache_positions: int = 4096
@@ -121,12 +129,15 @@ class ActorSettings:
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
     def __post_init__(self):
+        if self.native_scheduler and not self.game_graph:
+            object.__setattr__(self, 'game_graph', NATIVE_GAME_GRAPH)
         if self.native_round_barrier and not self.native_scheduler:
             raise ValueError('native_round_barrier requires native_scheduler')
         if not 1 <= self.native_producers <= 16 or not 4 <= self.native_quantum <= 128 or not 1 <= self.native_views <= 64 or not 1 <= self.native_depth <= 32:
             raise ValueError('Invalid native scheduler worker, quantum, view or depth setting')
-        if not 0 <= self.native_proof_workers <= 16 or not 0 < self.native_proof_slice_ms <= 1000:
-            raise ValueError('Invalid native proof worker or slice setting')
+        if (not 0 <= self.native_proof_workers <= 16 or not 0 < self.native_proof_slice_ms <= 1000
+                or not 0 < self.native_proof_budget <= 1):
+            raise ValueError('Invalid native proof worker, slice or budget setting')
         if self.native_scheduler and (not self.game_graph or self.pv_check or self.proven_line_rows or
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,
                      self.solver_deep_nodes,self.solver_leaf_nodes))):
