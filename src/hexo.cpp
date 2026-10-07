@@ -1460,32 +1460,16 @@ struct Search {
                         roots.clear();max_depth=0;
                     } else proof.clear();
                 }
-                for(int depth=1;depth<=max_depth;++depth) {
-                    // Freeze admission for the whole iteration, including PVS
-                    // re-searches. Scores from a different admitted tree cannot
-                    // provide bounds; only previous-iteration moves are reused.
-                    if(inject_tt) frozen_hints=tt;
-                    int best=-mate-1;Turn iteration=chosen;
-                    for(auto& t:roots) {
-                        check();int score;
-                        if(!b.model && depth==1 && t.leaf_score_exact) {++nodes;score=t.score;}
-                        else {
-                            CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
-                            score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
-                        }
-                        t.score=score;
-                        if(score>best) {best=score;iteration=t;}
-                        if(best>=mate) break;
-                    }
-                    chosen=iteration;chosen.score=best;output.depth=depth;
-                    std::stable_sort(roots.begin(),roots.end(),[](auto a,auto z){return a.score>z.score;});
+                // Ask whether the opponent has a forced win after the chosen
+                // turn; drop every root that the found strategy also beats.
+                auto refute=[&] {
                     while(!b.model && refutation_left>Clock::duration::zero() &&
                           std::none_of(probed.begin(),probed.end(),[&](const Turn& t){return t.count==chosen.count && t.cells==chosen.cells;})) {
                         const auto probe_start=Clock::now();const auto mark=proof.size();
                         const auto query=chosen;probed.push_back(query);int enemy=-1;
                         {
                             Restore restore(b);apply(b,query);proof_nodes=0;
-                            proof_deadline=std::min(deadline,probe_start+std::min(refutation_left,allowance/5));
+                            proof_deadline=std::min(deadline,probe_start+std::min(refutation_left,allowance/4));
                             try {if(b.winner<0 && forcing_material(b,b.player)) enemy=probe(b,std::min(6,max_depth/2));} catch(const Timeout&) {}
                         }
                         if(enemy<0) {proof.resize(mark);refutation_left-=Clock::now()-probe_start;break;}
@@ -1499,13 +1483,52 @@ struct Search {
                             } catch(const Timeout&) {break;}
                         }
                         refutation_left-=Clock::now()-probe_start;
-                        if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=best=-mate;break;}
+                        if(!std::count(refuted.begin(),refuted.end(),false)) {chosen.score=-mate;break;}
                         size_t j=0;
                         for(size_t i=0;i<roots.size();++i) if(!refuted[i]) roots[j++]=roots[i];
-                        roots.resize(j);chosen=roots.front();best=chosen.score;
+                        roots.resize(j);chosen=roots.front();
                     }
-                    if(best>=mate || best<=-mate) break;
-                }
+                };
+                // Deepen until the last quarter of the allowance, keeping a root
+                // that beats an unfinished iteration's earlier scores. Stop early
+                // when the next iteration is unlikely to finish in time.
+                int depth=1;
+                auto deepen=[&](bool reserve) {
+                    for(;depth<=max_depth;++depth) {
+                        // Freeze admission for the whole iteration, including PVS
+                        // re-searches. Scores from a different admitted tree cannot
+                        // provide bounds; only previous-iteration moves are reused.
+                        if(inject_tt) frozen_hints=tt;
+                        const auto began=Clock::now();
+                        int best=-mate-1;Turn iteration=chosen;
+                        for(auto& t:roots) {
+                            check();int score;
+                            if(!b.model && depth==1 && t.leaf_score_exact) {++nodes;score=t.score;}
+                            else {
+                                CandidatePause pause(b,depth==1);Restore branch(b);int side=b.player;apply(b,t);
+                                score=b.winner==side?mate:-negamax(b,depth-1,-mate-1,-best);
+                            }
+                            t.score=score;
+                            if(score>best) {best=score;iteration=t;if(reserve) chosen=t;}
+                            if(best>=mate) break;
+                        }
+                        chosen=iteration;chosen.score=best;output.depth=depth;
+                        std::stable_sort(roots.begin(),roots.end(),[](auto a,auto z){return a.score>z.score;});
+                        refute();
+                        if(chosen.score>=mate || chosen.score<=-mate) {depth=max_depth+1;return;}
+                        const auto now=Clock::now();
+                        if(reserve && now+(now-began)*4>deadline) {++depth;return;}
+                    }
+                };
+                // The played turn is probed even when the last iteration changed it.
+                // Time left after that continues the search without replacing it
+                // from an unfinished iteration.
+                const auto end=deadline;
+                deadline=end-allowance/4;
+                try {deepen(true);} catch(const Timeout&) {}
+                deadline=end;refutation_left=end-Clock::now();
+                if(chosen.score<mate && chosen.score>-mate) refute();
+                if(depth<=max_depth) deepen(false);
             } catch(const Timeout&) {}
         }
         output.q1=chosen.cells[0].q;output.r1=chosen.cells[0].r;

@@ -25,6 +25,15 @@ strategy; every remaining legal filler is checked separately. These probes share
 the existing root proof time budget, and retained proof storage stays capped at
 256 KiB.
 
+After each completed iteration the same prover asks whether the opponent has a
+forced win after the chosen turn; a strategy it finds removes every root turn it
+also beats. Iterative deepening stops with a quarter of the allowance left, or
+earlier when the next iteration would likely not finish. Until then, a root that
+beats the earlier scores of an unfinished iteration replaces the choice. The turn
+Native is about to play is then probed if no iteration probed it, and any time
+left continues the search without replacing the choice from an unfinished
+iteration.
+
 No weights, model, external solver or new dependency is required.
 The optional NNUE search keeps its existing candidate evaluation.
 
