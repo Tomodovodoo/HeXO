@@ -32,6 +32,8 @@ on:
       - 'web/coi-sw.js'
       - 'web/engine/**'
       - 'CMakeLists.txt'
+      - 'pyproject.toml'
+      - 'requirements/**'
       - 'tools/bench_dense_data.py'
       - 'tools/build_tactical.py'
       - 'tools/compare_search_modes.py'
