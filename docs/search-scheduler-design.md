@@ -1,7 +1,7 @@
 # HeXO search scheduler
 
-Updated 2026-10-07. Merged source baseline: main `8c173186`, including PR433,
-PR439, PR441, PR442 and PR444. PR438 integrates that baseline privately. Draft work
+Updated 2026-10-07. Merged source baseline: main `13d01f8`, including PR433,
+PR439, PR441, PR442, PR443 and PR444. PR438 integrates that baseline privately. Draft work
 is identified below; its presence on this branch does not make it deployed.
 This replaces the October 3 proposal.
 
@@ -34,9 +34,9 @@ of that question.
 | Proof supply | Wake one worker, close unsupported quiet sides, retry only after fresh work and count supply exclusions | PR415, PR427; PR440 sets opt-in proof defaults |
 | Actor launcher | Separate inference pumping and shard writes; bounded event drain and no-progress backoff | PR433 merged, including the queued-shard naming fix |
 | Actor graph allowance | Retain up to 1024 nodes per native actor game by default | PR444 merged; this changes the configured allowance, not proof of a loaded production binary |
-| Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; current IPC comparison returned two searched stones in all 12 HeXO turns; strict deadline checks and current Wasm verification remain open |
+| Clocked Play | Owned progress at completed comparisons, matching second-root replacement, final exact precedence and stop-reason delivery | This PR438; the pre-PR443 IPC comparison returned two searched stones in all 12 HeXO turns; strict deadline checks remain open |
 | Capture accounting | Attribute capture reservations to their model instead of a constructor-time device baseline | PR439 merged after actual two-model CUDA validation |
-| Shared proof workers | Lend globally bounded workers across producer loops while graph owners install results | Draft PR443; owner benchmarks in progress and a concurrent cooling-retry admission finding remains open |
+| Shared proof workers | Optional globally bounded service lends workers across producer loops; originating graph owners install results | PR443 merged; private native and browser builds completed. Earlier caller timings used separate loop-owned workers |
 
 These are source deliveries. Native actor/continuous-proof modes remain opt-in.
 They do not establish that production has loaded these binaries, that training
@@ -279,12 +279,13 @@ added 0.8-5.8 seconds in sampled turns with little proof evidence. Keep existing
 cheap immediate classification. Deeper checks earn CPU slices through utility
 and cost; whether another inline tactical check pays is a measurement question.
 
-Worker sharing is a separate unfinished step. Each current proof loop owns its
-workers; when that loop's games settle, another producer cannot use the idle
-capacity. A shared service needs fair admission and dispatch, client-specific
-cancellation/drain, immutable job and generation identities, and stable callback,
-library and worker-thread lifetimes. Only originating owners may install results.
-Equal queue shares alone do not guarantee dispatch fairness.
+PR443 adds an optional shared proof-worker service with bounded admission,
+producer fairness, client-specific cancellation/drain, immutable job identities,
+and retained callback, library and worker-thread lifetimes. Only originating
+owners install results. Native actor producers can join that service instead of
+each reserving a separate pool. Clocked NativePlay still owns its two workers;
+the earlier caller measurements predate PR443 and do not measure shared-worker
+throughput. A successful private rebuild does not establish production adoption.
 
 Known-premise and stamp queries currently clear the worker's raw resident table
 and frontier. This isolates proof scope but can destroy retained raw work. Sharing
