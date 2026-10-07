@@ -150,10 +150,10 @@ export class BrowserSession extends OfflineSession {
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
   /** The evaluation of the position whose `position()` text is `at`: by `spec` at exactly its budget when `exact`,
-   * else the deepest by its engine. */
+   * else the deepest by its engine; the solver preset only ever shows its own evaluations (python/play.py keys them apart). */
   lookupAt(at, spec = this.analysis, exact = false) {
     if (!spec) return null;
-    if (exact) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
+    if (exact || spec.budget?.solver_ms) return this.cache.get(`${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${at}`) || null;
     return (this.index.get(`${this.engineKey(spec)}|${at}`) || [])
       .sort((a, b) => Boolean(b.proof) - Boolean(a.proof) || b.simulations - a.simulations || b.solver_nodes - a.solver_nodes || (b.budget?.ms || 0) - (a.budget?.ms || 0) || (b.budget?.nodes || 0) - (a.budget?.nodes || 0))[0] || null;
   }
