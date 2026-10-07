@@ -330,7 +330,9 @@ class IsolatedTactics:
         self.control_lock, self.query_id, self.active_query = threading.Lock(), 0, None
         self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
-        self.replacement, self.aborted, self.busy, self.abort_requested = None, None, False, False
+        self.replacement, self.aborted, self.busy = None, None, False
+        # Calls are numbered on entry; an abort covers every call numbered up to `abort_upto`.
+        self.issued, self.pending, self.abort_upto = 0, 0, 0
         self._spawn()
 
     def _spawn(self):
@@ -365,9 +367,9 @@ class IsolatedTactics:
         with contextlib.suppress(OSError):  # the next query's write fails and retires it again
             self._spawn()
 
-    def _abort_requested(self):
+    def _abort_requested(self, ticket):
         with self.control_lock:
-            return self.abort_requested
+            return ticket <= self.abort_upto
 
     def _line(self, deadline):
         try:
@@ -391,12 +393,18 @@ class IsolatedTactics:
         dispatched = False
         unknown = lambda reason, build_hash=None: dict(unknown_result(reason, start, attacker, build_hash), budget=None,
                                                        gate_score=None, **({'proof_numbers': None} if bounds else {}))
+        with self.control_lock:
+            self.issued += 1
+            ticket = self.issued
+            self.pending += 1
         if not self.lock.acquire(timeout=ms/1000):
+            with self.control_lock:
+                self.pending -= 1
             return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
             with self.control_lock:
-                self.busy, self.abort_requested = True, False
+                self.busy = True
             # A finished replacement can itself have been aborted, so check again once it is joined.
             for _ in range(2):
                 if not self.replacement and self.aborted is self.process:
@@ -407,11 +415,11 @@ class IsolatedTactics:
                 if self.replacement.is_alive():
                     return unknown('tactical worker restarting')
                 self.replacement = None
-            if self._abort_requested():
+            if self._abort_requested(ticket):
                 return unknown('aborted')
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
-                if self._abort_requested():
+                if self._abort_requested(ticket):
                     self._retire(killed=True)
                     return unknown('aborted')
                 if line == 'timeout':
@@ -443,7 +451,7 @@ class IsolatedTactics:
             if resume:
                 request['resume'] = True
             with self.control_lock:
-                if self.abort_requested:
+                if ticket <= self.abort_upto:
                     return unknown('aborted')
                 self.query_id += 1
                 request['query_id'] = self.query_id
@@ -485,6 +493,7 @@ class IsolatedTactics:
         finally:
             with self.control_lock:
                 self.active_query, self.busy = None, False
+                self.pending -= 1
             self.lock.release()
 
     def cancel(self):
@@ -508,14 +517,16 @@ class IsolatedTactics:
     def abort(self):
         """End the running query now: it returns UNKNOWN and the worker restarts in the background. Without a running
         query it does nothing, so an idle child keeps its tables. A child killed after it answered is replaced before
-        the next query, which waits for it within its own budget."""
+        the next query, which waits for it within its own budget. Calls already made and still waiting to run
+        return UNKNOWN 'aborted' without dispatching."""
         with self.control_lock:
-            if not self.busy:
+            if not self.pending:
                 return
-            self.abort_requested = True
-            self.aborted = self.process
-            if self.process is not None:
-                self.process.kill()
+            self.abort_upto = self.issued
+            if self.busy:
+                self.aborted = self.process
+                if self.process is not None:
+                    self.process.kill()
 
     def close(self):
         with self.lock:

@@ -213,6 +213,18 @@ class Isolation(unittest.TestCase):
         finally:
             stuck.close()
 
+    def test_abort_reaches_a_call_still_waiting_for_its_turn(self):
+        pid = self.tactics.history([[0, 0]], ms=10000)['pid']
+        results = []
+        with self.tactics.lock:  # an earlier query still holds the worker
+            query = threading.Thread(target=lambda: results.append(self.tactics.history([[0, 0]], ms=20000)))
+            query.start()
+            time.sleep(.3)
+            self.tactics.abort()
+        query.join(5)
+        self.assertEqual(results[0]['reason'], 'aborted')
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
+
     def test_abort_while_the_child_starts_reports_the_abort(self):
         stuck = IsolatedTactics('slow-start', engine=ENGINE)
         try:
