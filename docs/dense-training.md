@@ -56,7 +56,7 @@ The replay window follows KataGo: at least `window_min_rows` full-search rows, t
 
 ## Actor search
 
-Actors search on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)) unless `--no-hybrid-scheduler` is given: native game graphs that keep up to `HYBRID_GAME_GRAPH` (1024) expanded nodes per game, one model-keyed inference queue, and `hybrid_proof_workers` (12) CPU proof workers that may take `hybrid_proof_budget` (0.1) of each graph owner's time. The older per-query solver budgets (`solver_*_nodes`), `pv_check` and `proven_line_rows` belong to the Python-coordinated search of `python/neural_search.py` and are refused unless `hybrid_scheduler` is off. An actor without the tactical solver build runs with no proof workers and logs a warning event.
+Actors search on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)) unless `--no-hybrid-scheduler` is given: native game graphs that keep up to `HYBRID_GAME_GRAPH` (1024) expanded nodes per game, one model-keyed inference queue, and `hybrid_proof_workers` (12) CPU proof workers that may take `hybrid_proof_budget` (0.1) of each graph owner's time, their proof loops reusing the solver's stamps of earlier certificates (`hybrid_proof_stamps`, on; `--no-hybrid-proof-stamps` turns it off). The older per-query solver budgets (`solver_*_nodes`), `pv_check` and `proven_line_rows` belong to the Python-coordinated search of `python/neural_search.py` and are refused unless `hybrid_scheduler` is off. An actor without the tactical solver build runs with no proof workers and logs a warning event.
 
 ## Kernels
 
