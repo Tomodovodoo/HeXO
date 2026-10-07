@@ -2411,6 +2411,29 @@ class TurnTrees(unittest.TestCase):
         self.assertTrue(self.trees)
         self.assertIsNone(self.trees[-1].ptr)
 
+    def test_cancellation_after_the_answer_keeps_the_solver_child(self):
+        from play import solve
+        from types import SimpleNamespace
+        aborted, callers, watching = [], [], threading.Event()
+
+        def watch(count):
+            # The job is cancelled while the query runs, and the query answers before the cancellation is acted on.
+            watching.set()
+            while not callers:
+                time.sleep(.001)
+            callers[0].join(PATIENCE)
+            raise Cancelled()
+
+        def history(*args, **options):
+            callers.append(threading.current_thread())
+            watching.wait(PATIENCE)
+            return dict(status='UNKNOWN', reason='no verified strategy', nodes_used=1)
+
+        prover = SimpleNamespace(history=history, abort=lambda: aborted.append(True))
+        with self.assertRaises(Cancelled):
+            solve(prover, [(0, 0)], 100, watch)
+        self.assertFalse(aborted)
+
     def test_pooled_evaluations_match_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]

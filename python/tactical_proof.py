@@ -330,7 +330,7 @@ class IsolatedTactics:
         self.control_lock, self.query_id, self.active_query = threading.Lock(), 0, None
         self.cancelled_query = None
         self.job = _memory_job(memory_mb) if sys.platform == 'win32' else None
-        self.replacement = None
+        self.replacement, self.aborted = None, None
         self._spawn()
 
     def _spawn(self):
@@ -391,6 +391,8 @@ class IsolatedTactics:
             return unknown('lock deadline')
         try:
             self.stats['queries'] += 1
+            if self.replacement is None and self.aborted is self.process:
+                self._retire(killed=True)
             if self.replacement:
                 self.replacement.join(timeout=max(0.0, start+ms/1000-time.perf_counter()))
                 if self.replacement.is_alive():
@@ -486,8 +488,10 @@ class IsolatedTactics:
             return True
 
     def abort(self):
-        """End the running query now: it returns UNKNOWN and the worker restarts in the background."""
-        process = self.process
+        """End the running query now: it returns UNKNOWN and the worker restarts in the background. A child killed
+        while idle or starting is replaced before the next query, which waits for it within its own budget."""
+        with self.control_lock:
+            process = self.aborted = self.process
         if process is not None:
             process.kill()
 

@@ -83,6 +83,16 @@ class Isolation(unittest.TestCase):
         self.assertEqual(results[0]['status'], 'UNKNOWN')
         self.assertNotEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], pid)
 
+    def test_abort_of_an_idle_or_starting_child_still_answers_the_next_query(self):
+        self.tactics.abort()
+        starting = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual(starting['reason'], 'scripted')
+        self.tactics.abort()
+        idle = self.tactics.history([[0, 0]], ms=10000)
+        self.assertEqual(idle['reason'], 'scripted')
+        self.assertNotEqual(idle['pid'], starting['pid'])
+        self.assertEqual(self.tactics.history([[0, 0]], ms=10000)['pid'], idle['pid'])
+
     def test_abandoned_native_work_replaces_child(self):
         pid = self.tactics.history([[2, 2]], ms=10000)['pid']
         self.assertEqual(self.tactics.stats['kills'], 1)
