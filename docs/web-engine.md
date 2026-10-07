@@ -5,8 +5,21 @@ Gumbel search (`src/gumbel.cpp`) and the tactical solver (`tools/tactical`) comp
 On the play page pick **Bubble (browser)** for a seat or for analysis; presets are lightning 8/2048, quick 32/2048,
 standard 128/32768, strong 512/131072, deep 2048/524288 and dangerous 65536/4000000 (simulations / solver nodes).
 Analysis also has the solver preset (`SOLVER` in `play-session.mjs`, docs/play.md): up to two minutes of proof work
-before the turn, the root solver beside a native owner whose frontier feeds `SOLVER_WORKERS` solver workers (the
-browser's threads less two, one to eight), stopping at the first verified proof (`proveRoot` in `worker.mjs`).
+before the turn, the root solver beside a native owner whose frontier feeds the proof workers, stopping at the first
+verified proof (`proveRoot` in `worker.mjs`).
+
+Every Bubble search on the page runs the hybrid scheduler, for analysis, review, refreshes, seats and matches. That
+is the native graph owner (`NativeOwner` in `search.mjs`, `src/gumbel_owner.cpp`) on the game's `GameGraph`, with the
+served page's settings of 8 views, depth 8, 16 root samples and the round barrier on. The preset's simulations are
+the owner's work per stone, counted as completed simulations over all its views, in quanta of 64, or of the
+stone's work when that is smaller (the owner takes 4 at least). With solver nodes above 0 the root queries (a win for the side to move, the opponent's
+threat, the defence) run first at that node budget, and then the owner's proof frontier runs on the proof workers
+during each stone's search; 0 solver nodes means no proof work. There are `PROOF_WORKERS` proof workers
+(`bubble.mjs`), each a Web Worker: half of `navigator.hardwareConcurrency` less one, from 1 to 8, so the main
+thread and inference keep the other half; ONNX Runtime's WebAssembly build alone asks for up to 8 threads. An
+8-thread laptop gets 3 proof workers, a 16-thread desktop 7, and 18 threads or more get 8. The solver preset uses the
+same count. The workers start with the network (`BubbleEngine.prepare`), before a move's clock runs. Bubble's engine
+version starts with `hybrid`, so the page does not reuse evaluations an older page saved with its per-leaf search.
 
 ```sh
 python tools/build_web.py wasm                      # gumbel, native, tactical and six wasm (committed)
@@ -175,12 +188,12 @@ the choice on their script URL.
 | `python/export_web.py` | HexNet to ONNX (opset 17, dynamic batch and crop size, fp32 and fp16) with a parity report |
 | `web/engine/engine-worker.mjs` | `EngineWorker`: a browser engine's worker from the page, with loading, cancellable calls, the stage watchdogs and the fallback chain |
 | `web/engine/stages.mjs` | Loading stages: the worker's reports, the words the page shows, the limits and the `?stall=` test hook |
-| `web/engine/bubble.mjs` | Page API: `BubbleEngine.load/turn/search/evaluate/bench`, `PRESETS`, `isolate()` |
-| `web/engine/worker.mjs` | Engine worker: a turn exactly like `python/play.py evaluate` |
+| `web/engine/bubble.mjs` | Page API: `BubbleEngine.load/turn/evaluate/bench`, `PRESETS`, `PROOF_WORKERS`, `isolate()` |
+| `web/engine/worker.mjs` | Engine worker: a turn with the fields of `python/play.py evaluate`, on the hybrid scheduler and the proof workers |
 | `web/engine/assets.mjs` | Engine files from this origin or the public site, checked and kept in the Cache API |
 | `web/engine/network.mjs` | Device probe, ONNX Runtime loading, sessions, batched evaluation |
 | `web/engine/encode.mjs` | `hexcrop.encode` and `hexnet.LineFeatures` |
-| `web/engine/search.mjs` | `hxg_*` driver: the `neural_search` loop, evaluation cache, root statistics |
+| `web/engine/search.mjs` | `hxg_*` trees and game graphs, `NativeOwner` and its proof frontier, evaluation cache, root statistics |
 | `web/engine/tactical.mjs`, `solver-worker.mjs` | Solver with a WASI shim, in a worker that a cancel terminates |
 | `web/engine/proof.mjs` | Certificate walk for the winning line |
 | `web/engine/seat.mjs` | Play page hook: the browser engines (`ENGINES`) as seats and analysis |
@@ -205,9 +218,9 @@ WebGPU with `shader-f16` loads both graphs, times a batch of 16 at crop 24 under
 1.25 times faster; fp32 reproduces the server's evaluations, fp16 does not. A limited adapter (see Loading) loads
 fp16 alone. Without WebGPU it runs the WebAssembly
 build with SIMD, and threads when the page is cross-origin isolated (`play.py` sends COOP/COEP; static hosts use
-`isolate()`). The search batch stays 16, as on the server, so a browser search is the server's search. A larger
-batch raises WebGPU throughput (64 leaves in 63 ms against 16 in 26 ms) but changes which leaves are searched;
-`BubbleEngine.turn` takes `batch_size` in its budget for that. WebAssembly time grows linearly with the batch.
+`isolate()`). The owner sends at most 16 rows per network batch. A larger batch raises WebGPU throughput (64
+leaves in 63 ms against 16 in 26 ms); `BubbleEngine.turn` takes `batch_size` in its budget for that. WebAssembly time
+grows linearly with the batch.
 
 The ONNX Runtime binary (27 MB WebGPU, 14 MB WebAssembly) and the model (4.6 MB fp32, 2.3 MB fp16) are fetched
 once and kept in the Cache API under their version and SHA-256. GitHub release downloads send no CORS headers, so
@@ -220,7 +233,7 @@ the model is served from the same origin: `build_web.py model` downloads the rel
 | ONNX vs PyTorch reference path, 47 recorded positions (CPU) | fp32 max abs 3.6e-5 policy, 9.1e-6 value; fp16 0.069 / 0.013 |
 | Browser evaluation vs PyTorch, same positions | WebGPU fp32 3.8e-5, WebAssembly 4.0e-5, WebGPU fp16 0.32; argmax 47/47 for all |
 | Encoder and line features vs `hexcrop` and `LineFeatures` (node) | identical |
-| Search vs native library, same seed and evaluations, 13 cases up to 512 simulations (node) | identical actions, visits, policy (1e-12) |
+| Per-leaf search (`hxg_*`, driven in `tests/web/engine.mjs`) vs native library, same seed and evaluations, 13 cases up to 512 simulations (node) | identical actions, visits, policy (1e-12) |
 | Solver wasm vs native library, 8 queries (node) | identical status, moves, certificate, nodes used |
 | Full turn, standard preset, two positions (WebGPU fp32, WebAssembly vs server CPU) | identical moves, value and top moves |
 
@@ -228,7 +241,8 @@ the model is served from the same origin: `build_web.py model` downloads the rel
 
 RTX 3070 Ti and Ryzen 9 5900X, Chrome 154 on Windows, while the training run kept the GPU about 93% busy. The server
 numbers are `play.Bubble` with the same search on the same machine in the same session. One search from a 9-stone
-position, root samples 16, batch 16, no solver, median of three (`web/engine/bench.html`).
+position, root samples 16, batch 16, no solver, median of three. These were measured on 2026-10-02 with the per-leaf
+search the page ran then, not the hybrid scheduler; `web/engine/bench.html` now times hybrid turns at each preset.
 
 Forward latency, ms per batch (crop 24 / crop 32):
 

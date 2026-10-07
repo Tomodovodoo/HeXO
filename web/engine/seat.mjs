@@ -532,7 +532,8 @@ async function serverless() {
   if (await isolate()) return true;
   Object.assign(page, original, {openMenu, pickItems});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);
-  bubble.entry.version = [build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
+  // 'hybrid' keeps evaluations of the hybrid scheduler apart from those an older page saved with its per-leaf search.
+  bubble.entry.version = ['hybrid', build.artefacts['gumbel.wasm'], build.artefacts['tactical.wasm']].join(':');
   bubble.entry.models = NETWORKS.length ? Object.fromEntries(NETWORKS.map(n => [n.name, n.model_version])) : {'': manifest.model_version};
   drip.entry.version = build.artefacts['native/native.wasm'];
   for (const {entry} of ENGINES.values()) entry.version ||= JSON.stringify(build.artefacts);

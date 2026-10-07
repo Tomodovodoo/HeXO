@@ -4,9 +4,9 @@ export const PRESETS = {lightning: {simulations: 8, solver_nodes: 2048}, quick: 
   standard: {simulations: 128, solver_nodes: 32768}, strong: {simulations: 512, solver_nodes: 131072},
   deep: {simulations: 2048, solver_nodes: 524288}, dangerous: {simulations: 65536, solver_nodes: 4000000}};
 
-/** The proof workers of the analysis solver preset (play-session.mjs SOLVER): the CPU threads left beside the page,
- * the search and the root solver, from 1 to 8. */
-export const SOLVER_WORKERS = Math.max(1, Math.min(8, (globalThis.navigator?.hardwareConcurrency || 4) - 2));
+/** The proof workers of every Bubble search with solver nodes, the solver preset included: half the browser's threads
+ * less one, from 1 to 8, so the page's main thread and inference keep the other half. */
+export const PROOF_WORKERS = Math.max(1, Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency || 4) / 2) - 1));
 
 /**
  * Registers ../coi-sw.js (cross-origin isolation for static hosts that cannot send headers) and reloads once, so
@@ -61,43 +61,28 @@ export class BubbleEngine extends EngineWorker {
 
   /**
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
-   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Optional hybrid_scheduler
-   * selects the hybrid scheduler: the native graph owner's compiled multi-view feeding. Optional hybrid_proof runs
-   * resident CPU solver slices through that owner's native graph frontier.
-   * Optional hybrid_capture uses bounded static WebGPU sessions and combined readback with that owner.
-   * Optional solver_ms (the SOLVER preset) spends up to that long on proof work alone before the turn (worker.mjs proveRoot).
-   * Optional leaf_nodes adds
-   * a per-turn leaf-proof allowance, capped at 2048 nodes and leaf_ms (default 10) per query. Under a clock
-   * `options.ms` is the turn's time and the budget a ceiling (see worker.mjs). `options.line`, a seat's game key,
-   * continues that game's search tree; `options.known` is the game's proof table (proof.mjs Proofs.list()) the turn
-   * may use. Checked local proof reuse is on by default; `options.proofStamps = false` disables it.
-   * Aborting `signal` cancels it (rejects with an AbortError).
+   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Every stone runs the hybrid
+   * scheduler (worker.mjs playTurn): `simulations` is its work per stone, and `solver_nodes` above 0 adds the root
+   * queries at that node budget and the owner's proof frontier on PROOF_WORKERS proof workers (`solver_workers`
+   * overrides the count). Optional solver_ms (the SOLVER preset) spends up to that long on proof work alone before the
+   * turn (worker.mjs proveRoot). Under a clock `options.ms` is the turn's time and the budget a ceiling (see
+   * worker.mjs). `options.line`, a seat's game key, continues that game's search graph; `options.known` is the game's
+   * proof table (proof.mjs Proofs.list()) the turn may use. Checked local proof reuse is on by default;
+   * `options.proofStamps = false` disables it. Aborting `signal` cancels it (rejects with an AbortError).
    */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, model: budget.checkpoint ? networkManifest(budget.checkpoint) : this.options.model,
-      simulations: budget.simulations, solverNodes: budget.solver_nodes,
-      hybridScheduler: budget.hybrid_scheduler ?? false,
-      hybridCapture: budget.hybrid_capture ?? false,
-      hybridProof: budget.hybrid_proof ?? false,
-      solverWorkers: budget.solver_workers ?? (budget.solver_ms ? SOLVER_WORKERS : 1), solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4,
-      proveMs: budget.solver_ms ?? 0,
-      leafNodes: budget.leaf_nodes ?? 0, leafQueryMs: budget.leaf_ms ?? 10,
+      simulations: budget.simulations, solverNodes: budget.solver_nodes, solverWorkers: budget.solver_workers ?? PROOF_WORKERS,
+      solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4, proveMs: budget.solver_ms ?? 0,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size ?? 16, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
       ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
-  /** Loads network `checkpoint` (a NETWORKS name, the default when null), so a timed turn does not spend its clock on it. */
+  /** Loads network `checkpoint` (a NETWORKS name, the default when null) and starts the PROOF_WORKERS proof workers, so
+   * a timed turn does not spend its clock on either. */
   prepare(checkpoint = null, options = {}) {
-    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model}, options);
-  }
-
-  /** One search of `simulations` from `history` (no solver): action, completed, elapsed_ms, evaluated, batches, policy.
-   * `options.qRangeFloor` is the tree's Q range floor (0 by default). Aborting `options.signal` cancels it (rejects
-   * with an AbortError). */
-  search(history, simulations, options = {}) {
-    return this.call({type: 'search', history, simulations, batchSize: options.batchSize ?? 16,
-      choice: options.choice ?? 'policy', qRangeFloor: options.qRangeFloor ?? 0}, options);
+    return this.call({type: 'use', model: checkpoint ? networkManifest(checkpoint) : this.options.model, proofWorkers: PROOF_WORKERS}, options);
   }
 
   /** Network predictions [{actions, logits, q}] for each history, as hexnet.DenseEvaluator gives them (q broadcast). */

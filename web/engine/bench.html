@@ -30,10 +30,11 @@ log(report.forward);
 report.search = {};
 for (const name of (query.get('presets') || 'lightning,quick,standard,strong,deep').split(',')) {
   const runs = [];
-  for (let i = 0; i < Number(query.get('runs') || 3); i++) runs.push(await engine.search(position, PRESETS[name].simulations));
-  const ms = runs.map(r => r.elapsed_ms).sort((a, b) => a - b)[runs.length >> 1];
-  report.search[name] = {simulations: PRESETS[name].simulations, completed: runs[0].completed, ms: Math.round(ms),
-    placements_per_s: Math.round(runs[0].completed / ms * 1000), evaluated: runs[0].evaluated, batches: runs[0].batches, network_ms: Math.round(runs[0].network_ms), action: runs[0].action};
+  for (let i = 0; i < Number(query.get('runs') || 3); i++) runs.push(await engine.turn(position, {simulations: PRESETS[name].simulations, solver_nodes: 0}));
+  const ms = runs.map(r => r.ms).sort((a, b) => a - b)[runs.length >> 1];
+  report.search[name] = {simulations: PRESETS[name].simulations, stones: runs[0].moves.length, completed: runs[0].actual_completed, ms,
+    placements_per_s: Math.round(runs[0].actual_completed / ms * 1000), forwards: runs[0].scheduler.reduce((n, s) => n + s.inference.forwards, 0),
+    moves: runs[0].moves};
   log({[name]: report.search[name]});
 }
 if (query.has('turn')) {
