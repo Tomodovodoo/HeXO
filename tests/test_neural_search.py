@@ -3428,8 +3428,8 @@ class NativeProofs(unittest.TestCase):
             proofs.stats()
 
     def test_native_service_retires_a_neural_lease_when_real_solver_finishes(self):
-        for feedback in (False,True):
-            with self.subTest(feedback=feedback):
+        for feedback,pending in ((False,2),(True,2),(False,4),(True,4)):
+            with self.subTest(feedback=feedback,pending=pending):
                 import ctypes as C
                 import json
                 import threading
@@ -3460,7 +3460,7 @@ class NativeProofs(unittest.TestCase):
                     try:
                         loop=native.hxp_new(pool.ptr,functions.ctypes.data,1,4,1000,1,64,0)
                         self.assertTrue(loop)
-                        service=native.hxb_new(16,2,0,0.)
+                        service=native.hxb_new(16,pending,0,0.)
                         self.assertTrue(service)
                         checked(native.hxb_feedback(service,feedback))
                         checked(native.hxb_attach(service,pool.ptr,0))
