@@ -133,6 +133,6 @@ export class PlayStorage {
       }
     }
     for (const name of ['sessions', 'games', 'matches', 'evaluations', 'coverage']) for (const row of data[name])
-      await this.put(name, name === 'sessions' ? {...row, _write_token: crypto.randomUUID()} : row);
+      await this.put(name, savedIds(name === 'sessions' ? {...row, _write_token: crypto.randomUUID()} : row));
   }
 }

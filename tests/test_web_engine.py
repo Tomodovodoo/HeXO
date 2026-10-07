@@ -300,7 +300,12 @@ await storage.put('evaluations',{id:key+'|{}|0,0',engine:'browser:native',engine
 await storage.put('evaluations',{id:key+'|{}|0,1',engine:'browser:native',engine_key:key,note:'older'});
 await storage.put('evaluations',{id:'browser:drip|null|abc||{}|0,1',engine:'browser:drip',note:'newer'});
 await storage.put('evaluations',{id:'other',engine:'browser:six',name:'Native (browser)',kind:'six'});
-console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluations:await storage.all('evaluations')}));"""
+const target=new PlayStorage(null);
+await target.put('evaluations',{id:'browser:drip|x',engine:'browser:drip',note:'present'});
+await target.restore({format:'hexo-browser-save',version:1,sessions:[],games:[],matches:[],coverage:[],
+ evaluations:[{id:'browser:native|x',engine:'browser:native',note:'backup'}]},{game(){}});
+console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluations:await storage.all('evaluations'),
+ restored:await target.all('evaluations')}));"""
         done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
                               capture_output=True, text=True, check=True)
         result = json.loads(done.stdout)
@@ -312,6 +317,7 @@ console.log(JSON.stringify({session:await storage.get('sessions','live'),evaluat
                          [dict(id='browser:drip|null|abc||{}|0,0', engine='browser:drip', engine_key='browser:drip|null|abc|',
                                note='native'), dict(id='browser:drip|null|abc||{}|0,1', engine='browser:drip', note='newer'),
                           dict(id='other', engine='browser:six', name='Native (browser)', kind='six')])
+        self.assertEqual(result['restored'], [dict(id='browser:drip|x', engine='browser:drip', note='backup')])
 
     def test_matching_replay_precedes_newer_unrelated_records(self):
         source = """import {Proofs} from './web/engine/proof.mjs';
