@@ -53,11 +53,13 @@ PRESETS = dict(
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
 PRESET_NAMES = list(PRESETS['bubble'])
-PV_CHECK = .25   # principal-variation check share of Bubble's play and analysis searches (neural_search.Recheck)
+HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
+PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
+SEEDS = itertools.count(1740)  # owner seeds: repeated searches of a position draw new root samples
+REFRESH_SHARE = .25  # share of a saved analysis's simulations its refresh searches again (Session.refresh)
 REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
 REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still moves its result
 REFRESH_MOVE = .05  # a refresh moved its result when its value changed by more than this, or its stones changed
-REVIEW_BATCH = dict(cpu=64, cuda=256)   # network leaves per pooled review batch
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
 SOLVER = dict(simulations=128, solver_nodes=32768, solver_ms=120_000)  # the analysis solver preset (see `prove`)
@@ -65,7 +67,7 @@ SOLVER_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 4))  # its native proof 
 LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
 # The engines take budgets as 32-bit signed integers.
 MAX_BUDGET = 2 ** 31 - 1
-KIND_LIMITS = dict(strix=dict(simulations=1), bubble=dict(leaf_nodes=0, leaf_ms=1))
+KIND_LIMITS = dict(strix=dict(simulations=1))
 HEXO_SITES = {'hexo.did.science': 'https://hexo.did.science/api',
               'hexo.mineking.dev': 'https://hexo.mineking.dev/proxy/api'}
 SHOWN = ('id', 'name', 'label', 'kind', 'badge', 'presets', 'checkpoints')
@@ -459,11 +461,8 @@ def model_key(path):
 
 
 def search_key(weights, entry, budget=None):
-    """The weights with the entry's Q floor, any optional leaf-proof allowance and the solver preset's clock, so saved searches
-    cannot mix."""
+    """The weights with the entry's Q floor and the solver preset's clock, so saved searches cannot mix."""
     key = weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
-    if budget and budget.get('leaf_nodes'):
-        key += f"~leaf{budget['leaf_nodes']}x{budget.get('leaf_ms', 10)}"
     if budget and budget.get('solver_ms'):
         key += f"~solver{budget['solver_ms']}"
     return key
@@ -478,7 +477,7 @@ class Yielded(Exception):
 
 
 class Watched:
-    """A network evaluator that reports each batch to `watch`, which may raise Cancelled."""
+    """A network evaluator that reports each batch's size to `watch`, which may raise Cancelled."""
 
     def __init__(self, inner, watch):
         self.inner, self.watch = inner, watch
@@ -487,27 +486,22 @@ class Watched:
         self.watch(len(histories))
         return self.inner.evaluate(histories)
 
-    def evaluate_leaves(self, leaves):
-        self.watch(len(leaves))
-        if hasattr(self.inner, 'evaluate_leaves'):
-            return self.inner.evaluate_leaves(leaves)
-        return self.inner.evaluate([history for _, _, history in leaves])
-
 
 class Bubble:
-    """One HexNet export on `device` with its evaluation cache."""
+    """One HexNet export on `device` with its evaluation cache: `evaluator` for single positions, `scheduler()` for the
+    hybrid scheduler's packed batches."""
 
     def __init__(self, path, device):
         import hexnet
         from legacy.train import digest
         from neural_search import EvaluationCache
         self.sha256 = digest(path)
-        self.evaluator = hexnet.DenseEvaluator(hexnet.load_model(path), device, self.sha256, max_batch=REVIEW_BATCH['cuda'])
+        self.evaluator = hexnet.DenseEvaluator(hexnet.load_model(path), device, self.sha256, max_batch=16)
         self.cache = EvaluationCache(4096)
         self.native = None
 
     def scheduler(self):
-        """The same weights for the hybrid scheduler's packed batches (see `prove`), made on first use."""
+        """The same weights for the hybrid scheduler's packed batches of up to 128 rows (see `search`), made on first use."""
         import hexnet
         if self.native is None:
             self.native = hexnet.DenseEvaluator(self.evaluator.model, self.evaluator.device, self.sha256, max_batch=128)
@@ -653,19 +647,23 @@ def top_rows(actions, policy, values=None, count=5, lead=None, won=False):
     return rows
 
 
-def glimpse(tree):
-    """The root of a search under way, or None before it has statistics: `top` (five first stones as in
-    `evaluate`), `value` (win probability of the side to move under the current policy) and `completed`."""
+def glimpse(frame, player):
+    """A search under way at its root, from a hybrid progress `frame` (InferenceService.progress) for `player` to
+    move, or None before the root has statistics: `top` (five first stones as in `evaluate`), `value` (win
+    probability of the side to move under the current improved policy, the root's own value when every shown stone
+    is proven lost) and `completed` (the owner's completed simulations)."""
     import numpy as np
-    stats = tree.result(0, 0, 0, 0)
-    policy, values, actions = stats['policy'], stats['values'], stats['actions']
+    edges = np.asarray(frame['edges'], np.float64)
+    actions, policy = edges[:, :2].astype(np.int64), edges[:, 5]
     if not len(actions) or not policy.sum() > 0:
         return None
     policy = policy / policy.sum()
-    top = top_rows(actions, policy, stats['completed_q'])
-    refuted = bool(top) and all(row[4] < 0 for row in top) and not stats.get('proven')
-    value = stats['node_value'] if refuted else float(policy @ values)
-    return dict(top=top, value=round((value + 1) / 2, 4), completed=int(stats['completed']),
+    top = top_rows(actions, policy, edges[:, 3])
+    winner = frame['exact_winner']
+    refuted = bool(top) and all(row[4] < 0 for row in top) and winner < 0
+    value = ((1. if winner == player else -1.) if winner >= 0 else frame['node_value'] if refuted
+             else float(policy @ edges[:, 4]))
+    return dict(top=top, value=round((value + 1) / 2, 4), completed=int(frame['completed']),
                 refuted=len(top) if refuted else 0)
 
 
@@ -748,23 +746,23 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     return found
 
 
-def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None, known=(), workers=None):
+def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, known=(), stamps=False):
     """The solver preset's view of `history`, in `solve`'s shape, found by proof work alone for up to `ms`.
 
     Two provers run until one returns a verified proof for either side or the clock ends: the tactical solver
-    `prover` asks the root for a mover win with 32,768 nodes, then four times as many each round, and a native
-    scheduler search of the position feeds `workers` proof workers (SOLVER_WORKERS by default) the positions its
-    neural search reaches, with the whole owner budget. `live(seen)` receives {solver: {elapsed_ms, root_nodes,
+    `prover` asks the root for a mover win with 32,768 nodes, then four times as many each round, and a hybrid
+    scheduler search of the position feeds the shared ProofWorkers `proofs` the positions its neural search reaches,
+    with the whole owner budget and proof stamps when `stamps`. `live(seen)` receives {solver: {elapsed_ms, root_nodes,
     frontier, busy, workers, proof}} about twice a second. `found['solver']` reports the totals, among them
     `native_nodes` and `certificates` of the native frontier."""
     from neural_search import GameGraph
     import tactical_proof
-    from hybrid_scheduler import SearchPool, InferenceService, ProofWorkers
+    from hybrid_scheduler import SearchPool, InferenceService
     history = [tuple(map(int, p)) for p in history]
     game = replay(history)
     player, remaining = game.player, game.remaining
     game.close()
-    start, workers = time.monotonic(), workers or SOLVER_WORKERS
+    start, workers = time.monotonic(), proofs.stats()['workers']
     end = start + ms / 1000
     found = dict(moves=[], pv=[], proof=None, threat=[], solved=True, used=0)
     premises, cells = [], 0
@@ -793,13 +791,12 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
                 return
             nodes = min(4 * nodes, tactical_proof.MAX_NODES)
     asking = threading.Thread(target=ask, daemon=True)
-    shared = ProofWorkers(package, workers=workers)
     evaluator = bubble.scheduler()
     graph = GameGraph(evaluator, bubble.sha256, history, seed=1740, cache=bubble.cache, tactics=True, round_barrier=True)
     pool = SearchPool([graph], quantum=64, views=8, depth=8, work=1, seed=1740)
     service, frame, event, shown = None, None, None, 0.
     try:
-        proofs = pool.enable_proofs(shared=shared, slice_ms=8, owner_budget=1.)
+        pool.enable_proofs(shared=proofs, slice_ms=8, stamps=stamps, owner_budget=1.)
         service = InferenceService([pool], [evaluator], batch_size=128, quantum=64, pending=2, flights=2,
                                    interleave_feedback=True, progress=True)
         service.start(continuous=True)
@@ -816,7 +813,7 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
                 if frame['exact_winner'] >= 0:
                     break
             if live and time.monotonic() >= shown:
-                busy = shared.stats()
+                busy = proofs.stats()
                 live(dict(solver=dict(elapsed_ms=round((time.monotonic() - start) * 1000), root_nodes=root['nodes'],
                                       frontier=busy['queued'] + busy['live'], busy=busy['active'], workers=workers,
                                       proof=None)))
@@ -834,20 +831,11 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
         records = pool.proofs.records() if pool.proofs is not None else []
         pool.close()
         graph.close()
-        shared.close()
     native = event if event is not None and event.get('exact_winner', -1) >= 0 else frame
     found['solver'] = dict(elapsed_ms=round((time.monotonic() - start) * 1000), root_nodes=root['nodes'],
                            native_nodes=stats.get('fresh_nodes', 0), certificates=stats.get('records', 0), workers=workers)
     found['used'] = root['nodes'] + stats.get('fresh_nodes', 0)
-    facts = []
-    for record in records:
-        request, answer = record['request'], record['result']
-        if answer.get('status') not in ('PROVEN_WIN', 'PROVEN_LOSS') or not answer.get('native_verified'):
-            continue
-        turns, cert = answer['proof_turns'], answer.get('certificate') or json.loads(answer['certificate_json'])
-        plies = len(answer['moves']) + 4 * (turns - 1) if answer['status'] == 'PROVEN_WIN' else 4 * turns + 2
-        pv, _ = principal_variation(request['history'], cert, attacker=answer['winner'], known=request.get('known', ()))
-        facts.append(dict(history=request['history'], winner=answer['winner'], plies=plies, pv=pv))
+    facts = frontier_facts(records)
     if facts:
         found['proofs'] = facts   # the frontier's verified answers join the game's proof table (Session.save)
     if root['result'] is not None:
@@ -916,7 +904,7 @@ class Proofs:
         self.known_cache = {}
 
     def add(self, history, record, line=None):
-        """Index the root proof and any leaf continuations retained in `record['proofs']`.
+        """Index the root proof and any proven continuations retained in `record['proofs']`.
         `line`, the record's saved text, skips a record already indexed."""
         if line in self.seen:
             return
@@ -1143,64 +1131,119 @@ def answered(history, known):
                 pv=outcome['pv'], threat=[], solved=True, ms=0, actual_completed=0, actual_solver_nodes=0, later=[])
 
 
-class SearchProofs:
-    """Leaf proofs within one turn's extra node and solver-time allowance.
+def frontier_facts(records):
+    """The verified answers among a proof loop's `records` (ProofLoop.records) as proof-table facts
+    {history, winner, plies, pv}."""
+    facts = []
+    for record in records:
+        request, answer = record['request'], record['result']
+        if answer.get('status') not in ('PROVEN_WIN', 'PROVEN_LOSS') or not answer.get('native_verified'):
+            continue
+        turns, cert = answer['proof_turns'], answer.get('certificate') or json.loads(answer['certificate_json'])
+        plies = len(answer['moves']) + 4 * (turns - 1) if answer['status'] == 'PROVEN_WIN' else 4 * turns + 2
+        pv, _ = principal_variation(request['history'], cert, attacker=answer['winner'], known=request.get('known', ()))
+        facts.append(dict(history=request['history'], winner=answer['winner'], plies=plies, pv=pv))
+    return facts
 
-    Each query gets at most 2048 nodes and `query_ms` (default 10), including certificate verification. Only solver time
-    consumes the time allowance; neural inference does not. Exhaustion leaves the search on neural values.
-    """
 
-    def __init__(self, prover, nodes, watch, query_ms=10):
-        self.prover, self.left, self.watch = prover, nodes, watch
-        self.query_ms = query_ms
-        self.ms = min(60_000, max(10_000, nodes // 8))
-        self.used = 0
-        self.records = {}
-        self.known = None
-
-    def history(self, history, *, ms=10, certificate=None):
-        allowance = min(ms, self.query_ms, int(self.ms))
-        if allowance < 1 or (not self.left and certificate is None):
-            return dict(status='UNKNOWN', native_verified=False)
-        self.watch(0)
-        start = time.perf_counter()
-        result = self.prover.history(history, nodes=min(2048, max(1, self.left)), ms=allowance, certificate=certificate)
-        if result.get('certificate') is None and result.get('certificate_json'):
-            result['certificate'] = json.loads(result['certificate_json'])
-        spent = result.get('nodes_used', 0)
-        self.used += spent
-        self.left = max(0, self.left - spent)
-        self.ms -= (time.perf_counter() - start) * 1000
-        self.watch(0)
-        if verified(result) and result.get('moves'):
-            found = winning_line(history, result)
-            fact = dict(history=[list(p) for p in history], winner=found['proof']['winner'],
-                        plies=found['proof']['plies'], pv=found['pv'])
-            old = self.records.get(proof_key(history))
-            if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
-                self.records[proof_key(history)] = fact
-            if self.known is not None:
-                self.known.add(history, found)
-        return result
+def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=False):
+    """Hybrid scheduler work on the game graphs of `roots` ([(graph, simulations)], each graph at its root), in one
+    SearchPool whose games share `bubble`'s packed network batches. Each graph's native owner completes
+    `simulations` simulations over up to HYBRID['views'] views: its root and the positions below it, at most
+    HYBRID['depth'] placements down, in quanta of at most HYBRID['quantum'], with 16 root samples and the round
+    barrier. With `proofs` (shared hybrid_scheduler.ProofWorkers) each owner also runs a proof frontier on those
+    workers, at most PROOF_BUDGET of the owner's time. `watch(n)` receives the network rows launched since its last
+    call and may raise Cancelled, which ends every search; while it returns True the network work waits and the
+    proofs go on. `live(frame)` receives the first root's progress frames
+    (InferenceService.progress) at most every 0.3 s. Returns per root its owner's final root record in
+    GameGraph.result's shape (`actions`, improved `policy`, `completed_q`, `values`, `visits`, `node_value`,
+    `exact_winner`, `proven`, `proof_plies`), its `action` the stone of the highest improved policy, or the owner's
+    own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
+    verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
+    spent. Each graph is left at its root."""
+    import numpy as np
+    from hybrid_scheduler import InferenceService, SearchPool
+    evaluator = bubble.scheduler()
+    histories = [[list(p) for p in graph.history] for graph, _ in roots]
+    quantum = max(4, min(HYBRID['quantum'], max(simulations for _, simulations in roots)))
+    pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=HYBRID['views'], depth=HYBRID['depth'],
+                      work=1, seed=next(SEEDS))
+    service, events, records, effort = None, {}, [], {}
+    try:
+        if proofs is not None:
+            pool.enable_proofs(shared=proofs, slice_ms=8, stamps=stamps, owner_budget=PROOF_BUDGET)
+        service = InferenceService([pool], [evaluator], batch_size=evaluator.max_batch, quantum=64, pending=2,
+                                   flights=2, interleave_feedback=True, progress=live is not None)
+        service.start(continuous=True)
+        service.launch()
+        for game, (history, (_, simulations)) in enumerate(zip(histories, roots)):
+            service.retarget(0, game, history, expected=0, work=max(1, simulations), samples=16, views=HYBRID['views'])
+        launched, sequence, shown, held = 0, 0, 0., False
+        while len(events) < len(roots):
+            rows = service.stats()['launched_rows']
+            if bool(watch(rows - launched)) != held:
+                held = not held
+                if held:
+                    service.pause()
+                else:
+                    service.resume()
+            launched = rows
+            if live is not None and 0 not in events and time.monotonic() >= shown:
+                if (frame := service.progress(0, 0, token=1, after=sequence)) is not None:
+                    sequence, shown = frame['snapshot_sequence'], time.monotonic() + .3
+                    live(frame)
+            while (event := service.event()) is not None:
+                events[event['game']] = event
+            if len(events) < len(roots):
+                service.wait(50)
+    finally:
+        try:
+            if service is not None:
+                service.close()
+        finally:
+            if pool.proofs is not None:
+                records = pool.proofs.records()
+                effort = {game: sum(e['fresh_nodes'] for e in pool.proofs.effort(game).values())
+                          for game in range(len(roots))}
+            pool.close()
+    facts, results = frontier_facts(records), []
+    for game, ((graph, _), history) in enumerate(zip(roots, histories)):
+        if 'error' in events[game]:
+            raise ValueError(f"Hybrid search failed: {events[game]['error']}")
+        event, edges = events[game], np.asarray(events[game]['edges'], np.float64)
+        graph.at(history)
+        winner, mover = event['exact_winner'], player_at(len(history))
+        policy = edges[:, 5]
+        result = dict(actions=edges[:, :2].astype(np.int64), policy=policy, completed_q=edges[:, 3], values=edges[:, 4],
+                      visits=edges[:, 6].astype(np.int64), node_value=float(event['node_value']), exact_winner=winner,
+                      proven=0 if winner < 0 else 1 if winner == mover else -1,
+                      proof_plies=int(event['proof_plies']) if winner >= 0 else 0,
+                      action=(list(event['action']) if winner >= 0 or not policy.sum() > 0
+                              else edges[np.argmax(policy), :2].astype(np.int64).tolist()),
+                      completed=int(event['completed']), frontier_nodes=effort.get(game, 0),
+                      proofs=[f for f in facts if f['history'][:len(history)] == history])
+        results.append(result)
+    return results
 
 
 class TurnSearch:
     """One evaluation under way (see `evaluate`): the solver's findings, then a search per stone of the turn until
     the turn is complete. When the solver already gave the turn, its stones are played and each position of the turn
     is still searched, for its rows. The searches of later stones are kept in `later` as evaluations of the positions
-    inside the turn, with leaf proofs but no separate full-budget root query; on a solver-proven turn they carry
-    the rest of its `pv`.
-    Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names the tree and simulations of the next search, None when the turn is
-    complete, (None, 0) for the raw policy; `take(result)` applies that search's result, None for the raw policy.
-    `trees(history, simulations, network)` gives the tree and the simulations to run for a stone; by default one
-    tree is advanced through the turn, each stone searched afresh with `simulations`. A seat's move passes its game
-    tree (`Engines.game_trees`). With a proof table `known` (`Proofs`) a position it proves lost for the side to move
-    gets that proof and line unless the solver proved one (a proven win needs its turn, see `answered`), each search
-    starts with the root's proven edges settled (`Proofs.edges`; the mover's losses first, then its wins from the
-    shortest, since the first win settles the root), and a proof whose turn reaches a proven position
-    continues into that position's line."""
+    inside the turn, without a separate root query; on a solver-proven turn they carry the rest of its `pv`.
+    Without a solver proof, a position the search proves has the turn's own stones as its `pv`. `request()` names
+    the game graph and simulations of the next search, None when the turn is complete, (None, 0) for the raw
+    policy; `take(result)` applies that search's result (see `search`), None for the raw policy.
+    `trees(history, simulations, network)` gives the graph and the simulations to run for a stone; by default one
+    fresh GameGraph is advanced through the turn, each stone searched with `simulations`. A seat's move passes its
+    game's graph (`Engines.game_graph`). With a proof table `known` (`Proofs`) a position it proves lost for the side
+    to move gets that proof and line unless the solver proved one (a proven win needs its turn, see `answered`), each
+    search starts with the root's proven edges settled (`Proofs.edges`; the mover's losses first, then its wins from
+    the shortest, since the first win settles the root), and a proof whose turn reaches a proven position continues
+    into that position's line. The positions a search's proof frontier proves join `known` and the result's
+    `proofs`."""
 
-    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None, proofs=None):
+    def __init__(self, bubble, network, history, simulations, solved, trees=None, q_range_floor=0., known=None):
         self.bubble, self.network, self.simulations, self.q_range_floor = bubble, network, simulations, q_range_floor
         self.history = [tuple(map(int, p)) for p in history]
         self.local = replay(self.history)
@@ -1212,7 +1255,7 @@ class TurnSearch:
         self.threat, self.solved, self.solver_used = solved['threat'], solved['solved'], solved['used']
         self.given, self.top, self.value, self.completed, self.tree = bool(self.moves), [], None, 0, None
         self.node_value = None
-        self.later, self.played = [], 0
+        self.later, self.played, self.facts = [], 0, {}
         self.trees = trees or self.advanced
         self.known = known if known is not None else Proofs()
         outcome = known.known(self.history) if known is not None and self.proof is None else None
@@ -1220,17 +1263,14 @@ class TurnSearch:
             self.proof = dict(winner=outcome['winner'], plies=outcome['plies'],
                               turns=proof_turns(outcome['plies'], self.local.remaining, False))
             self.pv = outcome['pv']
-        self.proofs = proofs
-        if proofs is not None:
-            proofs.known = self.known
 
     def advanced(self, history, simulations, network):
-        from neural_search import NeuralSearch
+        from neural_search import GameGraph
         if self.tree is None:
-            self.tree = NeuralSearch(network, self.bubble.sha256, history, seed=1740, cache=self.bubble.cache,
-                                     tactics=True, q_range_floor=self.q_range_floor)
+            self.tree = GameGraph(network, self.bubble.sha256, history, seed=1740, cache=self.bubble.cache,
+                                  tactics=True, q_range_floor=self.q_range_floor, round_barrier=True)
         else:
-            self.tree.advance(history[-1])
+            self.tree.at(history)
         return self.tree, simulations
 
     def request(self):
@@ -1249,7 +1289,6 @@ class TurnSearch:
             for action, (winner, distance, _) in sorted(edges.items(), key=lambda e: (e[1][0] == mover, e[1][1], e[0])):
                 with contextlib.suppress(ValueError):
                     tree.mark(action, winner, distance)
-        tree.proof_solver, tree.proof_ms = self.proofs, self.proofs.query_ms if self.proofs else 10
         return tree, simulations
 
     def take(self, result):
@@ -1259,13 +1298,20 @@ class TurnSearch:
         exact = None
         if result is not None:
             self.completed += result.get('completed', 0)
+            self.solver_used += result.get('frontier_nodes', 0)
+            for fact in result.get('proofs', []):
+                key, old = proof_key(fact['history']), self.facts.get(proof_key(fact['history']))
+                if old is None or (fact['plies'], -len(fact['pv'])) < (old['plies'], -len(old['pv'])):
+                    self.facts[key] = fact
+            if result.get('proofs'):
+                self.known.add(self.history, dict(proofs=result['proofs']))
             proven = result.get('proven') or 0
             exact = dict(winner=self.player if proven > 0 else 1 - self.player,
                          turns=proof_turns(result['proof_plies'], self.local.remaining, proven > 0),
                          plies=int(result['proof_plies'])) if proven else None
             if self.proof is None and (proven > 0 or proven < 0 and not self.moves):
                 self.proof = dict(exact, plies=exact['plies'] + self.played)
-        # Installing a root loss can settle a fresh tree before its first neural
+        # Installing a root loss can settle a fresh graph before its first neural
         # expansion. The proof is complete, but playing still needs a legal move.
         if result is None or result['action'] is None:
             current = [tuple(cell[:2]) for cell in self.local.cells]
@@ -1298,8 +1344,7 @@ class TurnSearch:
         self.played += 1
 
     def record(self):
-        from neural_search import GameGraph
-        if isinstance(self.tree, GameGraph) and self.played > 1 and not self.given:
+        if self.tree is not None and self.played > 1 and not self.given:
             # The later stones' searches changed the graph under the first root: read that root again.
             from dense_selfplay import root_value
             self.tree.at(self.history)
@@ -1317,10 +1362,9 @@ class TurnSearch:
             pv = pv + [[*p[:3], p[3] + len(self.moves)] for p in after['pv']]
         found = dict(moves=self.moves, value=round(value, 4), node_value=self.node_value, top=self.top, proof=self.proof, pv=pv,
                     threat=self.threat, solved=self.solved, ms=round((time.perf_counter() - self.start) * 1000),
-                    actual_completed=self.completed,
-                    actual_solver_nodes=self.solver_used + (self.proofs.used if self.proofs else 0), later=self.later)
-        if self.proofs is not None and self.proofs.records:
-            found['proofs'] = list(self.proofs.records.values())
+                    actual_completed=self.completed, actual_solver_nodes=self.solver_used, later=self.later)
+        if self.facts:
+            found['proofs'] = list(self.facts.values())
         given = answered(self.history, self.known)
         if given is not None and (not self.proof or given['proof']['plies'] <= proof_plies(self.proof, self.history)):
             found.update({k: given[k] for k in ('moves', 'value', 'top', 'proof', 'pv')})
@@ -1336,7 +1380,7 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10, pv_check=0., solver_ms=0, package=None):
+             solved=None, q_range_floor=0., known=None, solver_ms=0, package=None, proofs=None, stamps=False):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -1346,29 +1390,19 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     proof the turn's own stones; [] when unproven) and
     `threat` (the stones of a forced win the opponent would have if it moved now). `solved` is False when a solver
     initial root query failed to run (worker restarting, deadline), so the result must not count as solver-checked.
-    Opt-in `leaf_nodes` adds a shared leaf-proof allowance per turn, with at most 2048 nodes/`leaf_ms` per query;
-    both stones share that allowance. Zero keeps leaf probing disabled. `simulations` 0 plays the raw policy;
-    `solver_nodes` 0 skips root queries, and no `prover` skips all solver work. `watch(n)` is called
-    before each network batch of n positions and may raise Cancelled; `live(glimpse)` receives the search of the
-    first stone as it goes, a few times a second. `trees` is `TurnSearch`'s tree source; `solved`, when given, is
-    the solver's view (see `solve`) and no initial root query is made. `q_range_floor` is the fresh trees' neural_search floor.
+    Each stone is searched on the hybrid scheduler (see `search`) with `simulations` of work; `simulations` 0 plays
+    the raw policy. `solver_nodes` 0 skips root queries and the searches' proof frontier, and no `prover` skips all
+    solver work; otherwise the frontier runs on `proofs` (shared ProofWorkers), or on SOLVER_WORKERS of this call's
+    own on the tactical `package`, with proof stamps when `stamps`. `watch(n)` receives the network rows launched
+    and may raise Cancelled; `live(glimpse)` receives the search of the first stone as it goes, a few times a
+    second. `trees` is `TurnSearch`'s graph source; `solved`, when given, is the solver's view (see `solve`) and no
+    initial root query is made. `q_range_floor` is the fresh graphs' neural_search floor.
     `known`, a proof table (`Proofs`), answers a position it proves won for the side to move without solver or
-    search (see `answered`) and otherwise informs the search (see `TurnSearch`). `pv_check`, for trees that are a
-    GameGraph, is the share of each stone's simulations its principal-variation check takes (neural_search.Recheck).
-    `solver_ms` (the solver preset) replaces the root queries with `prove` on the tactical `package` for up to that
-    long; the search then plays the proven turn or, without a proof, searches as usual, and the result carries
-    `prove`'s `solver` totals."""
-    turn, shown = None, [0.]
-
-    def observe(n):
-        watch(n)
-        # A PV check temporarily searches the opponent's reply; its rows belong to that later position.
-        if (live and turn is not None and turn.tree is not None and not turn.moves
-                and turn.tree.history == turn.history and time.monotonic() >= shown[0]):
-            if (seen := glimpse(turn.tree)) is not None:
-                shown[0] = time.monotonic() + .3
-                live(seen)
-
+    search (see `answered`) and otherwise informs the search (see `TurnSearch`).
+    `solver_ms` (the solver preset) replaces the root queries with `prove` for up to that long; the search then
+    plays the proven turn or, without a proof, searches as usual, and the result carries `prove`'s `solver`
+    totals."""
+    from hybrid_scheduler import ProofWorkers
     game = replay(history)
     finished = game.winner >= 0
     game.close()
@@ -1376,8 +1410,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         raise ValueError('The game has finished')
     if (found := answered(history, known)) is not None:
         return found
-    proofs = SearchProofs(prover, leaf_nodes, watch, leaf_ms) if prover is not None and leaf_nodes and simulations else None
-    network = Watched(bubble.evaluator, observe)
+    network = Watched(bubble.evaluator, watch)
     facts = known.facts(history) if known is not None else []
     if trees is not None:
         tree, _ = trees(history, simulations, network)
@@ -1391,21 +1424,33 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             if old is None or fact['plies'] <= old['plies']:
                 merged[key] = fact
         facts = sorted(merged.values(), key=lambda f: len(f['history']))[:2048]
-    if solved is None and solver_ms and prover is not None:
-        solved = prove(bubble, prover, package, history, solver_ms, watch, live, facts)
-        if solved.get('proofs'):
-            # The frontier's verified positions settle the follow-up search's edges.
-            known = known if known is not None else Proofs()
-            known.add(history, dict(proofs=solved['proofs']))
-    turn = TurnSearch(bubble, network, history, simulations,
-                      solved or solve(prover, history, solver_nodes, watch, facts), trees, q_range_floor, known, proofs)
+    own = (ProofWorkers(package, workers=SOLVER_WORKERS)
+           if proofs is None and prover is not None and (solver_nodes or solver_ms) else None)
+    proofs = proofs if own is None else own
+    turn = None
     try:
+        if solved is None and solver_ms and prover is not None:
+            solved = prove(bubble, prover, proofs, history, solver_ms, watch, live, facts, stamps)
+            if solved.get('proofs'):
+                # The frontier's verified positions settle the follow-up search's edges.
+                known = known if known is not None else Proofs()
+                known.add(history, dict(proofs=solved['proofs']))
+        turn = TurnSearch(bubble, network, history, simulations,
+                          solved or solve(prover, history, solver_nodes, watch, facts), trees, q_range_floor, known)
+        frontier = proofs if prover is not None and solver_nodes else None
         while (asked := turn.request()) is not None:
             tree, count = asked
-            if tree is not None:
-                turn.tree = tree
-            check = dict(pv_check=pv_check) if pv_check else {}
-            turn.take(tree.search(max(1, count), root_samples=16, batch_size=16, **check) if tree is not None else None)
+            if tree is None:
+                turn.take(None)
+                continue
+            turn.tree = tree
+            show = None
+            if live and not turn.played:
+                def show(frame):
+                    if (seen := glimpse(frame, turn.player)) is not None:
+                        live(seen)
+            [result] = search(bubble, [(tree, max(1, count))], frontier, watch, show, stamps)
+            turn.take(result)
         found = turn.record()
         if solved and 'solver' in solved:
             found['solver'] = solved['solver']
@@ -1413,18 +1458,23 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 found['proofs'] = found.get('proofs', []) + solved['proofs']
         return found
     finally:
-        turn.close()
+        try:
+            if turn is not None:
+                turn.close()
+        finally:
+            if own is not None:
+                own.close()
 
 
-def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, batch_size=64,
-                  q_range_floor=0., known=None, leaf_nodes=0, leaf_ms=10):
+def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, q_range_floor=0.,
+                  known=None, proofs=None, stamps=False):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
-    proof table `known`; then fresh trees, one per position, search together with that table, checking opt-in
-    `leaf_nodes` proofs before sharing network batches of up to `batch_size`, stone by stone. Each result is what
-    `evaluate` would give at that budget with the table. `watch` may raise Cancelled."""
+    proof table `known`; then fresh game graphs, one per position, search together with that table in one
+    SearchPool (see `search`), stone by stone, sharing network batches, with their proof frontiers on `proofs`
+    when `solver_nodes` and `provers` are given. Each result is what `evaluate` would give at that budget with the
+    table. `watch` may raise Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
-    from neural_search import SearchCoordinator
     given = [answered(h, known) for h in histories]
     keys = [position_text(h) for h in histories]
     solved = {}
@@ -1447,23 +1497,25 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                 if known is not None:
                     known.add(unique[k], found)
     network = Watched(bubble.evaluator, watch)
+    frontier = proofs if provers and solver_nodes else None
     turns = []
     try:
-        for i, (k, history, a) in enumerate(zip(keys, histories, given)):
+        for k, history, a in zip(keys, histories, given):
             if a is None:
-                proofs = SearchProofs(provers[i % len(provers)], leaf_nodes, watch, leaf_ms) if provers and leaf_nodes and simulations else None
                 turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
-                                        q_range_floor=q_range_floor, known=known, proofs=proofs))
-        coordinator = SearchCoordinator(network, bubble.sha256, bubble.cache)
+                                        q_range_floor=q_range_floor, known=known))
         while asked := [(turn, request) for turn in turns if (request := turn.request()) is not None]:
-            if not simulations:
-                for turn, _ in asked:
+            searching = []
+            for turn, (tree, count) in asked:
+                if tree is None:
                     turn.take(None)
-                continue
-            results = coordinator.search_many([tree for _, (tree, _) in asked], simulations, root_samples=16,
-                                              batch_size=batch_size)
-            for (turn, _), result in zip(asked, results):
-                turn.take(result)
+                else:
+                    turn.tree = tree
+                    searching.append((turn, (tree, max(1, count))))
+            if searching:
+                for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
+                                                               stamps=stamps)):
+                    turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
     finally:
@@ -1508,6 +1560,7 @@ class Engines:
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
         self.helpers, self.kept, self.graphs, self.graph_ids = [], None, OrderedDict(), itertools.count(1)
+        self.workers = None
         self.external = {}
         self.children = {}
         self.last_turn = {}
@@ -1545,36 +1598,35 @@ class Engines:
         """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
         really had (no solver nodes when the solver is not built) and the key of the weights it used (see
         `model_key`). `line` (a seat's game, see `Session.lines`) or `game` (the analysis board's game, see
-        `Session.analysis_line`) searches that game's graph (see `game_graph`) with the principal-variation check
-        PV_CHECK; without either the turn searches fresh trees. With `keep` (a deepening tier) the search runs only
-        the simulations the root lacks, and a proof the solver found for the position is reused. `refresh`, a saved
-        evaluation of `history`, searches the game graph again with the PV_CHECK share of that evaluation's
-        simulations a stone and its solver findings; the graph is the one `budget` (the seat's) selects. A seat's
+        `Session.analysis_line`) searches that game's graph (see `game_graph`); without either the turn searches a
+        fresh graph. Searches with solver nodes run their proof frontier on this lane's `proof_workers`. With `keep`
+        (a deepening tier) the search runs only the simulations the root lacks, and a proof the solver found for the
+        position is reused. `refresh`, a saved evaluation of `history`, searches the game graph again with the
+        REFRESH_SHARE of that evaluation's simulations a stone and its solver findings; the graph is the one `budget` (the seat's) selects. A seat's
         evaluation or a tier's has a key ending in `:kept`, so continued evaluations are never mistaken for fresh
         ones. `used`, a list, receives the number `game_graph` gave each graph searched, before the search, so a
         caller sees it even when the search is cancelled."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        solver, build = self.solver() if (budget['solver_nodes'] or budget.get('leaf_nodes')) and refresh is None else (None, 'none')
-        spent = budget if solver or refresh is not None else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
+        solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
+        spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
         trees = solved = None
         floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
-            build = self.solver_build() if budget['solver_nodes'] or budget.get('leaf_nodes') else 'none'
-            share = max(1, round(PV_CHECK * refresh['simulations']))
+            build = self.solver_build() if budget['solver_nodes'] else 'none'
+            share = max(1, round(REFRESH_SHARE * refresh['simulations']))
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
             trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep, used=used)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
-                         solved, floor, known, leaf_nodes=spent.get('leaf_nodes', 0) if solver else 0,
-                         leaf_ms=spent.get('leaf_ms', 10), pv_check=PV_CHECK if trees else 0.,
-                         solver_ms=spent.get('solver_ms', 0) if solver else 0,
-                         package=self.tactical_package)
+                         solved, floor, known, solver_ms=spent.get('solver_ms', 0) if solver else 0,
+                         package=self.tactical_package, proofs=self.proof_workers() if solver else None,
+                         stamps=self.proof_stamps)
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry, spent)
         kept = ':kept' if keep or line is not None else ''
-        return found, spent, f"{weights}:{build if spent['solver_nodes'] or spent.get('leaf_nodes') else 'none'}{kept}"
+        return found, spent, f"{weights}:{build if spent['solver_nodes'] else 'none'}{kept}"
 
     def game_graph(self, bubble, game, build='none', q_range_floor=0., simulations=None, keep=False, used=None):
         """A `TurnSearch` tree source over the GameGraph of `game`: one graph per game, model, solver `build` and
@@ -1594,7 +1646,7 @@ class Engines:
                 graph, ident = kept[1:]
             else:
                 graph = GameGraph(network, bubble.sha256, cells, seed=1740, cache=bubble.cache, tactics=True,
-                                  q_range_floor=q_range_floor)
+                                  q_range_floor=q_range_floor, round_barrier=True)
                 ident = next(self.graph_ids)
             self.graphs[game] = key, graph, ident
             if used is not None:
@@ -1628,25 +1680,38 @@ class Engines:
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None, known=None):
         """`evaluate_many` of `histories` with the entry's export and the proof table `known`, its solver queries
-        spread over REVIEW_SOLVERS workers; returns (evaluation, budget it really had, key of the weights) per
+        spread over REVIEW_SOLVERS workers and its proof frontiers on `proof_workers`; returns (evaluation, budget it really had, key of the weights) per
         position as `evaluate` does."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] or budget.get('leaf_nodes') else ([], 'none')
-        spent = budget if provers else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes') if k in budget}
+        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
+        spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
-                              REVIEW_BATCH['cuda' if str(device or self.device).startswith('cuda') else 'cpu'],
-                              entry.get('q_range_floor', 0.), known, leaf_nodes=spent.get('leaf_nodes', 0),
-                              leaf_ms=spent.get('leaf_ms', 10))
+                              entry.get('q_range_floor', 0.), known, proofs=self.proof_workers() if provers else None,
+                              stamps=self.proof_stamps)
         out = []
         for record in found:
             used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
             weights = search_key(bubble.sha256[:16], entry, used)
-            out.append((record, used, f"{weights}:{build if used['solver_nodes'] or used.get('leaf_nodes') else 'none'}"))
+            out.append((record, used, f"{weights}:{build if used['solver_nodes'] else 'none'}"))
         return out
 
     def effective(self, budget):
         """`budget` as it can run here: no solver work when the tactical library is not built."""
-        return budget if self.solver_build() != 'none' else budget | {k: 0 for k in ('solver_nodes', 'leaf_nodes', 'solver_ms') if k in budget}
+        return budget if self.solver_build() != 'none' else budget | {k: 0 for k in ('solver_nodes', 'solver_ms') if k in budget}
+
+    def proof_workers(self):
+        """This lane's SOLVER_WORKERS native proof workers (hybrid_scheduler.ProofWorkers), which every search with
+        solver nodes shares, on the tactical build; made on first use and again when the build changes, None when
+        the solver is not built."""
+        from hybrid_scheduler import ProofWorkers
+        build = self.solver_build()
+        if build == 'none':
+            return None
+        if self.workers is None or self.workers[1] != build:
+            if self.workers is not None:
+                self.workers[0].close()
+            self.workers = ProofWorkers(self.tactical_package, workers=SOLVER_WORKERS), build
+        return self.workers[0]
 
     def solver_build(self):
         """The first 8 hex digits of the tactical library's recorded SHA-256, or 'none' when the library or its
@@ -1747,6 +1812,9 @@ class Engines:
         for helper, _ in self.helpers:
             helper.close()
         self.helpers = []
+        if self.workers is not None:
+            self.workers[0].close()
+            self.workers = None
         self.bubbles.clear()
         for child in self.children.values():
             child.end()
@@ -1899,7 +1967,7 @@ class Evaluations:
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
                       solver_nodes=budget['solver_nodes'], **evaluation,
                       at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        record.update({k: budget[k] for k in ('leaf_nodes', 'leaf_ms', 'solver_ms') if k in budget})
+        record.update({k: budget[k] for k in ('solver_ms',) if k in budget})
         with self.lock:
             saved = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
             saved, facts = json.loads(saved) if saved else {}, {}
@@ -2178,8 +2246,7 @@ class Session:
             weights = search_key(model_key(export_path(entry, seat['checkpoint'])), entry, budget)
         except (OSError, KeyError):
             return None
-        searched = budget['solver_nodes'] or budget.get('leaf_nodes')
-        return f"{weights}:{self.engines.solver_build() if searched else 'none'}"
+        return f"{weights}:{self.engines.solver_build() if budget['solver_nodes'] else 'none'}"
 
     # Reading
 
@@ -2924,7 +2991,7 @@ class Session:
         files = [library]
         if entry['kind'] == 'bubble':
             files += [library.with_name(library.name.replace('hexo', 'hexo_gumbel'))]
-            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] or seat['budget'].get('leaf_nodes') else 'none'
+            source['solver_build'] = self.engines.solver_build() if seat['budget']['solver_nodes'] else 'none'
         elif entry['kind'] == 'six':
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
@@ -3203,7 +3270,7 @@ class Session:
                 registry = {}
                 for seat in match['players']:
                     source = seat['source']
-                    if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
+                    if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
                         raise ValueError('Tactical solver build changed since the batch started')
                     if source.get('weights') and file_digest(file_identity(source['weights'])) != source['weights_sha256']:
                         raise ValueError('Checkpoint weights changed since the batch started')
@@ -3532,21 +3599,21 @@ class Session:
                     job.status, job.error = 'failed', f'{failure or ""} {error}'.strip()
 
     def watcher(self, job, count=True):
-        """A network-batch callback that stops a cancelled job and, when `count`, adds batch sizes to its progress.
-        A deepening job steps aside for more urgent analysis; deepening and review slow down while an engine seat
-        searches."""
+        """A network-row callback (see `search`) that stops a cancelled job and, when `count`, adds row counts to its
+        progress. A deepening job steps aside for more urgent analysis; deepening and review return True, which holds
+        their network work, while an engine seat searches."""
         def watch(n):
+            busy = False
             if hasattr(job, 'tier') or job.kind == 'review':
                 with self.lock:
                     if hasattr(job, 'tier') and self.queues['analysis'] and self.queues['analysis'][0][0] < job.priority:
                         job.cancelled = True
                     busy = any(j.kind == 'move' and j.status == 'running' for j in self.jobs.values())
-                if busy:
-                    time.sleep(.03)
             if job.cancelled:
                 raise Cancelled()
             if count:
                 job.done += n
+            return busy
         return watch
 
     def evaluation(self, job, seat, history, force=False):
@@ -3594,7 +3661,7 @@ class Session:
                 timer.start()
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
-            spent.update({k: refresh[k] for k in ('leaf_nodes', 'leaf_ms', 'solver_ms') if k in refresh})
+            spent.update({k: refresh[k] for k in ('solver_ms',) if k in refresh})
             if refresh.get('solver'):
                 found['solver'] = refresh['solver']   # a refresh rereads the graph; the proof work it replaces stays reported
         saved = self.save(history, weights, spent, found, model)
@@ -3708,7 +3775,7 @@ class Session:
             started = time.monotonic()
             if self.match and self.match['active']:
                 source = self.match['players'][job.side if self.match['current'] % 2 else 1-job.side]['source']
-                if (seat['budget'].get('solver_nodes') or seat['budget'].get('leaf_nodes')) and source['solver_build'] != self.engines.solver_build():
+                if seat['budget'].get('solver_nodes') and source['solver_build'] != self.engines.solver_build():
                     raise ValueError('Tactical solver build changed during this batch')
                 files = source['files'] | ({source['weights']: source['weights_sha256']} if source.get('weights') else {})
                 if any(file_digest(file_identity(path)) != digest for path, digest in files.items()):
