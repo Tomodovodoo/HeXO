@@ -1161,6 +1161,63 @@ class FusedCudaTests(unittest.TestCase):
         for out, snapshot in zip(outputs, saved):
             for name in out:
                 torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
+        # Models constructed before unrelated CUDA allocations must still get
+        # their own allowance. A process-wide constructor delta rejects both.
+        first = ActorGraph(model, max_incremental_bytes=32*2**20)
+        second = ActorGraph(model, max_incremental_bytes=32*2**20)
+        unrelated = torch.empty(64*2**20, dtype=torch.uint8, device='cuda')
+        try:
+            for capture in (first,second):
+                out = capture(inputs[0][:1])
+                self.assertIn(((24,72),1),capture.graphs)
+                self.assertFalse(capture.budget_exhausted)
+                self.assertTrue(capture.memory_accounting_valid)
+                self.assertGreater(capture.pool_reserved_bytes,0)
+                self.assertEqual(capture.incremental_reserved_bytes,
+                                 capture.pool_reserved_bytes+capture.staging_bytes)
+                self.assertLessEqual(capture.incremental_reserved_bytes,32*2**20)
+                self.assertGreaterEqual(capture.process_reserved_bytes,unrelated.numel())
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            charged = first.incremental_reserved_bytes
+            second(inputs[0][:2])
+            first(inputs[0][:1])
+            self.assertEqual(first.incremental_reserved_bytes,charged)
+            with unittest.mock.patch.object(torch.cuda,'memory_snapshot',
+                                           side_effect=AssertionError('replay must not inspect allocator')):
+                first(inputs[0][:1])
+            first.max_incremental_bytes = charged+1
+            with self.assertWarnsRegex(RuntimeWarning,'memory limit'):
+                out = first(inputs[0][:2])
+            self.assertTrue(first.budget_exhausted)
+            self.assertNotIn(((24,72),2),first.graphs)
+            self.assert_bf16_close(out['packed'],saved[0]['packed'][:2])
+            own_pool = sum(s['total_size'] for s in torch.cuda.memory_snapshot(
+                           mempool_id=first.pool,include_traces=False) if s['device']==first.device.index)
+            self.assertEqual(first.pool_reserved_bytes,own_pool)
+            self.assert_bf16_close(first(inputs[0][:1])['packed'],saved[0]['packed'][:1])
+            rejected = ActorGraph(model,max_incremental_bytes=0)
+            try:
+                with self.assertWarnsRegex(RuntimeWarning,'memory limit'):
+                    out = rejected(inputs[0][:1])
+                self.assertTrue(rejected.budget_exhausted)
+                self.assertFalse(rejected.graphs)
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            finally:
+                rejected.close()
+            with unittest.mock.patch.object(torch.cuda,'get_allocator_backend',return_value='cudaMallocAsync'), \
+                 self.assertWarnsRegex(RuntimeWarning,'native allocator'):
+                unsupported = ActorGraph(model)
+            try:
+                out = unsupported(inputs[0][:1])
+                self.assertFalse(unsupported.graphs)
+                self.assertFalse(unsupported.memory_accounting_valid)
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            finally:
+                unsupported.close()
+        finally:
+            first.close()
+            second.close()
+            del unrelated
         runner.close()
         reserved = torch.cuda.memory_reserved()
         for _ in range(4):
