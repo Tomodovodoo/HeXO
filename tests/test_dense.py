@@ -1885,6 +1885,7 @@ class DenseConfigTests(unittest.TestCase):
         self.assertIn('pair_policy_weight', dense_learn.KEEP)
         paired = dense_config.override(base, parser.parse_args(['--pair-policy-weight', '1']))
         self.assertEqual(dense_data.target_options(paired)['pair_policy_weight'], 1.)
+        # Old run configs omit these settings and resume with the defaults, so a default change would alter them.
         self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
                           base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
         self.assertEqual(base.future_target, 'legacy')
