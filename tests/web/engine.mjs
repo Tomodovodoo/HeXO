@@ -488,12 +488,18 @@ if (job.kind === 'encode') {
     GameGraphs: class extends GameGraphs { graph(...args) { return graph = super.graph(...args); } },
     Proofs, answered, settled, proofTurns, proofKey, proofEvidence, winningLine, proven,
     URL, performance, setTimeout, clearTimeout, onmessage: null,
-    postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p])}),
+    postMessage: message => messages.push({...message, root: graph?.history.map(p => [...p]), at: performance.now()}),
     probe: async () => ({provider: 'wasm', precisions: ['fp32']}), runtime: async () => ({env: {wasm: {numThreads: 1}}}),
     Stages, errorReport, stall,
     Network: {create: async () => ({version: 'uniform', precision: 'fp32', threads: 1,
       evaluateNative: Network.prototype.evaluateNative, maxBatch: 64,
-      forward: async (input, count, size) => ({policy: new Float32Array(count*(Array.isArray(size) ? size[0]*size[1] : size*size)), far: new Float32Array(count), value: new Float32Array(count)}),
+      // `peaked`: logits fall by 16 per cell away from the crop's centre, so searches keep meeting the same few
+      // stones, as a trained network's do; otherwise uniform.
+      forward: async (input, count, size) => {
+        const [height, width] = Array.isArray(size) ? size : [size, size], policy = new Float32Array(count*height*width);
+        if (job.peaked) policy.forEach((_, i) => { const c = i % (height*width); policy[i] = -16 * Math.hypot(Math.floor(c / width) - height / 2, c % width - width / 2); });
+        return {policy, far: new Float32Array(count), value: new Float32Array(count)};
+      },
       evaluate: async leaves => leaves.map(({history, actions}) => {
         if (messages.some(m => m.type === 'ready')) evaluations.push(history);
         const value = glimpsing ? (native.game(history).player === mover ? .86 : -.86) : 0;
@@ -569,6 +575,14 @@ if (job.kind === 'encode') {
     await context.onmessage({data: {type: 'turn', id: 1, history: job.history, simulations: job.simulations, solverNodes: job.nodes}});
     answer = {replies: messages.filter(m => m.id === 1 && m.type !== 'progress').map(m => m.type), ms: performance.now() - started};
     runInNewContext('frontierWorkers.close()', context);
+  } else if (job.cancelAfter) {
+    // A long search on a game's graph, cancelled `cancelAfter` ms in: when its replies came, and the live rows it sent.
+    const started = performance.now();
+    setTimeout(() => context.onmessage({data: {type: 'cancel', id: 1}}), job.cancelAfter);
+    await context.onmessage({data: {type: 'turn', id: 1, history: job.history, line: 'game', simulations: job.simulations, solverNodes: 0}});
+    const mine = messages.filter(m => m.id === 1), times = [started, ...mine.map(m => m.at)];
+    answer = {replies: mine.filter(m => m.type !== 'progress').map(m => m.type), ms: mine.at(-1).at - started,
+      gap: Math.max(...times.slice(1).map((t, i) => t - times[i])), live: mine.filter(m => m.live).map(m => m.live)};
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null, proveMs: job.proveMs ?? 0,

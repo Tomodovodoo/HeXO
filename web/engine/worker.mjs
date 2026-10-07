@@ -27,6 +27,10 @@ const cancelled = new Set(), solverWaits = new Map(), cancelWaits = new Map();
 
 class Cancelled extends Error {}
 
+/** Rows per network batch when a turn names none: a WebGPU forward costs about the same at 16 rows as at 64, while
+ * WebAssembly time grows with the rows, so a cancel there still lands within a short batch. */
+const BATCH = {webgpu: 64, wasm: 16};
+
 /** `promise`, or a Cancelled rejection as soon as job `id` is cancelled; the promise itself runs on. */
 function unlessCancelled(id, promise) {
   return new Promise((resolve, reject) => {
@@ -272,7 +276,7 @@ async function turn(request) {
  * or search, gives a position it proves lost for the mover its proof and line, and marks the proven stones of each
  * search root exact before it searches (NeuralSearch.settle); a stone the graph does not take is applied to the
  * search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = 16, choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
+async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
