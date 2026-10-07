@@ -365,6 +365,10 @@ class IsolatedTactics:
         with contextlib.suppress(OSError):  # the next query's write fails and retires it again
             self._spawn()
 
+    def _abort_requested(self):
+        with self.control_lock:
+            return self.abort_requested
+
     def _line(self, deadline):
         try:
             line = self.lines.get(timeout=max(0.0, deadline-time.perf_counter()))
@@ -403,8 +407,13 @@ class IsolatedTactics:
                 if self.replacement.is_alive():
                     return unknown('tactical worker restarting')
                 self.replacement = None
+            if self._abort_requested():
+                return unknown('aborted')
             if not self.ready:
                 line = self._line(min(start+ms/1000, self.started+self.startup_ms/1000))
+                if self._abort_requested():
+                    self._retire(killed=True)
+                    return unknown('aborted')
                 if line == 'timeout':
                     if time.perf_counter() >= self.started+self.startup_ms/1000:
                         self._retire(killed=True)

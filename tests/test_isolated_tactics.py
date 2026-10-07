@@ -213,6 +213,20 @@ class Isolation(unittest.TestCase):
         finally:
             stuck.close()
 
+    def test_abort_while_the_child_starts_reports_the_abort(self):
+        stuck = IsolatedTactics('slow-start', engine=ENGINE)
+        try:
+            results = []
+            query = threading.Thread(target=lambda: results.append(stuck.history([[0, 0]], ms=20000)))
+            query.start()
+            time.sleep(.3)
+            stuck.abort()
+            query.join(5)
+            self.assertEqual(results[0]['reason'], 'aborted')
+            self.assertEqual((stuck.stats['kills'], stuck.stats['exits']), (1, 0))
+        finally:
+            stuck.close()
+
     def test_memory_cap_applies_before_the_engine_loads(self):
         greedy = IsolatedTactics('greedy-start', engine=ENGINE, memory_mb=256)
         try:
