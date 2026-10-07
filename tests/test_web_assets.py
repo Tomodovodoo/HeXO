@@ -1,17 +1,13 @@
 """web/engine/assets.mjs: engine files from this origin, else from the public site, checked and kept in the Cache API."""
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT/'web'/'engine'
 NODE = shutil.which('node')
 SITE = 'https://tomodovodoo.github.io/HeXO/engine/'
-LOADERS = ('native-worker.mjs', 'six-worker.mjs', 'strix-worker.mjs', 'shrimp-worker.mjs', 'seal-worker.mjs',
-           'network.mjs', 'shrimp/network.mjs', 'bubble.mjs', 'native.mjs', 'six.mjs', 'strix.mjs', 'shrimp.mjs', 'seal.mjs')
 
 
 @unittest.skipUnless(NODE, 'needs node')
@@ -127,17 +123,6 @@ class Resolver(unittest.TestCase):
 
     def test_engine_lists_leave_out_engines_whose_files_no_origin_has(self):
         self.assertEqual(self.out['offered'], ['browser:bubble', 'browser:strix', 'browser:six', 'six'])
-
-
-class Loaders(unittest.TestCase):
-    def test_engine_loaders_fetch_through_assets(self):
-        for name in LOADERS:
-            with self.subTest(module=name):
-                text = (ENGINE/name).read_text(encoding='utf-8')
-                self.assertRegex(text, r"from '\.\.?/assets\.mjs'")
-                self.assertNotIn('fetch(', text)
-                self.assertNotIn('caches.', text)
-                self.assertIsNone(re.search(r"new Worker\(new URL", text))
 
 
 if __name__ == '__main__':

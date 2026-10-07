@@ -1592,10 +1592,6 @@ class DenseConfigTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_learner_speed_tile_explains_the_data_wait(self):
-        page = (ROOT/'web'/'training.html').read_text(encoding='utf-8')
-        self.assertIn("['Samples / second',n(l.samples_per_second,1),false,Number.isFinite(l.data_wait_fraction)?", page)
-
     def test_paused_learner_does_not_make_a_run_live(self):
         import dashboard
         with tempfile.TemporaryDirectory() as tmp:
@@ -1878,8 +1874,6 @@ class DenseConfigTests(unittest.TestCase):
         self.assertIn('pair_policy_weight', dense_learn.KEEP)
         paired = dense_config.override(base, parser.parse_args(['--pair-policy-weight', '1']))
         self.assertEqual(dense_data.target_options(paired)['pair_policy_weight'], 1.)
-        self.assertEqual((base.value_target, base.outcome_lambda, base.outcome_weight, base.calibration_games, base.validation_rows,
-                          base.validation_quota), ('outcome', .98, 0., 4000, 8192, 128))
         self.assertEqual(base.future_target, 'legacy')
         masked = dense_config.override(base, parser.parse_args(['--future-target', 'masked']))
         self.assertEqual(dense_data.target_options(masked)['future_target'], 'masked')

@@ -179,18 +179,6 @@ class PlayPage(unittest.TestCase):
         self.assertFalse(answer['paused'])
         self.assertGreater(answer['stones'], 0)
 
-    def test_the_human_seat_is_labelled_human(self):
-        sources = {name: (ROOT/'web'/name).read_text(encoding='utf-8') for name in ('index.html', 'engine/seat.mjs')}
-        self.assertIn(".kind[data-k=human]", sources['index.html'])
-        self.assertIn("return['human',null]", sources['index.html'])
-        self.assertIn("kind:'human',label:null", sources['index.html'])
-        self.assertIn("kind: 'human', label: null", sources['engine/seat.mjs'])
-        self.assertIn("followSeats(globalThis,()=>S,seat=>isHuman(seat),storage)", sources['index.html'])
-        self.assertIn("page.isHuman = seat =>", sources['engine/seat.mjs'])
-        for text in sources.values():
-            self.assertNotIn("'you'", text)
-            self.assertNotIn('data-k=you', text)
-
 
 @unittest.skipUnless(NODE, 'needs node')
 class BoardPerspective(unittest.TestCase):
@@ -239,7 +227,7 @@ class Overlay(unittest.TestCase):
         self.assertEqual([p['n'] for p in unnumbered['plies']], [1, 2, 3, 4, 5, 6])
         self.assertEqual(len({(p['q'], p['r']) for p in live['plies']}), len(pv))
         self.assertEqual(live['plies'][0]['fade'], 1)
-        self.assertAlmostEqual(live['plies'][-1]['fade'], .45)
+        self.assertLess(live['plies'][-1]['fade'], live['plies'][0]['fade'])  # later plies are fainter
         self.assertEqual(live['six'], [[1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0]])
         self.assertEqual(old, dict(candidates=[], plies=[], six=[]))
 

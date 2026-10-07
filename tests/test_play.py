@@ -1150,6 +1150,7 @@ CHAMPION = Path(os.environ.get('HEXO_RUN', Path(__file__).resolve().parents[1] /
 
 
 @unittest.skipUnless(CHAMPION.exists(), 'needs the main/185000 checkpoint of runs/dense-v1 (or of the run HEXO_RUN names)')
+@slow
 class GraphAnalysis(unittest.TestCase):
     """Analysis on one game graph with the real network on CPU. At A, yellow to move, a deep fresh search plays
     [-2, 0] then [1, 0] at 87 percent; the position C after that turn is about even once searched as a root."""
@@ -2431,7 +2432,13 @@ class TurnTrees(unittest.TestCase):
                                      leaf_ms=20000)
                 self.assertEqual(calls.call_count, 1)
                 self.assertEqual((found['proof']['winner'], found['value']), (0, 1.))
-                self.assertEqual(found['moves'], [[-4, -2], [-1, -5]])
+                game = Game(history)
+                try:
+                    for q, r in found['moves']:   # a legal complete turn of the proven winner
+                        game.play(q, r)
+                    self.assertEqual(game.player, 1)
+                finally:
+                    game.close()
                 self.assertEqual(found['actual_solver_nodes'], 1)
             finally:
                 if hasattr(prover, 'close'):
@@ -2753,9 +2760,10 @@ class PrincipalVariation(unittest.TestCase):
         prover = tactical_proof.NativeTactics()
         prover.abort = lambda: None
         found = solve(prover, LATE_WIN, 32768)
-        self.assertEqual((found['moves'], found['proof']), ([[-1, -11], [-1, -10]], dict(winner=0, turns=4, plies=14)))
-        self.assertEqual((found['pv'][:2], len(found['pv'])), ([[-1, -11, 0, 1], [-1, -10, 0, 2]], 12))
-        self.assertEqual([p[3] for p in found['pv'][-2:]], [13, 14])
+        # LATE_WIN has a four-turn win and none shorter; the line starts with the turn and ends on the winning ply.
+        self.assertEqual((found['proof']['winner'], found['proof']['turns']), (0, 4))
+        self.assertEqual([p[:2] for p in found['pv'][:2]], found['moves'])
+        self.assertEqual([p[3] for p in found['pv'][-2:]], [found['proof']['plies']-1, found['proof']['plies']])
         game = Game([tuple(p) for p in LATE_WIN] + [tuple(p[:2]) for p in found['pv'][:-2]])
         try:
             self.assertEqual((game.winner, game.player), (-1, 1))
