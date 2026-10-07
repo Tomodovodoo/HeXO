@@ -3107,6 +3107,26 @@ class NativeProofs(unittest.TestCase):
         self.assertGreater(proofs.stats()['submitted'], 4)
         proofs.drain()
 
+    def test_shared_idle_time_goes_to_the_producer_held_back(self):
+        import time
+        workers = self.shared(workers=2, queue=8)
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        empty = pools[0].enable_proofs(slice_ms=50, table_mb=1, tasks=8, shared=workers)
+        held = pools[1].enable_proofs(slice_ms=50, table_mb=1, tasks=32, shared=workers, owner_budget=1e-6)
+        empty.step()
+        self.offers(held, 8)
+        held.step()
+        self.wait(lambda: held.stats()['finished'] == held.stats()['submitted'] > 0)
+        held.step()
+        before = empty.stats()['idle_empty_ms'], held.stats()['idle_owner_ms']
+        time.sleep(.05)
+        after = empty.stats()['idle_empty_ms'], held.stats()['idle_owner_ms']
+        # Workers wait on the producer over its owner budget, not on the one without candidates.
+        self.assertGreaterEqual(after[1]-before[1], 2*45)
+        self.assertEqual(after[0], before[0])
+        for loop in (held, empty):
+            loop.drain()
+
     def test_shared_workers_close_after_their_loops_and_split_idle_time(self):
         import time
         from native_scheduler import ProofWorkers

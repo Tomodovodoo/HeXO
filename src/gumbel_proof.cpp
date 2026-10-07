@@ -158,8 +158,10 @@ struct Loop {
  // Supply census. Idle native-worker time is charged to the reason the last
  // refill stopped: every slot held, retries held back for fresh work, or no
  // dispatchable task, split over the exclusions (pending neural work, closed
- // scope, dormant) or none at all, or the owner over its proof budget. A shared service charges each attached
- // loop an equal part of its idle time, so the loops' sums are the service's.
+ // scope, dormant) or none at all, or the owner over its proof budget. A shared service
+ // charges its idle time in equal parts to the loops held back by one of those
+ // reasons, or to every loop when none has a candidate at all, so the loops'
+ // sums are the service's idle time.
  // The owner counts one refill locally and publishes it under the mutex.
  enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Owner,Reasons};
  enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,OwnerExits,Counts};
@@ -170,6 +172,7 @@ struct Loop {
   refilled=Clock::now();service.account(refilled);stop=reason;for(size_t k=0;k<census.size();++k)census[k]+=refill[k];++census[exit];
   if(reason==Empty)std::copy_n(refill.begin()+Excluded,3,excluded.begin());
  }
+ bool held()const{return stop!=Empty || excluded[0]+excluded[1]+excluded[2];}
  void charge(double ms){
   double total=double(excluded[0]+excluded[1]+excluded[2]);
   if(stop!=Empty)idle_ms[stop]+=ms;else if(!total)idle_ms[Empty]+=ms;
@@ -474,7 +477,8 @@ void Service::stop(){
 void Service::account(Clock::time_point now){
  if(idle_workers && now>idle_mark){
   double ms=std::chrono::duration<double,std::milli>(now-idle_mark).count()*double(idle_workers);idle_ms+=ms;
-  for(auto* loop:loops)loop->charge(ms/double(loops.size()));
+  size_t held=std::count_if(loops.begin(),loops.end(),[](const Loop* l){return l->held();});
+  for(auto* loop:loops)if(!held || loop->held())loop->charge(ms/double(held?held:loops.size()));
  }
  idle_mark=now;
 }
