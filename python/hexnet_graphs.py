@@ -128,6 +128,34 @@ class ActorGraph:
         self.incremental_reserved_bytes = incremental
         return self.graphs[key]
 
+    def prepare(self, canvases, cancelled=None):
+        """Build bounded replay capacities while no move clock is running."""
+        before = len(self.graphs)
+        caller = torch.cuda.current_stream(self.device)
+        with self.lock, torch.cuda.stream(self.stream):
+            self.stream.wait_stream(caller)
+            try:
+                for side in canvases:
+                    if not self.supports(side):
+                        raise ValueError('unsupported CUDA graph preparation shape')
+                    limit = self._limit(side, self.max_batch)
+                    for capacity in reversed(self.BATCHES):
+                        if capacity > limit or (side, capacity) in self.graphs:
+                            continue
+                        if self.budget_exhausted or cancelled is not None and cancelled():
+                            return len(self.graphs)-before
+                        try:
+                            self._capture(side, capacity)
+                        except (torch.OutOfMemoryError, MemoryError) as error:
+                            self.budget_exhausted = True
+                            self.capture_memory_error = str(error)
+                            warnings.warn('CUDA graph preparation reached its memory limit',
+                                          RuntimeWarning, stacklevel=2)
+                            return len(self.graphs)-before
+            finally:
+                self.stream.synchronize()
+        return len(self.graphs)-before
+
     @staticmethod
     def _segments(rows, limit, side=24):
         while rows > limit:
