@@ -4627,6 +4627,11 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(service.wait(50.))
         self.assertEqual(service.stats()['launched_rows'],launched)
         service.resume()
+        self.assertTrue(service.wait(10000.))
+        # While a root event waits for the caller, the launcher backs off instead of spinning.
+        with unittest.mock.patch.object(service,'pump',wraps=service.pump) as pump:
+            time.sleep(.3)
+        self.assertLess(pump.call_count,600)
         events = collect(len(histories))
         self.assertEqual({e['game'] for e in events},set(range(len(histories))))
         self.assertTrue(all(e['completed']==8 for e in events))

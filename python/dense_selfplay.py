@@ -1420,6 +1420,7 @@ def worker(args):
                     token_pause = True
                 if entered or pending_ack:
                     status('paused'); last = time.perf_counter()
+                written()
                 time.sleep(1.)
                 if time.perf_counter()-last >= 2:
                     status('paused'); last = time.perf_counter()

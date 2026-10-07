@@ -575,9 +575,12 @@ class InferenceService:
         def run():
             try:
                 while not halt.is_set():
+                    calls = self.calls
                     self.pump()
-                    if not self.pending and self.done():
-                        halt.wait(.01)
+                    if not self.pending and self.calls==calls:
+                        # take() returns at once while root events wait for the
+                        # caller, so an idle pump must not spin.
+                        halt.wait(.01 if self.done() else .001)
             except BaseException as error:
                 self._failure = error
                 self.cancel()
@@ -603,7 +606,9 @@ class InferenceService:
     def wait(self, ms):
         """Block up to `ms` for a root event; True when one is ready."""
         self._raise()
-        return bool(native.hxb_wait_event(self.ptr, ms))
+        ready = bool(native.hxb_wait_event(self.ptr, ms))
+        self._raise()  # A launcher failure cancels the service and ends the wait.
+        return ready
 
     def event(self):
         """Copy one immutable root/lifecycle completion; None while roots run.
