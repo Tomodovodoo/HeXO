@@ -182,12 +182,14 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
   const premises = facts.filter(f => f.history.length !== history.length || f.winner !== player).map(({history, winner, plies}) => ({history, winner, plies}));
   const root = {nodes: 0, mine: null, done: false};
   const asking = (async () => {
-    for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end; nodes = Math.min(4 * nodes, 10000000)) {
+    for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
       const found = await solve(id, history, {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
         ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 60000, Math.max(10000, nodes / 8))))});
       root.nodes += found.nodes_used || 0;
       if (verified(found) && found.moves.length) { root.mine = found; return; }
+      if (!searched(found)) continue;   // the solver worker was replaced: ask again
       if ((found.nodes_used || 0) < nodes) return;   // the solver ruled the root out before spending its nodes
+      nodes = Math.min(4 * nodes, 10000000);
     }
   })().catch(error => { if (!(error instanceof Cancelled)) throw error; });
   const graph = new GameGraph(native, {seed: 1740, tactics: true, model: network.version, roundBarrier: true, history: history.map(p => [...p])});

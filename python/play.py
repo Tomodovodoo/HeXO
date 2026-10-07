@@ -785,6 +785,9 @@ def prove(bubble, prover, package, history, ms, watch=lambda n: None, live=None,
             if verified(result) and result['moves']:
                 root['result'] = result
                 return
+            if not searched(result):   # the worker was starting or restarting: ask again
+                stop.wait(.05)
+                continue
             if result.get('nodes_used', 0) < nodes:   # the solver ruled the root out before spending its nodes
                 return
             nodes = min(4 * nodes, tactical_proof.MAX_NODES)
