@@ -411,10 +411,17 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                 raise ValueError(f"Native turn search failed: {found['error']}")
             if progress_context is not None and found['context'] != progress_context:
                 raise ValueError('Native final context differs from its progress')
-            edges, winner, probability, action, witness, row = read_choice(found, current)
-            token += 1
             root_search.update(elapsed_ms=found.get('elapsed_ms'),
                                issued=found.get('issued'), completed=found['root_completed'])
+            if found['exact_winner'] < 0 and not found['root_completed']:
+                # Expansion or inherited evidence can leave a legal choice, but
+                # neither is a completed comparison at this commanded root.
+                root_search['error'] = 'no_completed_comparison'
+                if progress_candidate is not None:
+                    result = progress_candidate
+                break
+            edges, winner, probability, action, witness, row = read_choice(found, current)
+            token += 1
             result['completed'] += found['root_completed']
             result['scheduler_completed'] += found['completed']
             if not selected:

@@ -9855,6 +9855,48 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertIn('calibration', self.league())                                    # added on start
 
 class DenseTimedWorker(unittest.TestCase):
+    def test_unsearched_completion_preserves_candidate_and_exact_evidence(self):
+        from types import SimpleNamespace
+        from timed_engine import native_turn, legal_turn, complete_candidate
+        from time_control import allowance
+        import threading
+        history = [[0, 0]]
+        first = dict(producer=0, game=0, model=0, token=1, history=history,
+                     context='first', action=[1, 0], exact_winner=-1,
+                     root_completed=2, completed=2,
+                     edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
+        for winner in (-1, 1):
+            with self.subTest(exact_winner=winner), \
+                    unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                pool = unittest.mock.Mock(proofs=None)
+                player = SimpleNamespace(options=dict(solver=False), solver_nodes_explicit=False,
+                    model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
+                    _timed_native=(None, pool, ('fixed', False, False, 0.)))
+                service = service_type.return_value
+                service.stats.return_value = dict(launched_rows=80)
+                service.progress.return_value = None
+                service.event.side_effect = [first, dict(producer=0, game=0, model=0,
+                    token=2, history=history+[[1, 0]], context='second', action=[2, 0],
+                    exact_winner=winner, root_completed=0, completed=200, issued=80,
+                    elapsed_ms=476., winning_turn=[[2, 0]] if winner == 1 else [],
+                    edges=np.array([[2, 0, 0, 0, .8, 1, 200, 0, 1]], float))]
+                result = native_turn(player, history, allowance(movetime=1000), threading.Event())
+            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+            self.assertEqual(result['completed'], 2)
+            self.assertEqual(result['root_searches'][1]['issued'], 80)
+            self.assertEqual(result['root_searches'][1]['completed'], 0)
+            if winner < 0:
+                self.assertEqual(len(result['stones']), 1)
+                self.assertEqual(result['moves'], complete_candidate(history, [[1, 0]]))
+                self.assertEqual(result['scheduler_completed'], 2)
+                self.assertEqual(result['root_searches'][1]['error'], 'no_completed_comparison')
+                self.assertEqual(result['proof_status'], 'UNKNOWN')
+            else:
+                self.assertEqual(result['moves'], [[1, 0], [2, 0]])
+                self.assertEqual(len(result['stones']), 2)
+                self.assertEqual(result['proof_status'], 'PROVEN_WIN')
+                self.assertNotIn('error', result['root_searches'][1])
+
     def test_dense_worker_plays_a_clocked_complete_turn_on_cpu(self):
         from timed_engine import TimedEngine, legal_turn
         with tempfile.TemporaryDirectory() as folder:
