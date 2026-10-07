@@ -9965,6 +9965,20 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual([s['root_completed'] for s in result['stones']], [2,3])
                 self.assertEqual(result['completed'], 5)
                 self.assertEqual(result['proof_status'], 'UNKNOWN')
+                # A cold continuation can miss its deadline. Record that
+                # attempted position without counting legal filler as search.
+                with unittest.mock.patch('native_scheduler.InferenceService') as service_type:
+                    service = service_type.return_value
+                    service.stats.return_value = dict(launched_rows=1)
+                    service.event.side_effect = [frames[0],
+                        dict(producer=0, game=0, model=0, token=2,
+                             history=[[0,0],[1,0]], error='deadline')]
+                    result = player.turn(game, 1000)
+                self.assertEqual(len(result['stones']), 1)
+                self.assertEqual(result['root_searches'][1]['history'], [[0,0],[1,0]])
+                self.assertEqual(result['root_searches'][1]['error'], 'deadline')
+                self.assertNotIn('completed', result['root_searches'][1])
+                self.assertEqual(result['completed'], 2)
                 # A real immediate pair is committed before the first winning
                 # publication can cancel the worker. No second inference is needed.
                 from timed_engine import dense_turn

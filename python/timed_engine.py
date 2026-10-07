@@ -263,7 +263,7 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
                   settings=dict(player.options) | dict(native_scheduler=True,
                       simulations=limits.get('simulations'), solver_nodes=None, solver_slice_ms=8),
-                  completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[])
+                  completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[], root_searches=[])
     service = None
     def stopped():
         return cancel.is_set() or time.monotonic() >= normal
@@ -271,7 +271,8 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
         if service is not None:
             result['evaluated'] = service.stats()['launched_rows']
         result.update(moves=legal_turn(history, moves), elapsed_ms=(time.monotonic()-started)*1000)
-        publish(dict(result, stones=list(result['stones'])))
+        publish(dict(result, stones=list(result['stones']),
+                     root_searches=[dict(root) for root in result['root_searches']]))
     try:
         emit(result['moves'])
         if stopped():
@@ -321,6 +322,9 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
             if ms <= 0 or cap is not None and not work:
                 break
             current = [list(cell[:2]) for cell in game.cells]
+            root_search = dict(history=current, token=token+1, allowance_ms=ms,
+                               queued_ms=(time.monotonic()-started)*1000)
+            result['root_searches'].append(root_search)
             service.retarget(0, 0, current, expected=token, work=work, ms=ms,
                              samples=limits.get('root_samples', 16), views=8)
             found = None
@@ -346,15 +350,20 @@ def native_turn(player, history, limits, cancel, publish=lambda result: None, an
                     break
                 service.wait(max(0., min(1., (normal-time.monotonic())*1000)))
             if found is None:
+                root_search['error'] = 'no_completion'
                 break
+            root_search['received_ms'] = (time.monotonic()-started)*1000
             token += 1
             if (found['producer'], found['game'], found['model'], found['token'], found['history']) != (0, 0, 0, token, current):
                 raise ValueError('Native turn completion does not match the current position')
             if 'error' in found:
+                root_search['error'] = found['error']
                 if found['error'] in ('deadline', 'cancelled'):
                     break
                 raise ValueError(f"Native turn search failed: {found['error']}")
             edges = np.asarray(found['edges'], np.float64)
+            root_search.update(elapsed_ms=found.get('elapsed_ms'),
+                               issued=found.get('issued'), completed=found['root_completed'])
             winner = found['exact_winner']
             value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
             probability = (value+1)/2
