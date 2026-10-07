@@ -2,7 +2,7 @@ name: Contracts
 on:
   pull_request:
     paths:
-      # Every module the three suites import, directly or through each other, and the native code they load.
+      # Everything the three suites import or read, directly or through each other, and the native code they load.
       - 'python/bot_api.py'
       - 'python/dashboard.py'
       - 'python/dense_*.py'
@@ -25,11 +25,17 @@ on:
       - 'python/tactical_proof.py'
       - 'python/time_control.py'
       - 'python/timed_engine.py'
+      - 'python/legacy/**'
       - 'src/**'
       - 'CMakeLists.txt'
+      - 'tools/compare_search_modes.py'
+      - 'tools/proof_stamps.py'
       - 'tools/tactical/**'
       - 'tests/__init__.py'
+      - 'tests/fixtures/**'
+      - 'tests/reference.py'
       - 'tests/test_dense.py'
+      - 'tests/test_neural_search.py'
       - 'tests/test_play.py'
       - 'tests/test_tactical_proof.py'
       - '.github/workflows/contracts.yml'

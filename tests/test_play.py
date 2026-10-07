@@ -2523,6 +2523,7 @@ class GameProofs(unittest.TestCase):
     def found_win(self):
         """The solver's win for side 0 at ply 80, checked against the position's known length and its own line."""
         found = self.analyse(80, 32768)
+        self.assertIsNotNone(found['proof'], found)
         plies = found['proof']['plies']
         self.assertEqual(found['proof'], self.label(self.start + [(-1, -11)], plies))
         self.assertIn(found['proof']['turns'], (4, 5))
@@ -2538,6 +2539,7 @@ class GameProofs(unittest.TestCase):
         session.analyse(80)
         wait(lambda: not session.state()['jobs'], 60)
         saved = session.lookup(session.history)
+        self.assertIsNotNone(saved['proof'], saved)
         self.assertEqual(saved['proof']['winner'], 0)
         self.assertGreater(len(saved['pv']), 5)
         self.assertEqual(saved['pv'], saved['proofs'][0]['pv'])

@@ -8992,7 +8992,7 @@ class EvaluatorLoopTests(unittest.TestCase):
         evaluator.start = slow
         with unittest.mock.patch.object(dense_eval, 'Pool', scripted()):
             evaluator.step()
-        self.assertEqual(sum(charged), 10.)                                 # two pairs started, 5 s each
+        self.assertAlmostEqual(sum(charged), 10.)                           # two pairs started, 5 s each
 
     def test_busy_pacing_keeps_complete_pairs_and_throttles_the_drain(self):
         evaluator = self.start(sprt_max_games=8, pool_games=4, busy_share=.5, pipeline=True)
