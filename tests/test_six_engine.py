@@ -163,7 +163,16 @@ class SixProtocolTests(unittest.TestCase):
                              'position radius 8 moves 0 0\ngo nodes 5 depth 2\n'
                              'position radius 8 moves 0 0 0 0\nposition radius 8 setup x 0 0\nquit\n')
         out = io.StringIO()
-        serve(player, source, out)
+        def commands():
+            expected = 0
+            for line in source:
+                yield line
+                if line.startswith('go'):
+                    expected += 1
+                    end = time.monotonic()+PATIENCE
+                    while out.getvalue().count('bestmove') < expected and time.monotonic() < end:
+                        time.sleep(.01)
+        serve(player, commands(), out)
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[:4], ['id name Bubble main/000001', 'id version abcdef123456', 'sixok', 'readyok'])
         self.assertEqual([line for line in lines if line.startswith('bestmove')], ['bestmove 0 0', 'bestmove 1 0 0 1'])
@@ -176,7 +185,14 @@ class SixProtocolTests(unittest.TestCase):
         player = FakePlayer([[(5, 0), (6, 0)]])
         flat = ' '.join(f'{q} {r}' for q, r in opening)
         out = io.StringIO()
-        serve(player, io.StringIO(f'position radius 8 moves {flat}\ngo\nquit\n'), out)
+        def commands():
+            yield f'position radius 8 moves {flat}\n'
+            yield 'go\n'
+            end = time.monotonic()+PATIENCE
+            while 'bestmove' not in out.getvalue() and time.monotonic() < end:
+                time.sleep(.01)
+            yield 'quit\n'
+        serve(player, commands(), out)
         self.assertEqual(out.getvalue().strip(), 'bestmove 5 0')
 
     def test_client_restart_after_timeout(self):
