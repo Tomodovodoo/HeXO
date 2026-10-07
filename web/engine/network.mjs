@@ -8,8 +8,8 @@ import {nextTask} from './tasks.mjs';
 const LIMITED_BYTES = 2 ** 28;
 const probes = new Map(), TIMED_OUT = Symbol('timed out');
 
-/** Give older Bubble exports distinct spatial input symbols before static
- * capture. Only features' shape metadata changes; tensor weights stay intact. */
+/** Gives older Bubble exports distinct spatial input symbols (height, width), so a session takes rectangular crops.
+ * Only features' shape metadata changes; tensor weights stay intact. */
 export function rectangularGraph(bytes) {
   bytes = new Uint8Array(bytes);
   const text = new TextDecoder(), encode = new TextEncoder();
@@ -220,9 +220,8 @@ export class Network {
     const graphs = (await Promise.all(files.map(file => cached(file, stages.file(file.path))))).map(rectangularGraph);
     const networks = [];
     for (const [i, precision] of device.precisions.entries()) {
-      networks.push(new Network(ort, await session(ort, graphs[i], device.provider, stages), precision,
-        {...manifest, spatial_axes: ['height', 'width']}, ort.env.wasm.numThreads,
-        {graph: graphs[i], provider: device.provider}));
+      networks.push(new Network(ort, await session(ort, graphs[i], device.provider, stages), precision, manifest,
+        ort.env.wasm.numThreads));
     }
     if (networks.length === 1) return networks[0];
     stages.enter('timing', device.provider);
@@ -236,18 +235,14 @@ export class Network {
 
   static FASTER = 1.25;
 
-  constructor(ort, session, precision, manifest, threads, {graph = null, provider = null} = {}) {
+  constructor(ort, session, precision, manifest, threads) {
     this.ort = ort;
     this.session = session;
     this.precision = precision;
     this.version = manifest.model_version;
-    this.rectangularCaptures = manifest.spatial_axes?.join() === 'height,width';
     this.threads = threads;
     this.maxBatch = 64;
     this.timings = null;
-    this.graph = graph;
-    this.provider = provider;
-    this.captures = null;
     this.closed = false;
     this.closing = null;
   }
@@ -274,28 +269,11 @@ export class Network {
     return result;
   }
 
-  /** Opt-in native batches use bounded static GPU sessions. Session creation
-   * and draining remain in the caller's clock; no implicit CPU fallback. */
-  async forwardCaptured(input, count, size, stop = () => false) {
-    if (this.closed) throw new Error('Native captures are closed');
-    if (this.provider !== 'webgpu' || !this.graph) throw new Error('Native captures require a WebGPU model');
-    this.captures ??= new Captures(this);
-    return this.captures.forward(input, count, size, stop);
-  }
-
-  captureStats() { return this.captures?.stats() ?? {rows: 0, physical: 0, forwards: 0, creates: 0, evictions: 0, setup_ms: 0,
-    entries: 0, cells: 0, owned_gpu_bytes: 0, staging_bytes: 0, unreleased_outputs: 0}; }
-
   async close() {
     if (this.closing) return this.closing;
     this.closed = true;
     this.closing = (async () => {
-      let error;
-      try { await this.captures?.close(); } catch (failed) { error = failed; }
-      try {
-        if (this.session) { await this.session.release(); this.session = null; }
-      } catch (failed) { error ??= failed; }
-      if (error) throw error;
+      if (this.session) { await this.session.release(); this.session = null; }
     })();
     try { await this.closing; } finally { this.closing = null; }
   }
@@ -326,20 +304,18 @@ export class Network {
   /** Compiled graph owner batches already own their crop/context mappings.
    * Keep JavaScript work at submission granularity and bound feature staging
    * on large canvases. The ONNX forward still returns its three output arrays. */
-  async evaluateNative(batch, {stop = () => batch.owner.done(), capture = false} = {}) {
+  async evaluateNative(batch, {stop = () => batch.owner.done()} = {}) {
     for (let group = 0; group < batch.groups.length; group++) {
       const g = batch.groups[group], rows = g.rows, height = g.height ?? g.size, width = g.width ?? g.size;
       const size = height === width ? height : [height, width];
-      const captured = capture && (height === width || this.rectangularCaptures);
       const limit = Math.min(this.maxBatch, Math.max(1, Math.floor(64 * 32 * 32 / (height * width))));
       for (let start = 0; start < rows; start += limit) {
         if (stop()) return false;
         const count = Math.min(limit, rows - start), input = batch.features(group, start, count);
         if (stop()) return false;
-        const prediction = captured ? await this.forwardCaptured(input, count, size, stop) : await this.forward(input, count, size);
-        if (!prediction) return false;
+        const prediction = await this.forward(input, count, size);
         batch.inference ??= {rows: 0, physical: 0, forwards: 0};
-        batch.inference.rows += count; batch.inference.physical += prediction.physical_rows ?? count; batch.inference.forwards++;
+        batch.inference.rows += count; batch.inference.physical += count; batch.inference.forwards++;
         batch.decode(group, start, count, prediction);
         // WASM forwards may resolve only through microtasks. Give worker
         // cancellation messages a task boundary before admitting more work.
@@ -348,144 +324,5 @@ export class Network {
       }
     }
     return true;
-  }
-}
-
-/** One network/model owns this cache. Bounds cover retained capture count and
- * canvas-row capacity, not the runtime allocator or driver residency. GPU
- * buffers and sessions are released only after their forward/download drains. */
-class Captures {
-  constructor(network) {
-    this.network = network;
-    this.entries = new Map();
-    this.outputs = new Set();
-    this.cells = 0;
-    this.tail = Promise.resolve();
-    this.closed = false;
-    this.counts = {rows: 0, physical: 0, forwards: 0, creates: 0, evictions: 0, setup_ms: 0};
-  }
-  stats() {
-    let gpu = 0, staging = 0;
-    for (const entry of this.entries.values()) {
-      gpu += (entry.input?.size ?? 0) + (entry.download?.size ?? 0); staging += entry.values.byteLength;
-    }
-    return {...this.counts, entries: this.entries.size, cells: this.cells, owned_gpu_bytes: gpu, staging_bytes: staging,
-      unreleased_outputs: this.outputs.size};
-  }
-  drainOutputs() {
-    let error;
-    for (const tensor of this.outputs) {
-      try { tensor.dispose(); this.outputs.delete(tensor); } catch (failed) { error ??= failed; }
-    }
-    if (error) throw error;
-  }
-  async release(entry) {
-    let error;
-    for (const [name, method] of [['session', 'release'], ['tensor', 'dispose'], ['input', 'destroy'], ['download', 'destroy']]) {
-      try {
-        if (entry[name]) { await entry[name][method](); entry[name] = null; }
-      } catch (failed) { error ??= failed; }
-    }
-    if (error) throw error;
-  }
-  async entry(count, size) {
-    const [height, width] = Array.isArray(size) ? size : [size, size], area = height * width;
-    if (height !== width && !this.network.rectangularCaptures) throw new Error('Model capture requires distinct height/width axes');
-    const maximum = Math.floor(64 * 32 * 32 / area);
-    if (!(count > 0 && count <= maximum)) throw new Error('Captured batch exceeds canvas capacity');
-    const quantum = Math.max(height, width) >= 40 ? 8 : 16;
-    const rows = Math.min(maximum, count <= 16 ? 2 ** Math.ceil(Math.log2(count)) : quantum * Math.ceil(count / quantum));
-    const key = `${height}x${width}/${rows}`;
-    if (this.entries.has(key)) {
-      const entry = this.entries.get(key); this.entries.delete(key); this.entries.set(key, entry); return entry;
-    }
-    const device = await this.network.ort.env.webgpu.device;
-    if (!device) throw new Error('WebGPU device is unavailable');
-    const limited = device.limits.maxBufferSize <= LIMITED_BYTES, limit = limited ? 65536 : 524288, slots = limited ? 8 : 24;
-    const cells = rows * area;
-    while (this.entries.size && (this.entries.size >= slots || this.cells + cells > limit)) {
-      const [old, entry] = this.entries.entries().next().value;
-      try { await this.release(entry); }
-      catch (error) { this.closed = this.network.closed = true; throw error; }
-      this.entries.delete(old); this.cells -= entry.cells; this.counts.evictions++;
-    }
-    const half = this.network.precision === 'fp16', length = rows * (area + 2), features = rows * CHANNELS * area;
-    const entry = {size, height, width, rows, cells, device, session: null, input: null, tensor: null, download: null,
-      values: half ? new Uint16Array(features) : new Float32Array(features)};
-    this.entries.set(key, entry); this.cells += cells;
-    const align = bytes => 16 * Math.ceil(bytes / 16), start = performance.now();
-    try {
-      entry.input = device.createBuffer({size: align(entry.values.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-      entry.tensor = this.network.ort.Tensor.fromGpuBuffer(entry.input, {dataType: half ? 'float16' : 'float32', dims: [rows, CHANNELS, height, width]});
-      entry.download = device.createBuffer({size: align(length * 4), usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
-      entry.session = await this.network.ort.InferenceSession.create(new Uint8Array(this.network.graph), {
-        executionProviders: [{name: 'webgpu', device}], freeDimensionOverrides: this.network.rectangularCaptures ? {batch: rows, height, width} : {batch: rows, size: height},
-        preferredOutputLocation: 'gpu-buffer', enableGraphCapture: true, graphOptimizationLevel: 'all', logSeverityLevel: 3});
-      this.counts.creates++;
-      return entry;
-    } catch (error) {
-      try { await this.release(entry); }
-      catch (failed) { this.closed = this.network.closed = true; throw new AggregateError([error, failed], 'Capture creation and cleanup failed'); }
-      this.entries.delete(key); this.cells -= cells;
-      throw error;
-    } finally { this.counts.setup_ms += performance.now() - start; }
-  }
-  async forward(input, count, size, stop) {
-    // Concurrent requests cannot overwrite a captured input or map its download
-    // twice. Close joins this same queue before releasing sessions.
-    if (this.closed) throw new Error('Native captures are closed');
-    const previous = this.tail; let release;
-    this.tail = new Promise(resolve => { release = resolve; });
-    await previous;
-    let outputs = null, entry = null, mapped = false;
-    try {
-      if (this.closed) throw new Error('Native captures are closed');
-      this.drainOutputs();
-      if (stop()) return null;
-      entry = await this.entry(count, size);
-      if (stop()) return null;
-      const area = entry.height * entry.width;
-      const values = this.network.precision === 'fp16' ? toHalf(input) : input, stride = CHANNELS * area;
-      entry.values.set(values);
-      // Padded rows copy a real input so every mask and reduction remains valid.
-      for (let row = count; row < entry.rows; row++) entry.values.set(values.subarray(0, stride), row * stride);
-      if (stop()) return null;
-      entry.device.queue.writeBuffer(entry.input, 0, entry.values);
-      this.counts.rows += count; this.counts.physical += entry.rows; this.counts.forwards++;
-      outputs = await entry.session.run({features: entry.tensor});
-      const command = entry.device.createCommandEncoder(); let offset = 0;
-      for (const name of ['policy', 'far', 'value']) {
-        if (outputs[name].type !== 'float32') throw new Error('Captured output must be float32');
-        const length = name === 'policy' ? entry.rows * area : entry.rows;
-        command.copyBufferToBuffer(outputs[name].gpuBuffer, 0, entry.download, offset, length * 4); offset += length * 4;
-      }
-      entry.device.queue.submit([command.finish()]);
-      await entry.download.mapAsync(GPUMapMode.READ); mapped = true;
-      const data = new Float32Array(entry.download.getMappedRange()).slice(0, offset / 4);
-      return {physical_rows: entry.rows, policy: data.slice(0, count * area), far: data.slice(entry.rows * area, entry.rows * area + count),
-        value: data.slice(entry.rows * (area + 1), entry.rows * (area + 1) + count)};
-    } finally {
-      // A rejected run may already have submitted device work. Its fence must
-      // settle before output tensors can release buffers referenced by commands.
-      let error;
-      try { if (entry) await entry.device.queue.onSubmittedWorkDone(); } catch (failed) { error = failed; }
-      try { if (mapped) entry.download.unmap(); } catch (failed) { error ??= failed; }
-      if (outputs) for (const tensor of Object.values(outputs)) {
-        try { tensor.dispose(); } catch (failed) { this.outputs.add(tensor); error ??= failed; }
-      }
-      release();
-      if (error) throw error;
-    }
-  }
-  async close() {
-    this.closed = true;
-    await this.tail;
-    let error;
-    try { this.drainOutputs(); } catch (failed) { error = failed; }
-    for (const [key, entry] of this.entries) {
-      try { await this.release(entry); this.entries.delete(key); this.cells -= entry.cells; }
-      catch (failed) { error ??= failed; }
-    }
-    if (error) throw error;
   }
 }
