@@ -68,3 +68,5 @@ Measured on the RTX 3070 Ti with a read-only copy of the run at `reset/195000` (
 | current learner (two runs) | 1010, 1011 |
 
 A steady export takes 31 s instead of 35 s, so a 2500-step export cycle trains about 960 samples/s instead of 750. Before, the training thread stalled 2.8 s every 30 seconds rebuilding replay priorities, buckets were padded to 16 rows (25% more cells than the rows hold), each batch was read from the worker pipe on the training thread, and the line convolution and pooling took 29% of the GPU step. Two 1500-step runs from the same checkpoint give the same training losses and validation metrics within their noise.
+
+A restart reads the shards through an index in `<run>/cache/shards/` (about 2 GB for the live run's 6,071 shards). The first learner start builds it with eight worker processes; later starts reuse it and rebuild only shards whose files changed. On the same copy, launch to the first logged step took 217 and 381 s without the index and 32 to 44 s with it (88 s while it was being built); the first export, which builds the validation sets, took 276 and 292 s without it and 37 to 40 s with it.

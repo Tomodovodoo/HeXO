@@ -14,6 +14,8 @@ millisecond time plus pid) holding
                  window {game, mover, plies, ...}; rows of the listed plies are proven wins for their side to move.
                  {kind: 'deblunder', game, first_ply, owner} records soften earlier losing-owner targets only
                  with --deblunder-weight > 0; they never add exact labels.
+Readers (ReplayWindow, ValidationSets, survey) read a shard's rows through its index, <run>/cache/shards/<name>.npz
+(shard_index), built once and rebuilt when the shard's files change; proof sidecars are read directly.
 `origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
@@ -54,6 +56,7 @@ False) has no policy, a null root value and full_search False; it never enters t
 toward `total_rows`.
 """
 from collections import Counter, OrderedDict, namedtuple
+import contextlib
 import hashlib
 import json
 import math
@@ -77,7 +80,11 @@ from legacy.train import digest, write_json
 SCHEMA = 'hexo-dense-shard-v1'
 FILES = ('episodes.json', 'rows.json', 'targets.npz')
 SIDECAR = 'proofs.jsonl'
+INDEXED = ('manifest.json', *FILES)
+JSON_FIELDS = ('proof_action', 'search', 'actors')
+SURVEY_CHUNK = 64
 Ref = namedtuple('Ref', 'shard index row episode')
+Survey = namedtuple('Survey', 'manifest count actors')
 Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof_action search legal offsets following start moves roots searched has_roots '
                              'has_search winner side held')
 FUTURE = (6, 20)
@@ -105,10 +112,20 @@ def player_at(ply):
     return ((ply+1)//2) % 2
 
 
+def holdout_key(episode):
+    """The game's 64-bit validation key: the first eight bytes of the sha256 of its moves, little-endian."""
+    return int.from_bytes(hashlib.sha256(json.dumps(episode['moves']).encode()).digest()[:8], 'little')
+
+
 def holdout(episode, fraction):
-    """Stable validation membership: the game's moves hash below `fraction` of the 64-bit range."""
-    h = hashlib.sha256(json.dumps(episode['moves']).encode()).digest()
-    return int.from_bytes(h[:8], 'little') < fraction*2**64
+    """Stable validation membership: the game's holdout_key lies below `fraction` of the 64-bit range."""
+    return holdout_key(episode) < fraction*2**64
+
+
+def held_out(keys, fraction):
+    """holdout() over a uint64 array of holdout keys, compared exactly as integers."""
+    limit = math.ceil(fraction*2**64)
+    return keys < np.uint64(limit) if limit < 2**64 else np.ones(len(keys), bool)
 
 
 def trained(episode, ply):
@@ -497,6 +514,158 @@ def label(shard, labels):
                 shard.proof_action.setdefault(i, labels[key])
 
 
+def shard_stamp(path):
+    """int64 [4, 2]: (size, mtime_ns) of the shard's manifest and data files (INDEXED), from one directory listing."""
+    with os.scandir(path) as entries:
+        stats = {e.name: e.stat() for e in entries}
+    return np.array([[stats[n].st_size, stats[n].st_mtime_ns] for n in INDEXED], np.int64)
+
+
+def index_shard(path):
+    """A verified shard as arrays. Per row: game, ply, player, remaining, proven (as stored), known_result, legal
+    (raw sha256 digests [rows, 32]), following (the row of the same game's next ply, else -1), network and
+    has_network (the episode's saved network value at the row's ply, and whether it has one) and offsets [rows+1] (policy offsets). Per
+    game: start [games+1] (ply offsets), winner, side (trained side, -1 for self-play), has_roots, has_search,
+    holdout (holdout_key) and actor (index into `actors`). Per ply: moves [plies, 2], roots (NaN for null) and
+    searched. proof_action and search map row indices to those row fields; actors lists the episode actors."""
+    episodes, rows = read_shard(path, policies=False)
+    game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
+    where = {(g, t): i for i, (g, t) in enumerate(zip(game.tolist(), ply.tolist()))}
+    per_ply = lambda key: [v for e in episodes for v in (e.get(key) or [None]*len(e['moves']))]
+    values = [episodes[r['game']].get('network_values') for r in rows]
+    actors = sorted({e['actor'] for e in episodes})
+    return dict(
+        game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
+        remaining=np.array([r['remaining'] for r in rows], np.int8),
+        proven=np.array([r.get('proven', 0) for r in rows], np.int8),
+        known_result=np.array([known_result(episodes[r['game']], r['ply']) for r in rows], np.int8),
+        legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
+        following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
+        network=np.array([0. if v is None or v[r['ply']] is None else v[r['ply']] for v, r in zip(values, rows)], np.float64),
+        has_network=np.array([v is not None and v[r['ply']] is not None for v, r in zip(values, rows)], bool),
+        offsets=load_offsets(path, len(rows)),
+        start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
+        winner=np.array([e['winner'] for e in episodes], np.int8),
+        side=np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8),
+        has_roots=np.array([e['root_values'] is not None for e in episodes], bool),
+        has_search=np.array([e.get('full_search') is not None for e in episodes], bool),
+        holdout=np.array([holdout_key(e) for e in episodes], np.uint64),
+        actor=np.array([actors.index(e['actor']) for e in episodes], np.int32),
+        moves=np.array([m for e in episodes for m in e['moves']], np.int32).reshape(-1, 2),
+        roots=np.array([np.nan if v is None else v for v in per_ply('root_values')], np.float64),
+        searched=np.array([bool(f) for f in per_ply('full_search')], bool),
+        proof_action={i: r['proof_action'] for i, r in enumerate(rows) if r.get('proof_action')},
+        search={i: r['search'] for i, r in enumerate(rows) if 'search' in r}, actors=actors)
+
+
+def shard_index(path, cache, fields=None):
+    """index_shard(path) restricted to `fields` (default all). Read from `cache`/<shard name>.npz while the stamp saved
+    there equals shard_stamp(path) and the file hashes saved there equal those of the shard's manifest; otherwise built
+    from the shard, which verifies its hashes, and saved there under a temporary name and linked into place. A stale
+    file is removed first; when another process holds it open, or links its own file first, that file stands and the
+    next read compares it again."""
+    path, cache = Path(path), Path(cache)
+    file, stamp = cache/f'{path.name}.npz', shard_stamp(path)
+    files = json.dumps(manifest(path)['files'], sort_keys=True)
+    try:
+        with np.load(file) as data:
+            if np.array_equal(data['stamp'], stamp) and str(data['files']) == files:
+                return {k: _unpack(k, data[k]) for k in fields or [k for k in data.files if k not in ('stamp', 'files')]}
+        with contextlib.suppress(FileNotFoundError, PermissionError):    # Windows: another process is reading it
+            file.unlink()
+    except FileNotFoundError:
+        pass
+    index = index_shard(path)
+    cache.mkdir(parents=True, exist_ok=True)
+    staged = cache/f'.{path.name}.{os.getpid()}.{threading.get_ident()}.npz'
+    try:
+        np.savez(staged, stamp=stamp, files=np.array(files), **{k: _pack(k, v) for k, v in index.items()})
+        os.link(staged, file)
+    except FileExistsError:
+        pass
+    finally:
+        staged.unlink(missing_ok=True)
+    return {k: index[k] for k in fields or index}
+
+
+def _pack(key, value):
+    """JSON_FIELDS as a JSON string array (mappings as [key, value] pairs); arrays unchanged."""
+    if key not in JSON_FIELDS:
+        return value
+    return np.array(json.dumps(value if key == 'actors' else list(value.items())))
+
+
+def _unpack(key, value):
+    if key not in JSON_FIELDS:
+        return value
+    value = json.loads(str(value))
+    return value if key == 'actors' else {int(i): v for i, v in value}
+
+
+def index_dir(run_dir):
+    """The run's shard index cache (shard_index), shared by every process and variant: the index of a shard depends on
+    its files only."""
+    return Path(run_dir)/'cache'/'shards'
+
+
+def label_keys(game, ply, labels):
+    """Bool mask of the rows (arrays `game`, `ply`) whose (game, ply) is a key of `labels`."""
+    if not labels:
+        return np.zeros(len(game), bool)
+    return np.isin(game.astype(np.int64)*2**16+ply, [g*2**16+t for g, t in labels])
+
+
+def exact_errors(name, proven, network, has_network):
+    """{row: regret} of the rows with an exact label (proven +1/-1) and a saved network value p with proven*p <= 0.8,
+    regret = (1 - proven*p)/2; raises ValueError when such a row's value lies outside [-1, 1]."""
+    rows = np.flatnonzero((np.abs(proven) == 1) & has_network)
+    signed = proven[rows]*network[rows]
+    regret = (1-signed)/2
+    bad = ~((regret >= 0) & (regret <= 1))
+    if bad.any():
+        raise ValueError(f'Invalid network value at {name} row {int(rows[bad][0])}')
+    keep = signed <= .8
+    return dict(zip(rows[keep].tolist(), regret[keep].tolist()))
+
+
+def retained_count(path, cache, seed, fraction):
+    """(retained trained rows, whether the proof sidecar was read) of the shard at `path`: rows of the evaluator being
+    trained that `retained` keeps for (seed, fraction), with the rows the sidecar lists counted as exact."""
+    path = Path(path)
+    x = shard_index(path, cache, ('game', 'ply', 'proven', 'known_result', 'offsets', 'side'))
+    labels = proof_labels(path)
+    exact = (x['proven'] != 0) | (x['known_result'] != 0) | label_keys(x['game'], x['ply'], labels)
+    keep = trained_rows(x['side'], x['game'], x['ply']) & retained(seed, path.name, np.diff(x['offsets']) > 0, exact, fraction)
+    return int(keep.sum()), labels is not None
+
+
+def actor_rows(path, cache):
+    """Counter of the shard's full-search rows per episode actor."""
+    x = shard_index(path, cache, ('offsets', 'game', 'actor', 'actors'))
+    actor, rows = np.unique(x['actor'][x['game'][np.diff(x['offsets']) > 0]], return_counts=True)
+    return Counter({x['actors'][a]: n for a, n in zip(actor.tolist(), rows.tolist())})
+
+
+def _survey_shard(task):
+    run_dir, name, seed, fraction = task
+    path, cache = Path(run_dir)/'shards'/name, index_dir(run_dir)
+    return name, Survey(manifest(path), retained_count(path, cache, seed, fraction), actor_rows(path, cache))
+
+
+def survey(run_dir, seed, fraction, processes):
+    """{shard name: Survey(manifest, retained_count, actor_rows)} over every shard of the run, with cheap-row retention
+    keyed by `seed` at `fraction`, building missing indices on the way. Spreads the shards over up to `processes`
+    spawned workers (hidden_main), at least SURVEY_CHUNK shards each, and works inline below two."""
+    tasks = [(str(run_dir), path.name, seed, fraction) for path in shard_dirs(run_dir)]
+    workers = min(processes, len(tasks)//SURVEY_CHUNK)
+    if workers < 2:
+        return dict(_survey_shard(task) for task in tasks)
+    with hidden_main():
+        pool = multiprocessing.get_context('spawn').Pool(workers)
+    with pool:
+        return dict(pool.imap_unordered(_survey_shard, tasks, 8))
+
+
 def _splitmix(x):
     """SplitMix64 finaliser of a uint64 array (wrapping arithmetic)."""
     x = x+np.uint64(0x9E3779B97F4A7C15)
@@ -581,8 +750,10 @@ class ReplayWindow:
     rows included; `rows` the window's trained rows (retained or not); `retained_rows` the training index and
     `retained_fraction` its share of the window's trained rows outside the validation split (1 without any);
     `total_full_rows`/`full_rows` full-search rows (all shards / window); `proven_rows` the window's rows with a
-    nonzero `proven` (sidecar labels included). Below fraction 1, total_rows reads each shard's rows once on first
-    use (`count`) and keeps its count until a refresh finds that the shard's proof sidecar appeared since.
+    nonzero `proven` (sidecar labels included). Below fraction 1, total_rows counts each shard once on first use
+    (retained_count) and keeps its count until a refresh finds that the shard's proof sidecar appeared since.
+    `survey` (dense_data.survey for this seed and cheap_row_fraction) supplies manifests and counts read beforehand.
+    Shards are read through their index (shard_index in index_dir(run_dir)).
 
     Memory: each admitted shard is held as numpy arrays (Shard): per row its game, ply, player, remaining, proven,
     raw legal digest, next-ply row and policy offset (proven includes the shard's proof_labels, applied at
@@ -603,36 +774,20 @@ class ReplayWindow:
     VALUE_CACHE = 4096
 
     def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.,
-                 policy_dir=None, cheap_row_fraction=1., seed=0):
+                 policy_dir=None, cheap_row_fraction=1., seed=0, survey=None):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
-        self.cheap_row_fraction, self.seed, self.counts = cheap_row_fraction, seed, {}
+        self.cheap_row_fraction, self.seed = cheap_row_fraction, seed
+        self.manifests = {n: v.manifest for n, v in (survey or {}).items()}
+        self.counts = {n: v.count for n, v in (survey or {}).items()}
+        self.index_dir = index_dir(run_dir)
         self.shape = dict(min_rows=min_rows, expand_per_row=expand_per_row, taper_exponent=taper_exponent)
         self.policy_dir = self.run_dir/'cache'/'policies' if policy_dir is None else Path(policy_dir)
-        self.manifests = {}; self.shards = {}; self.values = OrderedDict()
+        self.shards = {}; self.values = OrderedDict()
         self.admitted = self.indexed = None
         self.unlabelled = set(); self.deblunders = {}
         self.regret_mtime = None; self.regret_entries = {}; self.exact_regret = {}
         self.refresh()
         self.refresh_regret()
-
-    def exact_errors(self, name, episodes, rows, labels):
-        """Cached actor-value errors after native and sidecar labels, including predicted proof lines."""
-        errors = {}
-        for i, row in enumerate(rows):
-            proven = row.get('proven', 0)
-            if not proven and labels and (row['game'], row['ply']) in labels:
-                proven = 1
-            if proven not in (-1, 1):
-                continue
-            predictions = episodes[row['game']].get('network_values')
-            value = predictions[row['ply']] if predictions is not None else None
-            if value is not None:
-                regret = (1-proven*value)/2
-                if not 0 <= regret <= 1:
-                    raise ValueError(f'Invalid network value at {name}/{row["game"]}/{row["ply"]}')
-                if proven*value <= .8:
-                    errors[i] = regret
-        return errors
 
     def priority_rows(self, name, entries):
         """(ascending row indices, weights) of admitted shard `name`'s priority rows: restart buffer `entries`
@@ -658,34 +813,13 @@ class ReplayWindow:
 
     def load(self, name):
         path = self.run_dir/'shards'/name
-        episodes, rows = read_shard(path, policies=False)
+        x = shard_index(path, self.index_dir)
         labels, self.deblunders[name] = proof_annotations(path)
-        self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
-        offsets = load_offsets(path, len(rows))
         if labels is None:
             self.unlabelled.add(name)
-        game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
-        where = {(g, t): i for i, (g, t) in enumerate(zip(game.tolist(), ply.tolist()))}
-        per_ply = lambda key: [v for e in episodes for v in (e.get(key) or [None]*len(e['moves']))]
-        shard = Shard(
-            game=game, ply=ply.astype(np.int16), player=np.array([r['player'] for r in rows], np.int8),
-            remaining=np.array([r['remaining'] for r in rows], np.int8),
-            proven=np.array([r.get('proven', 0) for r in rows], np.int8),
-            known_result=np.array([known_result(episodes[r['game']], r['ply']) for r in rows], np.int8),
-            proof_action={i: r['proof_action'] for i, r in enumerate(rows) if r.get('proof_action')},
-            search={i: r['search'] for i, r in enumerate(rows) if 'search' in r},
-            legal=np.frombuffer(bytes.fromhex(''.join(r['legal_sha256'] for r in rows)), np.uint8).reshape(-1, 32),
-            offsets=offsets, following=np.array([where.get((g, t+1), -1) for g, t in zip(game.tolist(), ply.tolist())], np.int32),
-            start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
-            moves=np.array([m for e in episodes for m in e['moves']], np.int32).reshape(-1, 2),
-            roots=np.array([np.nan if v is None else v for v in per_ply('root_values')], np.float64),
-            searched=np.array([bool(f) for f in per_ply('full_search')], bool),
-            has_roots=np.array([e['root_values'] is not None for e in episodes], bool),
-            has_search=np.array([e.get('full_search') is not None for e in episodes], bool),
-            winner=np.array([e['winner'] for e in episodes], np.int8),
-            side=np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8),
-            held=np.array([holdout(e, self.validation_fraction) for e in episodes], bool))
+        shard = Shard(**{k: x[k] for k in Shard._fields if k != 'held'}, held=held_out(x['holdout'], self.validation_fraction))
         label(shard, labels)
+        self.exact_regret[name] = exact_errors(name, shard.proven, x['network'], x['has_network'])
         return shard
 
     def refresh(self):
@@ -722,8 +856,8 @@ class ReplayWindow:
                 labels, self.deblunders[name] = proof_annotations(self.run_dir/'shards'/name)
                 if labels is not None:
                     label(self.shards[name], labels); self.unlabelled.discard(name)
-                    episodes, rows = read_shard(self.run_dir/'shards'/name, policies=False)
-                    self.exact_regret[name] = self.exact_errors(name, episodes, rows, labels)
+                    x = shard_index(self.run_dir/'shards'/name, self.index_dir, ('network', 'has_network'))
+                    self.exact_regret[name] = exact_errors(name, self.shards[name].proven, x['network'], x['has_network'])
                     changed = True
         if not changed:
             return self.rows
@@ -776,23 +910,10 @@ class ReplayWindow:
             else:
                 for name in self.names:
                     if name not in self.counts:
-                        self.counts[name] = self.count(name)
+                        self.counts[name] = retained_count(self.run_dir/'shards'/name, self.index_dir, self.seed,
+                                                           self.cheap_row_fraction)
                 self.pacing_rows = sum(self.counts[n][0] for n in self.names)
         return self.pacing_rows
-
-    def count(self, name):
-        """(retained trained rows, whether its proof sidecar was read) of shard `name`, read from its files; rows the
-        sidecar lists count as exact."""
-        path = self.run_dir/'shards'/name
-        episodes = json.loads((path/'episodes.json').read_text()); rows = json.loads((path/'rows.json').read_text())
-        labels = proof_labels(path)
-        game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
-        proven = np.array([r.get('proven') or known_result(episodes[r['game']], r['ply'])
-                           or (r['game'], r['ply']) in (labels or ()) for r in rows], np.int8)
-        side = np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8)
-        full = np.diff(load_offsets(path, len(rows))) > 0
-        keep = trained_rows(side, game, ply) & retained(self.seed, name, full, proven, self.cheap_row_fraction)
-        return int(keep.sum()), labels is not None
 
     def refresh_regret(self):
         """Read the proof buffer only when its mtime changes, then match its entries to training rows."""
@@ -1039,12 +1160,17 @@ class ValidationSets:
     of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
     (`actors`); a shard's row candidates live for one refresh, so a new newest actor rescans the shards it
     played. Each refresh sets proven = +1 on chosen rows (and successors) that their shard's proof sidecar lists
-    (proof_labels), keeping the labels of the shards the chosen rows come from.
+    (proof_labels), keeping the labels of the shards the chosen rows come from. Shards are scanned through their
+    index (shard_index in index_dir(run_dir)); `survey` (dense_data.survey) supplies manifests and actor counts read
+    beforehand.
     """
 
-    def __init__(self, run_dir, fraction, seed, limit, quota):
+    def __init__(self, run_dir, fraction, seed, limit, quota, survey=None):
         self.run_dir, self.fraction, self.seed, self.limit, self.quota = Path(run_dir), fraction, seed, limit, quota
-        self.manifests = {}; self.actors = {}; self.entries = {}; self.following_index = {}; self.labels = {}
+        self.index_dir = index_dir(run_dir)
+        self.manifests = {n: v.manifest for n, v in (survey or {}).items()}
+        self.actors = {n: v.actors for n, v in (survey or {}).items()}
+        self.entries = {}; self.following_index = {}; self.labels = {}
         self.deblunders = {}
         self.subsets = {(source, split): [] for source in SOURCES for split in ('held', 'train')}
         self.picks = {key: [] for key in self.subsets}; self.walked = {key: set() for key in self.subsets}
@@ -1054,11 +1180,12 @@ class ValidationSets:
         """A shard's full-search rows as permuted (index, held, actor) candidates, kept in `scanned` (one
         refresh); records the shard's full-search rows per episode actor in `actors`."""
         if name not in scanned:
-            episodes, rows = read_shard(self.run_dir/'shards'/name)
-            full = [i for i, r in enumerate(rows) if len(r['policy'])]
-            held = [holdout(e, self.fraction) for e in episodes]
-            order = np.random.default_rng([self.seed, zlib.crc32(name.encode())]).permutation(len(full))
-            scanned[name] = [(i, held[rows[i]['game']], episodes[rows[i]['game']]['actor']) for i in (full[k] for k in order)]
+            x = shard_index(self.run_dir/'shards'/name, self.index_dir, ('offsets', 'game', 'holdout', 'actor', 'actors'))
+            full = np.flatnonzero(np.diff(x['offsets']) > 0)
+            full = full[np.random.default_rng([self.seed, zlib.crc32(name.encode())]).permutation(len(full))]
+            game = x['game'][full]
+            scanned[name] = list(zip(full.tolist(), held_out(x['holdout'], self.fraction)[game].tolist(),
+                                     [x['actors'][a] for a in x['actor'][game].tolist()]))
             self.actors[name] = Counter(a for _, _, a in scanned[name])
         return scanned[name]
 
@@ -1393,16 +1520,23 @@ def batches(window, rng, batch_size, settings, validation=False, calibration=lam
         yield collate_arrays(*examples(window, refs, rng, **target_options(s, calibration())))
 
 
-def start_hidden(processes):
-    """Start spawn-context `processes` with the parent's __main__ hidden, so each child imports only the modules
-    its target and arguments need instead of re-importing the parent's main script (and torch with it)."""
+@contextlib.contextmanager
+def hidden_main():
+    """Hide the parent's __main__ while spawn-context processes start inside the block, so each child imports only
+    the modules its target and arguments need instead of re-importing the parent's main script (and torch with it)."""
     main = sys.modules['__main__']
     sys.modules['__main__'] = types.ModuleType('__main__')
     try:
-        for process in processes:
-            process.start()
+        yield
     finally:
         sys.modules['__main__'] = main
+
+
+def start_hidden(processes):
+    """Start spawn-context `processes` under hidden_main."""
+    with hidden_main():
+        for process in processes:
+            process.start()
 
 
 def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_updates, initial_regret, run_seed):
