@@ -2469,6 +2469,78 @@ class NativeScheduler(unittest.TestCase):
                          (0, 0, 0, 0, 0, 0))
 
 
+    def test_first_cancel_keeps_its_cause_when_retarget_cleanup_crosses_deadline(self):
+        import threading
+        import time
+        from types import SimpleNamespace
+        from neural_search import checked
+        from native_scheduler import InferenceService
+        from tactical_proof import library
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        pool=self.pool([self.graph(NativeProofs.opening),self.graph()],quantum=16,views=1,work=4096)
+        pool.step();self.answer(pool)
+        cancel_entered,allow_cancel=threading.Event(),threading.Event()
+        loop,initial_generation=None,0
+        observed_generations=[]
+        def hold_cancel(token):
+            generation=native.hxp_generation(loop,0) if loop is not None else 0
+            # Continuous startup may prune the old query first. It remains
+            # held by the worker; gate only the subsequent root retarget.
+            if generation>initial_generation:
+                observed_generations.append(generation)
+                cancel_entered.set();allow_cancel.wait(5)
+        workers,join,entered,release,_=NativeProofs.held_workers(self,1,cancel_gate=hold_cancel)
+        service,thread=None,None
+        starts,errors=[],[]
+        try:
+            loop=join(pool)
+            initial_generation=native.hxp_generation(loop,0)
+            cells=np.asarray(NativeProofs.opening,np.int64)
+            checked(native.hxp_offer(loop,0,cells.ctypes.data,len(cells),1000.))
+            checked(native.hxp_step(loop))
+            self.assertTrue(entered.wait(PATIENCE))
+            service=InferenceService([pool],[SimpleNamespace(model_version='scheduler')],progress=True)
+            self.addCleanup(service.close)
+            service.start(continuous=True)
+            histories=[[[0,0],[1,2],[3,-1]],[[0,0],[2,1],[3,0]]]
+            queued=time.monotonic()
+            service.retarget(0,0,histories[0],ms=500,views=1)
+            # Retargeting cancels the old query. Hold that native callback so
+            # one active root and another queued root finish after their clocks.
+            self.assertTrue(cancel_entered.wait(PATIENCE))
+            self.assertGreater(observed_generations[0],initial_generation)
+            second_queued=time.monotonic()
+            service.retarget(0,1,histories[1],ms=500,views=1)
+            stopping=threading.Event()
+            def stop():
+                starts.append(time.monotonic());stopping.set()
+                try:service.cancel()
+                except BaseException as error:errors.append(error)
+            thread=threading.Thread(target=stop)
+            thread.start();self.assertTrue(stopping.wait(PATIENCE))
+            self.assertLess(starts[0]-queued,.5)
+            time.sleep(max(0,second_queued+.65-time.monotonic()))
+            allow_cancel.set();release.set()
+            thread.join(PATIENCE)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors,[])
+            service.cancel()  # Repeated cancellation after expiry keeps the first stop.
+            final=service.close(completions=True)
+            self.assertEqual(len(final),2)
+            self.assertEqual({e['game'] for e in final},{0,1})
+            for event in final:
+                self.assertEqual((event['history'],event['error']),(histories[event['game']],'cancelled'))
+            active=next(e for e in final if e['game']==0)
+            self.assertGreater(active['result_ready_elapsed_ms'],500)
+            self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches'],
+                              service.stats()['active_producers']),(0,0,0))
+        finally:
+            allow_cancel.set();release.set()
+            if thread is not None:thread.join(PATIENCE)
+            if service is not None:service.close()
+
+
 class NativeProofs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -3044,7 +3116,7 @@ class NativeProofs(unittest.TestCase):
             loop.drain()
         self.assertEqual(workers.stats()['live'], 0)
 
-    def held_workers(self, capacity, workers=1, gate=None):
+    def held_workers(self, capacity, workers=1, gate=None, cancel_gate=None):
         """A raw shared service whose answers wait for `release`, or for `gate(history)`'s event.
 
         Create the pools first: cleanups free every joined loop, then the service."""
@@ -3064,13 +3136,19 @@ class NativeProofs(unittest.TestCase):
             order.append(history)
             entered.set();(gate(history) if gate else release).wait(5)
             return actual(worker, request)
+        actual_cancel=library.lib.hexo_tactical_cancel
+        actual_cancel.argtypes,actual_cancel.restype=[C.c_uint64],C.c_bool
+        @C.CFUNCTYPE(C.c_bool,C.c_uint64)
+        def cancel(token):
+            if cancel_gate:cancel_gate(token)
+            return actual_cancel(token)
         names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
                  'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
-        functions = np.asarray([C.cast(query if name == 'worker_answer' else
+        functions = np.asarray([C.cast(query if name == 'worker_answer' else cancel if name == 'cancel' else
                                 getattr(library.lib, 'hexo_tactical_'+name), ptr).value for name in names], np.uint64)
         service = native.hxps_new(functions.ctypes.data, workers, capacity)
         self.assertTrue(service)
-        self.addCleanup(lambda: (query, checked(native.hxps_free(service))))
+        self.addCleanup(lambda: (query, cancel, checked(native.hxps_free(service))))
         def join(pool):
             loop = native.hxp_join(pool.ptr, service, 50, 1, 32, 0)
             self.assertTrue(loop)
