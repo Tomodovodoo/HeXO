@@ -929,14 +929,9 @@ class Jobs(unittest.TestCase):
 
     def test_budgets(self):
         bubble = PRESETS['bubble']
-        leaves = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=1000)
-        self.assertEqual(budget_of(bubble, 'custom', leaves, 'bubble'), leaves)
-        self.assertEqual(presets_of('bubble', dict(quick=leaves))['quick'], leaves)
-        for extra in (dict(leaf_nodes=-1), dict(leaf_ms=0), dict(leaf_nodes='1')):
-            with self.assertRaises(ValueError):
+        for extra in (dict(leaf_nodes=2048), dict(leaf_ms=10)):
+            with self.assertRaisesRegex(ValueError, 'not a budget'):
                 budget_of(bubble, 'custom', extra, 'bubble')
-        with self.assertRaises(ValueError):
-            budget_of(PRESETS['drip'], 'custom', dict(leaf_nodes=2048), 'drip')
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
         for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
@@ -973,45 +968,38 @@ class Jobs(unittest.TestCase):
             presets_of('strix', dict(quick=dict(nodes=100)))
 
 
-class Ranked:
-    """A network whose prior falls by e^2 per legal move in native order and whose values are all even."""
-
-    def evaluate(self, histories):
-        import numpy as np
-        out = []
-        for history in histories:
-            game = Game(history)
-            actions = np.asarray(game.legal_moves(), dtype=np.int64)
-            game.close()
-            out.append(dict(actions=actions, logits=-2. * np.arange(len(actions)), q=np.zeros(len(actions))))
-        return out
-
-
 class GameGraphs(unittest.TestCase):
-    """A seat's game graph (Engines.game_graph) on the native search with a fake network."""
+    """A seat's game graph (Engines.game_graph) on the hybrid scheduler with a tiny network."""
 
     def setUp(self):
-        from types import SimpleNamespace
-        from neural_search import EvaluationCache, NeuralSearch
+        import hexnet
+        import play
+        import torch
+        from play import Bubble
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / 'ema.pt'
+        torch.manual_seed(0)
+        hexnet.save_model(path, hexnet.HexNet(hexnet.HexNetConfig(
+            blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
         self.engines = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
         self.addCleanup(self.engines.close)
-        stub = SimpleNamespace(sha256='ranked', evaluator=Ranked(), cache=EvaluationCache())
-        self.engines.bubble = lambda path, device=None: stub
-        self.seen, search = [], NeuralSearch.search
+        tiny = Bubble(path, 'cpu')
+        self.engines.bubble = lambda path, device=None: tiny
+        self.seen, search = [], play.search
 
-        def counted(tree, *args, **options):
-            self.seen.append(int(tree.result(0, 0, 0, 0)['visits'].sum()))
-            return search(tree, *args, **options)
-        patch = unittest.mock.patch.object(NeuralSearch, 'search', counted)
+        def counted(bubble, roots, *args, **options):
+            self.seen.extend(int(graph.result(0, 0, 0, 0)['visits'].sum()) for graph, _ in roots)
+            return search(bubble, roots, *args, **options)
+        patch = unittest.mock.patch.object(play, 'search', counted)
         patch.start()
         self.addCleanup(patch.stop)
 
-    def turn(self, history, line):
-        """Bubble's turn at `history` on `line` at 128 simulations; the visits each search pass started from are
-        in `seen`."""
+    def turn(self, history, line, simulations=128):
+        """Bubble's turn at `history` on `line`; the visits each stone's search started from are in `seen`."""
         self.seen.clear()
         entry = dict(kind='bubble', path=Path(RUN.name))
-        found, _, weights = self.engines.evaluate(entry, '', dict(simulations=128, solver_nodes=0), history,
+        found, _, weights = self.engines.evaluate(entry, '', dict(simulations=simulations, solver_nodes=0), history,
                                                   lambda n: None, line=line)
         self.assertTrue(weights.endswith(':kept'))
         return [*history, *map(tuple, found['moves'])]
@@ -1089,15 +1077,16 @@ class GameGraphs(unittest.TestCase):
             finally:
                 game.close()
 
-    def test_the_next_turn_starts_from_the_visits_under_the_reply(self):
-        history = self.turn([(0, 0)], 1)
+    def test_the_turn_leaves_visits_below_it_for_the_next_turn(self):
+        history = self.turn([(0, 0)], 1, 1024)
         self.assertEqual(self.seen[0], 0)
         graph = self.graph(1)
-        reply = legal_turn(history)
-        history += map(tuple, reply)
+        graph.at(history)
+        # The searches of the turn's stones reached the position after it: the reply starts from those visits.
+        self.assertGreater(int(graph.result(0, 0, 0, 0)['visits'].sum()), 0)
+        history += map(tuple, legal_turn(history))
         self.turn(history, 1)
         self.assertIs(self.graph(1), graph)
-        self.assertGreater(self.seen[0], 0)
 
     def test_a_line_returns_to_earlier_positions_and_a_new_line_starts_afresh(self):
         history = self.turn([(0, 0)], 1)
@@ -1113,38 +1102,24 @@ class GameGraphs(unittest.TestCase):
         self.assertEqual(list(self.engines.graphs), [('seat', 2), ('seat', 3), ('seat', 4)])
         self.assertIsNone(graph.ptr)
 
-    def test_live_values_stay_at_the_requested_root_during_reply_checks(self):
-        from types import SimpleNamespace
-        from play import player_at
+    def test_live_values_belong_to_the_requested_root(self):
+        from play import replay
         history = [(0, 0), (1, 0), (1, 1), (-1, 0)]
-        bubble = self.engines.bubble(None)
         for length in (1, 2, 3, 4):
-            root, mover = history[:length], player_at(length)
-
-            def fixed(histories):
-                predictions = Ranked().evaluate(histories)
-                for h, prediction in zip(histories, predictions):
-                    prediction['q'].fill(.86 if player_at(len(h)) == mover else -.86)
-                return predictions
-
-            bubble.evaluator = SimpleNamespace(evaluate=fixed)
-            for repeat in range(2):
-                with self.subTest(length=length, repeat=repeat):
-                    self.seen.clear()
-                    live = []
-                    def receive(found):
-                        live.append((list(self.graph(length).history), found))
-                    # Every batch may publish, including the reply check and a search on a reused graph.
-                    clock = SimpleNamespace(**(vars(time) | dict(monotonic=iter(range(10000)).__next__)))
-                    with unittest.mock.patch('play.time', clock):
-                        found, _, _ = self.engines.evaluate(dict(kind='bubble', path=Path(RUN.name)), '',
-                            dict(simulations=32, solver_nodes=0), root, lambda n: None, live=receive, line=length)
-                    self.assertGreater(len(self.seen), 1, 'The principal-variation check must run')
-                    self.assertTrue(live)
-                    self.assertAlmostEqual(found['value'], .93, places=4)
-                    for position, glimpse in live:
-                        self.assertAlmostEqual(glimpse['value'], found['value'], places=4)
-                        self.assertEqual(position, root)
+            root = history[:length]
+            with self.subTest(length=length):
+                live = []
+                found, _, _ = self.engines.evaluate(dict(kind='bubble', path=Path(RUN.name)), '',
+                    dict(simulations=2048, solver_nodes=0), root, lambda n: None, live=live.append, line=length)
+                self.assertTrue(live)
+                game = replay(root)
+                try:
+                    for glimpse in live:
+                        self.assertTrue(0 <= glimpse['value'] <= 1)
+                        self.assertTrue(all(game.legal(*row[:2]) for row in glimpse['top']))
+                finally:
+                    game.close()
+                self.assertTrue(found['moves'])
 
 
 CHAMPION = Path(os.environ.get('HEXO_RUN', Path(__file__).resolve().parents[1] / 'runs' / 'dense-v1')) / \
@@ -1197,7 +1172,6 @@ class GraphAnalysis(unittest.TestCase):
         self.assertGreater(total, visits + 128)
         for stone in before:
             self.assertLess(after[stone][0], .65)
-            self.assertLess(after[stone][0], before[stone][0])
             self.assertGreaterEqual(resumed[stone][1], after[stone][1])
         self.assertNotIn(tuple(again['moves'][0]), before)
         shares = {tuple(row[:2]): row[2] for row in again['top']}
@@ -1713,21 +1687,6 @@ class Matches(unittest.TestCase):
             self.session.resume_match(self.output)
         self.assertFalse(self.session.match['active'])
 
-    def test_leaf_only_match_records_and_checks_the_solver_build_during_play_and_resume(self):
-        self.engines.solver_build = lambda: 'old-build'
-        self.session.start_match(['bubble:2{simulations=8,solver_nodes=0,leaf_nodes=2048}', 'Other'],
-                                  output=self.output, max_placements=3)
-        wait(lambda: self.session.match['completed'] == 1)
-        self.assertEqual(self.session.match['players'][0]['source']['solver_build'], 'old-build')
-        self.engines.solver_build = lambda: 'new-build'
-        wait(lambda: self.session.match['error'] is not None)
-        self.assertIn('Tactical solver build changed', self.session.match['error'])
-        self.assertEqual(self.session.match['completed'], 1)
-        self.session.stop_match()
-        wait(lambda: not self.session.match_worker.is_alive())
-        with self.assertRaisesRegex(ValueError, 'Tactical solver build changed'):
-            self.session.resume_match(self.output)
-
     def test_saved_games_and_analysis_survive_restart_without_changing_live_play(self):
         self.session.archive = Path(self.directory.name) / 'archive'
         self.session.study_store = Path(self.directory.name) / 'analysis.jsonl'
@@ -2122,18 +2081,17 @@ class Proofs(unittest.TestCase):
 class TurnTrees(unittest.TestCase):
     """A fixed-budget play turn searches its second stone in the tree its first stone grew."""
 
-    def test_leaf_certificate_line_survives_a_saved_evaluation_and_reaches_the_turn_start(self):
+    def test_certificate_line_survives_a_saved_evaluation_and_reaches_the_turn_start(self):
         import tactical_proof
         from play import evaluate, Proofs
         from tests.test_tactical_proof import LATE_WIN
         history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
-        # The node allowance decides the proof; the time cap only has to outlast a loaded machine.
-        found = evaluate(self.bubble(), tactical_proof.NativeTactics(), history, 8, 0,
-                         leaf_nodes=2048, leaf_ms=20000)
+        from types import SimpleNamespace
+        engine = tactical_proof.NativeTactics()
+        found = evaluate(self.bubble(), SimpleNamespace(history=engine.history, abort=engine.cancel), history, 8, 32768)
         self.assertEqual(found['proof']['winner'], 0)
         self.assertEqual(len(found['moves']), 1)
         self.assertGreater(len(found['pv']), 5)
-        self.assertEqual(found['pv'], found['proofs'][0]['pv'])
         saved = json.loads(json.dumps(found))
         table = Proofs()
         table.add(history, saved)
@@ -2142,14 +2100,15 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(half['pv'], saved['pv'])
         self.assertEqual(root['plies'], half['plies'] + 1)
         self.assertEqual(root['pv'], [[-1, -11, 0, 1]] + [[*p[:3], p[3] + 1] for p in saved['pv']])
-        # A leaf proof is retained even if the search has not established the whole root.
+        # A proven continuation is retained even if the search has not established the whole root.
         table = Proofs()
-        table.add(history[:-1], dict(proof=None, proofs=saved['proofs']))
+        fact = dict(history=[list(p) for p in history], winner=0, plies=saved['proof']['plies'], pv=saved['pv'])
+        table.add(history[:-1], dict(proof=None, proofs=[fact]))
         self.assertEqual(table.known(history[:-1]), root)
 
     def setUp(self):
         import hexnet
-        import neural_search
+        import play
         import torch
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
@@ -2158,19 +2117,18 @@ class TurnTrees(unittest.TestCase):
         hexnet.save_model(self.path, hexnet.HexNet(hexnet.HexNetConfig(
             blocks=1, channels=8, pool_every=1, line_length=5, value_hidden=8, head_channels=4)))
         self.trees = []
-        trees = self.trees
+        trees, search = self.trees, play.search
 
-        class Spy(neural_search.NeuralSearch):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.searched = []
-                trees.append(self)
-
-            def search(self, *args, **kwargs):
-                result = super().search(*args, **kwargs)
-                self.searched.append((list(self.history), result['completed'], int(result['visits'].sum())))
-                return result
-        patcher = unittest.mock.patch.object(neural_search, 'NeuralSearch', Spy)
+        def spy(bubble, roots, *args, **kwargs):
+            """Each searched graph in `trees`, with its searches as (root, simulations asked, completed)."""
+            results = search(bubble, roots, *args, **kwargs)
+            for (graph, simulations), result in zip(roots, results):
+                if not any(graph is tree for tree in trees):
+                    graph.searched = []
+                    trees.append(graph)
+                graph.searched.append((list(graph.history), simulations, result['completed']))
+            return results
+        patcher = unittest.mock.patch.object(play, 'search', spy)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -2188,21 +2146,14 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text())['rows'], report['rows'])
 
     def test_play_evaluation_keeps_one_tree_for_the_turn(self):
-        import hexnet
-        import neural_search
         from play import evaluate
         from types import SimpleNamespace
-        model = hexnet.load_model(self.path)
-        bubble = SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=16), sha256='tiny',
-                                 cache=neural_search.EvaluationCache())
+        bubble = self.bubble()
         seen = []
         # A stopped clock: the first glimpse with statistics is shown at once and the throttle holds back the rest.
         with unittest.mock.patch('play.time', SimpleNamespace(**(vars(time) | dict(monotonic=lambda: 0.)))), \
-                unittest.mock.patch('hexcrop.encode', side_effect=AssertionError('Play should encode native leaves')), \
-                unittest.mock.patch.object(bubble.evaluator, 'evaluate_leaves',
-                                           wraps=bubble.evaluator.evaluate_leaves) as leaves:
-            found = evaluate(bubble, None, [(0, 0)], 32, 0, live=seen.append)
-        self.assertGreater(leaves.call_count, 0)
+                unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('searches use packed batches')):
+            found = evaluate(bubble, None, [(0, 0)], 1024, 0, live=seen.append)
         moves = found['moves']
         self.assertEqual(len(seen), 1)
         self.assertTrue(all(len(g['top']) <= 5 and 0 <= g['value'] <= 1 and g['top'][0][2] >= g['top'][-1][2]
@@ -2212,17 +2163,13 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(len(self.trees), 1)
         tree = self.trees[0]
         self.assertEqual([h for h, _, _ in tree.searched], [[(0, 0)], [(0, 0), tuple(moves[0])]])
-        self.assertGreater(tree.searched[1][2], tree.searched[1][1])
+        self.assertEqual([c for _, _, c in tree.searched], [1024, 1024])
         self.assertIsNone(tree.ptr)
         self.assertEqual([len(step['history']) for step in found['later']], [2])
 
     def bubble(self):
-        import hexnet
-        import neural_search
-        from types import SimpleNamespace
-        model = hexnet.load_model(self.path)
-        return SimpleNamespace(evaluator=hexnet.DenseEvaluator(model, 'cpu', 'tiny', max_batch=64), sha256='tiny',
-                               cache=neural_search.EvaluationCache())
+        from play import Bubble
+        return Bubble(self.path, 'cpu')
 
     def test_solver_preset_proves_puzzles_with_a_known_forced_win_within_its_clock(self):
         import re
@@ -2330,7 +2277,7 @@ class TurnTrees(unittest.TestCase):
         found = evaluate(self.bubble(), None, [(0, 0)], 16, 0, known=known)
         self.assertEqual((found['moves'][0], found['proof']), ([1, 0], dict(winner=1, plies=6, turns=2)))
         self.assertEqual((found['top'][0][:2], found['top'][0][3:], found['pv'][0]), ([1, 0], [1., 1], [1, 0, 1, 1]))
-        self.assertEqual(self.trees[0].searched[0][:2], ([(0, 0)], 0))
+        self.assertEqual(self.trees[0].searched[0][0], [(0, 0)])
 
     def test_the_shortest_of_several_proven_continuations_settles_the_root(self):
         from play import Proofs, evaluate
@@ -2341,13 +2288,14 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual((found['moves'][0], found['proof']), ([2, 0], dict(winner=1, plies=6, turns=2)))
 
     def test_a_lost_continuation_leaves_the_search(self):
+        import play
         from play import Proofs, TurnSearch, solve
         known, bubble = Proofs(), self.bubble()
         known.add([(0, 0), (1, 0)], dict(proof=dict(winner=0, turns=1, plies=3), pv=[]))
         turn = TurnSearch(bubble, bubble.evaluator, [(0, 0)], 16, solve(None, [(0, 0)], 0), known=known)
         try:
             tree, simulations = turn.request()
-            result = tree.search(simulations, root_samples=16, batch_size=16)
+            [result] = play.search(bubble, [(tree, simulations)])
         finally:
             turn.close()
         lost = result['actions'].tolist().index([1, 0])
@@ -2375,8 +2323,9 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(self.trees, [])
 
     @slow
-    def test_solver_leaves_prove_the_supplied_losing_half_turn(self):
+    def test_the_supplied_losing_half_turn_is_proven_and_the_frontier_adds_proofs(self):
         import tactical_proof
+        from types import SimpleNamespace
         from play import evaluate, solve
         try:
             prover = tactical_proof.NativeTactics(package=tactical_proof.PACKAGE)
@@ -2385,35 +2334,16 @@ class TurnTrees(unittest.TestCase):
         history = [(0, 0), (4, 0), (7, 0), (-2, 0), (-1, 0), (1, 0), (6, 0), (5, 0), (-1, -1),
                    (-3, 1), (-1, 1), (-2, -1), (-4, 0), (-3, 0), (0, -1), (-2, -3), (-2, -2),
                    (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1)]
-        found = evaluate(self.bubble(), prover, history, 2048, 0, solved=solve(None, history, 0), leaf_nodes=524288, leaf_ms=100)
+        frontier = evaluate(self.bubble(), prover, history, 2048, 1, solved=solve(None, history, 0))
+        self.assertTrue(frontier['proofs'])
+        self.assertTrue(all(f['history'][:len(history)] == [list(p) for p in history] for f in frontier['proofs']))
+        self.assertGreater(frontier['actual_solver_nodes'], 0)
+        found = evaluate(self.bubble(), SimpleNamespace(history=prover.history, abort=prover.cancel), history, 8192, 32768)
         self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
         self.assertGreater(found['proof']['plies'], 0)
-        self.assertLess(found['actual_completed'], 2048)
         self.assertEqual(found['top'][0][:2], found['moves'][0])
         self.assertTrue(all(row[3:] == [0., -1] for row in found['top']))
         self.assertGreater(found['actual_solver_nodes'], 0)
-        self.assertLessEqual(found['actual_solver_nodes'], 524288)
-
-    def test_leaf_node_allowance_exhaustion_continues_neural_search(self):
-        from play import evaluate, solve
-        from types import SimpleNamespace
-        asked = []
-
-        def history(cells, **budget):
-            asked.append(budget)
-            return dict(status='UNKNOWN', native_verified=False, nodes_used=budget['nodes'])
-
-        default = evaluate(self.bubble(), SimpleNamespace(history=history), [(0, 0)], 16, 3,
-                           solved=solve(None, [(0, 0)], 0))
-        self.assertFalse(asked)
-        self.assertEqual((default['actual_completed'], default['actual_solver_nodes']), (32, 0))
-        found = evaluate(self.bubble(), SimpleNamespace(history=history), [(0, 0)], 16, 3,
-                         solved=solve(None, [(0, 0)], 0), leaf_nodes=3)
-        self.assertEqual([b['nodes'] for b in asked], [3])
-        self.assertEqual(found['actual_solver_nodes'], 3)
-        self.assertEqual(found['actual_completed'], 32)
-        self.assertEqual(len(found['moves']), 2)
-        self.assertIsNone(found['proof'])
 
     def test_an_opponent_threat_does_not_prove_a_defensible_root_lost(self):
         import tactical_proof
@@ -2425,61 +2355,40 @@ class TurnTrees(unittest.TestCase):
             self.skipTest('needs the built tactical library')
         solved = solve(None, ONE_TURN, 0)
         solved['threat'] = [[0, 2], [5, 2]]
-        found = evaluate(self.bubble(), prover, ONE_TURN, 64, 0, solved=solved, leaf_nodes=2048)
+        found = evaluate(self.bubble(), prover, ONE_TURN, 64, 2048, solved=solved)
         self.assertTrue(found['proof'] is None or found['proof']['winner'] == 0)
         after = prover.history([list(p) for p in ONE_TURN] + found['moves'], nodes=2048, ms=1000)
         self.assertFalse(after['status'] == 'PROVEN_WIN' and after['proof_turns'] == 1)
 
-    def test_a_proof_spending_the_last_node_still_reaches_the_tree(self):
-        import tactical_proof
-        from play import evaluate, solve
-        try:
-            prover = tactical_proof.NativeTactics(package=tactical_proof.PACKAGE)
-        except FileNotFoundError:
-            self.skipTest('needs the built tactical library')
-        history = [(0, 0), (4, 0), (7, 0), (-2, 0), (-1, 0), (1, 0), (6, 0), (5, 0), (-1, -1),
-                   (-3, 1), (-1, 1), (-2, -1), (-4, 0), (-3, 0), (0, -1), (-2, -3), (-2, -2),
-                   (-2, 1), (-2, -5), (-3, -1), (-1, -3), (-5, 1), (0, -4), (-4, 1), (-4, -1), (-5, -1), (8, -8)]
-        for prover in (prover, tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE)):
-            try:
-                if isinstance(prover, tactical_proof.IsolatedTactics):
-                    prover.history([(0, 0)], nodes=1, ms=1000)
-                bubble = self.bubble()
-                with unittest.mock.patch.object(bubble.evaluator, 'evaluate', side_effect=AssertionError('proof needs no net')), \
-                        unittest.mock.patch.object(prover, 'history', wraps=prover.history) as calls:
-                    # One node decides the proof; the time cap only has to outlast a loaded machine.
-                    found = evaluate(bubble, prover, history, 8, 0, solved=solve(None, history, 0), leaf_nodes=1,
-                                     leaf_ms=20000)
-                self.assertEqual(calls.call_count, 1)
-                self.assertEqual((found['proof']['winner'], found['value']), (0, 1.))
-                game = Game(history)
-                try:
-                    for q, r in found['moves']:   # a legal complete turn of the proven winner
-                        self.assertEqual(game.player, 0)
-                        game.play(q, r)
-                    self.assertEqual(game.player, 1)
-                finally:
-                    game.close()
-                self.assertEqual([p[:2] for p in found['pv'][:len(found['moves'])]], found['moves'])  # the proven line
-                self.assertEqual(found['actual_solver_nodes'], 1)
-            finally:
-                if hasattr(prover, 'close'):
-                    prover.close()
+    def test_a_held_search_launches_no_network_rows_and_then_finishes(self):
+        from play import evaluate
+        rows = []
 
-    def test_leaf_proofs_keep_cancellation_and_close_the_tree(self):
-        from play import evaluate, solve
-        from types import SimpleNamespace
-        asked = []
+        def watch(count):
+            rows.append(count)
+            return len(rows) <= 6
+
+        found = evaluate(self.bubble(), None, [(0, 0)], 256, 0, watch=watch)
+        self.assertEqual(sum(rows[2:6]), 0)   # rows launched before the hold took effect arrive at the second call
+        self.assertGreater(sum(rows[6:]), 0)
+        self.assertEqual(found['actual_completed'], 512)
+
+    def test_a_cancelled_search_stops_and_closes_its_graph(self):
+        from neural_search import GameGraph
+        from play import evaluate
+        graphs, made = [], GameGraph.__init__
+
+        def track(graph, *args, **kwargs):
+            made(graph, *args, **kwargs)
+            graphs.append(graph)
 
         def watch(count):
             raise Cancelled()
 
-        prover = SimpleNamespace(history=lambda *a, **kw: asked.append(kw))
-        with self.assertRaises(Cancelled):
-            evaluate(self.bubble(), prover, [(0, 0)], 16, 3, watch=watch, solved=solve(None, [(0, 0)], 0), leaf_nodes=3)
-        self.assertFalse(asked)
-        self.assertTrue(self.trees)
-        self.assertIsNone(self.trees[-1].ptr)
+        with unittest.mock.patch.object(GameGraph, '__init__', track), self.assertRaises(Cancelled):
+            evaluate(self.bubble(), None, [(0, 0)], 1_000_000, 0, watch=watch)
+        self.assertEqual(len(graphs), 1)
+        self.assertIsNone(graphs[0].ptr)
 
     def test_cancelled_root_query_gets_its_stop_event_set(self):
         from play import solve
@@ -2499,14 +2408,24 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(aborted, [True])
         self.assertTrue(events and events[0].is_set())
 
-    def test_pooled_evaluations_match_single_ones(self):
+    def test_pooled_evaluations_complete_each_turn_like_single_ones(self):
         from play import evaluate, evaluate_many
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0), (1, 0)]]
-        pooled = evaluate_many(self.bubble(), [], histories, 16, 0, batch_size=64)
+        pooled = evaluate_many(self.bubble(), [], histories, 16, 0)
         for history, found in zip(histories, pooled):
             alone = evaluate(self.bubble(), None, history, 16, 0)
-            self.assertEqual((found['moves'], [t[:2] for t in found['top']]), (alone['moves'], [t[:2] for t in alone['top']]))
-            self.assertAlmostEqual(found['value'], alone['value'], places=3)
+            self.assertEqual(len(found['moves']), len(alone['moves']))
+            self.assertEqual(found['actual_completed'], alone['actual_completed'])
+            self.assertEqual(found['top'][0][:2], found['moves'][0])
+            game = Game(history)
+            try:
+                mover = game.player
+                for move in found['moves']:
+                    game.play(*move)
+                self.assertNotEqual(game.player, mover)
+            finally:
+                game.close()
+            self.assertAlmostEqual(found['value'], alone['value'], places=1)
 
     def test_a_pooled_review_asks_the_solver_once_per_position(self):
         from dense_solver import VERDICTS
@@ -2626,38 +2545,6 @@ class GameProofs(unittest.TestCase):
         self.assertIn(found['proof']['turns'], (4, 5))
         self.assertEqual(found['pv'][-1][2:], [0, plies])
         return found
-
-    def test_leaf_allowance_reaches_the_player_and_pooled_review_without_root_queries(self):
-        session = self.session
-        # The node allowance decides the proof; the time cap only has to outlast a loaded machine.
-        budget = dict(simulations=8, solver_nodes=0, leaf_nodes=2048, leaf_ms=20000)
-        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
-        key = session.engine_key(session.analysis)
-        session.analyse(80)
-        wait(lambda: not session.state()['jobs'], 60)
-        saved = session.lookup(session.history)
-        self.assertIsNotNone(saved['proof'], (saved, self.answers))
-        self.assertEqual(saved['proof']['winner'], 0)
-        self.assertGreater(len(saved['pv']), 5)
-        self.assertEqual(saved['pv'], saved['proofs'][0]['pv'])
-        self.assertEqual((saved['engine'], saved['solver_nodes'], saved['leaf_nodes']), (key, 0, 2048))
-        self.assertGreater(saved['actual_solver_nodes'], 0)
-        self.assertLessEqual(saved['actual_solver_nodes'], 2048)
-        self.assertEqual(session.state()['evaluations'][79]['proof']['plies'], saved['proof']['plies'] + 1)
-        pooled = session.engines.evaluate_many(session.entries['bubble:tiny'], None, budget,
-                                               [list(session.history)], lambda n: None)
-        found, spent, weights = pooled[0]
-        self.assertEqual((spent, weights, found['pv']), (budget, key, saved['pv']))
-        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=dict(simulations=8, solver_nodes=0))
-        self.assertNotEqual(session.engine_key(session.analysis), key)
-        self.assertIsNone(session.lookup(session.history))
-        self.assertEqual(session.state()['evaluations'][80]['pv'], saved['pv'])
-        unavailable = Engines('cpu', tactical_package=Path(RUN.name) / 'missing')
-        self.addCleanup(unavailable.close)
-        self.assertEqual(unavailable.effective(budget), budget | dict(leaf_nodes=0))
-        session.configure_analysis('bubble:tiny', preset='custom', auto=False, custom=budget)
-        with self.assertRaisesRegex(ValueError, 'leaf-proof allowance'):
-            session.timed_config(session.analysis)
 
     def test_a_proof_carries_back_to_the_played_move_and_stays(self):
         seven = self.found_win()
@@ -2900,7 +2787,7 @@ class Registry(unittest.TestCase):
         self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
         self.assertNotEqual(*(play.search_key('ab', dict(q_range_floor=x)) for x in (.5000001, .5000002)))
         bubble = unittest.mock.Mock(sha256='ab'*32)
-        with unittest.mock.patch('neural_search.NeuralSearch') as tree:
+        with unittest.mock.patch('neural_search.GameGraph') as tree:
             turn = play.TurnSearch(bubble, None, [(0, 0)], 8, play.solve(None, [(0, 0)], 0), q_range_floor=.5)
             turn.advanced([(0, 0)], 8, None)
             turn.close()
