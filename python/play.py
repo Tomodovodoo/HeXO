@@ -55,6 +55,7 @@ PRESETS = dict(
 PRESET_NAMES = list(PRESETS['bubble'])
 HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
 PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
+SEEDS = itertools.count(1740)  # owner seeds: repeated searches of a position draw new root samples
 REFRESH_SHARE = .25  # share of a saved analysis's simulations its refresh searches again (Session.refresh)
 REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
 REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still moves its result
@@ -1154,15 +1155,19 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     workers, at most PROOF_BUDGET of the owner's time. `watch(n)` receives the network rows launched since its last
     call and may raise Cancelled, which ends every search; while it returns True the network work waits and the
     proofs go on. `live(frame)` receives the first root's progress frames
-    (InferenceService.progress) at most every 0.3 s. Returns per root the graph's root statistics afterwards
-    (GameGraph.result, choice 'policy') with `completed`, the simulations its owner completed, `proofs`, the verified
-    positions its frontier proved (frontier_facts), and `frontier_nodes`, the solver nodes that frontier spent."""
+    (InferenceService.progress) at most every 0.3 s. Returns per root its owner's final root record in
+    GameGraph.result's shape (`actions`, improved `policy`, `completed_q`, `values`, `visits`, `node_value`,
+    `exact_winner`, `proven`, `proof_plies`), its `action` the stone of the highest improved policy, or the owner's
+    own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
+    verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
+    spent. Each graph is left at its root."""
+    import numpy as np
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
     histories = [[list(p) for p in graph.history] for graph, _ in roots]
     quantum = max(4, min(HYBRID['quantum'], max(simulations for _, simulations in roots)))
     pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=HYBRID['views'], depth=HYBRID['depth'],
-                      work=1, seed=1740)
+                      work=1, seed=next(SEEDS))
     service, events, records, effort = None, {}, [], {}
     try:
         if proofs is not None:
@@ -1205,9 +1210,17 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     for game, ((graph, _), history) in enumerate(zip(roots, histories)):
         if 'error' in events[game]:
             raise ValueError(f"Hybrid search failed: {events[game]['error']}")
+        event, edges = events[game], np.asarray(events[game]['edges'], np.float64)
         graph.at(history)
-        result = graph.result(0, 0, 0, 0, choice='policy')
-        result.update(completed=int(events[game]['completed']), frontier_nodes=effort.get(game, 0),
+        winner, mover = event['exact_winner'], player_at(len(history))
+        policy = edges[:, 5]
+        result = dict(actions=edges[:, :2].astype(np.int64), policy=policy, completed_q=edges[:, 3], values=edges[:, 4],
+                      visits=edges[:, 6].astype(np.int64), node_value=float(event['node_value']), exact_winner=winner,
+                      proven=0 if winner < 0 else 1 if winner == mover else -1,
+                      proof_plies=int(event['proof_plies']) if winner >= 0 else 0,
+                      action=(list(event['action']) if winner >= 0 or not policy.sum() > 0
+                              else edges[np.argmax(policy), :2].astype(np.int64).tolist()),
+                      completed=int(event['completed']), frontier_nodes=effort.get(game, 0),
                       proofs=[f for f in facts if f['history'][:len(history)] == history])
         results.append(result)
     return results
