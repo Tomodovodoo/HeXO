@@ -937,6 +937,9 @@ class Bundle(unittest.TestCase):
         self.assertEqual(len(result['moves']), 2)
         self.assertIn('nested workers are not allowed', result['solver_error'])
         self.assertTrue(all(stats['completed'] >= 32 for stats in result['scheduler']))
+        solver = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, proveMs=2000, noWorkers=True))
+        self.assertIn('nested workers are not allowed', solver['solver_error'])
+        self.assertGreater(solver['solver_frames'], 1)   # the owner reports while the root prover is out
 
     def test_proof_workers_start_before_the_clock_and_serve_the_turn(self):
         answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, warm=True))

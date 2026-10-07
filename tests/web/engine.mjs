@@ -568,7 +568,7 @@ if (job.kind === 'encode') {
     runInNewContext('frontierWorkers.close()', context);
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
-      simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null,
+      simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null, proveMs: job.proveMs ?? 0,
       known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
@@ -576,7 +576,7 @@ if (job.kind === 'encode') {
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
     progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root}))}))
-    : messages.find(m => m.type === 'result').result;
+    : {...messages.find(m => m.type === 'result').result, solver_frames: messages.filter(m => m.live?.solver).length};
 } else if (job.kind === 'analysis-failure') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
   let calls = 0;

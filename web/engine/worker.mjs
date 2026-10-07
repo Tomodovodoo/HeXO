@@ -192,13 +192,14 @@ function frontierProofs(records, table, found) {
 async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool}) {
   const start = performance.now(), end = start + ms, remaining = native.game(history).remaining;
   const premises = facts.filter(f => f.history.length !== history.length || f.winner !== player).map(({history, winner, plies}) => ({history, winner, plies}));
-  const root = {nodes: 0, mine: null, done: false};
+  const root = {nodes: 0, mine: null, done: false, error: null};
   const asking = (async () => {
     for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
       const found = await solve(id, history, {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
         ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 60000, Math.max(10000, nodes / 8))))});
       root.nodes += found.nodes_used || 0;
       if (verified(found) && found.moves.length) { root.mine = found; return; }
+      if (found.reason?.startsWith(FAILED)) { root.error = found.reason; return; }   // no solver worker in this browser
       if (!searched(found)) continue;   // the solver worker was replaced: ask again
       if ((found.nodes_used || 0) < nodes) return;   // the solver ruled the root out before spending its nodes
       nodes = Math.min(4 * nodes, 10000000);
@@ -231,7 +232,7 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
   const exact = result.proven ? (result.proven > 0 ? player : 1 - player) : -1;
   const proof = !root.mine && exact >= 0 ? {winner: exact, turns: proofTurns(result.proof_plies, remaining, exact === player), plies: result.proof_plies} : null;
   const nativeNodes = result.proof_scheduler?.fresh_nodes || 0, certificates = result.proof_records?.length || 0;
-  return {mine: root.mine, proof, records: result.proof_records || [], used: root.nodes + nativeNodes, error: result.solver_error,
+  return {mine: root.mine, proof, records: result.proof_records || [], used: root.nodes + nativeNodes, error: result.solver_error || root.error,
     solver: {elapsed_ms: Math.round(performance.now() - start), root_nodes: root.nodes, native_nodes: nativeNodes, certificates, workers}};
 }
 
