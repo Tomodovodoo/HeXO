@@ -1070,6 +1070,42 @@ class FusedCudaTests(unittest.TestCase):
         self.assertLessEqual(float((a-b).norm()), tolerance*float(a.norm())+1e-5)
         self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
 
+    def test_actor_graph_captures_while_another_thread_runs_cuda_work(self):
+        # The actor's launcher thread captures new canvases while its main
+        # thread may evaluate, load a model or read memory statistics.
+        import threading
+        from hexnet_graphs import ActorGraph
+        torch.manual_seed(3071)
+        model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
+        runner = ActorGraph(model, max_batch=128)
+        stop, failures = threading.Event(), []
+        def other():
+            a = torch.randn(256, 256, device='cuda')
+            try:
+                while not stop.is_set():
+                    (a@a).sum().item()
+                    torch.cuda.mem_get_info()
+            except BaseException as error:
+                failures.append(error)
+        thread = threading.Thread(target=other)
+        thread.start()
+        try:
+            with torch.inference_mode():
+                for rows, side in ((3, 24), (17, 32), (40, 40), (9, (24, 32))):
+                    height, width = (side, side) if isinstance(side, int) else side
+                    x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
+                    x[:, 3] = 1
+                    with torch.autocast('cuda', torch.bfloat16):
+                        expected = model(x, x[:, 3:4], aux=False)
+                    out = runner(x.to(torch.uint8))
+                    for name in expected:
+                        self.assert_bf16_close(expected[name], out[name])
+        finally:
+            stop.set()
+            thread.join()
+        self.assertEqual(failures, [])
+        self.assertTrue(runner.graphs)
+
     @torch.inference_mode()
     def test_actor_graph_outputs_survive_other_replays(self):
         from hexnet_graphs import ActorGraph
