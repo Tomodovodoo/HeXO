@@ -117,8 +117,8 @@ struct Worker {void* native=nullptr;
  std::shared_ptr<Job> active;uint64_t token=0;double service=0;};
 // Native proof workers and their resident solver tables, shared by the proof
 // loops of one or more producers. Loops queue immutable jobs in their owners'
-// priority order; workers serve the loops with queued jobs in turn and hand
-// each answer back to its loop, whose graph owner alone installs it.
+// priority order; workers share their time among the loops with queued jobs
+// and hand each answer back to its loop, whose graph owner alone installs it.
 // `capacity` bounds queued plus running jobs over all loops; a loop with work
 // gets an equal share while others have work too. Resident tables stay with
 // their worker threads: a continuation prefers the worker of its last slice,
@@ -158,11 +158,11 @@ struct Loop {
  // Supply census. Idle native-worker time is charged to the reason the last
  // refill stopped: every slot held, retries held back for fresh work, or no
  // dispatchable task, split over the exclusions (pending neural work, closed
- // scope, dormant) or none at all. A shared service charges each attached
+ // scope, dormant) or none at all, or the owner over its proof budget. A shared service charges each attached
  // loop an equal part of its idle time, so the loops' sums are the service's.
  // The owner counts one refill locally and publishes it under the mutex.
- enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Reasons};
- enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,Counts};
+ enum Idle {Full,Held,Pending,Closed,Dormant,Empty,Owner,Reasons};
+ enum Count {Scans,Seen,Eligible,Deferred,Excluded,FullExits=Excluded+3,HeldExits,EmptyExits,FirstQueries,Retries,OwnerExits,Counts};
  using Census=std::array<uint64_t,Counts>;
  std::array<double,Reasons> idle_ms{};Idle stop=Empty;
  std::array<uint64_t,3> excluded{};Census census{};
@@ -411,13 +411,24 @@ struct Loop {
  void prune(){
   {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}sweep();}
  }
- uint64_t feedback(){auto before=installed;prune();collect();prune();return installed-before;}
+ // load: the owner's recent share of wall time in proof steps and feedback,
+ // decaying over 100 ms. Above `budget`, steps install but admit nothing, so
+ // the proof traffic one graph owner handles stays within its budget.
+ double budget=1,load=0;Clock::time_point marked=Clock::now();
+ void spent(Clock::time_point start){
+  auto now=Clock::now();double busy=std::chrono::duration<double>(now-start).count(),gap=std::chrono::duration<double>(now-marked).count();
+  load=load*std::exp(-gap/.1)+busy/.1;marked=now;step_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count();
+ }
+ uint64_t settle(){auto before=installed;prune();collect();prune();return installed-before;}
+ uint64_t feedback(){auto start=Clock::now();auto count=settle();spent(start);return count;}
   void step(){
-   auto start=Clock::now();++ticks;feedback();
+   auto start=Clock::now();++ticks;settle();
   for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;
    for(auto& v:o.views)if(v.active && v.tree->root->expanded)frontiers[i].offer(v.tree->root,v.history,v.relevance,std::abs(v.tree->root->q-v.tree->root->value));
   }
-  admit();step_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
+  if(load*std::exp(-std::chrono::duration<double>(start-marked).count()/.1)<=budget)admit();
+  else{std::lock_guard lock(mutex);if(!stopping && enabled)publish({},Owner,OwnerExits);}
+  spent(start);
  }
  void retarget(int game){auto& f=frontiers[game];++f.generation;f.tasks.clear();std::lock_guard lock(mutex);for(auto& [id,job]:live)if(job->game==size_t(game))mark(*job,true);sweep();}
  const char* release(int game){
@@ -464,18 +475,24 @@ void Service::account(Clock::time_point now){
  idle_mark=now;
 }
 // Free slots for `loop`: the service bound, and an equal share among loops
-// that hold jobs or whose last refill found work.
+// that hold jobs or whose last refill found work within their owner's budget.
 size_t Service::room(const Loop& loop)const{
  size_t held=0,wanting=0,own=loop.live.size()+loop.reserved;
- for(auto* l:loops){size_t h=l->live.size()+l->reserved;held+=h;wanting+=l==&loop || h || (l->enabled && l->stop!=Loop::Empty);}
+ for(auto* l:loops){size_t h=l->live.size()+l->reserved;held+=h;wanting+=l==&loop || h || (l->enabled && l->stop!=Loop::Empty && l->stop!=Loop::Owner);}
  size_t share=std::max<size_t>(1,capacity/wanting);
  return held>=capacity || own>=share?0:std::min(capacity-held,share-own);
 }
-// The next loop in turn with queued jobs gives its oldest job this worker may
-// continue, else its oldest job; no producer's queue waits behind another's refills.
+// Among loops with queued jobs, the one running on the fewest workers serves
+// next, ties in turn, so producers share worker time rather than job counts and
+// none waits behind another's refills. It gives its oldest job this worker may
+// continue, else its oldest job.
 std::shared_ptr<Job> Service::take(int worker){
- size_t n=0;while(loops[(turn+n)%loops.size()]->queued.empty())++n;
- auto& q=loops[(turn+n)%loops.size()]->queued;turn=(turn+n+1)%loops.size();
+ size_t chosen=SIZE_MAX,fewest=SIZE_MAX;
+ for(size_t n=0;n<loops.size();++n){size_t i=(turn+n)%loops.size();if(loops[i]->queued.empty())continue;
+  size_t running=std::count_if(workers.begin(),workers.end(),[&](const auto& w){return w->active && w->active->loop==loops[i];});
+  if(running<fewest){fewest=running;chosen=i;}
+ }
+ auto& q=loops[chosen]->queued;turn=(chosen+1)%loops.size();
  auto it=std::find_if(q.begin(),q.end(),[&](const auto& j){return j->preferred<0 || j->preferred==worker;});if(it==q.end())it=q.begin();
  auto job=*it;q.erase(it);--waiting;return job;
 }
@@ -560,13 +577,17 @@ extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop
 extern "C" HX_API const char* hxp_record(void* p,int i){auto& records=static_cast<proving::Loop*>(p)->records;return i<0 || i>=int(records.size())?nullptr:records[i].c_str();}
 // counts: refill scans, candidates seen, eligible, eligible inside a retry delay, excluded by pending neural work,
 // closed scope and dormancy, refills stopped with every slot held, with retries held back, without a dispatchable
-// task, first queries of frontier entries, dispatches inside a retry delay.
-// idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, and no candidate at all.
+// task, first queries of frontier entries, dispatches inside a retry delay, steps that skipped admission over the
+// owner's proof budget.
+// idle: native-worker idle ms charged to held slots, held retries, pending, closed, dormant, no candidate at all,
+// and the owner's proof budget.
 extern "C" HX_API void hxp_supply_stats(void* p,uint64_t* counts,double* idle){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.service.account(proving::Clock::now());
  std::copy(loop.census.begin(),loop.census.end(),counts);std::copy(loop.idle_ms.begin(),loop.idle_ms.end(),idle);}
 extern "C" HX_API void hxp_scope_stats(void* p,uint64_t* out){auto& loop=*static_cast<proving::Loop*>(p);uint64_t checks=0,changed=0,unchanged=0,ns=0,cells=0,closed=0;
  for(auto& f:loop.frontiers){checks+=f.scope_checks;changed+=f.scope_changed;unchanged+=f.scope_unchanged;ns+=f.scope_ns;cells+=f.members.size();for(auto& [key,task]:f.tasks)closed+=bool(task->closed&1)+bool(task->closed&2);}
  std::array<uint64_t,10> values{checks,changed,unchanged,ns,loop.available_facts,loop.sent_facts,loop.empty_scope_jobs,loop.quantum_ms,cells,closed};std::copy(values.begin(),values.end(),out);}
+// Share of the graph owner's wall time that proof steps and feedback may take before admission pauses.
+extern "C" HX_API int hxp_budget(void* p,double share){if(!std::isfinite(share) || share<=0 || share>1){gumbel::error="Proof owner budget must lie in (0, 1]";return 0;}static_cast<proving::Loop*>(p)->budget=share;return 1;}
 extern "C" HX_API uint64_t hxp_generation(void* p,int game){return static_cast<proving::Loop*>(p)->frontiers.at(game).generation;}
 extern "C" HX_API const char* hxp_release(void* p,int game){return static_cast<proving::Loop*>(p)->release(game);}
 extern "C" HX_API int hxp_effort(void* p,int game,uint64_t* out){auto& f=static_cast<proving::Loop*>(p)->frontiers.at(game);int i=0;for(auto [generation,e]:f.effort){if(out){std::array<uint64_t,4> row{generation,e.fresh,e.queries,e.missing};std::copy(row.begin(),row.end(),out+4*i);}++i;}return i;}

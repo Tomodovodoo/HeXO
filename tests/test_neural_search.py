@@ -2915,8 +2915,8 @@ class NativeProofs(unittest.TestCase):
             loop.drain()
         self.assertEqual(workers.stats()['live'], 0)
 
-    def held_workers(self, capacity):
-        """A raw shared service of one worker whose answers wait for `release`.
+    def held_workers(self, capacity, workers=1, gate=None):
+        """A raw shared service whose answers wait for `release`, or for `gate(history)`'s event.
 
         Create the pools first: cleanups free every joined loop, then the service."""
         import ctypes as C
@@ -2931,14 +2931,15 @@ class NativeProofs(unittest.TestCase):
         actual.argtypes, actual.restype = [ptr, C.c_char_p], ptr
         @C.CFUNCTYPE(ptr, ptr, C.c_char_p)
         def query(worker, request):
-            order.append(json.loads(request)['history'])
-            entered.set();release.wait(5)
+            history = json.loads(request)['history']
+            order.append(history)
+            entered.set();(gate(history) if gate else release).wait(5)
             return actual(worker, request)
         names = ('worker_new', 'worker_free', 'worker_answer', 'answer_info', 'answer_moves',
                  'answer_json', 'answer_free', 'free', 'prepare', 'cancel', 'release', 'worker_busy')
         functions = np.asarray([C.cast(query if name == 'worker_answer' else
                                 getattr(library.lib, 'hexo_tactical_'+name), ptr).value for name in names], np.uint64)
-        service = native.hxps_new(functions.ctypes.data, 1, capacity)
+        service = native.hxps_new(functions.ctypes.data, workers, capacity)
         self.assertTrue(service)
         self.addCleanup(lambda: (query, checked(native.hxps_free(service))))
         def join(pool):
@@ -2965,6 +2966,28 @@ class NativeProofs(unittest.TestCase):
         release.set()
         self.wait(lambda: len(order) == 16)
         self.assertEqual([0 if h[1][1] == -1 else 1 for h in order], [0]+[1, 0]*7+[1])
+
+    def test_a_producer_with_long_jobs_leaves_other_workers_to_other_producers(self):
+        from neural_search import checked
+        pools = [self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096) for _ in range(2)]
+        import threading
+        start = threading.Event()
+        # The first producer's answers hold their workers; the second's wait only for `start`.
+        service, join, entered, release, order = self.held_workers(
+            16, workers=2, gate=lambda h: start if h[1][1] == 1 else release)
+        loops = [join(pool) for pool in pools]
+        sides = ([[0,0],[k,-1],[k,1]] for k in range(1, 9)), ([[0,0],[-k,1],[-k,2]] for k in range(1, 9))
+        for loop, histories in zip(reversed(loops), reversed(list(sides))):
+            for history in histories:
+                cells = np.asarray(history, np.int64)
+                checked(native.hxp_offer(loop, 0, cells.ctypes.data, len(cells), 1.))
+            checked(native.hxp_step(loop))
+        self.wait(lambda: len(order) == 2)
+        start.set()
+        self.wait(lambda: sum(h[1][1] == 1 for h in order) == 8)
+        # One held job of the first producer at a time; the other worker runs the second's queue dry.
+        last = max(i for i, h in enumerate(order) if h[1][1] == 1)
+        self.assertEqual(sum(h[1][1] == -1 for h in order[:last]), 1)
 
     def test_concurrent_producer_refills_never_exceed_the_shared_bound(self):
         import threading
@@ -3015,6 +3038,31 @@ class NativeProofs(unittest.TestCase):
         self.assertEqual(survivor.stats()['unknown']+survivor.stats()['installed'], 5)
         stats = workers.stats()
         self.assertEqual((stats['queued'], stats['live'], stats['active']), (0, 0, 0))
+
+    def test_owner_over_its_proof_budget_installs_answers_but_admits_nothing(self):
+        import time
+        pool = self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096)
+        for budget in (0., 1.5):
+            with self.assertRaisesRegex(ValueError, 'budget'):
+                pool.enable_proofs(slice_ms=50, table_mb=1, workers=1, owner_budget=budget)
+            self.assertIsNone(pool.proofs)
+        proofs = pool.enable_proofs(slice_ms=50, table_mb=1, workers=1, queue=4, tasks=32, owner_budget=1e-6)
+        self.offers(proofs, 8)
+        proofs.step()
+        self.assertEqual(proofs.stats()['submitted'], 4)
+        self.wait(lambda: proofs.stats()['finished'] == 4)
+        # That step's own work puts the owner over a tiny budget: answers install, nothing new goes out.
+        proofs.step()
+        stats = proofs.stats()
+        self.assertEqual((stats['submitted'], stats['ready'], stats['unknown']+stats['installed']), (4, 0, 4))
+        self.assertEqual(stats['supply_owner_exits'], 1)
+        time.sleep(.05)
+        self.assertGreaterEqual(proofs.stats()['idle_owner_ms'], 45)
+        # The load decays over about a second while the owner does other work, and admission resumes.
+        time.sleep(2)
+        proofs.step()
+        self.assertGreater(proofs.stats()['submitted'], 4)
+        proofs.drain()
 
     def test_shared_workers_close_after_their_loops_and_split_idle_time(self):
         import time

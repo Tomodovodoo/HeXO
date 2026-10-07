@@ -55,6 +55,7 @@ for name, result, args in (
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
 bind('hxp_join', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int)
+bind('hxp_budget', C.c_int, ptr, C.c_double)
 bind('hxps_new', ptr, ptr, C.c_int, C.c_int)
 bind('hxps_free', C.c_int, ptr)
 bind('hxps_stats', None, ptr, ptr, ptr)
@@ -133,9 +134,12 @@ class ProofLoop:
     `queue` bounds its queued plus running jobs, by default eight per worker, so
     workers keep work between the graph owner's refills. With `shared`, it queues
     on those ProofWorkers instead and takes no package, workers, queue or direct.
+    `owner_budget` is the share of the graph owner's recent wall time that proof
+    steps and installation may take; above it the loop installs answers but admits
+    no new jobs, so more workers never take more of that owner's time.
     """
     def __init__(self, pool, package=None, *, workers=None, queue=None, slice_ms=8, table_mb=4,
-                 tasks=256, stamps=False, endpoints=8, direct=False, shared=None):
+                 tasks=256, stamps=False, endpoints=8, direct=False, shared=None, owner_budget=1.):
         if not isinstance(endpoints,int) or not 0<=endpoints<=8:
             raise ValueError('Neural frontier limit must be an integer from 0 to 8')
         if shared is not None and (package is not None or workers is not None or queue is not None or direct):
@@ -158,6 +162,7 @@ class ProofLoop:
             if not self._ptr:
                 checked(False)
             checked(native.hxp_neural(self._ptr, callback, endpoints))
+            checked(native.hxp_budget(self._ptr, owner_budget))
         except BaseException:
             if self._ptr:
                 checked(native.hxp_free(self._ptr));self._ptr=None
@@ -205,13 +210,14 @@ class ProofLoop:
         frontier=np.empty(6, np.uint64)
         native.hxp_neural_stats(self.ptr, frontier.ctypes.data)
         result['neural_frontier']=dict(zip(('paths','candidates','rejected','bytes','install_ns','records'),map(int,frontier)))
-        counts, idle = np.empty(12, np.uint64), np.empty(6, np.float64)
+        counts, idle = np.empty(13, np.uint64), np.empty(7, np.float64)
         native.hxp_supply_stats(self.ptr, counts.ctypes.data, idle.ctypes.data)
         result.update(zip(('supply_scans', 'supply_seen', 'supply_eligible', 'supply_deferred', 'supply_pending',
                            'supply_closed', 'supply_dormant', 'supply_full_exits', 'supply_held_exits',
-                           'supply_empty_exits', 'supply_first_queries', 'supply_deferred_dispatched'), map(int, counts)))
+                           'supply_empty_exits', 'supply_first_queries', 'supply_deferred_dispatched',
+                           'supply_owner_exits'), map(int, counts)))
         result.update(zip(('idle_capacity_ms', 'idle_held_ms', 'idle_pending_ms', 'idle_closed_ms',
-                           'idle_dormant_ms', 'idle_empty_ms'), map(float, idle)))
+                           'idle_dormant_ms', 'idle_empty_ms', 'idle_owner_ms'), map(float, idle)))
         return result
 
     def records(self):
