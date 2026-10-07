@@ -1070,6 +1070,42 @@ class FusedCudaTests(unittest.TestCase):
         self.assertLessEqual(float((a-b).norm()), tolerance*float(a.norm())+1e-5)
         self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
 
+    def test_actor_graph_captures_while_another_thread_runs_cuda_work(self):
+        # The actor's launcher thread captures new canvases while its main
+        # thread may evaluate, load a model or read memory statistics.
+        import threading
+        from hexnet_graphs import ActorGraph
+        torch.manual_seed(3071)
+        model = hexnet.HexNet(TINY, net_kernels='fused').cuda().to(memory_format=torch.channels_last).eval().requires_grad_(False)
+        runner = ActorGraph(model, max_batch=128)
+        stop, failures = threading.Event(), []
+        def other():
+            a = torch.randn(256, 256, device='cuda')
+            try:
+                while not stop.is_set():
+                    (a@a).sum().item()
+                    torch.cuda.mem_get_info()
+            except BaseException as error:
+                failures.append(error)
+        thread = threading.Thread(target=other)
+        thread.start()
+        try:
+            with torch.inference_mode():
+                for rows, side in ((3, 24), (17, 32), (40, 40), (9, (24, 32))):
+                    height, width = (side, side) if isinstance(side, int) else side
+                    x = torch.randint(0, 2, (rows, 8, height, width), device='cuda').bfloat16().contiguous(memory_format=torch.channels_last)
+                    x[:, 3] = 1
+                    with torch.autocast('cuda', torch.bfloat16):
+                        expected = model(x, x[:, 3:4], aux=False)
+                    out = runner(x.to(torch.uint8))
+                    for name in expected:
+                        self.assert_bf16_close(expected[name], out[name])
+        finally:
+            stop.set()
+            thread.join()
+        self.assertEqual(failures, [])
+        self.assertTrue(runner.graphs)
+
     @torch.inference_mode()
     def test_actor_graph_outputs_survive_other_replays(self):
         from hexnet_graphs import ActorGraph
@@ -1149,6 +1185,63 @@ class FusedCudaTests(unittest.TestCase):
         for out, snapshot in zip(outputs, saved):
             for name in out:
                 torch.testing.assert_close(out[name], snapshot[name], rtol=0, atol=0)
+        # Models constructed before unrelated CUDA allocations must still get
+        # their own allowance. A process-wide constructor delta rejects both.
+        first = ActorGraph(model, max_incremental_bytes=32*2**20)
+        second = ActorGraph(model, max_incremental_bytes=32*2**20)
+        unrelated = torch.empty(64*2**20, dtype=torch.uint8, device='cuda')
+        try:
+            for capture in (first,second):
+                out = capture(inputs[0][:1])
+                self.assertIn(((24,72),1),capture.graphs)
+                self.assertFalse(capture.budget_exhausted)
+                self.assertTrue(capture.memory_accounting_valid)
+                self.assertGreater(capture.pool_reserved_bytes,0)
+                self.assertEqual(capture.incremental_reserved_bytes,
+                                 capture.pool_reserved_bytes+capture.staging_bytes)
+                self.assertLessEqual(capture.incremental_reserved_bytes,32*2**20)
+                self.assertGreaterEqual(capture.process_reserved_bytes,unrelated.numel())
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            charged = first.incremental_reserved_bytes
+            second(inputs[0][:2])
+            first(inputs[0][:1])
+            self.assertEqual(first.incremental_reserved_bytes,charged)
+            with unittest.mock.patch.object(torch.cuda,'memory_snapshot',
+                                           side_effect=AssertionError('replay must not inspect allocator')):
+                first(inputs[0][:1])
+            first.max_incremental_bytes = charged+1
+            with self.assertWarnsRegex(RuntimeWarning,'memory limit'):
+                out = first(inputs[0][:2])
+            self.assertTrue(first.budget_exhausted)
+            self.assertNotIn(((24,72),2),first.graphs)
+            self.assert_bf16_close(out['packed'],saved[0]['packed'][:2])
+            own_pool = sum(s['total_size'] for s in torch.cuda.memory_snapshot(
+                           mempool_id=first.pool,include_traces=False) if s['device']==first.device.index)
+            self.assertEqual(first.pool_reserved_bytes,own_pool)
+            self.assert_bf16_close(first(inputs[0][:1])['packed'],saved[0]['packed'][:1])
+            rejected = ActorGraph(model,max_incremental_bytes=0)
+            try:
+                with self.assertWarnsRegex(RuntimeWarning,'memory limit'):
+                    out = rejected(inputs[0][:1])
+                self.assertTrue(rejected.budget_exhausted)
+                self.assertFalse(rejected.graphs)
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            finally:
+                rejected.close()
+            with unittest.mock.patch.object(torch.cuda,'get_allocator_backend',return_value='cudaMallocAsync'), \
+                 self.assertWarnsRegex(RuntimeWarning,'native allocator'):
+                unsupported = ActorGraph(model)
+            try:
+                out = unsupported(inputs[0][:1])
+                self.assertFalse(unsupported.graphs)
+                self.assertFalse(unsupported.memory_accounting_valid)
+                self.assert_bf16_close(out['packed'],saved[0]['packed'][:1])
+            finally:
+                unsupported.close()
+        finally:
+            first.close()
+            second.close()
+            del unrelated
         runner.close()
         reserved = torch.cuda.memory_reserved()
         for _ in range(4):
@@ -1673,6 +1766,11 @@ class DenseConfigTests(unittest.TestCase):
         for bad in (dict(pv_check=.25), dict(game_graph=512, pv_check=.5), dict(game_graph=-1)):
             with self.assertRaisesRegex(ValueError, 'game_graph must be nonnegative'):
                 dense_config.ActorSettings(**bad)
+        # Native actors bound each game's graph by default; legacy actors keep one tree per model.
+        native = dense_config.ActorSettings(native_scheduler=True)
+        self.assertEqual(native.game_graph, dense_config.NATIVE_GAME_GRAPH)
+        self.assertEqual(dense_config.ActorSettings(native_scheduler=True, game_graph=4096).game_graph, 4096)
+        self.assertEqual(dataclasses.replace(native).game_graph, dense_config.NATIVE_GAME_GRAPH)
         self.assertEqual(dense_selfplay.actor_flags(parser.parse_args(['--historical-weighting', 'uniform'])),
                          ['--historical-weighting', 'uniform'])
         prefixed = argparse.ArgumentParser()
@@ -4594,6 +4692,58 @@ class EngineTests(unittest.TestCase):
         service.close()
         self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']), (0,0))
 
+    def test_launcher_thread_feeds_forwards_until_pause_and_raises_its_failure(self):
+        from native_scheduler import InferenceService
+        from tests.test_neural_search import NativeScheduler
+        import native_dense
+        torch.set_num_threads(2)
+        histories = [[[0,0],[1,r]] for r in range(-2,2)]
+        pool = NativeScheduler.pool(self,[NativeScheduler.graph(self,h) for h in histories],views=1,work=8)
+        evaluator = dense_selfplay.Evaluator(hexnet.HexNet(TINY),'cpu',model_version='scheduler',max_batch=16)
+        service = InferenceService([pool],[evaluator],batch_size=8,quantum=64)
+        self.addCleanup(service.close)
+        service.start(continuous=True)
+        service.launch()
+        def collect(count):
+            # The caller only waits for and reads events; it never pumps.
+            events, end = [], time.monotonic()+10
+            while len(events)<count and time.monotonic()<end:
+                service.wait(100.)
+                while (event:=service.event()) is not None:
+                    events.append(event)
+            return events
+        tokens = {}
+        for index, history in enumerate(histories):
+            service.retarget(0,index,history,work=8,views=1)
+        for event in collect(len(histories)):
+            tokens[event['game']] = event['token']
+        self.assertEqual(set(tokens),set(range(len(histories))))
+        service.pause()
+        launched = service.stats()['launched_rows']
+        for index, history in enumerate(histories):
+            service.retarget(0,index,history+[[3,0]],expected=tokens[index],work=8,views=1)
+        self.assertFalse(service.wait(50.))
+        self.assertEqual(service.stats()['launched_rows'],launched)
+        service.resume()
+        self.assertTrue(service.wait(10000.))
+        # While a root event waits for the caller, the launcher backs off instead of spinning.
+        with unittest.mock.patch.object(service,'pump',wraps=service.pump) as pump:
+            time.sleep(.3)
+        self.assertLess(pump.call_count,600)
+        events = collect(len(histories))
+        self.assertEqual({e['game'] for e in events},set(range(len(histories))))
+        self.assertTrue(all(e['completed']==8 for e in events))
+        self.assertGreater(service.stats()['launched_rows'],launched)
+        with unittest.mock.patch.object(native_dense,'submit',side_effect=RuntimeError('forward failed')):
+            token = next(e['token'] for e in events if e['game']==0)
+            service.retarget(0,0,histories[0]+[[3,0],[4,0]],expected=token,work=8,views=1)
+            with self.assertRaisesRegex(RuntimeError,'forward failed'):
+                end = time.monotonic()+10
+                while time.monotonic()<end:
+                    service.wait(50.)
+        service.close()
+        self.assertEqual((service.stats()['pending_rows'],service.stats()['inflight_batches']),(0,0))
+
     def test_continuous_pause_fences_forwards_then_resumes_every_game(self):
         from native_scheduler import InferenceService
         from neural_search import native
@@ -7041,8 +7191,16 @@ class ActorModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pick('latest')
 
+    def test_shard_names_queued_in_one_millisecond_stay_distinct_and_ordered(self):
+        with unittest.mock.patch.object(dense_selfplay.time, 'time_ns', return_value=1791300000000123456):
+            names = [dense_selfplay.shard_name()]
+            for _ in range(3):
+                names.append(dense_selfplay.shard_name(names[-1]))
+        self.assertEqual(names, sorted(set(names)))
+        self.assertEqual(len({len(n) for n in names}), 1)
+
     def test_worker_switches_between_games(self):
-        """The pointer moves as the first shard is written: the game started before it keeps the first model, the
+        """The pointer moves as the first shard is published: the game started before it keeps the first model, the
         next game plays the second, and the switch is an 'actor_model' event."""
         self.export('main/000010', 1.)
         self.export('main/000020', 2.)
@@ -7054,12 +7212,12 @@ class ActorModelTests(unittest.TestCase):
         dense_config.save(self.run, config)
         pointer = lambda cid: (self.run/'actor.json').write_text(json.dumps(dict(checkpoint=cid, reason='newest', vetoed=[])))
         pointer('main/000010')
-        write_shard = dense_data.write_shard
+        name = dense_selfplay.shard_name
 
-        def publish(path, identity, *args):
+        def publish(*args):
             pointer('main/000020')
-            return write_shard(path, identity, *args)
-        with unittest.mock.patch.object(dense_data, 'write_shard', publish):
+            return name(*args)
+        with unittest.mock.patch.object(dense_selfplay, 'shard_name', publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=2, initial_model=None))
         shards = [dense_data.manifest(path)['identity'] for path in dense_data.shard_dirs(self.run)]
         self.assertEqual([s['checkpoint'] for s in shards], ['main/000010', 'main/000020'])
@@ -7085,11 +7243,12 @@ class ActorModelTests(unittest.TestCase):
                 opening_random_plies=0.))
         dense_config.save(self.run,config)
         (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010',reason='newest',vetoed=[])))
-        write_shard = dense_data.write_shard
-        def publish(path,identity,*args):
+        name = dense_selfplay.shard_name
+        def publish(*args):
+            # The controller rotates the checkpoint as the first shard is published.
             (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000020',reason='newest',vetoed=[])))
-            return write_shard(path,identity,*args)
-        with unittest.mock.patch.object(dense_data,'write_shard',publish):
+            return name(*args)
+        with unittest.mock.patch.object(dense_selfplay,'shard_name',publish):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run),worker=0,games=6,initial_model=None))
         status = json.loads((self.run/'actor-status.json').read_text())
         self.assertEqual((status['stage'],status['games_completed']),('finished',6))

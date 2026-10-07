@@ -95,6 +95,7 @@ class NativeGames:
                 self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size,
                     quantum=min(128,batch_size),pending=4)
                 self.service.start(continuous=True)
+                self.service.launch()
                 for key in self.idle:
                     self.service.release(*key,expected=0)
             except BaseException:
@@ -129,6 +130,7 @@ class NativeGames:
                                             slice_ms=slice_ms,table_mb=4) if proof_workers else None)
             self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size)
             self.service.start(continuous=True)
+            self.service.launch()
             for index in range(len(games)):
                 self.next_root(index)
         except BaseException:
@@ -342,11 +344,18 @@ class NativeGames:
     def resume(self):
         self.service.resume()
 
-    def step(self):
-        """Pump bulk inference and consume immutable placement/lifecycle events."""
-        self.service.pump()
+    def step(self, wait_ms=50.):
+        """Consume immutable placement/lifecycle events, waiting up to `wait_ms` for one.
+
+        The service's launcher thread keeps forwards running meanwhile, so new
+        events can arrive while these are handled; one step takes at most two
+        per slot and returns, leaving the caller its own work between steps.
+        """
+        self.service.wait(wait_ms)
         finished = []
-        while (event:=self.service.event()) is not None:
+        for _ in range(2*len(self.games)):
+            if (event:=self.service.event()) is None:
+                break
             key = event['producer'],event['game']
             if key in self.idle:
                 group = next(g for g in self.groups.values() if key in g['slots'])
