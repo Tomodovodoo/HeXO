@@ -50,11 +50,12 @@ class NativeGames:
     older games continue; fixed cohorts retain their original model set.
     In dynamic mode `producers` bounds producer threads plus host workers, and
     each model's slots are split over `model_producers` independent producers.
-    `proof_workers` native proof workers serve every producer's live games.
+    `proof_workers` native proof workers serve every producer's live games;
+    `proof_budget` caps each graph owner's share of time in proof work (ProofLoop owner_budget).
     """
     def __init__(self, games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                  batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0, progress=None,
-                 dynamic=False, model_producers=1):
+                 dynamic=False, model_producers=1, proof_budget=1.):
         if not games or any(not g.native_owner for g in games) or producers<1:
             raise ValueError('A nonempty cohort of native-owner games is required')
         if not 1<=model_producers<=producers:
@@ -78,7 +79,7 @@ class NativeGames:
         self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
         self.split = min(model_producers,len(self.games))
         self.proof_workers = ProofWorkers(proof_package,workers=proof_workers) if proof_workers else None
-        self.proof_options = dict(slice_ms=slice_ms,table_mb=4,shared=self.proof_workers)
+        self.proof_options = dict(slice_ms=slice_ms,table_mb=4,shared=self.proof_workers,owner_budget=proof_budget)
         if dynamic:
             try:
                 if any(not self.fits({m.sha for m in g.trees}) for g in games):
@@ -500,7 +501,8 @@ class ActorEngine:
             self.engine = NativeGames(self.slots,dynamic=True,producers=s.native_producers,
                 quantum=s.native_quantum,views=s.native_views,depth=s.native_depth,
                 cache=s.cache_positions,batch_size=s.leaf_batch,proof_workers=s.native_proof_workers,
-                slice_ms=s.native_proof_slice_ms,progress=self.progress,model_producers=s.native_model_producers)
+                slice_ms=s.native_proof_slice_ms,progress=self.progress,model_producers=s.native_model_producers,
+                proof_budget=s.native_proof_budget)
         finished = self.engine.step()
         self.account()
         for index,game in finished:

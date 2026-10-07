@@ -46,6 +46,7 @@ class ActorSettings:
     native_depth: int = 8
     native_proof_workers: int = 12 # CPU proof workers shared by every producer's live games
     native_proof_slice_ms: int = 8
+    native_proof_budget: float = 1. # share of each graph owner's time proof steps may take before it stops admitting jobs
     full_sims: int = 64          # recorded policy targets come from these searches
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
@@ -134,8 +135,9 @@ class ActorSettings:
             raise ValueError('native_round_barrier requires native_scheduler')
         if not 1 <= self.native_producers <= 16 or not 4 <= self.native_quantum <= 128 or not 1 <= self.native_views <= 64 or not 1 <= self.native_depth <= 32:
             raise ValueError('Invalid native scheduler worker, quantum, view or depth setting')
-        if not 0 <= self.native_proof_workers <= 16 or not 0 < self.native_proof_slice_ms <= 1000:
-            raise ValueError('Invalid native proof worker or slice setting')
+        if (not 0 <= self.native_proof_workers <= 16 or not 0 < self.native_proof_slice_ms <= 1000
+                or not 0 < self.native_proof_budget <= 1):
+            raise ValueError('Invalid native proof worker, slice or budget setting')
         if self.native_scheduler and (not self.game_graph or self.pv_check or self.proven_line_rows or
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,
                      self.solver_deep_nodes,self.solver_leaf_nodes))):
