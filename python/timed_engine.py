@@ -27,7 +27,7 @@ def proof_settings(solver):
 
 
 SAVED_IDS = dict(kind=('native', 'drip'), engine=('native:Native', 'drip:Drip'), id=('native:Native', 'drip:Drip'),
-                 name=('Native', 'Drip'), checkpoint=('native', 'drip'))
+                 name=('Native', 'Drip'), checkpoint=('native', 'drip'), badge=('native', 'drip'))
 
 
 def saved_ids(record):

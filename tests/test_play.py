@@ -1688,15 +1688,17 @@ class Matches(unittest.TestCase):
         self.session.stop_match()
         wait(lambda: not self.session.match_worker.is_alive())
         summary = self.output / 'summary.json'
-        older = summary.read_text(encoding='utf-8').replace('"drip:Drip"', '"native:Native"').replace(
-            '"Drip"', '"Native"').replace('"kind": "drip"', '"kind": "native"')
-        self.assertNotIn('Drip', older)
-        summary.write_text(older, encoding='utf-8')
+        older = json.loads(summary.read_text(encoding='utf-8').replace('"drip:Drip"', '"native:Native"').replace(
+            '"Drip"', '"Native"').replace('"drip"', '"native"'))
+        older['players'][0]['source']['badge'] = 'native'
+        self.assertNotIn('Drip', json.dumps(older))
+        summary.write_text(json.dumps(older), encoding='utf-8')
         self.session.resume_match(self.output)
         wait(lambda: not self.session.match_worker.is_alive())
         self.assertEqual(self.session.match['completed'], 2)
         self.assertEqual([(p['engine'], p['name'], p['source']['kind']) for p in self.session.match['players']],
                          [('drip:Drip', 'Drip', 'drip'), ('drip:Other', 'Other', 'drip')])
+        self.assertEqual(self.session.entries['drip:Drip']['badge'], 'drip')
 
     def test_resume_rejects_a_changed_tactical_solver(self):
         self.session.start_match(['bubble:2@quick', 'Other'], output=self.output, max_placements=3)
