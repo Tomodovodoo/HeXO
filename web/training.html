@@ -184,7 +184,7 @@ chart('d-loss-chart',variants.flatMap(v=>{const rows=saved.filter(p=>p.variant==
 $('d-learning-note').textContent=`Batch ${lc.batch??'?'}, weight decay ${lc.weight_decay??'?'}, EMA ${lc.ema??'?'}, target ${lc.samples_per_row??'?'} samples per row (per-variant settings are in each manifest's learner block). Second line in the table: short value BCE / opponent CE / labelled future loss, legacy BCE or masked CE.`;
 const entries=new Map(cp.map(p=>[p.id,{id:p.id,variant:p.variant,step:p.step,league:p}]));for(const p of checkpoints)entries.set(p.id,{...entries.get(p.id),id:p.id,variant:p.variant,step:p.step,manifest:p});
 for(const v of (league.variants||[]).filter(v=>v.checkpoint&&matchesVariant({variant:v.checkpoint.split('/')[0]})))entries.set(v.id,{id:v.id,variant:v.checkpoint.split('/')[0],step:+v.checkpoint.split('/')[1],league:v});
-for(const r of (ev.resumed||[]).filter(r=>!entries.has(r.id)&&r.id.includes('/')&&matchesVariant({variant:r.id.split('/')[0]})))entries.set(r.id,{id:r.id,variant:r.id.split('/')[0],step:+r.id.split('/')[1]||0});
+for(const r of [...(ev.resumed||[]),...(ev.provisional?[ev.provisional]:[])].filter(r=>r?.id&&!entries.has(r.id)&&r.id.includes('/')&&matchesVariant({variant:r.id.split('/')[0]})))entries.set(r.id,{id:r.id,variant:r.id.split('/')[0],step:+r.id.split('/')[1]||0});
 
 const losses=q=>q?`${f(q.policy_ce)} / ${f(q.value_bce)}${[q.short_value_bce,q.opponent_ce,q.future_bce,q.future_masked_ce].some(Number.isFinite)?`\n${f(q.short_value_bce)} / ${f(q.opponent_ce)} / ${'future_masked_ce' in q?'masked CE '+f(q.future_masked_ce):'legacy BCE '+f(q.future_bce)}`:''}`:'—';
 $('d-checkpoints').replaceChildren();
