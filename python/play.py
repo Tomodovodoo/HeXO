@@ -1514,11 +1514,12 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     proof table `known`; then fresh game graphs, one per position, search together with that table in one
     SearchPool (see `search`), stone by stone, sharing network batches, with their proof frontiers on `proofs`
     when `solver_nodes` and `provers` are given. Each result is what `evaluate` would give at that budget with the
-    table; with `ms` each root query gets a quarter of it and each stone half, the pooled owners sharing that clock.
-    `watch` may raise Cancelled."""
+    table; with `ms` each turn has that clock as in `evaluate` (root queries at most a quarter, the first of two
+    stones 60% of what is left, the last stone the rest), the pooled owners sharing it. `watch` may raise Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
     given = [answered(h, known) for h in histories]
     keys = [position_text(h) for h in histories]
+    end = time.monotonic() + ms / 1000 if ms else None
     solved = {}
     if provers and solver_nodes:
         free = queue.Queue()
@@ -1556,8 +1557,12 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                     turn.tree = tree
                     searching.append((turn, (tree, max(1, count))))
             if searching:
+                clock = None
+                if end is not None:
+                    clock = max(1., (end - time.monotonic()) * 1000)
+                    clock *= .6 if any(turn.local.remaining == 2 for turn, _ in searching) else 1
                 for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
-                                                               stamps=stamps, ms=ms / 2 if ms else None, views=views)):
+                                                               stamps=stamps, ms=clock, views=views)):
                     turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
