@@ -1033,8 +1033,8 @@ def record_network_values(slots):
 
 class Forks:
     """KataGo's game forks for one actor worker. `offer(episode, model)` forks a finished game with probability
-    fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else with probability fork_anywhere_fraction
-    at a uniformly drawn placement of the game. At that position it draws a uniform number of candidates between
+    fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else, drawn again, with probability
+    fork_anywhere_fraction at a uniformly drawn placement of the game. At that position it draws a uniform number of candidates between
     fork_min_choices and fork_early_choices (early) or fork_anywhere_choices (anywhere), each a uniform legal move with
     replacement, scores each by `model`'s value head for the side that plays it, and queues the game's moves before
     that placement plus the best candidate. `take()` pops the oldest queued fork as (metadata {kind, ply, choices},
@@ -1047,10 +1047,10 @@ class Forks:
         self.queue = deque()
 
     def offer(self, episode, model):
-        s, moves, draw = self.settings, episode['moves'], self.rng.random()
-        if draw < s.fork_early_fraction:
+        s, moves = self.settings, episode['moves']
+        if self.rng.random() < s.fork_early_fraction:
             kind, ply, most = 'early', int(self.rng.exponential(s.fork_early_plies)), s.fork_early_choices
-        elif draw < s.fork_early_fraction+s.fork_anywhere_fraction:
+        elif self.rng.random() < s.fork_anywhere_fraction:
             kind, ply, most = 'anywhere', int(self.rng.integers(max(1, len(moves)))), s.fork_anywhere_choices
         else:
             return None

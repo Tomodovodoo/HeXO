@@ -129,7 +129,7 @@ class ActorSettings:
     book_fraction: float = 0.  # share of all games starting from live off-policy book positions
     # Game forks (dense_selfplay.Forks, KataGo's early and anywhere forks): a finished game forks with probability
     # fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else with probability fork_anywhere_fraction
-    # at a uniform placement of the game, into the best of fork_min_choices to fork_early_choices or
+    # (a second draw) at a uniform placement of the game, into the best of fork_min_choices to fork_early_choices or
     # fork_anywhere_choices random legal moves by the value head; the fork is the worker's next game. 0 = never.
     fork_early_fraction: float = 0.
     fork_anywhere_fraction: float = 0.
@@ -187,9 +187,9 @@ class ActorSettings:
         if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
             raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
         if (not 0 <= self.fork_early_fraction <= 1 or not 0 <= self.fork_anywhere_fraction <= 1
-                or self.fork_early_fraction+self.fork_anywhere_fraction > 1 or not self.fork_early_plies > 0
+                or not self.fork_early_plies > 0
                 or not 1 <= self.fork_min_choices <= min(self.fork_early_choices, self.fork_anywhere_choices)):
-            raise ValueError('fork fractions must be nonnegative and sum to at most 1, fork_early_plies positive and '
+            raise ValueError('fork fractions must lie in [0, 1], fork_early_plies must be positive and '
                              'fork_min_choices between 1 and both choice limits')
 
 

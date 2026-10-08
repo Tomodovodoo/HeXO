@@ -6276,7 +6276,12 @@ class EngineTests(unittest.TestCase):
                                     integers=lambda low, high=None, size=None: 3 if size is None else np.full(size, index))
             offered = dense_selfplay.Forks(replace(settings, max_plies=20), 0., drawn).offer(dict(moves=five+[[9, 9]]), model)
             self.assertEqual(offered is not None, forked)
-        for bad in (dict(fork_early_fraction=.6, fork_anywhere_fraction=.5), dict(fork_early_plies=0.),
+        anywhere = SimpleNamespace(random=iter([.5, .05]).__next__, exponential=None,
+                                   integers=np.random.default_rng(0).integers)
+        metadata, _ = dense_selfplay.Forks(replace(settings, fork_early_fraction=.4, fork_anywhere_fraction=.1), 0.,
+                                           anywhere).offer(dict(moves=moves), model)
+        self.assertEqual(metadata['kind'], 'anywhere')
+        for bad in (dict(fork_anywhere_fraction=1.5), dict(fork_early_plies=0.),
                     dict(fork_min_choices=13)):
             with self.assertRaisesRegex(ValueError, 'fork fractions'):
                 dense_config.ActorSettings(**bad)
