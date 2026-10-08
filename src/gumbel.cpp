@@ -421,11 +421,15 @@ struct Tree {
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,std::exp(edges[i].logit-maximum)/total)+1e-20);mean+=shape[i];}
   mean/=n;
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::max(0.,shape[i]-mean);excess+=shape[i];}
+  // Gamma(a) draws as log Gamma(a + 1) + log(U) / a, normalized in log space: tiny shapes underflow as plain draws.
+  double top=-std::numeric_limits<double>::infinity();
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){
    double alpha=root_concentration*(excess>0?.5*(shape[i]/excess+1./n):1./n);
-   sum+=root_edges[i].noise=std::gamma_distribution<double>(alpha,1.)(rng);
+   double u=std::max(std::generate_canonical<double,53>(rng),1e-300);
+   shape[i]=std::log(std::gamma_distribution<double>(alpha+1,1.)(rng))+std::log(u)/alpha;top=std::max(top,shape[i]);
   }
-  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)root_edges[i].noise=sum>0?root_edges[i].noise/sum:1./n;
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)sum+=root_edges[i].noise=std::exp(shape[i]-top);
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)root_edges[i].noise/=sum;
  }
  // Root sampling uses the evidence available at this search's start. Keep it with the view's root session so
  // predictions from early candidates or other views cannot change the remaining Gumbel-top-k draws.

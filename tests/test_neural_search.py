@@ -129,6 +129,10 @@ class NeuralTree(unittest.TestCase):
         self.assertGreater(share['shaped'], share['uniform']+.25)
         self.assertGreater(counts['shaped'][2], 0)
         self.assertLess(counts['shaped'][2], counts['uniform'][2])
+        # A tiny concentration makes a near one-hot draw, one noised move per search, never a uniform share.
+        for seed in range(5):
+            sparse, _ = sampled(seed, root_noise=.25, root_concentration=1e-3)
+            self.assertLessEqual(np.count_nonzero(Tiered.tier(sparse) == 2), 1)
         graph = GameGraph(Tiered(), 'shaped-noise', history, seed=1, root_noise=.25, root_concentration=10.83)
         self.addCleanup(graph.close)
         self.assertEqual(np.count_nonzero(graph.search(16, root_samples=8, batch_size=8)['visits']), 8)
