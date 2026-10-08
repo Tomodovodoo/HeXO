@@ -2,15 +2,17 @@
 
 Bubble runs entirely in the browser: the network under ONNX Runtime Web (WebGPU, else WebAssembly), the native
 Gumbel search (`src/gumbel.cpp`) and the tactical solver (`tools/tactical`) compiled to WebAssembly, in Web Workers.
-On the play page pick **Bubble (browser)** for a seat or for analysis; presets are lightning 8/2048, quick 32/2048,
-standard 128/32768, strong 512/131072, deep 2048/524288 and dangerous 65536/4000000 (simulations / solver nodes).
+On the play page pick **Bubble (browser)** for a seat or for analysis; presets are lightning 16/1024, quick 64/2048,
+standard 256/4096, strong 512/8192, deep 1024/16384 and dangerous 65536/4000000 (nodes of work per stone / root query
+nodes), the served page's GPU ladder (docs/play.md has their times). A custom budget runs Nodes or Time with a
+Width (`customForm` and `customBudget` in `play-session.mjs`); under Time the turn runs on the timed path below.
 Analysis also has the solver preset (`SOLVER` in `play-session.mjs`, docs/play.md): up to two minutes of proof work
 before the turn, the root solver beside a native owner whose frontier feeds the proof workers, stopping at the first
 verified proof (`proveRoot` in `worker.mjs`).
 
 Every Bubble search on the page runs the hybrid scheduler, for analysis, review, refreshes, seats and matches. That
 is the native graph owner (`NativeOwner` in `search.mjs`, `src/gumbel_owner.cpp`) on the game's `GameGraph`, with the
-served page's settings of 8 views, depth 8, 16 root samples and the round barrier on. The preset's simulations are
+served page's settings of 8 views (a custom Width changes it), depth 8, 16 root samples and the round barrier on. The preset's simulations are
 the owner's work per stone, counted as completed simulations over all its views, in quanta of 64, or of the
 stone's work when that is smaller (the owner takes 4 at least). With solver nodes above 0 the root queries (a win for the side to move, the opponent's
 threat, the defence) run first at that node budget, and then the owner's proof frontier runs on the proof workers
@@ -408,7 +410,8 @@ positions sent out to ONNX Runtime Web. HeXO adds three exports to `web_bot.cpp`
 turn at its next batch, `six_score` and `six_nodes`. Both seats and the analysis panel can use it. As analysis it
 shows its turn: the first stone as the top move, both stones as the line, the win chance from its score (100% when
 its threat solver proves a win, whose distance Six does not report) and the positions searched; the presets give it the server's
-Six positions (lightning 240 to dangerous 2,000,000) and the network select lists the site's networks, newest
+Six positions (lightning 120 to dangerous 2,000,000), or a custom Positions or Time (Six's movetime, the positions
+then a ceiling), and the network select lists the site's networks, newest
 first. It plays like the server's Six (`python/six_engine.py` driving `sixengine`): Six's default search settings,
 radius 8, mirrored coordinates, `go nodes N` with no time limit, and the tree kept while the game continues.
 
@@ -428,8 +431,9 @@ since one thread evaluates about 2.7 positions per second. A 30,000-position sea
 same two stones on WebGPU in the browser (102 s) and from `sixengine --cpu` on the Ryzen 9 5900X (720 s).
 
 Speed on the RTX 3070 Ti (otherwise idle) in the Claude desktop browser pane, WebGPU, from one stone, measured before
-the ladder was rebased: 1,500 positions 1.3 s, 6,000 positions 22 s, 30,000 positions 102 s. On that scale the current
-presets cost about 0.5 s (lightning, 240), 3 s (quick, 960), 13 s (standard, 3,840) and a minute (strong, 15,360).
+the ladder was rebased: 1,500 positions 1.3 s, 6,000 positions 22 s, 30,000 positions 102 s. The ladder of 120 to
+1,920 positions spans about half a second to a few seconds per turn; docs/play.md has the times measured on
+2026-10-08 with training sharing the GPU.
 The search itself and its threat solver run on one thread in the worker, so turns slow down as the tree grows. On
 WebAssembly a position costs about 0.4 s on one thread, so without WebGPU lightning takes about two minutes and the
 heavier presets are impractical. A device whose WebGPU cannot start, create or run Six's graph falls back to

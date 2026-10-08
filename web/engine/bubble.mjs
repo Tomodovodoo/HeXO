@@ -1,8 +1,9 @@
 /* Bubble running in the browser: the page-side handle of worker.mjs. */
 
-export const PRESETS = {lightning: {simulations: 8, solver_nodes: 2048}, quick: {simulations: 32, solver_nodes: 2048},
-  standard: {simulations: 128, solver_nodes: 32768}, strong: {simulations: 512, solver_nodes: 131072},
-  deep: {simulations: 2048, solver_nodes: 524288}, dangerous: {simulations: 65536, solver_nodes: 4000000}};
+/** Work per stone and root query nodes per level, as the served page's GPU ladder (python/play.py PRESETS). */
+export const PRESETS = {lightning: {simulations: 16, solver_nodes: 1024}, quick: {simulations: 64, solver_nodes: 2048},
+  standard: {simulations: 256, solver_nodes: 4096}, strong: {simulations: 512, solver_nodes: 8192},
+  deep: {simulations: 1024, solver_nodes: 16384}, dangerous: {simulations: 65536, solver_nodes: 4000000}};
 
 /** The proof workers of every Bubble search with solver nodes, the solver preset included: half the browser's threads
  * less one, from 1 to 8, so the page's main thread and inference keep the other half. */
@@ -60,8 +61,9 @@ export class BubbleEngine extends EngineWorker {
   }
 
   /**
-   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional q_range_floor and
-   * checkpoint, a NETWORKS name} (a PRESETS entry): the fields of python/play.py evaluate. Every stone runs the hybrid
+   * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional ms (a budget in
+   * time: the turn's clock, simulations its ceiling), views (the owner's width, 8 by default), q_range_floor and
+   * checkpoint, a NETWORKS name} (a PRESETS entry or a custom budget): the fields of python/play.py evaluate. Every stone runs the hybrid
    * scheduler (worker.mjs playTurn): `simulations` is its work per stone, and `solver_nodes` above 0 adds the root
    * queries at that node budget and the owner's proof frontier on PROOF_WORKERS proof workers (`solver_workers`
    * overrides the count). Optional solver_ms (the SOLVER preset) spends up to that long on proof work alone before the
@@ -76,7 +78,7 @@ export class BubbleEngine extends EngineWorker {
       solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4, proveMs: budget.solver_ms ?? 0,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      ms: options.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
+      ms: options.ms ?? budget.ms ?? null, views: budget.views ?? 8, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
   /** Loads network `checkpoint` (a NETWORKS name, the default when null) and starts the PROOF_WORKERS proof workers, so

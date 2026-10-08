@@ -90,6 +90,14 @@ export async function json(path) {
   }
 }
 
+/** False when available.json (written by every tools/build_web.py run, here or on the site) says this build has no
+ * optional `part` ('seal', 'strix_network'), so its manifest is not asked for; true when it has it or no record
+ * says either way. */
+export async function published(part) {
+  const record = await json('available.json').then(found => found.data, () => ({}));
+  return record[part] !== false;
+}
+
 /** The `files` pins ({name: SHA-256}) of manifest `found` (a json() result for `path`). A local manifest written before
  * builds pinned their files borrows the site's pins when `same(site manifest)` says both describe one build. */
 export async function pins(path, {data, local}, same) {

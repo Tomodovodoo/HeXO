@@ -40,18 +40,24 @@ from time_control import Clock, TimeControl, duration, milliseconds
 from timed_engine import saved_ids
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bubble's levels are work per stone (`simulations`, the hybrid owner's completed simulations) and root query nodes,
+# chosen for wall time per turn on main/185000 (docs/play.md): on a GPU from under half a second to about four.
 PRESETS = dict(
-    bubble=dict(lightning=dict(simulations=8, solver_nodes=2048), quick=dict(simulations=32, solver_nodes=2048),
-                standard=dict(simulations=128, solver_nodes=32768), strong=dict(simulations=512, solver_nodes=131072),
-                deep=dict(simulations=2048, solver_nodes=524288), dangerous=dict(simulations=65536, solver_nodes=4_000_000)),
+    bubble=dict(lightning=dict(simulations=16, solver_nodes=1024), quick=dict(simulations=64, solver_nodes=2048),
+                standard=dict(simulations=256, solver_nodes=4096), strong=dict(simulations=512, solver_nodes=8192),
+                deep=dict(simulations=1024, solver_nodes=16384), dangerous=dict(simulations=65536, solver_nodes=4_000_000)),
     drip=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000),
               deep=dict(ms=10000), dangerous=dict(ms=60000)),
     seal=dict(lightning=dict(ms=100), quick=dict(ms=250), standard=dict(ms=1000), strong=dict(ms=3000), deep=dict(ms=10000),
               dangerous=dict(ms=60000)),
-    six=dict(lightning=dict(nodes=240), quick=dict(nodes=960), standard=dict(nodes=3840), strong=dict(nodes=15360),
-             deep=dict(nodes=61440), dangerous=dict(nodes=2_000_000)),
+    six=dict(lightning=dict(nodes=120), quick=dict(nodes=240), standard=dict(nodes=480), strong=dict(nodes=960),
+             deep=dict(nodes=1920), dangerous=dict(nodes=2_000_000)),
     strix=dict(lightning=dict(simulations=2), quick=dict(simulations=8), standard=dict(simulations=64),
                strong=dict(simulations=128), deep=dict(simulations=512), dangerous=dict(simulations=4096)))
+# Bubble on a CPU server (two torch threads, about 26 simulations a second): the same span of wall time.
+CPU_PRESETS = dict(lightning=dict(simulations=4, solver_nodes=512), quick=dict(simulations=8, solver_nodes=1024),
+                   standard=dict(simulations=16, solver_nodes=2048), strong=dict(simulations=32, solver_nodes=4096),
+                   deep=dict(simulations=64, solver_nodes=8192), dangerous=dict(simulations=1024, solver_nodes=131072))
 PRESET_NAMES = list(PRESETS['bubble'])
 HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
 PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
@@ -64,7 +70,10 @@ REVIEW_SOLVERS = 4                      # tactical workers a review queries at o
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
 SOLVER = dict(simulations=128, solver_nodes=32768, solver_ms=120_000)  # the analysis solver preset (see `prove`)
 SOLVER_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 4))  # its native proof workers
-LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
+LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1, views=1)
+VIEWS = 16  # the widest custom Bubble search: views per position (HYBRID['views'] by default)
+# The custom budgets whose two amounts exclude each other: work (Bubble's Nodes, Six's Positions) or Time in ms.
+EXCLUSIVE = dict(bubble=('simulations', 'ms'), six=('nodes', 'ms'))
 # The engines take budgets as 32-bit signed integers.
 MAX_BUDGET = 2 ** 31 - 1
 KIND_LIMITS = dict(strix=dict(simulations=1))
@@ -293,10 +302,12 @@ def six_backend(folder):
     return 'CPU', ['--cpu'], []
 
 
-def presets_of(kind, spec):
-    """The presets of an engine entry: the kind's defaults, overridden per preset by `spec`. Six-protocol presets
-    may add `args`, extra command-line arguments for an engine whose strength is set at launch, like Shrimp."""
-    presets = {name: dict(budget) for name, budget in PRESETS[kind].items()}
+def presets_of(kind, spec, device=None):
+    """The presets of an engine entry: the kind's defaults (CPU_PRESETS for a Bubble on a 'cpu' server `device`),
+    overridden per preset by `spec`. Six-protocol presets may add `args`, extra command-line arguments for an engine
+    whose strength is set at launch, like Shrimp."""
+    defaults = CPU_PRESETS if kind == 'bubble' and device == 'cpu' else PRESETS[kind]
+    presets = {name: dict(budget) for name, budget in defaults.items()}
     if not isinstance(spec or {}, dict):
         raise ValueError('presets must be an object')
     for name, budget in (spec or {}).items():
@@ -313,7 +324,7 @@ def presets_of(kind, spec):
     return presets
 
 
-def scan(models=None, runs=None, extra_runs=(), seal=None):
+def scan(models=None, runs=None, extra_runs=(), seal=None, device=None):
     """Every engine on offer, by id.
 
     Bubble runs come from `extra_runs`, the directories in `runs`, and `models`; single `.pt` exports come from
@@ -330,12 +341,13 @@ def scan(models=None, runs=None, extra_runs=(), seal=None):
     Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
     `cwd`, `mirrored`, `libraries`, `files` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
     see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
-    entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine."""
+    entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine. `device`, the
+    server's ('cpu' or 'cuda'), picks Bubble's preset ladder (see `presets_of`)."""
     found, seen = [], set()
     models = models and Path(models).resolve()
 
     def add(kind, name, presets=None, label=None, badge=None, **fields):
-        found.append(dict(name=name, label=label or name, kind=kind, badge=badge or kind, presets=presets_of(kind, presets),
+        found.append(dict(name=name, label=label or name, kind=kind, badge=badge or kind, presets=presets_of(kind, presets, device),
                           **fields))
 
     def bubble(path, name=None, label=None, q_range_floor=0.):
@@ -461,10 +473,14 @@ def model_key(path):
 
 
 def search_key(weights, entry, budget=None):
-    """The weights with the entry's Q floor and the solver preset's clock, so saved searches cannot mix."""
+    """The weights with the entry's Q floor, the solver preset's clock and a Bubble budget's Time and Width when they
+    are not the defaults, so saved searches cannot mix."""
     key = weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
     if budget and budget.get('solver_ms'):
         key += f"~solver{budget['solver_ms']}"
+    if budget and entry.get('kind') == 'bubble':
+        key += (f"~ms{budget['ms']}" if budget.get('ms') else '') + (
+            f"~views{budget['views']}" if budget.get('views', HYBRID['views']) != HYBRID['views'] else '')
     return key
 
 
@@ -690,11 +706,12 @@ def winning_line(history, result, known=()):
                 proof=dict(winner=player_at(len(history)), turns=result['proof_turns'], plies=plies, **evidence))
 
 
-def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
+def solve(prover, history, solver_nodes, watch=lambda n: None, known=(), limit_ms=None):
     """What the solver knows of `history` for `evaluate`: `moves` and `pv` (see `principal_variation`) of a proven
     win for the side to move, its certificate tightened to the fewest attacker turns the budget allows, `proof`
     ({winner, turns, plies} or None), `threat` (the stones of the opponent's forced win if it moved now), `solved`
-    (False when a query failed to run) and `used` (nodes spent). `solver_nodes` 0 or no `prover` asks nothing."""
+    (False when a query failed to run) and `used` (nodes spent). `solver_nodes` 0 or no `prover` asks nothing.
+    `limit_ms` caps each query's deadline, for a budget in time."""
     found = dict(moves=[], pv=[], proof=None, threat=[], solved=True, used=0)
     if prover is None or not solver_nodes:
         return found
@@ -702,7 +719,7 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=()):
     game = replay(history)
     player, remaining = game.player, game.remaining
     game.close()
-    deadline = min(60_000, max(10_000, solver_nodes // 8))
+    deadline = min(60_000, max(10_000, solver_nodes // 8), *([max(1, int(limit_ms))] if limit_ms else []))
     limited, cells = [], 0
     for fact in known:
         if len(limited) >= 4096 or cells + len(fact['history']) > 200_000:
@@ -752,9 +769,11 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
     Two provers run until one returns a verified proof for either side or the clock ends: the tactical solver
     `prover` asks the root for a mover win with 32,768 nodes, then four times as many each round, and a hybrid
     scheduler search of the position feeds the shared ProofWorkers `proofs` the positions its neural search reaches,
-    with the whole owner budget and proof stamps when `stamps`. `live(seen)` receives {solver: {elapsed_ms, root_nodes,
-    frontier, busy, workers, proof}} about twice a second. `found['solver']` reports the totals, among them
-    `native_nodes` and `certificates` of the native frontier."""
+    with the whole owner budget and proof stamps when `stamps`. `live(seen)` receives {solver: {elapsed_ms, root
+    ('asking', or 'no forcing win' once the solver rules out a mover win before spending its nodes), root_nodes,
+    root_budget (the current query's nodes), frontier (queued and running proof jobs), busy, workers, frontier_nodes,
+    checked (frontier jobs answered), proof}} about twice a second, read from the running loops. `found['solver']`
+    reports the totals, among them `native_nodes` and `certificates` of the native frontier."""
     from neural_search import GameGraph
     import tactical_proof
     from hybrid_scheduler import SearchPool, InferenceService
@@ -772,11 +791,12 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
         if len(f['history']) != len(history) or f['winner'] != player:
             premises.append({k: f[k] for k in ('history', 'winner', 'plies')})
             cells += len(f['history'])
-    root, stop = dict(nodes=0, result=None), threading.Event()
+    root, stop = dict(nodes=0, budget=32768, result=None, ruled=False), threading.Event()
 
     def ask():
         nodes = 32768
         while not stop.is_set() and time.monotonic() < end:
+            root['budget'] = nodes
             left = int((end - time.monotonic()) * 1000)
             result = prover.history(history, attacker='mover', nodes=nodes, ms=max(1, min(left, 60_000, max(10_000, nodes // 8))),
                                     shortest=True, cancel_event=stop, **(dict(known=premises) if premises else {}))
@@ -788,6 +808,7 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
                 stop.wait(.05)
                 continue
             if result.get('nodes_used', 0) < nodes:   # the solver ruled the root out before spending its nodes
+                root['ruled'] = True
                 return
             nodes = min(4 * nodes, tactical_proof.MAX_NODES)
     asking = threading.Thread(target=ask, daemon=True)
@@ -813,10 +834,12 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
                 if frame['exact_winner'] >= 0:
                     break
             if live and time.monotonic() >= shown:
-                busy = proofs.stats()
-                live(dict(solver=dict(elapsed_ms=round((time.monotonic() - start) * 1000), root_nodes=root['nodes'],
-                                      frontier=busy['queued'] + busy['live'], busy=busy['active'], workers=workers,
-                                      proof=None)))
+                busy, loop = proofs.stats(), pool.proofs.progress()
+                live(dict(solver=dict(elapsed_ms=round((time.monotonic() - start) * 1000),
+                                      root='no forcing win' if root['ruled'] else 'asking', root_nodes=root['nodes'],
+                                      root_budget=root['budget'], frontier=busy['queued'] + busy['live'],
+                                      busy=busy['active'], workers=workers, frontier_nodes=loop['fresh_nodes'],
+                                      checked=loop['finished'], proof=None)))
                 shown = time.monotonic() + .5
             service.wait(50)
     finally:
@@ -833,6 +856,7 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
         graph.close()
     native = event if event is not None and event.get('exact_winner', -1) >= 0 else frame
     found['solver'] = dict(elapsed_ms=round((time.monotonic() - start) * 1000), root_nodes=root['nodes'],
+                           root='no forcing win' if root['ruled'] else 'asking',
                            native_nodes=stats.get('fresh_nodes', 0), certificates=stats.get('records', 0), workers=workers)
     found['used'] = root['nodes'] + stats.get('fresh_nodes', 0)
     facts = frontier_facts(records)
@@ -1146,7 +1170,7 @@ def frontier_facts(records):
     return facts
 
 
-def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=False):
+def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=False, ms=None, views=None):
     """Hybrid scheduler work on the game graphs of `roots` ([(graph, simulations)], each graph at its root), in one
     SearchPool whose games share `bubble`'s packed network batches. Each graph's native owner completes
     `simulations` simulations over up to HYBRID['views'] views: its root and the positions below it, at most
@@ -1160,13 +1184,15 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     `exact_winner`, `proven`, `proof_plies`), its `action` the stone of the highest improved policy, or the owner's
     own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
     verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
-    spent. Each graph is left at its root."""
+    spent. Each graph is left at its root. With `ms` each owner also stops at that clock, its `simulations` a
+    ceiling; `views` replaces HYBRID['views']."""
     import numpy as np
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
+    views = views or HYBRID['views']
     histories = [[list(p) for p in graph.history] for graph, _ in roots]
     quantum = max(4, min(HYBRID['quantum'], max(simulations for _, simulations in roots)))
-    pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=HYBRID['views'], depth=HYBRID['depth'],
+    pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=views, depth=HYBRID['depth'],
                       work=1, seed=next(SEEDS))
     service, events, records, effort = None, {}, [], {}
     try:
@@ -1177,7 +1203,8 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
         service.start(continuous=True)
         service.launch()
         for game, (history, (_, simulations)) in enumerate(zip(histories, roots)):
-            service.retarget(0, game, history, expected=0, work=max(1, simulations), samples=16, views=HYBRID['views'])
+            service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(ms)) if ms else 0,
+                             samples=16, views=views)
         launched, sequence, shown, held = 0, 0, 0., False
         while len(events) < len(roots):
             rows = service.stats()['launched_rows']
@@ -1380,7 +1407,8 @@ class TurnSearch:
 
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
-             solved=None, q_range_floor=0., known=None, solver_ms=0, package=None, proofs=None, stamps=False):
+             solved=None, q_range_floor=0., known=None, solver_ms=0, package=None, proofs=None, stamps=False, ms=0,
+             views=None):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -1401,7 +1429,9 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     search (see `answered`) and otherwise informs the search (see `TurnSearch`).
     `solver_ms` (the solver preset) replaces the root queries with `prove` for up to that long; the search then
     plays the proven turn or, without a proof, searches as usual, and the result carries `prove`'s `solver`
-    totals."""
+    totals. `ms` (a budget in time) is the turn's clock: the root queries get at most a quarter of it, the first of
+    two stones 60% of what is left, the last stone the rest, with `simulations` a ceiling per stone. `views` is the
+    owners' width (HYBRID['views'] when None)."""
     from hybrid_scheduler import ProofWorkers
     game = replay(history)
     finished = game.winner >= 0
@@ -1435,8 +1465,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 # The frontier's verified positions settle the follow-up search's edges.
                 known = known if known is not None else Proofs()
                 known.add(history, dict(proofs=solved['proofs']))
+        end = time.monotonic() + ms / 1000 if ms else None
         turn = TurnSearch(bubble, network, history, simulations,
-                          solved or solve(prover, history, solver_nodes, watch, facts), trees, q_range_floor, known)
+                          solved or solve(prover, history, solver_nodes, watch, facts, ms / 4 if ms else None),
+                          trees, q_range_floor, known)
         frontier = proofs if prover is not None and solver_nodes else None
         while (asked := turn.request()) is not None:
             tree, count = asked
@@ -1449,7 +1481,11 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 def show(frame):
                     if (seen := glimpse(frame, turn.player)) is not None:
                         live(seen)
-            [result] = search(bubble, [(tree, max(1, count))], frontier, watch, show, stamps)
+            clock = None
+            if end is not None:
+                clock = max(1., (end - time.monotonic()) * 1000)
+                clock *= .6 if turn.local.remaining == 2 else 1
+            [result] = search(bubble, [(tree, max(1, count))], frontier, watch, show, stamps, clock, views)
             turn.take(result)
         found = turn.record()
         if solved and 'solver' in solved:
@@ -1467,13 +1503,14 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, q_range_floor=0.,
-                  known=None, proofs=None, stamps=False):
+                  known=None, proofs=None, stamps=False, ms=0, views=None):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
     proof table `known`; then fresh game graphs, one per position, search together with that table in one
     SearchPool (see `search`), stone by stone, sharing network batches, with their proof frontiers on `proofs`
     when `solver_nodes` and `provers` are given. Each result is what `evaluate` would give at that budget with the
-    table. `watch` may raise Cancelled."""
+    table; with `ms` each root query gets a quarter of it and each stone half, the pooled owners sharing that clock.
+    `watch` may raise Cancelled."""
     from concurrent.futures import ThreadPoolExecutor
     given = [answered(h, known) for h in histories]
     keys = [position_text(h) for h in histories]
@@ -1486,7 +1523,8 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
         def ask(history):
             prover = free.get()
             try:
-                return solve(prover, history, solver_nodes, watch, known.facts(history) if known is not None else ())
+                return solve(prover, history, solver_nodes, watch, known.facts(history) if known is not None else (),
+                             ms / 4 if ms else None)
             finally:
                 free.put(prover)
 
@@ -1514,7 +1552,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                     searching.append((turn, (tree, max(1, count))))
             if searching:
                 for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
-                                                               stamps=stamps)):
+                                                               stamps=stamps, ms=ms / 2 if ms else None, views=views)):
                     turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
@@ -1621,7 +1659,7 @@ class Engines:
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, floor, known, solver_ms=spent.get('solver_ms', 0) if solver else 0,
                          package=self.tactical_package, proofs=self.proof_workers() if solver else None,
-                         stamps=self.proof_stamps)
+                         stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
         if not found.pop('solved'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry, spent)
@@ -1687,7 +1725,7 @@ class Engines:
         spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
                               entry.get('q_range_floor', 0.), known, proofs=self.proof_workers() if provers else None,
-                              stamps=self.proof_stamps)
+                              stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
         out = []
         for record in found:
             used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
@@ -2143,10 +2181,49 @@ class Job:
         return self.cancelled
 
 
+def custom_form(kind, standard, custom):
+    """The custom budget form of a Bubble or a Six (EXCLUSIVE kinds): both amounts, the work (Bubble's `simulations`,
+    shown as Nodes; Six's `nodes`, shown as Positions) and Time `ms`, with `active` naming the one that applies, and for
+    Bubble the Width `views`. Missing values come from the `standard` preset, 1000 ms and HYBRID['views']. A custom
+    budget saved before the form keeps its work active, and a Bubble's old `solver_nodes` is dropped."""
+    work, _ = EXCLUSIVE[kind]
+    if custom is not None and not isinstance(custom, dict):
+        raise ValueError('A custom budget is an object of numbers')
+    custom = {k: v for k, v in (custom or {}).items() if not (kind == 'bubble' and k == 'solver_nodes')}
+    form = {work: standard[work], 'ms': 1000, 'active': work} | ({'views': HYBRID['views']} if kind == 'bubble' else {})
+    for key, value in custom.items():
+        if key == 'args':
+            continue
+        if key == 'active':
+            if value not in EXCLUSIVE[kind]:
+                raise ValueError(f'active must be one of {", ".join(EXCLUSIVE[kind])}')
+        elif key not in form:
+            raise ValueError(f'{key} is not a budget of this engine')
+        elif type(value) is not int or not LIMITS[key] <= value <= (VIEWS if key == 'views' else MAX_BUDGET):
+            raise ValueError(f"{key} must be an integer from {LIMITS[key]} to {VIEWS if key == 'views' else MAX_BUDGET}")
+        form[key] = value
+    return form
+
+
+def custom_budget(kind, form):
+    """The budget a custom `form` (see `custom_form`) runs: its active amount, and for Bubble its width and root
+    query nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Bubble Time budget keeps
+    `simulations` as a ceiling of 65,536 per stone."""
+    active = form['active']
+    if kind == 'six':
+        return {active: form[active]}
+    if active == 'ms':
+        return dict(simulations=65536, ms=form['ms'], views=form['views'],
+                    solver_nodes=min(4_000_000, max(1024, 4 * form['ms'])))
+    return dict(simulations=form['simulations'], views=form['views'],
+                solver_nodes=min(4_000_000, max(1024, 16 * form['simulations'])) if form['simulations'] else 0)
+
+
 def budget_of(presets, preset, custom=None, kind=None):
     """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
     against the smallest values in LIMITS and the `kind`'s own (larger budgets only take longer) (a preset's launch `args` are not custom).
-    A Bubble's 'solver' is the analysis solver preset SOLVER."""
+    A Bubble's or a Six's custom budget is the one its form selects (see `custom_form`). A Bubble's 'solver' is the
+    analysis solver preset SOLVER."""
     limits = LIMITS | KIND_LIMITS.get(kind, {})
     if preset == 'solver' and kind == 'bubble':
         return dict(SOLVER)
@@ -2154,6 +2231,8 @@ def budget_of(presets, preset, custom=None, kind=None):
         if preset not in presets:
             raise ValueError('Unknown preset')
         return dict(presets[preset])
+    if kind in EXCLUSIVE:
+        return custom_budget(kind, custom_form(kind, presets['standard'], custom))
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
     budget = dict(presets['standard'])
@@ -2202,6 +2281,8 @@ class Session:
         self.outcome, self.clock_turns, self.notice, self.clock_partial_ms = None, [], None, 0
         self.match_file = None
         self.retries = {}
+        # The position and analysis settings whose analysis was cancelled (see `dismissal`), or None.
+        self.dismissed = None
         self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
         bubble = next((e for e in entries.values() if e['kind'] == 'bubble'), None)
         opponent = bubble or entries['drip:Drip']
@@ -2226,6 +2307,9 @@ class Session:
         else:
             checkpoint = None
         budget = budget_of(entry['presets'], preset, custom, entry['kind'])
+        if preset == 'custom' and entry['kind'] in EXCLUSIVE:
+            form = custom_form(entry['kind'], entry['presets']['standard'], custom)
+            return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget, custom=form)
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
 
     def new_lines(self, *sides):
@@ -2277,7 +2361,7 @@ class Session:
             return None
         a = self.analysis
         preset = 'standard' if a['preset'] == 'solver' else a['preset']
-        return self.seat(a['engine'], a['checkpoint'], preset, a['budget'] if preset == 'custom' else None)
+        return self.seat(a['engine'], a['checkpoint'], preset, a.get('custom', a['budget']) if preset == 'custom' else None)
 
     def review_target(self):
         """(store key, budget) of the review evaluations, the key None without an analysis model."""
@@ -2446,7 +2530,10 @@ class Session:
                 if job.status == 'queued':
                     job.status = 'cancelled'
         opening = not self.history or remaining == 2
-        if self.analysis and self.analysis['auto'] and winner < 0 and opening and not self.deepening(winner):
+        if self.dismissed is not None and self.dismissed != self.dismissal(self.history):
+            self.dismissed = None
+        if (self.analysis and self.analysis['auto'] and winner < 0 and opening and not self.deepening(winner)
+                and self.dismissed is None):
             self.request_analysis(self.history, 1)
         self.deepen(winner)
         self.save_freeplay()
@@ -2474,7 +2561,7 @@ class Session:
                     job.status = 'cancelled'
         busy = any(hasattr(job, 'tier') and job.history == current and job.status in ('queued', 'running')
                    for job in self.jobs.values())
-        if not active or busy:
+        if not active or busy or self.dismissed == self.dismissal(current):
             return
         for tier in PRESET_NAMES:
             failed = any(getattr(job, 'tier', None) == tier and job.history == current
@@ -2485,6 +2572,13 @@ class Session:
             if key and not failed and not self.store.covering(current, key + ':kept', budget):
                 self.submit(Job('analyse', 3, current, seat=seat, force=False, tier=tier, game=self.analysis_line))
                 return
+
+    def dismissal(self, history):
+        """The key a cancelled analysis of `history` leaves in `dismissed`: the position and the analysis settings
+        without Auto. While it matches, Auto and deepening do not queue that position again; any move, settings
+        change or analysis request clears it."""
+        settings = {k: v for k, v in (self.analysis or {}).items() if k != 'auto'}
+        return tuple(map(tuple, history)), json.dumps(settings, sort_keys=True)
 
     def submit(self, job):
         self.jobs[job.id] = job
@@ -2682,6 +2776,7 @@ class Session:
         with self.lock:
             if not self.analysis or not 0 <= ply <= len(self.history):
                 raise ValueError('Nothing to analyse')
+            self.dismissed = None
             for job in self.jobs.values():
                 stale = job.kind == 'analyse' and job.priority == 0 and job.history != tuple(self.history[:ply])
                 if stale and job.status in ('queued', 'running'):
@@ -2690,9 +2785,12 @@ class Session:
                         job.status = 'cancelled'
             game = replay(self.history)
             try:
-                deepening = ply == len(self.history) and self.deepening(game.winner)
+                winner = game.winner
+                deepening = ply == len(self.history) and self.deepening(winner)
             finally:
                 game.close()
+            if deepening:
+                self.deepen(winner)
             history = self.history[:ply]
             saved = self.lookup(history)
             if not force and self.stale(saved, ply) and not saved.get('proof'):
@@ -2732,6 +2830,8 @@ class Session:
             job = self.jobs.get(job_id)
             if job and job.status in ('queued', 'running'):
                 job.cancelled = True
+                if job.kind == 'analyse':
+                    self.dismissed = self.dismissal(job.history)
                 if job.kind == 'move':
                     self.paused = True
                     if self.game_clock:
@@ -2934,7 +3034,7 @@ class Session:
             if '@' in selector:
                 selector, specification['checkpoint'] = selector.rsplit('@', 1)
         if Path(selector).is_file() and Path(selector).suffix == '.pt':
-            found = scan(extra_runs=[Path(selector)])
+            found = scan(extra_runs=[Path(selector)], device=getattr(self.engines, 'device', None))
             entry = next(e for e in found.values() if e['kind'] == 'bubble')
             same = next((e for e in self.entries.values() if e['kind'] == 'bubble' and e['path'] == entry['path']
                          and not e.get('q_range_floor')), None)
@@ -4262,7 +4362,15 @@ def main():
     from hexo import library
     seal = library.with_name(library.name.replace('hexo', 'hexo_seal'))
     runs = [path for path in (args.dense_model, args.dense_run) if path]
-    find = lambda: scan(args.models, args.runs, runs, seal)
+    try:
+        import torch
+        torch.set_num_threads(2)
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    if args.device == 'auto':
+        args.device = 'cuda' if cuda else 'cpu'
+    find = lambda: scan(args.models, args.runs, runs, seal, args.device)
     entries = find()
     book = args.book or (args.dense_run / 'openings.json' if args.dense_run and
                         (args.dense_run / 'openings.json').exists() else None)
@@ -4275,14 +4383,6 @@ def main():
     if args.match and args.out is None:
         name = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.urandom(3).hex()
         args.out = ROOT / 'artifacts' / 'play' / name
-    try:
-        import torch
-        torch.set_num_threads(2)
-        cuda = torch.cuda.is_available()
-    except ImportError:
-        cuda = False
-    if args.device == 'auto':
-        args.device = 'cuda' if cuda else 'cpu'
     store_path = args.evaluations or ((args.out / 'evaluations.jsonl') if args.match else
                                      (args.dense_run or args.models) / 'play-evaluations.jsonl')
     if not args.match:

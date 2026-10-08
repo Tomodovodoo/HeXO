@@ -19,6 +19,8 @@ seal   Seal's headers at the revision pinned in tools/engines.json, each checked
 six    Six's networks (CixMango/Six, MIT): the pinned release's from its archive (or --six-archive, that file saved
        locally), older generations from its 'networks' release, each checked against its pinned SHA-256 and rewritten
        for WebGPU, into six/networks/ (ignored).
+Every run then writes available.json (ignored): which optional parts this folder holds ({"seal": bool,
+"strix_network": bool}), so a page skips the manifests a site does not publish.
 """
 import argparse
 import base64
@@ -189,6 +191,12 @@ def build_seal(emxx):
                         '-sEXPORTED_FUNCTIONS=_malloc,_free,_seal_move', '-o', str(SEAL/'engine.mjs')], check=True)
     manifest = dict(revision=spec['revision'], files=sha256s(SEAL, ('engine.mjs', 'engine.wasm')))
     (SEAL/'manifest.json').write_text(json.dumps(manifest)+'\n', encoding='utf-8')
+
+
+def record_available():
+    """available.json: whether seal/manifest.json and strix/networks.json are here, read by assets.mjs published()."""
+    found = dict(seal=(SEAL/'manifest.json').exists(), strix_network=(ENGINE/'strix'/'networks.json').exists())
+    (ENGINE/'available.json').write_text(json.dumps(found)+'\n', encoding='utf-8')
 
 
 def sha256s(folder, names):
@@ -385,6 +393,7 @@ def main():
         build_seal(args.emxx)
     if 'six' in args.parts:
         build_six(args.six_archive)
+    record_available()
 
 
 if __name__ == '__main__':

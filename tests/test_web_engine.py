@@ -408,6 +408,28 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(browser[1]['top'][0][:2], [6,-4])
         self.assertEqual([r['proof']['plies'] for r in browser], [52]*3)
 
+    def test_custom_budgets_apply_the_amount_last_edited_and_keep_the_other(self):
+        answer = node(dict(kind='custom-forms'))
+        self.assertEqual(answer['old'], dict(budget=dict(simulations=300, views=8, solver_nodes=4800),
+                                             custom=dict(simulations=300, ms=1000, active='simulations', views=8)))
+        self.assertEqual(answer['time']['budget'], dict(simulations=65536, ms=2500, views=8, solver_nodes=10000))
+        self.assertEqual(answer['time']['custom']['simulations'], 300)
+        self.assertEqual(answer['nodes']['budget'], dict(simulations=600, views=4, solver_nodes=9600))
+        self.assertEqual(answer['nodes']['custom']['ms'], 2500)
+        self.assertEqual((answer['six']['budget'], answer['sixBack']['budget']), (dict(ms=900), dict(nodes=800)))
+        self.assertEqual(answer['sixBack']['custom']['ms'], 900)
+        self.assertEqual(answer['reloaded'], answer['time'])
+        self.assertEqual(answer['bad'], 400)
+
+    def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
+        answer = node(dict(kind='dismissal'))
+        self.assertEqual(answer, dict(before=[3], cancelled=[], auto=True, asked=[3], again=[], moved=[4]))
+
+    def test_the_page_keeps_auto_after_cancel_and_asks_again_once_the_view_moves(self):
+        answer = node(dict(kind='page-dismissal'))
+        self.assertEqual(answer, dict(opened=['/analyse 1'], cancelled=['/cancel'], auto=True, back=['/analyse 0'],
+                                      forward=['/analyse 1']))
+
     def test_frontier_certificate_is_visible_before_the_first_stone_and_after_reload(self):
         from tests.test_tactical_proof import LATE_WIN
         history = [list(p) for p in LATE_WIN] + [[-1, -11]]
@@ -816,6 +838,18 @@ class Bundle(unittest.TestCase):
         self.assertTrue(answer['solved'])
         self.assertGreater(answer['actual_solver_nodes'], 0)
         self.assertGreater(answer['scheduler'][0]['proof']['installed'], 0)
+
+    def test_deep_solve_reports_running_frontier_work_after_the_root_has_no_forcing_win(self):
+        # Three stones in: the solver rules out a win for the side to move at once, and the frontier goes on.
+        answer = node(dict(kind='worker-turn', history=[[0,0],[1,0],[0,1]], simulations=32, nodes=2048, proveMs=2500))
+        frames = answer['solver_live']
+        self.assertEqual(answer['solver']['root'], 'no forcing win')
+        ruled = [f for f in frames if f['root'] == 'no forcing win']
+        self.assertGreater(len(ruled), 2)
+        for before, after in zip(ruled, ruled[1:]):
+            self.assertGreater(after['elapsed_ms'], before['elapsed_ms'])
+        self.assertGreater(ruled[-1]['checked'], ruled[1]['checked'])
+        self.assertGreater(ruled[-1]['frontier_nodes'], ruled[1]['frontier_nodes'])
 
     def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
         import re

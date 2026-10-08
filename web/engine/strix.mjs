@@ -2,7 +2,7 @@
  * the play page's browser engines (seat.mjs). It plays as python/play.py's Strix: the same presets in simulations per
  * placement, with a network `python tools/build_web.py strix-network` placed in strix/ (listed in strix/networks.json,
  * the first is the default), or the site's when this origin has none. */
-import {json, workerUrl} from './assets.mjs';
+import {NotOnSite, json, published, workerUrl} from './assets.mjs';
 import {watchdog, workerError} from './stages.mjs';
 
 import {NEURAL_PRESET} from './device.mjs';
@@ -126,8 +126,10 @@ export class StrixEngine {
   }
 }
 
-/** The strix/networks.json entries, from the site when this origin has none; throws when neither answers. */
+/** The strix/networks.json entries, from the site when this origin has none; throws when neither answers, and
+ * NotOnSite when the build has no Strix network. */
 async function networks() {
+  if (!await published('strix_network')) throw new NotOnSite('strix/networks.json');
   const {data, local} = await json('strix/networks.json');
   return data.networks.map(network => ({...network, path: `strix/${network.file}`, local}));
 }

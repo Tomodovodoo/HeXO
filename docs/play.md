@@ -215,24 +215,47 @@ server, so the page names the sides people play (`people`) when it asks for a ne
 Until the switch or its set is changed in this browser session, each seat change sets the book from who plays
 the seats: off when both are Human, on otherwise (a seat a browser engine plays is an engine).
 
-| Preset | Bubble simulations per stone | Bubble solver nodes | Drip and Seal ms | Six positions | Strix simulations |
-|---|---|---|---|---|---|
-| Lightning | 8 | 2,048 | 100 | 240 | 2 |
-| Quick | 32 | 2,048 | 250 | 960 | 8 |
-| Standard | 128 | 32,768 | 1,000 | 3,840 | 64 |
-| Strong | 512 | 131,072 | 3,000 | 15,360 | 128 |
-| Deep | 2,048 | 524,288 | 10,000 | 61,440 | 512 |
-| Dangerous | 65,536 | 4,000,000 | 60,000 | 2,000,000 | 4,096 |
+Bubble's and Six's levels are amounts of work, not time: Bubble's nodes per stone (the hybrid owner's completed
+simulations) with its root query nodes, and Six's positions. The counts were picked so each ladder spans about the
+same wall time on its own device, under half a second at Lightning to a few seconds at Deep. A CPU server gives Bubble
+its own ladder (`CPU_PRESETS`); the browser uses the GPU one. The dial's tooltip names each level's count.
 
-Six's ladder is 30 positions per Bubble simulation, the ratio of the 170-game Bubble-versus-Six tournament, where the
-two sides took about the same time per turn at every tier.
+| Preset | Bubble nodes, GPU | Bubble nodes, CPU server | Bubble root query nodes, GPU / CPU | Drip and Seal ms | Six positions | Strix simulations |
+|---|---|---|---|---|---|---|
+| Lightning | 16 | 4 | 1,024 / 512 | 100 | 120 | 2 |
+| Quick | 64 | 8 | 2,048 / 1,024 | 250 | 240 | 8 |
+| Standard | 256 | 16 | 4,096 / 2,048 | 1,000 | 480 | 64 |
+| Strong | 512 | 32 | 8,192 / 4,096 | 3,000 | 960 | 128 |
+| Deep | 1,024 | 64 | 16,384 / 8,192 | 10,000 | 1,920 | 512 |
+| Dangerous | 65,536 | 1,024 | 4,000,000 / 131,072 | 60,000 | 2,000,000 | 4,096 |
 
-On a Ryzen 9 5900X with two threads, main/185000 takes about 1, 8, 36 and 125 seconds per turn at Quick to Deep;
-Dangerous takes many minutes per stone on a CPU. A thinking engine's seat shows a progress line (a moving one when
-the engine reports no progress) and its cancel button. The custom budget shows the engine's own fields: Search
-(simulations, 0 plays the raw policy) and Solver (nodes, 0 turns it off; the solver gets up to a minute) for Bubble,
-Positions for Six, Search for Strix (at least 1), and ms (at least 10) for Drip and Seal. Any larger whole number up to
-2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes longer.
+Seconds per analysis turn on main/185000, from 3, 5 and 9 stones (the range over the three), RTX 3070 Ti and Ryzen 9
+5900X, measured on 2026-10-08 while the training run shared the GPU and CPU. Old is the ladder before this one
+(8, 32, 128, 512 and 2,048 nodes with 2,048 to 524,288 root nodes; Six 240 to 61,440 positions).
+
+| Preset | Served GPU | Served GPU, old | Browser WebGPU | Browser, old | Served CPU | Six (browser) | Six, old |
+|---|---|---|---|---|---|---|---|
+| Lightning | 0.3 to 0.8 | 0.5 to 1.0 | 0.08 to 0.10 | 0.07 to 0.10 | 0.5 to 1.0 | 0.3 to 0.4 | 0.7 to 0.8 |
+| Quick | 0.7 to 1.8 | 1.3 to 1.7 | 0.33 to 0.36 | 0.18 to 0.22 | 0.5 to 1.2 | 0.7 to 0.8 | 1.6 to 2.1 |
+| Standard | 1.6 to 2.4 | 2.0 to 10 | 1.0 to 1.1 | 0.49 to 0.57 | 1.5 to 1.9 | 1.0 to 1.1 | 5.8 to 7.6 |
+| Strong | 1.7 to 3.8 | 3.1 to 19 | 1.8 to 2.3 | 1.8 to 2.2 | 2.8 to 3.4 | 1.6 to 2.1 | 24 to 31 |
+| Deep | 3.3 to 11 | 6.0 to 65 | 3.4 to 4.6 | 7.7 to 9.5 | 6.3 to 6.9 | 2.7 to 3.6 | 89 to 104 |
+
+On the old ladder the root queries made most of the served time: a query that cannot spend its nodes runs to its
+10 s deadline, which the five-stone position hit from Standard up. The CPU server's old ladder took about 1, 8, 36
+and 125 s at Quick to Deep. The CPU column was measured with 1,024 root nodes at Lightning. Six was measured only in
+the browser (WebGPU); a served Six on TensorRT or CUDA runs the same counts faster. Dangerous stays a stress level.
+
+A thinking engine's seat shows a progress line (a moving one when the engine reports no progress) and its cancel
+button. The custom budget shows the engine's own fields. Bubble has Time (ms per turn) and Nodes (work per stone),
+and exactly one of them applies: editing one makes it the budget and greys the other, which keeps its value for
+later. Width is the number of views the owner searches per position (1 to 16, 8 by default). The root queries get 16
+nodes per node of work, or 4 per ms, between 1,024 and 4,000,000; under Time they get at most a quarter of the
+clock, the first of two stones 60% of the rest and Nodes is not a limit (65,536 per stone at most). Six has Positions
+or Time on the same rule. Strix has Search (at least 1), Drip and Seal ms (at least 10). The choice is saved with the
+custom budget. An older custom Bubble budget opens with its simulations as Nodes; its solver nodes are dropped. Any
+larger whole number up to 2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes
+longer. A time budget's evaluations are saved under their own key (`~ms2500`), as are a width other than 8 (`~views4`).
 A Bubble seat, served or in the browser, keeps one search graph for its game (a `GameGraph`, see
 [neural-search.md](neural-search.md)), adding each turn's simulations to the visits already under the position until
 undo, a new or loaded game or a seat change, so its moves are saved with the kept-tree evaluations and never read
@@ -241,7 +264,7 @@ back from the store.
 ### How Bubble searches
 
 Every Bubble search on the served page runs on the hybrid scheduler ([search-scheduler-design.md](search-scheduler-design.md)):
-analysis, Auto analysis, deepening, refresh, review, engine turns and matches. Each stone of a turn is one search of
+analysis, Auto, deepening, refresh, review, engine turns and matches. Each stone of a turn is one search of
 the game graph at that position. A native graph owner spends the preset's simulations there as completed
 simulations over up to eight views: the position itself and positions below it that its own evidence ranks, at most
 eight placements down. Each view searches in quanta of up to 64 simulations (fewer when the budget is smaller), with
@@ -256,13 +279,13 @@ the game's proof table. Each lane (engine moves, and analysis with review) has o
 than the machine's threads and between 2 and 12, shared by all of its searches; the frontier may take the owner's
 whole time. Solver nodes 0 turns both off, and so does a missing tactical build.
 
-| Preset | Work per stone | Owner quantum | Root query nodes | Proof frontier |
+| Preset | Work per stone (GPU) | Owner quantum | Root query nodes | Proof frontier |
 |---|---|---|---|---|
-| Lightning | 8 | 8 | 2,048 | on |
-| Quick | 32 | 32 | 2,048 | on |
-| Standard | 128 | 64 | 32,768 | on |
-| Strong | 512 | 64 | 131,072 | on |
-| Deep | 2,048 | 64 | 524,288 | on |
+| Lightning | 16 | 16 | 1,024 | on |
+| Quick | 64 | 64 | 2,048 | on |
+| Standard | 256 | 64 | 4,096 | on |
+| Strong | 512 | 64 | 8,192 | on |
+| Deep | 1,024 | 64 | 16,384 | on |
 | Dangerous | 65,536 | 64 | 4,000,000 | on |
 
 ### By hand
@@ -314,7 +337,9 @@ model, beside the one that plays engine moves, so they keep up during play. With
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
 position through every preset, Lightning first, showing each as it lands and starting again when the position
 changes. That deepening runs last in the queue, gives way to any other analysis and holds its network work while
-an engine seat searches. Each preset continues the search of the one before on the same position, adding only the
+an engine seat searches. Cancelling an analysis leaves Auto on: Auto and deepening only stop asking for that position
+at those settings until something changes, a move, a step back or forward, another preset or engine, or Analyse
+again. Each preset continues the search of the one before on the same position, adding only the
 simulations it lacks, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
 (their engine key ends in `:kept`), shown like them, and never used by review. All analysis of one game searches one
 game graph, kept until undo or a new or loaded game: a position reached from several analysed positions is one node,
@@ -382,14 +407,17 @@ and ], M and 0. Only the drawing changes. The move list, exports, analysis and s
 and the browser remembers the view without putting it in links or saved games.
 Changing the analysis engine, checkpoint or strength evaluates the shown position again at once.
 
-The Solver switch beside Auto analysis sets the analysis to the solver preset, for puzzles and positions where a
+The Deep Solve switch beside Auto sets the analysis to the solver preset, for puzzles and positions where a
 forced win is the answer you want. Each analysis then spends up to two minutes on proof work alone and stops as soon
 as a verified proof for either side arrives. Two provers run side by side: the tactical solver asks the root for a
 win of the side to move with 32,768 nodes and four times as many each round, and a hybrid scheduler search of the
 position feeds the analysis lane's proof workers (up to 12, four fewer than the machine's threads) the positions its
-neural search reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar: time, root nodes,
-queued and running proof jobs, busy workers, then the winner and distance, or the nodes and certificates spent
-without a proof. The turn and candidates are searched afterwards at the Standard simulations, from the proven turn
+neural search reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar, read
+from the running solver and proof loop about twice a second: time, the root query's nodes and its current budget,
+the frontier's answered jobs and nodes, its queued and running jobs and busy workers. When the root query stops
+before spending its nodes, the side to move has no forcing win there; the panel says so and goes on showing the
+frontier's work on the replies. Then it shows the winner and distance, or the nodes and certificates spent without
+a proof. The turn and candidates are searched afterwards at the Standard simulations, from the proven turn
 when there is one. Solver evaluations are saved under their own key (`~solver120000`) and their proofs join the
 game's proof table like any other; engine seats cannot use the preset. The static page has the same switch. Its
 proof workers are Web Workers, half the browser's threads less one, from one to eight (`PROOF_WORKERS`, see

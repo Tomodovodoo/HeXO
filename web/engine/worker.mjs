@@ -1,6 +1,6 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
  * In: {type: 'load', options} | {type: 'use', id, model, proofWorkers}
- *     | {type: 'turn', id, history, model, simulations, solverNodes, solverWorkers, batchSize, qRangeFloor, ms, line, known}
+ *     | {type: 'turn', id, history, model, simulations, solverNodes, solverWorkers, batchSize, qRangeFloor, ms, views, line, known}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats} | {type: 'evaluate', id, histories}.
  * Out: {type: 'progress', id?, fraction, stage?} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
  *     | {type: 'error', id?, message, stage?}: stages.mjs's loading stages; a stage in an error is where it stopped.
@@ -198,43 +198,50 @@ function frontierProofs(records, table, found) {
  * The solver preset (python/play.py prove): proof work alone on `history` for up to `ms`, until a verified proof for
  * either side. The tactical solver asks the root for a win of `player` (the side to move) with 32,768 nodes, then four
  * times as many each round, while a native owner's neural search feeds `workers` proof workers (`pool`, null when they
- * could not start) the positions it reaches. Posts progress with live {solver: {elapsed_ms, root_nodes, frontier, busy,
- * workers, proof}} at most twice a second, after a neural batch. Resolves to {mine (a verified root answer, or null), proof ({winner, turns, plies} the native search proved,
+ * could not start) the positions it reaches. Posts progress with live {solver: {elapsed_ms, root ('asking', or 'no
+ * forcing win' once the solver rules out a mover win before spending its nodes), root_nodes, root_budget (the current
+ * query's nodes), frontier (queued and running proof jobs), busy, workers, frontier_nodes, checked (frontier jobs
+ * answered), proof}}, read from the running owner and solver, at most twice a second after a neural batch or a root
+ * query. Resolves to {mine (a verified root answer, or null), proof ({winner, turns, plies} the native search proved,
  * or null), records (the frontier's verified answers), used (nodes), solver (totals), error}.
  */
 async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool}) {
   const start = performance.now(), end = start + ms, remaining = native.game(history).remaining;
   const premises = facts.filter(f => f.history.length !== history.length || f.winner !== player).map(({history, winner, plies}) => ({history, winner, plies}));
-  const root = {nodes: 0, mine: null, done: false, error: null};
+  const root = {nodes: 0, budget: 32768, mine: null, done: false, error: null, ruled: false};
+  let report = () => {};
   const asking = (async () => {
     for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
+      root.budget = nodes;
       const found = await solve(id, history, {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
         ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 60000, Math.max(10000, nodes / 8))))});
       root.nodes += found.nodes_used || 0;
+      report();
       if (verified(found) && found.moves.length) { root.mine = found; return; }
       if (found.reason?.startsWith(FAILED)) { root.error = found.reason; return; }   // no solver worker in this browser
       if (!searched(found)) continue;   // the solver worker was replaced: ask again
-      if ((found.nodes_used || 0) < nodes) return;   // the solver ruled the root out before spending its nodes
+      if ((found.nodes_used || 0) < nodes) { root.ruled = true; report(true); return; }   // ruled out before spending its nodes
       nodes = Math.min(4 * nodes, 10000000);
     }
   })().catch(error => { if (!(error instanceof Cancelled)) throw error; });
   const graph = new GameGraph(native, {seed: 1740, tactics: true, model: network.version, roundBarrier: true, history: history.map(p => [...p])});
-  let result = null, shown = 0, frontier = 0, busy = 0;
+  let result = null, shown = 0, frontier = 0, busy = 0, frontierNodes = 0, checked = 0;
   try {
     const owner = new NativeOwner(graph, {work: 0, ms});
-    const report = () => {
-      if (performance.now() < shown) return;
+    report = (now = false) => {
+      if (root.done || !now && performance.now() < shown) return;
       shown = performance.now() + 500;
       const stats = owner.proofs?.ptr ? owner.proofs.stats() : null;
-      if (stats) { frontier = stats.queued + stats.active; busy = stats.active; }
+      if (stats) { frontier = stats.queued + stats.active; busy = stats.active; frontierNodes = stats.fresh_nodes; checked = stats.finished; }
       postMessage({type: 'progress', id, fraction: Math.min(1, (performance.now() - start) / ms), stage: {name: 'proving'},
-        live: {solver: {elapsed_ms: Math.round(performance.now() - start), root_nodes: root.nodes, frontier, busy, workers, proof: null}}});
+        live: {solver: {elapsed_ms: Math.round(performance.now() - start), root: root.ruled ? 'no forcing win' : 'asking',
+          root_nodes: root.nodes, root_budget: root.budget, frontier, busy, workers, frontier_nodes: frontierNodes, checked, proof: null}}});
     };
     try {
       result = await owner.search({network, batchSize, choice: 'policy',
         proofs: pool && {workers, slice: 8, table: 4, stamps, cancel: pool.cooperative ? worker => pool.cancel(worker) : null,
           query: (worker, request, stopped) => pool.query(worker, request, stopped)},
-        stop: () => cancelled.has(id) || root.mine !== null, onBatch: report});
+        stop: () => cancelled.has(id) || root.mine !== null, onBatch: () => report()});
     } finally { owner.close(); }
   } finally {
     graph.close();
@@ -246,7 +253,8 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
   const proof = !root.mine && exact >= 0 ? {winner: exact, turns: proofTurns(result.proof_plies, remaining, exact === player), plies: result.proof_plies} : null;
   const nativeNodes = result.proof_scheduler?.fresh_nodes || 0, certificates = result.proof_records?.length || 0;
   return {mine: root.mine, proof, records: result.proof_records || [], used: root.nodes + nativeNodes, error: result.solver_error || root.error,
-    solver: {elapsed_ms: Math.round(performance.now() - start), root_nodes: root.nodes, native_nodes: nativeNodes, certificates, workers}};
+    solver: {elapsed_ms: Math.round(performance.now() - start), root: root.ruled ? 'no forcing win' : 'asking', root_nodes: root.nodes,
+      native_nodes: nativeNodes, certificates, workers}};
 }
 
 /** Bubble's turn from `history` with the fields of python/play.py evaluate (moves, value, top, proof, pv, threat, solved, ms),
@@ -276,7 +284,7 @@ async function turn(request) {
  * or search, gives a position it proves lost for the mover its proof and line, and marks the proven stones of each
  * search root exact before it searches (NeuralSearch.settle); a stone the graph does not take is applied to the
  * search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
+async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, views = 8, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
@@ -417,7 +425,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         if (line != null && edges.size) touched = tree.id;
         check();
         let searchedResult;
-        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(64, simulations)), work: simulations,
+        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(64, simulations)), work: simulations, views,
           ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
         try {
           searchedResult = await owner.search({network, batchSize, choice,
