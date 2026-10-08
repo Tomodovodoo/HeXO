@@ -50,7 +50,7 @@ async function load(options = {}) {
     stages.probed(device);
     stages.enter('download');
     const build = (await json('build.json')).data;
-    const file = {path: 'shrimp/shrimp.wasm', sha256: build.artefacts['shrimp/shrimp.wasm'], lines: true};
+    const file = {path: 'shrimp/shrimp.wasm', sha256: build.artefacts['shrimp/shrimp.wasm']};
     const wasm = await cached(file, stages.file(file.path));
     const ort = await runtime(device.provider, options.threads, stages);
     network = await ShrimpNetwork.create({device, ort, stages});

@@ -400,16 +400,7 @@ function recheck(entry, force = false) {
     config = fixed;
     save();
   }
-  const session = page.browserPlay, choices = session && [...session.seats, session.analysis, ...session.match?.players ?? []];
-  const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
-  if (stale?.length) {
-    for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
-    session.cancelJobs(job => job.spec.engine === entry.id && !entry.checkpoints.includes(job.spec.checkpoint));
-    session.jobs = session.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== entry.id);
-    session.persist();
-    page.accept(session.state());
-    session.pump();
-  } else if (state()) page.renderPanels();
+  if (!page.browserPlay?.relist(entry.id) && state()) page.renderPanels();
 }
 
 /** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, a Bubble takes

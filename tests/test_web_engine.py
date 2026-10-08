@@ -464,6 +464,19 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(answer['bad'], 400)
         self.assertEqual((answer['shrimp']['budget']['visits'], answer['shrimp'].get('custom')), (64, None))
 
+    def test_a_retired_or_unlisted_checkpoint_plays_as_the_engines_first(self):
+        answer = node(dict(kind='retired-checkpoints'))
+        restored = answer['restored']
+        self.assertEqual((restored['seat'], restored['analysis']), ('strix-237000', 'strix-237000'))
+        self.assertEqual((restored['played'][0], restored['history']), ('strix-237000', [[0, 0]]))
+        self.assertEqual((answer['early'], answer['empty']), ([200, 200], [None, 'pulsatrix-10-best']))
+        self.assertEqual((answer['moved'], answer['again']), (True, False))
+        self.assertEqual(answer['filled'], ['strix-237000', 'strix-237000'])
+        self.assertEqual(answer['players'], [['strix-237000', True], ['strix-237000', True]])
+        self.assertEqual(answer['reloaded'], ['strix-237000', 'strix-237000'])
+        self.assertEqual(answer['bubble'], [200, 'b1', 200, 'b1', 200, 'b2', 200, None])
+        self.assertFalse(answer['untouched'])
+
     def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
         answer = node(dict(kind='dismissal'))
         self.assertEqual(answer, dict(before=[3], cancelled=[], auto=True, asked=[3], again=[], moved=[4]))

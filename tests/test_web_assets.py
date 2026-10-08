@@ -41,8 +41,9 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['mismatch']['keys'], [])
         self.assertIn('no SHA-256', self.out['unpinned']['error'])
 
-    def test_build_json_digests_read_crlf_as_lf(self):
-        self.assertEqual(self.out['lines'], 'line one\r\nline two')
+    def test_a_binary_whose_bytes_hold_crlf_matches_only_its_exact_digest(self):
+        self.assertEqual(self.out['binary']['exact'], 'line one\r\nline two')
+        self.assertIn('does not match its SHA-256', self.out['binary']['normalized']['error'])
 
     def test_cache_is_reused_and_a_new_version_replaces_the_old(self):
         case = self.out['reuse']

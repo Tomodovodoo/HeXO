@@ -13,7 +13,7 @@ const playerAt = ply => ply === 0 ? 0 : ((ply - 1 >> 1) + 1) % 2;
 /** Drip's files (assets.mjs records): native.wasm as web/engine/build.json pins it. */
 export async function files() {
   const {data, local} = await json('build.json');
-  return [{path: 'native/native.wasm', sha256: data.artefacts['native/native.wasm'], lines: true, local}];
+  return [{path: 'native/native.wasm', sha256: data.artefacts['native/native.wasm'], local}];
 }
 
 export class DripEngine {

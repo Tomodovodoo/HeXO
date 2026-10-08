@@ -119,11 +119,9 @@ export async function pins(path, {data, local}, same) {
   return other && same(other) ? other.files ?? {} : {};
 }
 
-/** SHA-256 hex of `bytes`, with CRLF read as LF when `lines` (as tools/build_web.py records build.json's files). */
-export async function sha256(bytes, lines = false) {
-  let data = new Uint8Array(bytes);
-  if (lines) data = data.filter((b, i) => !(b === 13 && data[i + 1] === 10));
-  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', data)), b => b.toString(16).padStart(2, '0')).join('');
+/** SHA-256 hex of `bytes` exactly, as tools/build_web.py records build.json's .wasm files. */
+export async function sha256(bytes) {
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function open() {
@@ -227,7 +225,7 @@ export async function cached(file, progress = () => {}) {
         if (!again.ok) throw new Error(`${file.path}: ${again.status}`);
         return bounded(again.arrayBuffer(), file.path, LIMITS.whole);   // no chunks to watch: bound the whole read
       });
-  if (file.sha256 && await sha256(body, file.lines) !== file.sha256) {
+  if (file.sha256 && await sha256(body) !== file.sha256) {
     await forget().catch(() => {});
     throw new Error(`${file.path} from ${local ? 'this site' : site()} does not match its SHA-256`);
   }
