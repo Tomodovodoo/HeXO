@@ -57,7 +57,8 @@ def processor_times():
         return (kernel.value+user.value-idle.value)/1e7, (kernel.value+user.value)/1e7
     try:
         with open('/proc/stat') as f:
-            ticks = [int(v) for v in f.readline().split()[1:]]
+            # user nice system idle iowait irq softirq steal; guest time is already inside user and nice.
+            ticks = [int(v) for v in f.readline().split()[1:9]]
     except (OSError, ValueError):
         return None
     hz = os.sysconf('SC_CLK_TCK')
