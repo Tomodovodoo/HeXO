@@ -485,6 +485,32 @@ def provisional(league, evaluator):
                 elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None)
 
 
+def resumed(run, league, evaluator):
+    """League-shaped rows, like `provisional`, of every checkpoint without a league entry whose report against the
+    champion already holds games (an evaluation waiting to resume, or one un-rated for more games), oldest step
+    first; the checkpoint the evaluator is playing now is left to `provisional`. games_planned is the report's
+    planned_games. Reports without games, of other opponents or of league checkpoints are ignored."""
+    champion = league.get('champion')
+    if not isinstance(champion, str):
+        return []
+    entries = {c.get('id'): c for c in league.get('checkpoints') or [] if isinstance(c, dict)}
+    live = (evaluator.get('comparison') or {}).get('candidate') if evaluator.get('stage') in ('playing', 'throttled') else None
+    base = (league.get('anchors') or {}).get(champion, entries.get(champion) or {}).get('elo')
+    rows = []
+    for path in (run/'evaluations').glob(f'*-vs-{champion.replace("/", "-")}/report.json'):
+        report = read_json(path, {})
+        candidate, metrics = report.get('candidate'), report.get('metrics') or {}
+        if not isinstance(candidate, str) or candidate in entries or candidate == live or report.get('opponent') != champion                 or not report.get('games'):
+            continue
+        interval = metrics.get('elo_delta_95pct')
+        known = finite(base) and finite(metrics.get('elo_delta'))
+        rows.append(dict(id=candidate, opponent=champion, wins=metrics.get('wins'), losses=metrics.get('losses'),
+                         capped=metrics.get('incomplete'), games=len(report['games']), games_planned=metrics.get('planned_games'),
+                         elo=base+metrics['elo_delta'] if known else None,
+                         elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None))
+    return sorted(rows, key=lambda row: (row['id'].rsplit('/', 1)[0], int(row['id'].rsplit('/', 1)[1]) if row['id'].rsplit('/', 1)[-1].isdigit() else 0))
+
+
 def dense_run(run, config, fresh=30):
     """/api/run payload of a dense run (layout: dense_config); processes silent for `fresh` seconds are not live."""
     now = time.time()
@@ -586,6 +612,7 @@ def dense_run(run, config, fresh=30):
     evaluator = status(run/'evaluator-status.json')
     evaluator['heartbeat'] = beat(evaluator)
     evaluator['provisional'] = provisional(league, evaluator)
+    evaluator['resumed'] = resumed(run, league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
                 league=league, external_ratings=external_ratings(run, league), champion=champion,
                 checkpoints=checkpoints, tactical=tactical, data=data, now=now)

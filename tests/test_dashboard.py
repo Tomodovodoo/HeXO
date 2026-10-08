@@ -92,6 +92,39 @@ class TacticalResults(unittest.TestCase):
             self.assertEqual(first['sources'], ['manual log'])
 
 
+class ResumedReports(unittest.TestCase):
+    """A checkpoint without a league entry still shows the games its report against the champion already holds,
+    with a provisional Elo on the champion's rating, until the evaluator reaches it again."""
+
+    def test_unrated_checkpoint_with_games_on_disk_gets_a_provisional_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            league = dict(champion='main/185000', checkpoints=[dict(id='main/185000', elo=1700.)])
+            (run/'league.json').write_text(json.dumps(league), encoding='utf-8')
+            def report(candidate, games, planned=64, **metrics):
+                path = run/'evaluations'/f'{candidate.replace("/", "-")}-vs-main-185000'/'report.json'
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(dict(candidate=candidate, opponent='main/185000', games=[{}]*games,
+                                                metrics=dict(planned_games=planned, **metrics))), encoding='utf-8')
+            report('new-schedule/205000', 40, wins=35, losses=5, incomplete=0, elo_delta=324., elo_delta_95pct=[50., 2400.])
+            report('new-schedule/207500', 10, wins=6, losses=4, incomplete=0, elo_delta=60., elo_delta_95pct=[-100., 300.])
+            report('new-schedule/192500', 0, wins=0, losses=0, incomplete=0, elo_delta=0.)
+            playing = dict(stage='playing', comparison=dict(candidate='new-schedule/207500', opponent='main/185000'))
+            rows = dashboard.resumed(run, league, playing)
+            self.assertEqual([r['id'] for r in rows], ['new-schedule/205000'])
+            row = rows[0]
+            self.assertEqual((row['wins'], row['losses'], row['capped'], row['games'], row['games_planned']), (35, 5, 0, 40, 64))
+            self.assertAlmostEqual(row['elo'], 2024.)
+            self.assertEqual(row['elo_interval'], [1750., 4100.])
+            idle = dict(stage='idle')
+            self.assertEqual([r['id'] for r in dashboard.resumed(run, league, idle)], ['new-schedule/205000', 'new-schedule/207500'])
+            league['checkpoints'].append(dict(id='new-schedule/205000', elo=2000.))
+            self.assertEqual([r['id'] for r in dashboard.resumed(run, league, idle)], ['new-schedule/207500'])
+            (run/'league.json').write_text(json.dumps(league), encoding='utf-8')
+            (run/'evaluator-status.json').write_text(json.dumps(idle), encoding='utf-8')
+            self.assertEqual([r['id'] for r in dashboard.dense_run(run, {})['evaluator']['resumed']], ['new-schedule/207500'])
+
+
 class ExternalRatings(unittest.TestCase):
     def test_legacy_match_tracks_current_reference_rating(self):
         with tempfile.TemporaryDirectory() as directory:
