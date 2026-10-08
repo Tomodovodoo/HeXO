@@ -926,7 +926,7 @@ function renderSeat(side){
   const pick=el('button',{class:'pick'},...badge(...shown(seat)));
   const items=[{id:'human',ids:['human'],kind:'human',label:null},...pickItems(()=>true)];
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
-  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.budget,...ch});
+  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.custom??seat.budget,...ch});
   const controls=seat.engine==='human'?[]:seatControls(seat,send,'seat'+side,configButton('seat'+side,seat));
   if(seat.engine!=='human'&&entryOf(seat.engine)?.clocks)controls.push(clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-seat'+side));
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
@@ -951,7 +951,7 @@ function renderCard(){
 }
 function sendAnalysis(change){
   const a=S.analysis;
-  return post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:a.auto,...change}).then(done=>{
+  return post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.custom??a.budget,auto:a.auto,...change}).then(done=>{
     if(done&&!finished()&&Object.keys(change).some(k=>k!=='auto'))post('/analyse',{ply:view});return done});
 }
 function renderEngineHead(){

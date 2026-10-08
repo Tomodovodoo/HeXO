@@ -719,7 +719,12 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=(), limit_m
     game = replay(history)
     player, remaining = game.player, game.remaining
     game.close()
-    deadline = min(60_000, max(10_000, solver_nodes // 8), *([max(1, int(limit_ms))] if limit_ms else []))
+    longest, end = min(60_000, max(10_000, solver_nodes // 8)), time.monotonic() + limit_ms / 1000 if limit_ms else None
+
+    def deadline():
+        """Each query's ms: its own deadline, within what is left of `limit_ms` for all of them."""
+        return longest if end is None else max(1, min(longest, int((end - time.monotonic()) * 1000)))
+
     limited, cells = [], 0
     for fact in known:
         if len(limited) >= 4096 or cells + len(fact['history']) > 200_000:
@@ -733,14 +738,14 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=(), limit_m
     # witness, while still reusing every interior fact.
     mine_known = [f for f in known if len(f['history']) != len(history) or f['winner'] != player]
     mine_options = dict(known=[{k: f[k] for k in ('history', 'winner', 'plies')} for f in mine_known]) if mine_known else {}
-    mine = interruptible(lambda stop: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline,
+    mine = interruptible(lambda stop: prover.history(history, attacker='mover', nodes=solver_nodes, ms=deadline(),
                                                      shortest=True, cancel_event=stop, **mine_options),
                          watch, prover.abort)
     found.update(solved=searched(mine), used=mine.get('nodes_used', 0))
     if verified(mine) and mine['moves']:
         found.update(winning_line(history, mine, mine_known))
         return found
-    theirs = interruptible(lambda stop: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline,
+    theirs = interruptible(lambda stop: prover.history(history, attacker='opponent', nodes=solver_nodes, ms=deadline(),
                                                        cancel_event=stop, **options), watch, prover.abort)
     found.update(solved=found['solved'] and searched(theirs), used=found['used'] + theirs.get('nodes_used', 0))
     if verified(theirs):
@@ -749,7 +754,7 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=(), limit_m
         return found
     # The real defender root can use graph facts even when the flipped-turn
     # proposal search did not find a threat within its budget.
-    defended = interruptible(lambda stop: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline,
+    defended = interruptible(lambda stop: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline(),
                                                         cancel_event=stop, **options), watch, prover.abort)
     found.update(solved=found['solved'] and searched(defended), used=found['used'] + defended.get('nodes_used', 0))
     if defended.get('status') == 'PROVEN_LOSS' and defended.get('native_verified'):
@@ -2005,7 +2010,7 @@ class Evaluations:
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
                       solver_nodes=budget['solver_nodes'], **evaluation,
                       at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        record.update({k: budget[k] for k in ('solver_ms',) if k in budget})
+        record.update({k: budget[k] for k in ('solver_ms', 'ms', 'views') if k in budget})
         with self.lock:
             saved = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
             saved, facts = json.loads(saved) if saved else {}, {}
@@ -2447,7 +2452,7 @@ class Session:
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'solver_ms', 'refuted', 'solver')}
+                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'solver_ms', 'ms', 'views', 'refuted', 'solver')}
                     if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')
