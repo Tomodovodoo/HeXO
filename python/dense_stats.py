@@ -3,6 +3,24 @@ import math
 
 import numpy as np
 
+# Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
+PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'search_choice', 'q_range_floor', 'opening_suite', 'opening_book', 'seal_ms',
+            'external_engine', 'external_name',
+            'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
+            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
+PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', q_range_floor=0., external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
+                         solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
+                         solver_gate_cap_nodes=0, pipeline=False)
+
+
+def same_protocol(report_settings, settings):
+    """Whether a report with `report_settings` was played under the PROTOCOL of `settings` (a dict, such as the
+    evaluator's published status settings). Under the live book that includes opening_book (dense_openings.Book.digest
+    of its openings), which changes only at a book refresh: a report is reused while the book keeps its openings,
+    and a refresh that changes them starts every comparison afresh. A frozen suite's name fixes its openings
+    (opening_book ''); either side without a PROTOCOL_DEFAULTS field is taken at its default."""
+    return all(report_settings.get(k, PROTOCOL_DEFAULTS.get(k)) == settings.get(k, PROTOCOL_DEFAULTS.get(k)) for k in PROTOCOL)
+
 
 def pair_scores(records):
     """{pair seed: candidate points / 2} with wins 1, caps 1/2, losses 0 per game; pairs must be intact."""

@@ -19,6 +19,7 @@ import urllib.parse
 
 import dense_config
 import dense_openings
+import dense_stats
 from legacy.rating_compat import audited_prior, scheduled_revision
 
 
@@ -485,6 +486,49 @@ def provisional(league, evaluator):
                 elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None)
 
 
+def resumed(run, league, evaluator):
+    """League-shaped rows, like `provisional`, of every checkpoint without a league entry whose report against the
+    champion already holds games (an evaluation waiting to resume, or one un-rated for more games), of every skipped
+    checkpoint with such games (the evaluator rates it on them at its next step), and of every
+    pending variant (no verdict) whose report against its bound checkpoint does, oldest step first; the comparison
+    the evaluator is playing now is left to `provisional`. The score is dense_stats.tally of the report's games
+    (capped games count half a point) and games_planned the report's sprt_max_games setting. Reports without games
+    or played under another protocol than the evaluator's published settings (which the evaluator would archive
+    rather than resume) are ignored, as are all reports while the evaluator publishes no settings."""
+    champion, settings = league.get('champion'), evaluator.get('settings')
+    if not isinstance(champion, str) or not isinstance(settings, dict):
+        return []
+    entries = {c.get('id'): c for c in league.get('checkpoints') or [] if isinstance(c, dict)}
+    variants = [v for v in league.get('variants') or [] if isinstance(v, dict) and isinstance(v.get('id'), str)]
+    live = (evaluator.get('comparison') or {}).get('candidate') if evaluator.get('stage') in ('playing', 'throttled') else None
+    anchors = league.get('anchors') or {}
+    wanted = {v['id']: v['checkpoint'] for v in variants if not v.get('verdict') and isinstance(v.get('checkpoint'), str)}
+    rows = []
+    for path in (run/'evaluations').glob('*-vs-*/report.json'):
+        report = read_json(path, {})
+        candidate, opponent, games = report.get('candidate'), report.get('opponent'), report.get('games')
+        if not isinstance(candidate, str) or not isinstance(opponent, str) or candidate == live \
+                or not isinstance(games, list) or not games or not isinstance(report.get('settings'), dict) \
+                or not dense_stats.same_protocol(report['settings'], settings):
+            continue
+        if candidate in wanted:
+            if opponent != wanted[candidate]:
+                continue
+        elif (candidate in entries and not entries[candidate].get('skipped')) or any(v['id'] == candidate for v in variants) \
+                or opponent != champion:
+            continue
+        base = (anchors[opponent] if opponent in anchors else entries.get(opponent) or {}).get('elo')
+        score = dense_stats.tally(games)
+        known = finite(base) and finite(score['elo_delta'])
+        interval = score['elo_interval']
+        rows.append(dict(id=candidate, opponent=opponent, **{k: score[k] for k in ('wins', 'losses', 'capped', 'games')},
+                         games_planned=report['settings'].get('sprt_max_games'),
+                         elo=base+score['elo_delta'] if known else None,
+                         elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None))
+    step = lambda cid: int(cid.split('/')[1].split('@')[0]) if cid.split('/')[1].split('@')[0].isdigit() else 0
+    return sorted(rows, key=lambda row: (row['id'].split('/')[0], step(row['id']), row['id']))
+
+
 def dense_run(run, config, fresh=30):
     """/api/run payload of a dense run (layout: dense_config); processes silent for `fresh` seconds are not live."""
     now = time.time()
@@ -586,6 +630,7 @@ def dense_run(run, config, fresh=30):
     evaluator = status(run/'evaluator-status.json')
     evaluator['heartbeat'] = beat(evaluator)
     evaluator['provisional'] = provisional(league, evaluator)
+    evaluator['resumed'] = resumed(run, league, evaluator)
     return dict(name=run.name, config=config, actor=actor, actors=actors, learners=learners, evaluator=evaluator,
                 league=league, external_ratings=external_ratings(run, league), champion=champion,
                 checkpoints=checkpoints, tactical=tactical, data=data, now=now)
