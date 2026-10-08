@@ -22,7 +22,8 @@ import torch
 
 import dense_config
 from dense_config import log_event
-from dense_stats import pair_scores, pentanomial, summary, sprt, tally
+from dense_stats import PROTOCOL, PROTOCOL_DEFAULTS, pair_scores, pentanomial, summary, sprt, tally
+import dense_stats
 import dense_data
 import dense_openings
 from dense_posterior import MODEL, Posterior, parents
@@ -47,14 +48,6 @@ def anchor_engine(settings):
 
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
-# Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
-PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'search_choice', 'q_range_floor', 'opening_suite', 'opening_book', 'seal_ms',
-            'external_engine', 'external_name',
-            'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
-            'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
-PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', q_range_floor=0., external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
-                         solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
-                         solver_gate_cap_nodes=0, pipeline=False)
 CHAMPION = 'champion'  # the symbolic base of a variant, bound to the champion when its comparison starts
 # The PROTOCOL fields of one side's search, which a variant may override; max_plies, opening_suite, seal_ms
 # and opening_book belong to the game.
@@ -493,11 +486,8 @@ def load_reports(run, settings=None):
 
 
 def same_protocol(report, settings):
-    """Whether `report` was played under the PROTOCOL of `settings`. Under the live book that includes opening_book
-    (dense_openings.Book.digest of its openings), which changes only at a book refresh: a report is reused while the
-    book keeps its openings, and a refresh that changes them starts every comparison afresh. A frozen suite's name
-    fixes its openings (opening_book ''); a report without a PROTOCOL_DEFAULTS field was played at its default."""
-    return all(report['settings'].get(k, PROTOCOL_DEFAULTS.get(k)) == getattr(settings, k) for k in PROTOCOL)
+    """Whether `report` was played under the PROTOCOL of `settings` (dense_stats.same_protocol on the settings' fields)."""
+    return dense_stats.same_protocol(report['settings'], {k: getattr(settings, k) for k in PROTOCOL})
 
 
 def payoff(reports, ratings=None):

@@ -15,6 +15,7 @@ from urllib.request import urlopen
 import dashboard
 import dense_config
 import dense_openings
+import dense_stats
 from dashboard import bound_evaluation
 
 
@@ -93,41 +94,52 @@ class TacticalResults(unittest.TestCase):
 
 
 class ResumedReports(unittest.TestCase):
-    """A checkpoint without a league entry still shows the games its report against the champion already holds,
-    scored like the live tally (capped games count half), with a provisional Elo on the champion's rating and the
-    match's planned games, until the evaluator reaches it again. The checkpoint in play and decided variants are
-    left to their own rows."""
+    """A checkpoint without a league entry, or a pending variant, still shows the games its report against its
+    opponent already holds, scored like the live tally (capped games count half), with a provisional Elo on the
+    opponent's rating and the match's planned games, until the evaluator reaches it again. The comparison in
+    play, decided variants and reports under another protocol are left out."""
 
     def test_unrated_checkpoint_with_games_on_disk_gets_a_provisional_row(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
-            league = dict(champion='main/185000', checkpoints=[dict(id='main/185000', elo=1700.)],
-                          variants=[dict(id='main/185000@policy', checkpoint='main/185000', verdict=dict(decision='worse'))])
+            protocol = {k: dense_stats.PROTOCOL_DEFAULTS.get(k) for k in dense_stats.PROTOCOL}
+            protocol.update(sims=64, opening_book='book-a', search_choice='policy', sprt_max_games=64)
+            league = dict(champion='main/185000', checkpoints=[dict(id='main/185000', elo=1700.), dict(id='main/170000', elo=1600.)],
+                          variants=[dict(id='main/185000@policy', checkpoint='main/185000', verdict=dict(decision='worse')),
+                                    dict(id='main/170000@puct', checkpoint='main/170000')])
             (run/'league.json').write_text(json.dumps(league), encoding='utf-8')
             def game(seed, colour, winner):
                 return dict(seed=seed, challenger_color=colour, winner=winner, opening=[], plies=20, moves=[])
-            def report(candidate, games, planned=64):
-                path = run/'evaluations'/f'{candidate.replace("/", "-")}-vs-main-185000'/'report.json'
+            def report(candidate, games, opponent='main/185000', **settings):
+                path = run/'evaluations'/f'{candidate.replace("/", "-")}-vs-{opponent.replace("/", "-")}'/'report.json'
                 path.parent.mkdir(parents=True)
-                path.write_text(json.dumps(dict(candidate=candidate, opponent='main/185000', games=games,
-                                                settings=dict(sprt_max_games=planned), metrics={})), encoding='utf-8')
+                path.write_text(json.dumps(dict(candidate=candidate, opponent=opponent, games=games,
+                                                settings={**protocol, **settings}, metrics={})), encoding='utf-8')
             pairs = [game(s, c, w) for s in range(5) for c, w in ((0, 0), (1, 1))]  # five pairs, the candidate wins all
             pairs += [game(5, 0, 0), game(5, 1, -1)]  # a sixth pair with one win and one capped game
             report('new-schedule/205000', pairs)
             report('new-schedule/207500', [game(0, 0, 0), game(0, 1, 1)])
             report('new-schedule/192500', [])
+            report('new-schedule/180000', [game(0, 0, 0), game(0, 1, 1)], opening_book='book-before-refresh')
             report('main/185000@policy', [game(0, 0, 1), game(0, 1, 0)])
-            playing = dict(stage='playing', comparison=dict(candidate='new-schedule/207500', opponent='main/185000'))
+            report('main/170000@puct', [game(0, 0, 0), game(0, 1, 0)], opponent='main/170000')
+            playing = dict(stage='playing', settings=protocol, comparison=dict(candidate='new-schedule/207500', opponent='main/185000'))
             rows = dashboard.resumed(run, league, playing)
-            self.assertEqual([r['id'] for r in rows], ['new-schedule/205000'])
-            row = rows[0]
+            self.assertEqual([r['id'] for r in rows], ['main/170000@puct', 'new-schedule/205000'])
+            row = rows[1]
             self.assertEqual((row['wins'], row['losses'], row['capped'], row['games'], row['games_planned']), (11, 0, 1, 12, 64))
             self.assertGreater(row['elo'], 1700.+300.)
             self.assertLess(row['elo_interval'][0], row['elo'])
             self.assertGreater(row['elo_interval'][1], row['elo'])
-            idle = dict(stage='idle')
-            self.assertEqual([r['id'] for r in dashboard.resumed(run, league, idle)], ['new-schedule/205000', 'new-schedule/207500'])
+            variant = rows[0]
+            self.assertEqual((variant['opponent'], variant['wins'], variant['losses']), ('main/170000', 2, 0))
+            self.assertGreater(variant['elo'], 1600.)
+            idle = dict(stage='idle', settings=protocol)
+            self.assertEqual([r['id'] for r in dashboard.resumed(run, league, idle)],
+                             ['main/170000@puct', 'new-schedule/205000', 'new-schedule/207500'])
+            self.assertEqual(dashboard.resumed(run, league, dict(stage='idle')), [])
             league['checkpoints'].append(dict(id='new-schedule/205000', elo=2000.))
+            league['variants'][1]['verdict'] = dict(decision='better')
             (run/'league.json').write_text(json.dumps(league), encoding='utf-8')
             (run/'evaluator-status.json').write_text(json.dumps(idle), encoding='utf-8')
             self.assertEqual([r['id'] for r in dashboard.dense_run(run, {})['evaluator']['resumed']], ['new-schedule/207500'])
