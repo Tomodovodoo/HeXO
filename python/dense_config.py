@@ -44,7 +44,8 @@ class ActorSettings:
     hybrid_quantum: int = 32
     hybrid_views: int = 8
     hybrid_depth: int = 8
-    hybrid_proof_workers: int = 12 # CPU proof workers shared by every producer's live games
+    hybrid_proof_workers: int = 12 # most CPU proof workers shared by every producer's live games
+    hybrid_proof_floor: int = 2 # fewest serving proof workers when the GPU waits for rows (hybrid_selfplay.ProofSizer); at or above hybrid_proof_workers fixes the count
     hybrid_proof_slice_ms: int = 8
     hybrid_proof_budget: float = .1 # share of each graph owner's time proof steps may take before it stops admitting jobs (docs/search-scheduler-design.md)
     hybrid_proof_stamps: bool = True # proof loops reuse the solver's stamp library of earlier certificates (tactical_proof stamps)
@@ -139,8 +140,8 @@ class ActorSettings:
             raise ValueError('hybrid_round_barrier requires hybrid_scheduler')
         if not 1 <= self.hybrid_producers <= 16 or not 4 <= self.hybrid_quantum <= 128 or not 1 <= self.hybrid_views <= 64 or not 1 <= self.hybrid_depth <= 32:
             raise ValueError('Invalid hybrid scheduler producer, quantum, view or depth setting')
-        if (not 0 <= self.hybrid_proof_workers <= 16 or not 0 < self.hybrid_proof_slice_ms <= 1000
-                or not 0 < self.hybrid_proof_budget <= 1):
+        if (not 0 <= self.hybrid_proof_workers <= 16 or not 1 <= self.hybrid_proof_floor <= 16
+                or not 0 < self.hybrid_proof_slice_ms <= 1000 or not 0 < self.hybrid_proof_budget <= 1):
             raise ValueError('Invalid hybrid proof worker, slice or budget setting')
         if self.hybrid_scheduler and (self.pv_check or self.proven_line_rows or
                 any((self.solver_root_nodes,self.solver_finalist_nodes,self.solver_threat_nodes,

@@ -4622,6 +4622,39 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.engine.receipt['inference']['pending_rows'],0)
         self.assertGreater(engine.evals,0)
 
+    def test_hybrid_actor_status_reports_its_serving_proof_workers_and_their_signal(self):
+        from hybrid_selfplay import ActorEngine, ProofSizer
+        from tactical_proof import library
+        if not library().is_file():
+            self.skipTest('Build the tactical library first')
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'sized','fixed','cpu',64,128)
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,hybrid_views=4,hybrid_quantum=8,
+            game_graph=192,full_sims=16,cheap_sims=4,full_fraction=.5,max_plies=8,leaf_batch=64,opening_random_plies=0.,
+            hybrid_proof_workers=3,hybrid_proof_floor=1)
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        for i in range(2):
+            engine.add(dense_selfplay.SelfPlayGame([model]*2,settings,70+i,hybrid=True))
+        windows = []
+        with unittest.mock.patch.dict(ProofSizer.__init__.__kwdefaults__, window=.02, dwell=.02):
+            end = time.monotonic()+PATIENCE
+            while engine.slots and time.monotonic()<end:
+                engine.step()
+                summary = engine.summary()['proof_workers']
+                self.assertEqual((summary['floor'],summary['ceiling']),(1,3))
+                self.assertTrue(1<=summary['serving']<=3)
+                self.assertEqual(summary['serving'],engine.engine.proof_workers.stats()['serving'])
+                if summary['window']:
+                    windows.append(summary['window'])
+        self.assertFalse(engine.slots)
+        self.assertTrue(windows)
+        for window in windows:
+            self.assertTrue(0<=window['starved']<=1+1e-6 and 0<=window['backlog']<=1+1e-6, window)
+            self.assertGreaterEqual(window['proof_busy'],0)
+        engine.drain()
+        self.assertIsNone(engine.summary()['proof_workers'])
+
     def test_hybrid_actor_splits_model_slots_over_producers_within_the_host_allocation(self):
         from hybrid_selfplay import ActorEngine
         torch.set_num_threads(2)
@@ -7482,6 +7515,128 @@ class ActorModelTests(unittest.TestCase):
         self.assertEqual(final['phase_ack'],{})
         self.assertGreater(final['paused_seconds'],0)
 
+
+
+class ProofSizerTests(unittest.TestCase):
+    """The proof pool shrinks while inference waits for rows on a busy machine and grows when CPU is spare."""
+    class Service:
+        def __init__(self):
+            self.clock = dict(now=0., starved=0., unflown=0., backlog=0., ready_rows=0, oldest_ready_s=0., flights=0,
+                              producer_wall=0., producer_wait=0., producer_cpu=0.)
+
+        def supply(self):
+            return dict(self.clock)
+
+    class Workers:
+        def __init__(self, count):
+            self.count, self.serving, self.calls = count, count, []
+
+        def stats(self):
+            return dict(workers=self.count, serving=self.serving, worker_service_ms=0.)
+
+        def serve(self, count):
+            if not 1 <= count <= self.count:
+                raise ValueError('Serving proof workers must lie between one and the pool size')
+            self.serving = count
+            self.calls.append(count)
+
+    def sizer(self, workers=12, floor=2):
+        from hybrid_selfplay import ProofSizer
+        self.service, self.workers, self.times = self.Service(), self.Workers(workers), [0., 0.]
+        return ProofSizer(self.service, self.workers, floor, processors=lambda: tuple(self.times))
+
+    def advance(self, seconds, starved=0., backlog=0., machine=.5):
+        clock = self.service.clock
+        clock['now'] += seconds
+        clock['starved'] += starved*seconds
+        clock['backlog'] += backlog*seconds
+        clock['producer_wall'] += seconds
+        self.times[0] += machine*24*seconds
+        self.times[1] += 24*seconds
+
+    def windows(self, sizer, count, **window):
+        """Serving counts after each of `count` five-second windows."""
+        seen = []
+        for _ in range(count):
+            self.advance(5., **window)
+            sizer.observe()
+            seen.append(sizer.serving)
+        return seen
+
+    def test_starved_inference_on_a_busy_machine_parks_workers_down_to_the_floor(self):
+        sizer = self.sizer()
+        seen = self.windows(sizer, 30, starved=.5, machine=.95)
+        self.assertEqual(seen[-1], 2)
+        self.assertEqual(min(seen), 2)
+        self.assertEqual(seen, sorted(seen, reverse=True))
+        # One change per window at most, and none within the ten-second dwell after one.
+        times = [t for t, _ in sizer.summary()['history']]
+        self.assertTrue(all(b-a >= 10 for a, b in zip(times, times[1:])))
+        self.assertEqual(self.workers.calls, [n for _, n in sizer.summary()['history']])
+        self.assertEqual(self.workers.serving, 2)
+
+    def test_fed_inference_with_queued_rows_or_a_spare_machine_wakes_workers_up_to_the_pool(self):
+        for window in (dict(starved=0., backlog=.8, machine=.95), dict(starved=.5, backlog=0., machine=.6)):
+            with self.subTest(**window):
+                sizer = self.sizer()
+                self.windows(sizer, 30, starved=.5, machine=.95)
+                self.assertEqual(sizer.serving, 2)
+                seen = self.windows(sizer, 40, **window)
+                self.assertEqual(seen[-1], 12)
+                self.assertEqual(seen, sorted(seen))
+                self.assertLessEqual(max(seen), 12)
+
+    def test_inside_the_thresholds_the_count_holds(self):
+        sizer = self.sizer()
+        for window in (dict(starved=.5, machine=.85),               # starved, machine neither busy nor spare
+                       dict(starved=.1, machine=.95),               # starvation between fed and starved
+                       dict(starved=.01, backlog=.2, machine=.95)):  # fed, but rows barely queue
+            self.windows(sizer, 4, **window)
+            self.assertEqual(sizer.serving, 12, window)
+        self.assertEqual(self.workers.calls, [])
+
+    def test_partial_windows_and_a_reset_discard_the_span_in_progress(self):
+        sizer = self.sizer()
+        self.advance(4., starved=1., machine=1.)
+        sizer.observe()
+        self.assertEqual((sizer.serving, sizer.summary()['window']), (12, {}))
+        # A pause resets the window, so its starvation never counts.
+        sizer.reset()
+        self.advance(5., machine=.85)
+        sizer.observe()
+        self.assertEqual(sizer.serving, 12)
+        self.assertEqual(sizer.summary()['window']['starved'], 0.)
+
+    def test_a_floor_at_the_pool_size_fixes_the_count_and_still_reports_the_signal(self):
+        sizer = self.sizer(workers=6, floor=6)
+        self.windows(sizer, 10, starved=.9, machine=1.)
+        summary = sizer.summary()
+        self.assertEqual((summary['serving'], summary['floor'], summary['ceiling'], summary['changes']), (6, 6, 6, 0))
+        self.assertAlmostEqual(summary['window']['starved'], .9)
+        self.assertAlmostEqual(summary['window']['machine'], 1.)
+        self.assertEqual(self.workers.calls, [])
+
+    def test_without_processor_times_only_starvation_lowers(self):
+        from hybrid_selfplay import ProofSizer
+        self.service, self.workers = self.Service(), self.Workers(4)
+        sizer = ProofSizer(self.service, self.workers, 1, processors=lambda: None)
+        self.times = [0., 0.]
+        self.windows(sizer, 10, starved=.5)
+        self.assertEqual(sizer.serving, 1)
+        self.assertIsNone(sizer.summary()['window']['machine'])
+        self.windows(sizer, 10, starved=.5)
+        self.assertEqual(sizer.serving, 1)
+
+    def test_a_failed_processor_reading_leaves_that_window_without_a_machine_share(self):
+        sizer = self.sizer()
+        readings = [None, (0., 0.)]
+        sizer.processors = lambda: readings.pop(0) if readings else tuple(self.times)
+        sizer.reset()
+        self.times[:] = [0., 0.]
+        self.windows(sizer, 1, machine=.95)
+        self.assertIsNone(sizer.summary()['window']['machine'])
+        self.windows(sizer, 1, machine=.95)
+        self.assertAlmostEqual(sizer.summary()['window']['machine'], .95)
 
 
 class PacerTests(unittest.TestCase):
