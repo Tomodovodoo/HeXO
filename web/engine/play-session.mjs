@@ -180,8 +180,8 @@ export class BrowserSession extends OfflineSession {
     return {engine: input.engine, checkpoint, preset, budget: copy(budget), ...(form ? {custom: form} : {}), auto: input.auto ?? false};
   }
   /** After engine `id`'s checkpoint list filled or changed: the seats, the analysis and the match's players of it whose
-   * checkpoint the list does not have move to its first, ending their jobs and forgetting its failed ones. Returns
-   * whether any moved. */
+   * checkpoint the list does not have move to its first (a moved player's `version` is its new engineKey), ending their
+   * jobs and forgetting its failed ones. Returns whether any moved. */
   relist(id) {
     const entry = this.entries.get(id);
     if (!entry?.checkpoints?.length) return false;
@@ -189,7 +189,7 @@ export class BrowserSession extends OfflineSession {
     const players = this.match?.players ?? [];
     if (![...this.seats, this.analysis, ...players].some(stale)) return false;
     this.seats = this.seats.map(fix); this.analysis = fix(this.analysis);
-    if (this.match) this.match.players = players.map(fix);
+    if (this.match) this.match.players = players.map(p => stale(p) ? {...fix(p), version: this.engineKey(fix(p))} : p);
     this.cancelJobs(job => stale(job.spec));
     this.jobs = this.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== id);
     this.changed(); this.pump();

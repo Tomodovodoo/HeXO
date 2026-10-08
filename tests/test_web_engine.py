@@ -430,6 +430,7 @@ console.log(JSON.stringify(out));"""
         self.assertEqual((answer['early'], answer['empty']), ([200, 200], [None, 'pulsatrix-10-best']))
         self.assertEqual((answer['moved'], answer['again']), (True, False))
         self.assertEqual(answer['filled'], ['strix-237000', 'strix-237000'])
+        self.assertEqual(answer['players'], [['strix-237000', True], ['strix-237000', True]])
         self.assertEqual(answer['reloaded'], ['strix-237000', 'strix-237000'])
         self.assertEqual(answer['bubble'], [200, 'b1', 200, 'b1', 200, 'b2', 200, None])
         self.assertFalse(answer['untouched'])

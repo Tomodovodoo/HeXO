@@ -781,9 +781,11 @@ if (job.kind === 'encode') {
   const seat = async (side, body) => (await late.request('/seat', {side, ...body}, 'POST'))[0];
   answer.early = [await seat(0, {engine: 'strix'}), await seat(1, {engine: 'strix', checkpoint: 'pulsatrix-10-best'})];
   answer.empty = late.seats.map(spec => spec.checkpoint);
+  late.match = {players: late.seats.map(spec => ({...spec, name: 'Strix', version: late.engineKey(spec)}))};
   list.push('strix-237000');
   answer.moved = late.relist('strix'); answer.again = late.relist('strix');
   answer.filled = late.seats.map(spec => spec.checkpoint);
+  answer.players = late.match.players.map(p => [p.checkpoint, p.version === late.engineKey(p)]);
   await late.saving;
   const back = new BrowserSession(native); back.storage = late.storage; await back.restore();
   answer.reloaded = back.seats.map(spec => spec.checkpoint);
