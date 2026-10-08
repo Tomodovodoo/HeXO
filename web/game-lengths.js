@@ -23,11 +23,11 @@ window.GameLengths=class {
         const select=(label,options)=>{const sel=element('select',null,{'aria-label':label});for(const [value,text] of options)sel.append(new Option(text,value));const wrap=element('label',label);wrap.append(sel);controls.append(wrap);sel.onchange=()=>this.refresh(true);return sel};
         this.run=select('Run',[]);
         this.hours=select('Window',[[6,'Last 6 hours'],[1,'Last hour'],[24,'Last 24 hours'],[0,'All time']]);
-        this.start=select('Starts',[['all','All actor starts'],['selfplay','Normal starts'],['book','Opening book'],['restart','Restart buffer']]);
+        this.start=select('Starts',[['all','All actor starts'],['selfplay','Normal starts'],['book','Opening book'],['restart','Restart buffer'],['fork','Game forks']]);
         this.summary=element('p','Loading game lengths...');this.legend=element('div',null,{class:'length-legend'});
         this.chart=svg('svg',{class:'length-chart',role:'img','aria-label':'Histogram of self-play game lengths in placements'});
         this.hover=element('p','Hover or focus a bar for its game counts.');
-        this.el.append(head,this.summary,this.legend,this.chart,this.hover,element('p','Recorded placements include opening and restart prefixes and stored proof continuations. Only published actor shards are counted; windows use shard publication time. Capped games are included.',{class:'length-note'}));
+        this.el.append(head,this.summary,this.legend,this.chart,this.hover,element('p','Recorded placements include opening, restart and fork prefixes and stored proof continuations. Only published actor shards are counted; windows use shard publication time. Capped games are included.',{class:'length-note'}));
         parent.append(this.el);
         new ResizeObserver(()=>this.draw()).observe(this.chart);
     }

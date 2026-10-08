@@ -437,8 +437,8 @@ def counted_median(counts):
 
 def game_lengths(run, hours=6, start='all'):
     """Histogram of recorded actor episode lengths, selected by shard publication time and start type."""
-    if hours not in (0, 1, 6, 24) or start not in ('all', 'selfplay', 'book', 'restart'):
-        raise ValueError('Use hours 0, 1, 6 or 24 and start all, selfplay, book or restart')
+    if hours not in (0, 1, 6, 24) or start not in ('all', 'selfplay', 'book', 'restart', 'fork'):
+        raise ValueError('Use hours 0, 1, 6 or 24 and start all, selfplay, book, restart or fork')
     now, counts = time.time(), Counter()
     for path, manifest in dense_manifests(run/'shards'):
         origin = manifest.get('origin') or ('converted' if 'source' in manifest.get('identity', {}) else 'actor')

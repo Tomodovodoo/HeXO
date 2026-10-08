@@ -55,9 +55,11 @@ Replay validation's policy CE, target entropy, KL and top-1 use the same policy 
 
 The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. Phases are off in a new run. With `--phase-rows N` on the learner and `--phase-follow` on the actors, the two alternate: actors play until N new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. That is how the live run shared one GPU; without it, all three compete for the card at once. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state. A shard directory moved out of `shards/` while the learner runs (a quarantine) leaves the window and the validation subsets at their next refresh, and a `shard_vanished` event records it.
 
-## Book and restart starts
+## Book, restart and fork starts
 
 `--book-fraction` starts that share of new games from the opening book's off-policy pool, with a random hex symmetry, and `--restart-fraction` from the proof pass's restart buffer. Preset stones produce no rows; search and training start after them. A tactical opening from `openings/tactical/` fixes the value target of the first position after its prefix, so a later blunder cannot contradict the opening's known result.
+
+Game forks follow KataGo. `--fork-early-fraction` forks that share of finished games at a placement drawn from an exponential with mean `fork_early_plies` (6). `--fork-anywhere-fraction` forks a share of the rest at a uniform placement of the game. At the fork point the actor draws between `fork_min_choices` (3) and `fork_early_choices` (12) or `fork_anywhere_choices` (36) random legal moves and lets the value head pick the best one for the side that plays it. The game's earlier moves plus that move start the worker's next game, ahead of any book or restart draw. A fork game is an ordinary game from there: no opening placements are sampled, and its prefix and forked move have no rows. Its episode records origin `fork` and `fork` {kind, ply, choices}, `ply` being the forked move's index, and shard manifests count `fork_games`. A validation game, a fork point past the game's end, a forked position at the ply cap, or a draw that includes a winning move gives no fork. Both shares are 0 by default.
 
 ## Actor search
 

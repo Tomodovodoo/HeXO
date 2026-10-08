@@ -694,15 +694,16 @@ class SelfPlayGame:
     `restart` (entry, moves) starts the game after `moves`, the forced opening of a restart buffer `entry`: those
     plies get no row, a null root value and full_search False, no opening ply is sampled after them, and the
     episode records origin 'restart' and `restart` (the entry's RESTART_SOURCE fields). `book` (metadata, moves)
-    uses the same forced-prefix treatment and records origin 'book' plus its source metadata; ordinary games
-    record origin 'selfplay'.
+    uses the same forced-prefix treatment and records origin 'book' plus its source metadata, and `fork`
+    (metadata, moves) from Forks records origin 'fork' and `fork`; ordinary games record origin 'selfplay'.
     `network_values` stores uncorrected predictions for trained searched plies; record_network_values
     fills missing predictions before the worker saves a completed episode.
     With adjudicate_proven a proven search (+1: the side to move wins, -1: every legal move loses) plays its
     move and ends the game there (`adjudicate`). With proven_line_rows, an applicable two-stone winning
     certificate may start with either legal stone so its continuation teaches both conditional complements."""
 
-    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, hybrid=False):
+    def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, fork=None,
+                 hybrid=False):
         self.hybrid = hybrid
         if hybrid and (settings.graph_nodes <= 0 or settings.pv_check or settings.proven_line_rows):
             raise ValueError('Hybrid self-play requires game_graph, uses native depth views, and has no certificate line rows')
@@ -712,15 +713,17 @@ class SelfPlayGame:
             raise ValueError('Hybrid self-play uses frontier slice settings, not legacy solver query budgets')
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
-        if restart is not None and book is not None:
-            raise ValueError('A game cannot start from both a restart and an opening book')
+        if sum(start is not None for start in (restart, book, fork)) > 1:
+            raise ValueError('A game starts from at most one of a restart, an opening book and a fork')
         self.restart, forced = (None, []) if restart is None else (restart[0], [[int(q), int(r)] for q, r in restart[1]])
         self.book = None if book is None else book[0]
-        if book is not None:
-            forced = [[int(q), int(r)] for q, r in book[1]]
+        self.fork = None if fork is None else fork[0]
+        for start in (book, fork):
+            if start is not None:
+                forced = [[int(q), int(r)] for q, r in start[1]]
         self.forced_plies = len(forced)
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
-            if settings.opening_random_plies > 0 and restart is None and book is None else 0
+            if settings.opening_random_plies > 0 and restart is None and book is None and fork is None else 0
         graph = settings.graph_nodes if hybrid else settings.game_graph
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
                                         settings.q_range_floor, graph)
@@ -976,9 +979,12 @@ class SelfPlayGame:
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
                        root_values=self.values, network_values=self.network_values, full_search=self.full,
-                       origin='book' if self.book is not None else 'restart' if self.restart else 'selfplay')
+                       origin='book' if self.book is not None else 'fork' if self.fork is not None
+                       else 'restart' if self.restart else 'selfplay')
         if self.book is not None:
             episode['book'] = self.book
+        if self.fork is not None:
+            episode['fork'] = self.fork
         if self.restart:
             episode['restart'] = {k: self.restart[k] for k in RESTART_SOURCE}
             if 'value_source' in self.restart:
@@ -1023,6 +1029,62 @@ def record_network_values(slots):
             for slot, ply in items[1:]:
                 slot.network_values[ply] = float(prediction[2][0])
     return sizes
+
+
+class Forks:
+    """KataGo's game forks for one actor worker. `offer(episode, model)` forks a finished game with probability
+    fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else with probability fork_anywhere_fraction
+    at a uniformly drawn placement of the game. At that position it draws a uniform number of candidates between
+    fork_min_choices and fork_early_choices (early) or fork_anywhere_choices (anywhere), each a uniform legal move with
+    replacement, scores each by `model`'s value head for the side that plays it, and queues the game's moves before
+    that placement plus the best candidate. `take()` pops the oldest queued fork as (metadata {kind, ply, choices},
+    moves), or None. No fork is queued when the placement lies at or beyond the game's end, the game is a validation
+    game, its forced placements reach max_plies, a candidate completes six (the best move would end the game) or no
+    candidate fits the largest crop."""
+
+    def __init__(self, settings, validation_fraction, rng):
+        self.settings, self.validation_fraction, self.rng = settings, validation_fraction, rng
+        self.queue = deque()
+
+    def offer(self, episode, model):
+        s, moves, draw = self.settings, episode['moves'], self.rng.random()
+        if draw < s.fork_early_fraction:
+            kind, ply, most = 'early', int(self.rng.exponential(s.fork_early_plies)), s.fork_early_choices
+        elif draw < s.fork_early_fraction+s.fork_anywhere_fraction:
+            kind, ply, most = 'anywhere', int(self.rng.integers(max(1, len(moves)))), s.fork_anywhere_choices
+        else:
+            return None
+        if ply >= len(moves) or ply+1 >= s.max_plies or dense_data.holdout(episode, self.validation_fraction):
+            return None
+        prefix = [[int(q), int(r)] for q, r in moves[:ply]]
+        game = Game([tuple(m) for m in prefix])
+        try:
+            player, legal = game.player, np.asarray(game.legal_moves(), np.int64)
+            candidates = legal[self.rng.integers(len(legal), size=int(self.rng.integers(s.fork_min_choices, most+1)))]
+            histories, movers = [], []
+            for q, r in candidates.tolist():
+                game.play(q, r)
+                if game.winner >= 0:
+                    return None
+                histories.append(np.asarray(prefix+[[q, r]], np.int64).reshape(-1, 2))
+                movers.append(game.player)
+                game.undo()
+        finally:
+            game.close()
+        best, chosen = -np.inf, None
+        for candidate, mover, prediction in zip(candidates.tolist(), movers, model.evaluator.evaluate(histories)):
+            if prediction is not None:
+                value = float(prediction[2][0]) if mover == player else -float(prediction[2][0])
+                if value > best:
+                    best, chosen = value, candidate
+        if chosen is None:
+            return None
+        fork = dict(kind=kind, ply=ply, choices=len(candidates)), prefix+[chosen]
+        self.queue.append(fork)
+        return fork
+
+    def take(self):
+        return self.queue.popleft() if self.queue else None
 
 
 class BookStarts:
@@ -1279,6 +1341,8 @@ def worker(args):
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
+    forks = Forks(settings, config.learner.validation_fraction, np.random.default_rng(seeds.spawn(1)[0])) \
+        if settings.fork_early_fraction or settings.fork_anywhere_fraction else None
     if settings.hybrid_scheduler:
         from hybrid_selfplay import ActorEngine
         engine = ActorEngine(settings)
@@ -1372,7 +1436,8 @@ def worker(args):
                       placements_per_second=(state['positions']-since['positions'])/elapsed,
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
         fields.update(book_games=sum(e.get('origin') == 'book' for e in episodes),
-                      restart_games=sum(e.get('origin') == 'restart' for e in episodes))
+                      restart_games=sum(e.get('origin') == 'restart' for e in episodes),
+                      fork_games=sum(e.get('origin') == 'fork' for e in episodes))
         # The writer thread owns these lists; the launcher keeps the GPU busy meanwhile. At most two
         # shards wait to be written, so a stalled disk holds back the main loop instead of memory.
         while len(writes) >= 2:
@@ -1398,7 +1463,8 @@ def worker(args):
         while len(engine.slots) < settings.games_in_flight and (args.games is None or started < args.games):
             seed = seeds.spawn(1)[0].generate_state(1, np.uint64)[0].item()
             book, restart = None, None
-            if start_rng is not None:
+            fork = forks.take() if forks else None
+            if fork is None and start_rng is not None:
                 # Unconditional shares, also when historical opponents are enabled. Failed restart/book draws
                 # become ordinary starts, rather than increasing the other source's allocation.
                 draw = start_rng.random()
@@ -1410,9 +1476,9 @@ def worker(args):
                 opponent, learner = historical.next()
                 sides = [model, opponent] if learner == 0 else [opponent, model]
                 engine.add(SelfPlayGame(sides, settings, seed, learner, opponent.checkpoint, restart=restart, book=book,
-                                        hybrid=settings.hybrid_scheduler))
+                                        fork=fork, hybrid=settings.hybrid_scheduler))
             else:
-                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book,
+                engine.add(SelfPlayGame([model, model], settings, seed, restart=restart, book=book, fork=fork,
                                         hybrid=settings.hybrid_scheduler))
             started += 1
 
@@ -1472,6 +1538,8 @@ def worker(args):
                               f'a searched position spans more than the largest crop', process=args.worker)
                 episodes.append(episode)
                 rows.extend(dict(r, game=len(episodes)-1) for r in items)
+                if forks:
+                    forks.offer(episode, model)
                 state['positions'] += unsearched(items)
                 state['games_completed'] += 1; state['terminal'] += episode['winner'] >= 0; state['plies'] += len(episode['moves'])
                 if len(episodes) >= settings.shard_games:

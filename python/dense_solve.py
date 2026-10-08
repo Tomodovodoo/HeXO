@@ -305,8 +305,7 @@ class Solver:
     def game(self, shard, g, e):
         """(window records, buffer entries) of episode `g` of `shard`."""
         s, moves, T = self.s, e['moves'], len(e['moves'])
-        start = e['restart']['ply'] if e.get('origin') == 'restart' else \
-            e['book']['ply'] if e.get('origin') == 'book' else 0
+        start = dense_data.forced_plies(e)
         roots = e.get('root_values') or [None]*T
         network = e.get('network_values') or [None]*T
         memo = {}

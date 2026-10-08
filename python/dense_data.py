@@ -42,6 +42,10 @@ starts from a buffer position: its first `restart.ply` moves are the source game
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
 {shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games` and their
 replayed plies without rows as `forced_plies`.
+A fork game (dense_selfplay.Forks) has origin 'fork' and `fork` {kind: 'early' or 'anywhere', ply, choices}: its
+first `fork.ply` moves are a finished game's, and the move at `fork.ply` is the best of `choices` random legal moves
+by the value head. Those `fork.ply`+1 placements have no rows and null root values; the game is otherwise ordinary.
+The manifest counts fork games as `fork_games`.
 Book games likewise omit rows for their forced prefix and keep null root values there. `book` records
 {suite, key, digest, ply, off_policy}; `book_games` counts them, and `forced_plies` includes their prefixes too.
 An optional book `tactical` {winner, source} is a manually labelled result at exactly `book.ply`. It supplies
@@ -101,6 +105,15 @@ CALIBRATION_RIDGE = 1.
 CALIBRATION_ITERATIONS = 25
 POLICY_ATTEMPTS = 20
 STALE_STAGING_SECONDS = 600.  # a policy staging file this old belongs to a writer that died
+
+
+def forced_plies(episode):
+    """Placements an actor episode replays without search or rows: a restart's or book's ply, a fork's ply plus its
+    forked move, else 0."""
+    origin = episode.get('origin')
+    if origin == 'fork':
+        return episode['fork']['ply']+1
+    return episode[origin]['ply'] if origin in ('restart', 'book') else 0
 
 
 def legal_digest(actions):
@@ -335,7 +348,7 @@ def geometry_summary(episodes):
     groups, extremes = {}, {}
     for game, episode in enumerate(episodes):
         moves = np.asarray(episode['moves'], np.int64).reshape(-1, 2)
-        forced = (episode.get('book') or episode.get('restart') or {}).get('ply', 0)
+        forced = forced_plies(episode)
         line = (episode.get('adjudicated') or {}).get('ply', len(moves))
         for ply, action in enumerate(moves):
             source = 'forced-prefix' if ply < forced else 'proof-line' if ply >= line else 'played'
@@ -385,8 +398,8 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
                   adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')),
                   restart_games=sum(e.get('origin') == 'restart' for e in episodes),
                   book_games=sum(e.get('origin') == 'book' for e in episodes),
-                  forced_plies=sum(e['restart']['ply'] if e.get('origin') == 'restart' else e['book']['ply']
-                                   for e in episodes if e.get('origin') in ('restart', 'book')))
+                  fork_games=sum(e.get('origin') == 'fork' for e in episodes),
+                  forced_plies=sum(forced_plies(e) for e in episodes))
     with tempfile.TemporaryDirectory(dir=path.parent, prefix='pending-') as temporary:
         stage = Path(temporary)/'shard'
         stage.mkdir()

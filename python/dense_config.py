@@ -127,6 +127,16 @@ class ActorSettings:
     restart_fraction: float = 0.
     restart_temperature: float = 1.
     book_fraction: float = 0.  # share of all games starting from live off-policy book positions
+    # Game forks (dense_selfplay.Forks, KataGo's early and anywhere forks): a finished game forks with probability
+    # fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else with probability fork_anywhere_fraction
+    # at a uniform placement of the game, into the best of fork_min_choices to fork_early_choices or
+    # fork_anywhere_choices random legal moves by the value head; the fork is the worker's next game. 0 = never.
+    fork_early_fraction: float = 0.
+    fork_anywhere_fraction: float = 0.
+    fork_early_plies: float = 6.
+    fork_early_choices: int = 12
+    fork_anywhere_choices: int = 36
+    fork_min_choices: int = 3
     net_kernels: str = 'reference'  # opt-in Triton features, normalization and inference LineConv
     cuda_graphs: bool = False  # reuse bounded CUDA graphs for frozen fused actor models
 
@@ -176,6 +186,11 @@ class ActorSettings:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
         if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
             raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
+        if (not 0 <= self.fork_early_fraction <= 1 or not 0 <= self.fork_anywhere_fraction <= 1
+                or self.fork_early_fraction+self.fork_anywhere_fraction > 1 or not self.fork_early_plies > 0
+                or not 1 <= self.fork_min_choices <= min(self.fork_early_choices, self.fork_anywhere_choices)):
+            raise ValueError('fork fractions must be nonnegative and sum to at most 1, fork_early_plies positive and '
+                             'fork_min_choices between 1 and both choice limits')
 
 
 VALUE_TARGETS = ('outcome', 'td', 'calibrated')
