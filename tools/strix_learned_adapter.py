@@ -1,4 +1,4 @@
-"""Independent public Strix checkpoint opponent using direct relational inference."""
+"""Strix opponent: the pinned wrapper running one hexo-safetensors-v1 network through direct relational inference."""
 import hashlib
 import json
 import os
@@ -8,10 +8,6 @@ import threading
 import time
 
 from legacy.strix_reference import REVISION, StrixReference
-
-MODEL_SHA256 = "aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185"
-MODEL_URL = "https://hexo.tyto.cc/model.safetensors"
-
 
 def mirror(q, r):
     """Strix's axial frame from ours and back: HTTTX (q, r) is Strix (q + r, -r), and the map is its own inverse."""
@@ -50,17 +46,17 @@ class StrixLearned(StrixReference):
             binary = binary.with_suffix(".exe")
         super().__init__(executable or binary)
         self.model_content = Path(model_path).read_bytes()
-        if hashlib.sha256(self.model_content).hexdigest() != MODEL_SHA256:
-            raise ValueError("Strix checkpoint does not match pinned public model SHA256")
+        self.model_sha256 = hashlib.sha256(self.model_content).hexdigest()
         header_size = int.from_bytes(self.model_content[:8], "little")
         header = json.loads(self.model_content[8:8+header_size])
+        self.source_checkpoint = header["__metadata__"]["source_checkpoint"]
         self.simulations, self.actions, self.timeout_ms, self.seed = simulations, actions, timeout_ms, seed
         self.calls = 0
         self.last_result = None
-        self.metadata = dict(revision=REVISION, model_url=MODEL_URL, model_sha256=MODEL_SHA256,
+        self.metadata = dict(revision=REVISION, model_sha256=self.model_sha256,
             model_bytes=len(self.model_content), model_metadata=header["__metadata__"],
-            checkpoint_license="unknown; public download does not establish redistribution permission",
-            source_license="MIT", backend="InferModel.eval_states + gumbel_mcts, native CPU",
+            checkpoint_license="hosted with the author's permission", source_license="MIT",
+            backend="InferModel.eval_states + gumbel_mcts, native CPU",
             simulations_per_placement=simulations, m_actions=actions, c_visit=50, c_scale=1,
             gumbel_noise=False, timeout_ms=timeout_ms, seed=seed, equal_wall_budget=False,
             root_forcing=dict(enabled=True, phases=[1,2], generator="wide", depth=6, nodes=2000),
@@ -105,7 +101,7 @@ class StrixLearned(StrixReference):
         model_path = Path(self.snapshot_directory.name)/"model.safetensors"
         model_path.write_bytes(self.model_content)
         result = self._exchange(dict(load=str(model_path)), deadline)
-        if result.get("status") != "READY" or result.get("source_checkpoint") != "checkpoint_000010.pt":
+        if result.get("status") != "READY" or result.get("source_checkpoint") != self.source_checkpoint:
             raise RuntimeError(f"Strix model load failed: {result}")
         self.metadata.update(executable_sha256=self.executable_sha256, loaded_metadata=result["metadata"],
                              build_provenance=self.build_provenance)
@@ -147,12 +143,12 @@ class StrixLearned(StrixReference):
                 raise queue.Empty
             result.update(moves=[list(m) for m in moves], wall_ms=(time.monotonic()-start)*1000,
                           executable_sha256=self.executable_sha256,
-                          model_sha256=MODEL_SHA256)
+                          model_sha256=self.model_sha256)
             self.last_result = result
             return moves
         except (queue.Empty, OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
             self.last_result = dict(status="UNKNOWN", reason="wall_timeout" if isinstance(error,queue.Empty) else str(error),
-                wall_ms=(time.monotonic()-start)*1000, executable_sha256=self.executable_sha256,model_sha256=MODEL_SHA256)
+                wall_ms=(time.monotonic()-start)*1000, executable_sha256=self.executable_sha256,model_sha256=self.model_sha256)
             self.close()
             self.last_result["wall_ms"] = (time.monotonic()-start)*1000
             raise RuntimeError(f"Strix learned query failed: {self.last_result['reason']}") from error

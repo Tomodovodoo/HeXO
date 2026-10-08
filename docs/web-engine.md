@@ -441,8 +441,8 @@ WebAssembly at lightning (see Loading).
 
 ## Strix (browser)
 
-Strix ([SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix) at `5a771e5`) with the network hexo.tyto.cc
-lists as `pulsatrix-10-best` also runs in the page as **Strix (browser)**, for a seat or the analysis, with the
+Strix ([SootyOwl/hexo-strix](https://github.com/SootyOwl/hexo-strix) at `5a771e5`) with the network `strix-237000`
+also runs in the page as **Strix (browser)**, for a seat or the analysis, with the
 server's presets in simulations per placement (lightning 2, quick 8, standard 64, strong 128, deep 512, dangerous
 4,096). hexo.tyto.cc runs Strix the same way: the Rust network (`hexo-infer`) and Gumbel search (`hexo-mcts`)
 compiled to WebAssembly in a worker that a cancel terminates. Here `tools/strix_web` wraps the same calls as the
@@ -451,12 +451,14 @@ and Strix's mirrored frame) as a `wasm32-wasip1` library with SIMD, run through 
 `build_web.py strix` builds `web/engine/strix/strix.wasm` (676 KB) and records it in `build.json`; `build_web.py wasm`
 builds it with the rest.
 
-The network is not committed. `python tools/build_web.py strix-network` downloads the file pinned in
-`tools/engines.json` (2.8 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
+The network is not committed. `strix-237000` is the Strix network at training step 237000, converted to
+`hexo-safetensors-v1` with hexo-strix's own exporter. Its author, Tyto, who trained it, allows this repository to host
+it in the `strix-networks-v1` release and the public site to serve it. `python tools/build_web.py strix-network`
+downloads the file pinned in `tools/engines.json` (1.1 MB, checked against its SHA-256) into `web/engine/strix/` with `networks.json`; without
 that file the page downloads the public site's when it publishes one, and otherwise asks for a local build
 ([Running a local copy](#running-a-local-copy)). The worker keeps `strix.wasm` and the network in the Cache API under their
-digests. The network's licence is unstated in the repository, so the Pages workflow fetches it only while the repository
-variable `PUBLISH_STRIX_NETWORK` is `true`; a local build always fetches it. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
+digests. The Pages workflow fetches it while the repository variable `PUBLISH_STRIX_NETWORK` is `true`; a local
+build always fetches it. The engine code is MIT (`web/engine/strix/LICENSE-hexo-strix.txt`); the Rust
 crates it links (serde, serde_json, rand, safetensors, rayon, rustc-hash) are MIT or Apache 2.0.
 
 A search runs on one thread. On the Ryzen 9 5900X under node 24, from a 19-stone position, a turn takes 1.0 s at

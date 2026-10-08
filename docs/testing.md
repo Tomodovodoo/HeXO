@@ -206,9 +206,9 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_relational.RelationalTests` | 7 | Relational encoder: symmetry transforms and native encoder parity | 2.4 | 0.0 | - | - | keep; moved from its own workflow into Contracts |
 | `test_seal_current.SealCurrentContract` | 10 | Seal's current adapter: build provenance and turn validation | 0.1 | 0.0 | one test needs the built adapter | - | keep |
 | `test_six_engine.SixProtocolTests` | 15 | Six protocol server and client: stop during search, clocks, handshake, restarts, cancel, coordinates, match side | 4.2 | 0.0 | spawned fake engines, a 2 s sleep | notation_api opponent failure | keep; stale search result fixed (#457) |
-| `test_strix_learned.TurnValidation` | 3 | Strix turn validation and the checkpoint hash check before launch | 0.0 | 0.0 | - | strix_reference SequentialReplay | keep |
+| `test_strix_learned.TurnValidation` | 3 | Strix turn validation and the network header check before launch | 0.0 | 0.0 | - | strix_reference SequentialReplay | keep |
 | `test_strix_learned.Frame` | 1 | Stones and moves mirror into Strix's frame | 0.0 | 0.0 | - | - | keep |
-| `test_strix_learned.LearnedProcess` | 3 | The learned Strix process plays two moves then one and is reused | 0.0 | 0.0 | needs HEXO_STRIX_PUBLIC_MODEL and the built engine | - | keep, optional engine |
+| `test_strix_learned.LearnedProcess` | 3 | The learned Strix process plays two moves then one and is reused | 0.0 | 0.0 | needs HEXO_STRIX_PUBLIC_MODEL (a Strix network) and the built engine | - | keep, optional engine |
 | `test_strix_reference.SequentialReplay` | 3 | Principal-variation validation rules | 0.0 | 0.0 | - | strix_learned TurnValidation | keep |
 | `test_strix_reference.CorpusProvenance` | 1 | The Strix corpus tool reports the executable it ran | 0.0 | 0.0 | - | - | keep |
 | `test_strix_reference.NativeReference` | 9 | The Strix reference process: timeouts and recovery | 0.0 | 0.0 | needs the built Strix reference | - | keep, optional engine |

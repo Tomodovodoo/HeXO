@@ -334,13 +334,14 @@ def scan(models=None, runs=None, extra_runs=(), seal=None, device=None):
     entry: {"name", "kind": "bubble", "path", optional "q_range_floor" (0 to 2, the searches' neural_search floor)},
     {"name", "kind": "six", "command", "mirrored", "presets", optional "files" a match also hashes and
     "badge"; a command starting with "python" runs on this server's Python},
-    {"name", "kind": "strix", "model", optional "engine"} or {"name", "kind": "seal", "library"}, paths relative
-    to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
+    {"name", "kind": "strix", "model" or "networks" ({id: path}, the default first), optional "engine"} or
+    {"name", "kind": "seal", "library"}, paths relative to the file. `seal`, the library built with -DHEXO_SEAL_SOURCE, adds Seal when it exists. Entries carry `id`,
     `name`, `kind` (how the server runs it), `badge` (which bot it is, as the page shows it: the kind unless a Six
     protocol entry names another bot, like Shrimp), `presets`, `label` (the name the page shows; the first run in `extra_runs` is labelled
     Bubble), `checkpoints` (Bubble checkpoints or Six networks), and the server-only `path` (Bubble), `command`,
     `cwd`, `mirrored`, `libraries`, `files` and, for a Six folder, `networks` ({name: path}) and `backend` (Six protocol,
-    see `command_of`), `model` and `engine` (Strix) or `library` (Seal). An id is `kind:name`;
+    see `command_of`), `model` or `networks` and `engine` (Strix; its networks are its `checkpoints`) or `library`
+    (Seal). An id is `kind:name`;
     entries sharing one get a suffix from `engine_identity`, so an id never moves to another engine. `device`, the
     server's ('cpu' or 'cuda'), picks Bubble's preset ladder (see `presets_of`)."""
     found, seen = [], set()
@@ -406,7 +407,11 @@ def scan(models=None, runs=None, extra_runs=(), seal=None, device=None):
                         files=[(path.parent / file).resolve() for file in spec.get('files', [])])
                 elif kind == 'strix':
                     engine = {'engine': (path.parent / spec['engine']).resolve()} if 'engine' in spec else {}
-                    add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve(), **engine)
+                    if 'networks' in spec:
+                        networks = {str(k): (path.parent / v).resolve() for k, v in spec['networks'].items()}
+                        add('strix', name, spec.get('presets'), checkpoints=list(networks), networks=networks, **engine)
+                    else:
+                        add('strix', name, spec.get('presets'), model=(path.parent / spec['model']).resolve(), **engine)
                 elif kind == 'seal' and (path.parent / spec['library']).is_file():
                     add('seal', name, spec.get('presets'), library=(path.parent / spec['library']).resolve())
             except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
@@ -427,7 +432,7 @@ def engine_identity(entry):
     """What makes an entry its engine: its path (and a Bubble's Q range floor), command or library, or its model and
     executable (Strix)."""
     identity = str(entry.get('path') or entry.get('command') or entry.get('library') or
-                   (entry.get('model'), entry.get('engine')))
+                   (entry.get('model') or entry.get('networks'), entry.get('engine')))
     return identity + (f"@q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
 
 
@@ -1787,7 +1792,7 @@ class Engines:
             return 'none'
 
     def turn(self, entry, budget, history, stop=lambda: False, checkpoint=None):
-        """A turn from a non-Bubble engine, a Six folder's at network `checkpoint`. A Six-protocol engine's search
+        """A turn from a non-Bubble engine, a Six folder's or a Strix entry's at network `checkpoint`. A Six-protocol engine's search
         is stopped when `stop()` turns true.
         Drip, Seal and Strix searches cannot be interrupted in process, so each kind searches in a SearchChild;
         when `stop()` turns true the child and everything it started are killed and a fresh one starts on the next
@@ -1803,7 +1808,8 @@ class Engines:
         if kind not in self.children:
             self.children[kind] = SearchChild([sys.executable, str(Path(__file__).resolve()), 'search', kind])
         child = self.children[kind]
-        request = dict(budget, history=[list(p) for p in history], model=str(entry.get('model')),
+        model = entry['networks'][checkpoint] if entry.get('networks') else entry.get('model')
+        request = dict(budget, history=[list(p) for p in history], model=str(model),
                        **{key: str(entry[key]) for key in ('engine', 'library') if entry.get(key)})
         child.process.stdin.write(json.dumps(request) + '\n')
         child.process.stdin.flush()
@@ -3109,6 +3115,8 @@ class Session:
                   if k in ('kind', 'badge', 'name', 'path', 'cwd', 'model', 'engine', 'library', 'mirrored', 'q_range_floor')}
         if entry['kind'] == 'six':
             source['command'] = command_of(entry, seat['checkpoint'])
+        if entry['kind'] == 'strix' and entry.get('networks'):
+            source['model'] = str(entry['networks'][seat['checkpoint']])
         if 'libraries' in entry:
             source['libraries'] = list(map(str, entry['libraries']))
         if entry['kind'] == 'bubble':
@@ -3133,7 +3141,7 @@ class Session:
             command_files = [Path(entry.get('cwd') or os.getcwd()) / arg for arg in source['command']]
             files += [path for path in command_files if path.is_file()] + list(entry.get('files', []))
         elif entry['kind'] == 'strix':
-            files += [Path(entry['model']), *([Path(entry['engine'])] if entry.get('engine') else [])]
+            files += [Path(source['model']), *([Path(entry['engine'])] if entry.get('engine') else [])]
         elif entry['kind'] == 'seal':
             files += [Path(entry['library'])]
         source['files'] = {str(path.resolve()): file_digest(file_identity(path)) for path in files}

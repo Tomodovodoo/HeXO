@@ -20,13 +20,16 @@
     "kind": "strix",
     "repository": "SootyOwl/hexo-strix",
     "revision": "5a771e572553a8bd8e010112b2ce65f16e5afa1b",
-    "licence": "MIT; the model's licence is not stated, so it is downloaded from its site for local use and not published",
+    "licence": "MIT engine; the network is hosted in this repository's strix-networks-v1 release and served on the public site with the permission of its author, Tyto, who trained it",
     "executable": "hexo-strix-learned",
-    "model": {
-      "url": "https://hexo.tyto.cc/model.safetensors",
-      "sha256": "aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185",
-      "size": 2810120
-    }
+    "networks": [
+      {
+        "id": "strix-237000",
+        "url": "https://github.com/Tomodovodoo/HeXO/releases/download/strix-networks-v1/strix-237000.safetensors",
+        "sha256": "787c3d7cffb25478a00c25094e3fbcf169a5d5fe0ec0565a87ffd2753b990941",
+        "size": 1141304
+      }
+    ]
   },
   "shrimp": {
     "name": "Shrimp",
