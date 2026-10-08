@@ -847,15 +847,17 @@ struct Tree {
  }
  // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e d) for the N
  // eligible edges, p their softmax over the eligible logits and d the noise: 1 / N, or with root_concentration > 0
- // the search's Dirichlet draw (draw_noise). Only the opening phase's Gumbel-top-k draws on these; halving, the final
+ // the search's Dirichlet draw (draw_noise) renormalized over the edges still eligible, so proofs that remove edges
+ // after the draw leave the noise weight at e. Only the opening phase's Gumbel-top-k draws on these; halving, the final
  // choice, the improved policy and every non-root node use the edge logits.
  std::vector<double> sampling(const Node& node)const {
   std::vector<double> out;double maximum=-1e300,total=0;int n=0;
   for(auto& e:node.edges){out.push_back(e.logit);if(e.read().eligible){maximum=std::max(maximum,e.logit);++n;}}
   if(root_noise<=0 || !n)return out;
-  for(auto& e:node.edges)if(e.read().eligible)total+=std::exp(e.logit-maximum);
+  double mass=0;
+  for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible){total+=std::exp(out[i]-maximum);if(root_concentration>0)mass+=root_edges[i].noise;}
   for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible)
-   out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise*(root_concentration>0?root_edges[i].noise:1./n));
+   out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise*(mass>0?root_edges[i].noise/mass:1./n));
   return out;
  }
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the

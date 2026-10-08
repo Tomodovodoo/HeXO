@@ -129,6 +129,9 @@ class NeuralTree(unittest.TestCase):
         self.assertGreater(share['shaped'], share['uniform']+.25)
         self.assertGreater(counts['shaped'][2], 0)
         self.assertLess(counts['shaped'][2], counts['uniform'][2])
+        graph = GameGraph(Tiered(), 'shaped-noise', history, seed=1, root_noise=.25, root_concentration=10.83)
+        self.addCleanup(graph.close)
+        self.assertEqual(np.count_nonzero(graph.search(16, root_samples=8, batch_size=8)['visits']), 8)
         for bad in (-1., float('inf'), float('nan')):
             with self.assertRaisesRegex(ValueError, 'Invalid root noise concentration'):
                 NeuralSearch(Uniform(), 'shaped-noise', root_concentration=bad)

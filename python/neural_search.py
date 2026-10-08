@@ -355,9 +355,11 @@ class GameGraph(NeuralSearch):
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
-                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0, archive_forward=False, round_barrier=False):
+                 proof_ms=100, q_range_floor=0., root_noise=0., root_concentration=0., limit=GRAPH_LIMIT, archive_bytes=0,
+                 archive_forward=False, round_barrier=False):
         super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
-                         q_range_floor=q_range_floor, root_noise=root_noise, limit=limit, archive_bytes=archive_bytes,
+                         q_range_floor=q_range_floor, root_noise=root_noise, root_concentration=root_concentration,
+                         limit=limit, archive_bytes=archive_bytes,
                          archive_forward=archive_forward, round_barrier=round_barrier)
 
     def at(self, history):
