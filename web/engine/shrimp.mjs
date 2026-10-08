@@ -33,7 +33,7 @@ export class ShrimpEngine extends EngineWorker {
    * WebAssembly fallback), the graph and shrimp.wasm. */
   async files() {
     const [{provider}, {file}, {data, local}] = await Promise.all([probe(this.options.prefer), ShrimpNetwork.files(), json('build.json')]);
-    return [...await loadFiles(provider, this.options.prefer), file, {path: 'shrimp/shrimp.wasm', sha256: data.artefacts['shrimp/shrimp.wasm'], lines: true, local}];
+    return [...await loadFiles(provider, this.options.prefer), file, {path: 'shrimp/shrimp.wasm', sha256: data.artefacts['shrimp/shrimp.wasm'], local}];
   }
 }
 

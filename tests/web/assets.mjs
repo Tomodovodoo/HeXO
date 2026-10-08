@@ -62,7 +62,10 @@ out.unpinned = await attempt(() => assets.cached({path: 'd.mjs'}));
 
 reset();
 here.set('e.wasm', 'line one\r\nline two');
-out.lines = text(await assets.cached({path: 'e.wasm', sha256: hash('line one\nline two'), lines: true}));
+out.binary = {exact: text(await assets.cached({path: 'e.wasm', sha256: hash('line one\r\nline two')}))};
+reset();
+here.set('e.wasm', 'line one\r\nline two');
+out.binary.normalized = await attempt(() => assets.cached({path: 'e.wasm', sha256: hash('line one\nline two')}));
 
 reset();
 site.set('f.onnx', 'first');

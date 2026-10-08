@@ -58,6 +58,9 @@ export function customBudget(kind, form) {
   if (active === 'ms') return {simulations: 65536, ms: form.ms, views: form.views, solver_nodes: Math.min(4000000, Math.max(1024, 4 * form.ms))};
   return {simulations: form.simulations, views: form.views, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
 }
+/** The spec a /seat or /analysis `body` asks of the slot holding `current`: `current` with `body`'s fields, without its
+ * checkpoint when `body` names another engine. */
+const choose = (current, body) => ({...current, ...body.engine !== undefined && body.engine !== current?.engine ? {checkpoint: null} : {}, ...body});
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
@@ -158,6 +161,8 @@ export class BrowserSession extends OfflineSession {
     this.cancelJobs(job => job.spec.engine === id && job.spec.preset !== 'lightning' && !job.tier && job.kind !== 'review');
     this.changed(); this.pump();
   }
+  /** The seat or analysis spec `input` asks for. A checkpoint the engine does not offer (a retired network, or another
+   * engine's) becomes its first; while its list is still empty the requested one is kept for relist() to check. */
   spec(input) {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
@@ -171,9 +176,24 @@ export class BrowserSession extends OfflineSession {
       const least = {ms: 10, nodes: 1, visits: 1}[name] ?? (entry.kind === 'strix' ? 1 : 0);
       if (typeof value === 'number' && (!Number.isInteger(value) || value < least || value > MAX_BUDGET)) throw Error(`${FIELD_NAMES[name] || name} must be a whole number from ${least} to ${MAX_BUDGET}`);
     }
-    const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
-    if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
+    const offered = entry.checkpoints ?? [], checkpoint = offered.length ? offered.includes(input.checkpoint) ? input.checkpoint : offered[0] : input.checkpoint ?? null;
     return {engine: input.engine, checkpoint, preset, budget: copy(budget), ...(form ? {custom: form} : {}), auto: input.auto ?? false};
+  }
+  /** After engine `id`'s checkpoint list filled or changed: the seats, the analysis and the match's players of it whose
+   * checkpoint the list does not have move to its first, ending their jobs and forgetting its failed ones. Returns
+   * whether any moved. */
+  relist(id) {
+    const entry = this.entries.get(id);
+    if (!entry?.checkpoints?.length) return false;
+    const stale = spec => spec?.engine === id && !entry.checkpoints.includes(spec.checkpoint), fix = spec => stale(spec) ? {...spec, ...this.spec(spec)} : spec;
+    const players = this.match?.players ?? [];
+    if (![...this.seats, this.analysis, ...players].some(stale)) return false;
+    this.seats = this.seats.map(fix); this.analysis = fix(this.analysis);
+    if (this.match) this.match.players = players.map(fix);
+    this.cancelJobs(job => stale(job.spec));
+    this.jobs = this.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== id);
+    this.changed(); this.pump();
+    return true;
   }
   /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
   engineKey(spec) {
@@ -390,7 +410,7 @@ export class BrowserSession extends OfflineSession {
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
       if (body.preset === 'solver') throw Error('The solver preset is for analysis');
-      const seat = this.spec({...this.seats[body.side], ...body, budget: body.preset === 'custom' ? body.custom : undefined});
+      const seat = this.spec({...choose(this.seats[body.side], body), budget: body.preset === 'custom' ? body.custom : undefined});
       if (this.timeControl.mode !== 'fixed') this.clockable(seat);
       this.cancelJobs(j => j.kind === 'move' && j.side === body.side); this.renewLines(body.side); this.seats[body.side] = seat;
       if (this.clock?.side === body.side) this.freezeClock();
@@ -400,7 +420,7 @@ export class BrowserSession extends OfflineSession {
       if (control.mode !== 'fixed') this.seats.forEach(seat => this.clockable(seat));
       this.cancelJobs(j => j.kind === 'move'); this.match = null; this.timeControl = control; this.freshClock();
     } else if (path === '/analysis') {
-      this.cancelJobs(j => j.kind !== 'move'); this.analysis = this.spec({...this.analysis, ...body, budget: body.preset === 'custom' ? body.custom : undefined});
+      this.cancelJobs(j => j.kind !== 'move'); this.analysis = this.spec({...choose(this.analysis, body), budget: body.preset === 'custom' ? body.custom : undefined});
     } else if (path === '/analyse') {
       const ply = body.ply ?? this.history.length;
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');

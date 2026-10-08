@@ -19,6 +19,7 @@
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
 // {kind: 'table', records: [[history, record]], queries: [history], result, lost, exact, mover} -> {known, edges} per query
 //   from a proof.mjs Proofs and `settled` of `result`, `lost` and `exact` with the edges of the first query
+// {kind: 'retired-checkpoints'} -> the checkpoints a BrowserSession gives Strix and Bubble seats naming networks it does not offer
 // {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and searches other positions
 //   with the stones the proof table it is sent proves marked (see `searched`): the evaluations at ply - 1 after analysis,
 //   undo, another preset and a reload, and `given`, the turn proof.mjs answered gives at ply - 1 from `found`'s table
@@ -762,6 +763,33 @@ if (job.kind === 'encode') {
   other.registerEngine({id: 'shrimp', name: 'Shrimp', kind: 'six', badge: 'shrimp', presets: SHRIMP}, {turn});
   await other.request('/seat', {side: 1, engine: 'shrimp', preset: 'custom', custom: {...SHRIMP.standard, visits: 64}}, 'POST');
   answer.shrimp = {budget: other.seats[1].budget, custom: other.seats[1].custom};
+} else if (job.kind === 'retired-checkpoints') {
+  // Checkpoints the engine no longer offers: a saved Strix seat and analysis naming a retired network, Strix chosen
+  // while its list is still empty and after it fills, and Bubble's networks.
+  const wait = () => new Promise(resolve => setTimeout(resolve, 5)), played = [];
+  const strix = checkpoints => ({id: 'strix', name: 'Strix', kind: 'strix', checkpoints, presets: {standard: {simulations: 1}}});
+  const bubble = checkpoints => ({id: 'bubble', name: 'Bubble', kind: 'bubble', checkpoints, presets: {standard: {simulations: 1, solver_nodes: 0}}});
+  const adapter = {turn: async (history, budget, options) => { played.push(options.checkpoint); return {moves: [[0, 0]], value: .5, top: []}; }};
+  const saved = new BrowserSession(native), retired = {engine: 'strix', checkpoint: 'pulsatrix-10-best', preset: 'standard', budget: {simulations: 1}, auto: false};
+  await saved.storage.saveSession({id: 'live', history: [], seats: [retired, {engine: 'human'}], analysis: {...retired, auto: true}, paused: false, _write_token: 'a'}, null, null);
+  const s = new BrowserSession(native); s.storage = saved.storage; await s.restore();
+  s.registerEngine(strix(['strix-237000']), adapter);
+  for (const end = Date.now() + 30000; !s.history.length && Date.now() < end;) await wait();
+  answer = {restored: {seat: s.seats[0].checkpoint, analysis: s.analysis.checkpoint, played: played.slice(), history: s.history}};
+  const list = [], late = new BrowserSession(native);
+  late.registerEngine(strix(list), adapter); late.registerEngine(bubble(['b2', 'b1']), adapter); late.registerEngine({...bubble([]), id: 'plain'}, adapter);
+  const seat = async (side, body) => (await late.request('/seat', {side, ...body}, 'POST'))[0];
+  answer.early = [await seat(0, {engine: 'strix'}), await seat(1, {engine: 'strix', checkpoint: 'pulsatrix-10-best'})];
+  answer.empty = late.seats.map(spec => spec.checkpoint);
+  list.push('strix-237000');
+  answer.moved = late.relist('strix'); answer.again = late.relist('strix');
+  answer.filled = late.seats.map(spec => spec.checkpoint);
+  await late.saving;
+  const back = new BrowserSession(native); back.storage = late.storage; await back.restore();
+  answer.reloaded = back.seats.map(spec => spec.checkpoint);
+  answer.bubble = [await seat(0, {engine: 'bubble', checkpoint: 'b1'}), late.seats[0].checkpoint, await seat(0, {engine: 'bubble', preset: 'standard'}), late.seats[0].checkpoint,
+    await seat(1, {engine: 'bubble'}), late.seats[1].checkpoint, await seat(1, {engine: 'plain'}), late.seats[1].checkpoint];
+  answer.untouched = late.relist('bubble');
 } else if (job.kind === 'dismissal') {
   // Auto deepening while an engine seat plays, with analyses that run until cancelled: which positions have an
   // analysis running or queued after a cancel, an analysis request and a move.
