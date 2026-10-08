@@ -44,6 +44,16 @@ class Ranked(Uniform):
     def evaluate(self, histories):
         return [dict(p, logits=-2.*np.arange(len(p['actions']))) for p in super().evaluate(histories)]
 
+class Tiered(Uniform):
+    """Logit 0 for the first four legal moves in native order, -7 for the next 40 and -16 for the rest."""
+    @staticmethod
+    def tier(moves):
+        return np.where(moves < 4, 0, np.where(moves < 44, 1, 2))
+
+    def evaluate(self, histories):
+        return [dict(p, logits=np.array([0., -7., -16.])[self.tier(np.arange(len(p['actions'])))])
+                for p in super().evaluate(histories)]
+
 def take_owed(service, limit, *out):
     """hxb_take for a batch the producers owe: retries its 1 s wait until a batch or an error, or PATIENCE runs out."""
     import time
@@ -86,6 +96,49 @@ class NeuralTree(unittest.TestCase):
         for bad in (-.1, 1., float('nan')):
             with self.assertRaisesRegex(ValueError, 'Invalid root noise'):
                 NeuralSearch(Uniform(), 'root-noise', root_noise=bad)
+
+    def test_shaped_dirichlet_noise_favours_moves_above_the_mean_prior(self):
+        history = recorded_position()
+        def sampled(seed, **options):
+            search = NeuralSearch(Tiered(), 'shaped-noise', history, seed=seed, **options)
+            try:
+                result = search.search(16, root_samples=8, batch_size=8)
+            finally:
+                search.close()
+            return np.flatnonzero(result['visits']), result['policy']
+        counts = dict(plain=np.zeros(3), uniform=np.zeros(3), shaped=np.zeros(3))
+        for seed in range(20):
+            plain, policy = sampled(seed)
+            uniform, _ = sampled(seed, root_noise=.25)
+            zero, _ = sampled(seed, root_noise=.25, root_concentration=0.)
+            np.testing.assert_array_equal(zero, uniform)
+            shaped, noisy = sampled(seed, root_noise=.25, root_concentration=10.83)
+            self.assertEqual(len(shaped), 8)
+            # Noise moves the sampled set, never the prior inside the target.
+            unsampled = np.setdiff1d(np.arange(len(policy)), np.union1d(plain, shaped))
+            np.testing.assert_allclose(noisy[unsampled]/noisy[unsampled[0]], policy[unsampled]/policy[unsampled[0]],
+                                       rtol=1e-9)
+            for name, moves in (('plain', plain), ('uniform', uniform), ('shaped', shaped)):
+                counts[name] += np.bincount(Tiered.tier(moves), minlength=3)
+        # Without noise every sample past the four leaders comes from the 40 plausible moves. The uniform share
+        # spends its picks on the 794 junk moves in proportion to their number; the shaped draw puts half its
+        # concentration on moves above the mean capped log prior, so far more of its picks are plausible.
+        self.assertEqual(counts['plain'][2], 0)
+        share = {name: c[1]/(c[1]+c[2]) for name, c in counts.items()}
+        self.assertLess(share['uniform'], .15)
+        self.assertGreater(share['shaped'], share['uniform']+.25)
+        self.assertGreater(counts['shaped'][2], 0)
+        self.assertLess(counts['shaped'][2], counts['uniform'][2])
+        # A tiny concentration makes a near one-hot draw, one noised move per search, never a uniform share.
+        for seed in range(5):
+            sparse, _ = sampled(seed, root_noise=.25, root_concentration=1e-3)
+            self.assertLessEqual(np.count_nonzero(Tiered.tier(sparse) == 2), 1)
+        graph = GameGraph(Tiered(), 'shaped-noise', history, seed=1, root_noise=.25, root_concentration=10.83)
+        self.addCleanup(graph.close)
+        self.assertEqual(np.count_nonzero(graph.search(16, root_samples=8, batch_size=8)['visits']), 8)
+        for bad in (-1., float('inf'), float('nan')):
+            with self.assertRaisesRegex(ValueError, 'Invalid root noise concentration'):
+                NeuralSearch(Uniform(), 'shaped-noise', root_concentration=bad)
 
     def test_q_range_floor_flattens_only_small_spreads(self):
         def entropy(p):

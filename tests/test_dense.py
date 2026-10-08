@@ -1849,6 +1849,10 @@ class DenseConfigTests(unittest.TestCase):
         for bad in (-.1, 1., float('nan')):
             with self.assertRaisesRegex(ValueError, r'root_noise must lie in \[0, 1\)'):
                 dense_config.ActorSettings(root_noise=bad)
+        self.assertEqual(base.root_noise_concentration, 0.)
+        for bad in (-1., float('inf'), float('nan')):
+            with self.assertRaisesRegex(ValueError, 'root_noise_concentration must be finite and nonnegative'):
+                dense_config.ActorSettings(root_noise_concentration=bad)
         graph_args = parser.parse_args(['--game-graph', '512', '--pv-check', '0.25'])
         self.assertEqual(dense_selfplay.actor_flags(graph_args), ['--game-graph', '512', '--pv-check', '0.25'])
         legacy = dense_config.ActorSettings(hybrid_scheduler=False)
@@ -5339,7 +5343,7 @@ class EngineTests(unittest.TestCase):
         models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'native-{k}', f'model-{k}', 'cpu', 32, 64) for k in range(2)]
         settings = dense_config.ActorSettings(full_fraction=.5, full_sims=32, cheap_sims=8, root_samples=8,
                                              cheap_root_samples=4, game_graph=192, max_plies=7, tactics=False,
-                                             opening_random_plies=0., root_noise=.2)
+                                             opening_random_plies=0., root_noise=.2, root_noise_concentration=10.83)
         games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, hybrid=True) for i in range(2)]
         games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', hybrid=True))
         events = []
@@ -6280,8 +6284,10 @@ class EngineTests(unittest.TestCase):
 
     def test_root_noise_reaches_only_full_searches(self):
         draws, calls = iter([.1, .9, .1, .1]), []
-        fake = SimpleNamespace(hxg_root_noise=lambda tree, noise: calls.append((tree, noise)) or 1)
-        slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=.5, root_noise=.25), moves=[],
+        fake = SimpleNamespace(hxg_root_noise=lambda tree, noise: calls.append((tree, noise)) or 1,
+                               hxg_root_concentration=lambda tree, c: calls.append((tree, 'concentration', c)) or 1)
+        slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=.5, root_noise=.25,
+                                                                   root_noise_concentration=10.83), moves=[],
                                forced_plies=0, rng=SimpleNamespace(random=lambda: next(draws)),
                                tree=SimpleNamespace(ptr='root'))
         with unittest.mock.patch.object(dense_selfplay, 'native', fake):
@@ -6289,7 +6295,8 @@ class EngineTests(unittest.TestCase):
                 dense_selfplay.SelfPlayGame.plan(slot)
             slot.settings = replace(slot.settings, root_noise=0.)
             dense_selfplay.SelfPlayGame.plan(slot)
-        self.assertEqual(calls, [('root', .25), ('root', 0.), ('root', .25)])
+        shaped = ('root', 'concentration', 10.83)
+        self.assertEqual(calls, [('root', .25), shaped, ('root', 0.), shaped, ('root', .25), shaped])
 
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]
