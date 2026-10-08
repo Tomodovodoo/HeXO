@@ -2197,13 +2197,14 @@ class Job:
 def custom_form(kind, standard, custom):
     """The custom budget form of a Bubble or a Six (EXCLUSIVE kinds): both amounts, the work (Bubble's `simulations`,
     shown as Nodes; Six's `nodes`, shown as Positions) and Time `ms`, with `active` naming the one that applies, and for
-    Bubble the Width `views`. Missing values come from the `standard` preset, 1000 ms and HYBRID['views']. A custom
-    budget saved before the form keeps its work active, and a Bubble's old `solver_nodes` is dropped."""
+    Bubble the Width `views`. Missing values come from the `standard` preset, 1000 ms and HYBRID['views']. Without
+    `active`, Time applies when only it is given and the work otherwise, so a custom budget saved before the form keeps
+    its work; a Bubble's old `solver_nodes` is dropped."""
     work, _ = EXCLUSIVE[kind]
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
     custom = {k: v for k, v in (custom or {}).items() if not (kind == 'bubble' and k == 'solver_nodes')}
-    form = {work: standard[work], 'ms': 1000, 'active': work} | ({'views': HYBRID['views']} if kind == 'bubble' else {})
+    form = {work: standard[work], 'ms': 1000, 'active': 'ms' if 'ms' in custom and work not in custom else work} | ({'views': HYBRID['views']} if kind == 'bubble' else {})
     for key, value in custom.items():
         if key == 'args':
             continue
@@ -3039,7 +3040,7 @@ class Session:
         selector = specification['engine']
         if selector.endswith('}') and '{' in selector:
             selector, custom = selector[:-1].rsplit('{', 1)
-            specification.update(preset='custom', custom={k.strip(): int(v.strip())
+            specification.update(preset='custom', custom={k.strip(): v.strip() if k.strip() == 'active' else int(v.strip())
                                  for k, v in (item.split('=', 1) for item in custom.split(','))})
         if '@' in selector:
             selector, suffix = selector.rsplit('@', 1)

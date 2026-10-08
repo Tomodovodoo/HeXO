@@ -30,10 +30,11 @@ const FIELD_NAMES = {simulations: 'Nodes', solver_nodes: 'Solver', nodes: 'Posit
 const EXCLUSIVE = {bubble: ['simulations', 'ms'], six: ['nodes', 'ms']}, VIEWS = 16, WIDTH = 8;
 
 /** The custom form of a Bubble or a Six from `custom` (python/play.py custom_form): both amounts, `active` naming the
- * one that applies, and Bubble's Width `views`; an older custom budget keeps its work active and drops Bubble's
- * solver nodes. Throws on a value out of range. */
+ * one that applies (without it Time when only Time is given, else the work, so an older custom budget keeps its work),
+ * and Bubble's Width `views`; Bubble's old solver nodes are dropped. Throws on a value out of range. */
 export function customForm(kind, standard, custom = {}) {
-  const [work] = EXCLUSIVE[kind], form = {[work]: standard[work], ms: 1000, active: work, ...(kind === 'bubble' ? {views: WIDTH} : {})};
+  const [work] = EXCLUSIVE[kind], timed = custom && 'ms' in custom && !(work in custom);
+  const form = {[work]: standard[work], ms: 1000, active: timed ? 'ms' : work, ...(kind === 'bubble' ? {views: WIDTH} : {})};
   for (const [key, value] of Object.entries(custom || {})) {
     if (kind === 'bubble' && key === 'solver_nodes' || key === 'args') continue;
     if (key === 'active') {
@@ -634,7 +635,8 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0,
+        ...(job.spec.budget.ms ? {ms: Math.max(10, Math.round(REFRESH_SHARE * job.spec.budget.ms))} : {})}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,

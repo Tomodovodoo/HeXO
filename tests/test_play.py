@@ -1821,6 +1821,8 @@ class Matches(unittest.TestCase):
         self.assertEqual(self.session.match_seat('Drip@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,views=4}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, views=4, solver_nodes=8192))
+        for selector in ('bubble:2{ms=2500}', 'bubble:2{simulations=64,ms=2500,active=ms}'):
+            self.assertEqual(self.session.match_seat(selector, 'standard')['budget']['ms'], 2500)
         with self.assertRaisesRegex(ValueError, 'not a budget'):
             self.session.match_seat('Drip{simulations=128}', 'standard')
 
