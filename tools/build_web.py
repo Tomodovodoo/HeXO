@@ -5,8 +5,9 @@ wasm   native graph owner/feed/batch -> gumbel.mjs + gumbel.wasm and src/hexo.cp
        strix/strix.wasm (cargo with the wasm32-wasip1 target), tools/six -> six/six.mjs + six/six.wasm (Six's network
        search, built as Six builds it for its site); build.json binds them to their sources (committed).
 strix  only tools/strix_web -> strix/strix.wasm, refreshing its entries in build.json.
-strix-network  the Strix network pinned in tools/engines.json (hexo.tyto.cc's pulsatrix-10-best, licence unstated)
-       into strix/ with strix/networks.json (ignored). Without it the page downloads the public site's.
+strix-network  the Strix networks pinned in tools/engines.json (this repository's strix-networks-v1 release, hosted
+       with their author's permission) into strix/ with strix/networks.json, the default first (ignored). Without
+       them the page downloads the public site's.
 ort    onnxruntime-web from the npm registry, checked against its published integrity, into ort/ (ignored).
 model  every bubble-<step> GitHub release (--release all, the default), one release (--release TAG or 'latest'), or a
        local --checkpoint ema.pt (named by its step folder, else by its digest), exported by export_web into
@@ -43,7 +44,6 @@ ENGINE = ROOT/'web'/'engine'
 TACTICAL = ROOT/'tools'/'tactical'
 SHRIMP = ROOT/'tools'/'shrimp_web'
 STRIX = ROOT/'tools'/'strix_web'
-STRIX_NETWORK = 'pulsatrix-10-best'
 SEAL = ENGINE/'seal'
 SIX = ROOT/'tools'/'six'
 ORT_VERSION = '1.30.0'
@@ -162,15 +162,19 @@ def refresh_strix(cargo):
 
 
 def build_strix_network():
-    """The Strix network pinned in tools/engines.json into strix/<id>.safetensors and strix/networks.json."""
-    model = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['strix']['model']
-    data = fetch(model['url'])
-    if len(data) != model['size'] or hashlib.sha256(data).hexdigest() != model['sha256']:
-        raise ValueError(f"{model['url']} does not match the SHA-256 pinned in tools/engines.json")
+    """The Strix networks pinned in tools/engines.json into strix/<id>.safetensors and strix/networks.json, in the
+    manifest's order, so the default comes first."""
+    spec = json.loads((ROOT/'tools'/'engines.json').read_text(encoding='utf-8'))['strix']
     out = ENGINE/'strix'
-    (out/f'{STRIX_NETWORK}.safetensors').write_bytes(data)
-    networks = [dict(id=STRIX_NETWORK, file=f'{STRIX_NETWORK}.safetensors', sha256=model['sha256'], size=model['size'],
-                     source=model['url'], licence='unstated')]
+    out.mkdir(exist_ok=True)
+    networks = []
+    for network in spec['networks']:
+        data = fetch(network['url'])
+        if len(data) != network['size'] or hashlib.sha256(data).hexdigest() != network['sha256']:
+            raise ValueError(f"{network['url']} does not match the SHA-256 pinned in tools/engines.json")
+        (out/f"{network['id']}.safetensors").write_bytes(data)
+        networks.append(dict(id=network['id'], file=f"{network['id']}.safetensors", sha256=network['sha256'],
+                             size=network['size'], source=network['url'], licence=spec['licence']))
     (out/'networks.json').write_text(json.dumps(dict(networks=networks), indent=1)+'\n', encoding='utf-8')
 
 

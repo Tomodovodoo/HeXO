@@ -20,6 +20,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+MODEL_SHA256 = 'aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185'  # pulsatrix-10-best
 
 
 def _sha(data):
@@ -118,9 +119,8 @@ def freeze_opponent(kind, destination, config):
         reference_python = (source/'python/legacy/strix_reference.py').read_bytes()
         adapter_python = (source/'tools/strix_learned_adapter.py').read_bytes()
         selected_reference = _module(source/'python/legacy/strix_reference.py', source_bytes=reference_python)
-        selected_adapter = _module(source/'tools/strix_learned_adapter.py', selected_reference,
-                                   source_bytes=adapter_python)
-        REVISION, MODEL_SHA256 = selected_reference.REVISION, selected_adapter.MODEL_SHA256
+        _module(source/'tools/strix_learned_adapter.py', selected_reference, source_bytes=adapter_python)
+        REVISION = selected_reference.REVISION
         build_bytes = binary.with_name('build-provenance.json').read_bytes()
         build = json.loads(build_bytes)
         model = Path(config['model']).read_bytes()

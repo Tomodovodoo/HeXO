@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ import threading
 import unittest
 
 from hexo import Game
-from tools.strix_learned_adapter import MODEL_SHA256, StrixLearned, mirror, validate_turn
+from tools.strix_learned_adapter import StrixLearned, mirror, validate_turn
 
 
 class TurnValidation(unittest.TestCase):
@@ -33,11 +34,11 @@ class TurnValidation(unittest.TestCase):
                 validate_turn(game, moves)
             self.assertEqual((game.key, game.state(), game.features()), before)
 
-    def test_wrong_checkpoint_rejected_before_launch(self):
+    def test_file_without_a_safetensors_header_rejected_before_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"wrong.safetensors"
-            path.write_bytes(b"not the pinned model")
-            with self.assertRaisesRegex(ValueError, "SHA256"):
+            path.write_bytes(b"not a network")
+            with self.assertRaises(ValueError):
                 StrixLearned(path)
 
 
@@ -45,7 +46,7 @@ class Frame(unittest.TestCase):
     def test_stones_and_moves_cross_into_strix_frame(self):
         opponent = object.__new__(StrixLearned)
         opponent.__dict__.update(timeout_ms=5000, lock=threading.Lock(), process=object(), simulations=2, actions=2,
-                                 seed=0, calls=0, executable_sha256='x')
+                                 seed=0, calls=0, executable_sha256='x', model_sha256='y')
         sent = []
         def exchange(request, deadline):
             sent.append(request)
@@ -63,7 +64,8 @@ class LearnedProcess(unittest.TestCase):
     def setUp(self):
         model = os.environ.get("HEXO_STRIX_PUBLIC_MODEL")
         if not model:
-            self.skipTest("set HEXO_STRIX_PUBLIC_MODEL to the pinned external checkpoint")
+            self.skipTest("set HEXO_STRIX_PUBLIC_MODEL to a pinned Strix network")
+        self.model = Path(model)
         self.opponent = StrixLearned(model, simulations=2, actions=2)
         if not Path(self.opponent.executable).exists():
             self.skipTest("build tools/strix_learned first")
@@ -72,11 +74,9 @@ class LearnedProcess(unittest.TestCase):
 
     def test_loaded_relational_model_persistent_turns(self):
         metadata = self.opponent.metadata
-        config = json.loads(metadata["loaded_metadata"]["model_config"])
-        self.assertTrue(config["axis_relational"])
-        self.assertEqual(config["axis_window"], 8)
-        self.assertEqual(metadata["model_sha256"], MODEL_SHA256)
-        self.assertEqual(metadata["loaded_metadata"]["train_steps"], "10")
+        self.assertEqual(metadata["loaded_metadata"], metadata["model_metadata"])
+        self.assertEqual(json.loads(metadata["loaded_metadata"]["model_config"])["hidden_dim"], 128)
+        self.assertEqual(metadata["model_sha256"], hashlib.sha256(self.model.read_bytes()).hexdigest())
         self.assertFalse(metadata["equal_wall_budget"])
         self.assertEqual(metadata["root_forcing"], dict(enabled=True, phases=[1,2],generator="wide",depth=6,nodes=2000))
         self.assertEqual(metadata["build_provenance"]["executable_sha256"], metadata["executable_sha256"])
