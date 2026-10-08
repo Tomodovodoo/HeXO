@@ -36,7 +36,7 @@ for name, result, args in (
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
     ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
     ('profile', C.c_int, [ptr, C.c_int]), ('feedback', C.c_int, [ptr, C.c_int]), ('schedule_stats', None, [ptr, ptr]),
-    ('progress', C.c_int, [ptr, C.c_int]),
+    ('progress', C.c_int, [ptr, C.c_int]), ('supply', None, [ptr, ptr]),
     ('progress_rows', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, C.c_uint64, ptr, ptr, ptr]),
     ('reclaim_ready', C.c_int, [ptr]), ('reclaim', C.c_int, [ptr, ptr]),
     ('reclaim_stats', None, [ptr, ptr]), ('owner_reclaim_stats', None, [ptr, ptr]),
@@ -61,6 +61,7 @@ bind('hxp_budget', C.c_int, ptr, C.c_double)
 bind('hxps_new', ptr, ptr, C.c_int, C.c_int)
 bind('hxps_free', C.c_int, ptr)
 bind('hxps_stats', None, ptr, ptr, ptr)
+bind('hxps_serve', C.c_int, ptr, C.c_int)
 bind('hxp_neural', C.c_int, ptr, C.c_uint64, C.c_int)
 bind('hxp_neural_stats', None, ptr, ptr)
 bind('hxp_endpoint_queue_stats', None, ptr, ptr)
@@ -97,7 +98,8 @@ class ProofWorkers:
     table, and returns the answer to that loop; only the loop's graph owner installs
     it. `queue` bounds queued plus running jobs over all loops, eight per worker by
     default, and a loop gets an equal share of it while other loops have work.
-    Close every attached loop first.
+    `serve` parks workers without freeing their solvers or tables; the queue bound
+    shrinks with the serving count. Close every attached loop first.
     """
     def __init__(self, package=None, *, workers=12, queue=None, direct=False):
         queue = 8*workers if queue is None else queue
@@ -113,11 +115,15 @@ class ProofWorkers:
             raise ValueError('Proof workers are closed')
         return self._ptr
 
+    def serve(self, count):
+        """Serve jobs on the first `count` workers, from one to all; the rest park after any job they hold."""
+        checked(native.hxps_serve(self.ptr, count))
+
     def stats(self):
-        """Busy workers, queued and live jobs over all loops, and worker wall time."""
-        out, times = np.empty(5, np.uint64), np.empty(2, np.float64)
+        """Busy and serving workers, queued and live jobs over all loops, and worker wall time."""
+        out, times = np.empty(6, np.uint64), np.empty(2, np.float64)
         native.hxps_stats(self.ptr, out.ctypes.data, times.ctypes.data)
-        result = dict(zip(('workers', 'active', 'queued', 'live', 'loops'), map(int, out)))
+        result = dict(zip(('workers', 'active', 'queued', 'live', 'loops', 'serving'), map(int, out)))
         result.update(zip(('worker_service_ms', 'worker_idle_ms'), map(float, times)))
         return result
 
@@ -848,6 +854,23 @@ class InferenceService:
         native.hxb_owner_reclaim_stats(self.ptr,games.ctypes.data)
         result.update(zip(('owner_reclaim_queued','owner_reclaim_active','reclaimed_games',
                            'owner_reclaim_ns','reclaim_reserved','replacement_deferrals'),map(int,games)))
+        return result
+
+    def supply(self):
+        """Cumulative supply clocks in seconds; difference two readings for shares of a window.
+
+        `starved`: a batch flight slot was free and no row was ready, so inference
+        waited for producers. `unflown`: no batch was in flight. `backlog`: every
+        slot was in flight and rows were waiting. Paused time counts in none.
+        `producer_*` sum producer threads' wall, waiting and thread CPU time.
+        `ready_rows`, `oldest_ready_s` and `flights` are current values.
+        """
+        out = np.empty(10, np.uint64)
+        native.hxb_supply(self.ptr, out.ctypes.data)
+        names = ('now', 'starved', 'unflown', 'backlog', 'ready_rows', 'oldest_ready_s', 'flights',
+                 'producer_wall', 'producer_wait', 'producer_cpu')
+        result = {k: int(v)/1e9 for k, v in zip(names, out)}
+        result['ready_rows'], result['flights'] = int(out[4]), int(out[6])
         return result
 
     def cancel(self):

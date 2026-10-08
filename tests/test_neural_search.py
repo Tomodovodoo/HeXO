@@ -1556,6 +1556,52 @@ class HybridScheduler(unittest.TestCase):
                 service.abandon_fenced(batch[0])
             service.close()
 
+    def test_native_service_supply_clocks_separate_waiting_inference_from_waiting_rows(self):
+        import time
+        from types import SimpleNamespace
+        from hybrid_scheduler import InferenceService
+        pool = self.pool([self.graph() for _ in range(4)], quantum=16, views=4, work=4096, cache=0)
+        service = InferenceService([pool], [SimpleNamespace(model_version='scheduler')], batch_size=1, flights=1)
+        batch = None
+        def span(seconds=.05):
+            first = service.supply()
+            time.sleep(seconds)
+            last = service.supply()
+            return {k: last[k]-first[k] for k in ('now', 'starved', 'unflown', 'backlog', 'producer_wall')}, last
+        try:
+            service.start(continuous=True)
+            # No root to search: inference waits for rows the whole time, nothing queues.
+            change, _ = span()
+            self.assertGreaterEqual(change['starved'], .9*change['now'])
+            self.assertGreaterEqual(change['unflown'], .9*change['now'])
+            self.assertEqual(change['backlog'], 0)
+            for game in range(4):  # distinct roots, so their rows do not coalesce
+                service.retarget(0, game, [(0, 0), (game+1, -1), (game+1, 1)], work=4096, views=4)
+            batch = service.take(1000.)
+            self.assertIsNotNone(batch)
+            until = time.monotonic()+PATIENCE
+            while service.supply()['ready_rows'] == 0 and time.monotonic() < until:
+                time.sleep(.001)
+            # The only flight is out and rows wait behind it: producers wait for inference.
+            change, last = span()
+            self.assertGreaterEqual(change['backlog'], .9*change['now'])
+            self.assertEqual((change['starved'], change['unflown']), (0, 0))
+            self.assertGreater(last['oldest_ready_s'], .04)
+            self.assertEqual(last['flights'], 1)
+            self.assertGreater(last['producer_wall'], 0)
+            self.assertLessEqual(last['producer_wait']+last['producer_cpu'], last['producer_wall']+.05)
+            service.abandon_fenced(batch[0])
+            batch = None
+            service.pause(timeout=PATIENCE)
+            # Paused inference is not starved.
+            change, _ = span()
+            self.assertEqual((change['starved'], change['unflown'], change['backlog']), (0, 0, 0))
+        finally:
+            service.cancel()
+            if batch is not None:
+                service.abandon_fenced(batch[0])
+            service.close()
+
     def test_native_service_delivers_zero_row_root_and_release_without_batch_wait(self):
         import ctypes as C
         import time
@@ -3139,6 +3185,7 @@ class NativeProofs(unittest.TestCase):
     def held_workers(self, capacity, workers=1, gate=None, cancel_gate=None):
         """A raw shared service whose answers wait for `release`, or for `gate(history)`'s event.
 
+        `self.served` lists the native worker of every query in order.
         Create the pools first: cleanups free every joined loop, then the service."""
         import ctypes as C
         import json
@@ -3148,12 +3195,13 @@ class NativeProofs(unittest.TestCase):
         library = NativeTactics(independent=True)
         self.addCleanup(library.close)
         entered, release, order = threading.Event(), threading.Event(), []
+        self.served = []
         actual = library.lib.hexo_tactical_worker_answer
         actual.argtypes, actual.restype = [ptr, C.c_char_p], ptr
         @C.CFUNCTYPE(ptr, ptr, C.c_char_p)
         def query(worker, request):
             history = json.loads(request)['history']
-            order.append(history)
+            order.append(history);self.served.append(worker)
             entered.set();(gate(history) if gate else release).wait(5)
             return actual(worker, request)
         actual_cancel=library.lib.hexo_tactical_cancel
@@ -3280,7 +3328,7 @@ class NativeProofs(unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join()
-        out, times = np.empty(5, np.uint64), np.empty(5, np.float64)
+        out, times = np.empty(6, np.uint64), np.empty(5, np.float64)
         native.hxps_stats(service, out.ctypes.data, times.ctypes.data)
         self.assertEqual(int(out[3]), 4)
         submitted, stats = 0, np.empty(16, np.uint64)
@@ -3394,6 +3442,63 @@ class NativeProofs(unittest.TestCase):
         workers.close()
         with self.assertRaisesRegex(ValueError, 'closed'):
             workers.stats()
+
+    def test_parked_proof_workers_finish_their_job_take_no_more_and_wake_with_their_solvers(self):
+        from neural_search import checked
+        pool = self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096)
+        service, join, entered, release, order = self.held_workers(16, workers=2)
+        loop = join(pool)
+        stats, times = np.empty(16, np.uint64), np.empty(5, np.float64)
+        def finished():
+            native.hxp_stats(loop, stats.ctypes.data, times.ctypes.data)
+            return int(stats[3])
+        def offer(first):
+            for k in range(first, first+4):
+                cells = np.asarray([[0,0],[k,-1],[k,1]], np.int64)
+                checked(native.hxp_offer(loop, 0, cells.ctypes.data, len(cells), 1.))
+            checked(native.hxp_step(loop))
+        offer(1)
+        self.wait(lambda: len(self.served) == 2)
+        solvers = set(self.served)
+        self.assertEqual(len(solvers), 2)
+        # Parking one worker lets it finish the job it holds; the other then serves the queue alone.
+        checked(native.hxps_serve(service, 1))
+        out = np.empty(6, np.uint64)
+        native.hxps_stats(service, out.ctypes.data, times.ctypes.data)
+        self.assertEqual((int(out[0]), int(out[5])), (2, 1))
+        release.set()
+        self.wait(lambda: finished() == 4)
+        native.hxp_stats(loop, stats.ctypes.data, times.ctypes.data)
+        self.assertEqual(int(stats[5]), 0)
+        self.assertEqual(len(set(self.served[2:])), 1)
+        # Woken, the parked worker serves again on the same native solver.
+        checked(native.hxps_serve(service, 2))
+        release.clear()
+        offer(5)
+        self.wait(lambda: len(self.served) == 6)
+        self.assertEqual(set(self.served[4:]), solvers)
+        release.set()
+        self.wait(lambda: finished() == 8)
+        for count in (0, 3):
+            self.assertEqual(native.hxps_serve(service, count), 0)
+            self.assertIn(b'between one and the pool size', native.hxg_error())
+
+    def test_parked_proof_workers_are_not_idle_capacity(self):
+        import time
+        workers = self.shared(workers=4, queue=8)
+        pool = self.pool([self.graph([[0,0]])], quantum=4, views=1, work=4096)
+        loop = pool.enable_proofs(slice_ms=50, table_mb=1, tasks=8, shared=workers)
+        workers.serve(1)
+        loop.step()
+        start, before = time.perf_counter(), workers.stats()
+        time.sleep(.1)
+        after, wall = workers.stats(), (time.perf_counter()-start)*1e3
+        self.assertEqual((after['workers'], after['serving']), (4, 1))
+        # One serving worker waits; three parked ones are not spare capacity.
+        idle = after['worker_idle_ms']-before['worker_idle_ms']
+        self.assertGreaterEqual(idle, .9*wall-5)
+        self.assertLessEqual(idle, 1.5*wall)
+        loop.drain()
 
     def test_attached_loop_prevents_pool_free_and_duplicate_owners(self):
         graph = self.graph()
