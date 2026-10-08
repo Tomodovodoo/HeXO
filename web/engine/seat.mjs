@@ -551,10 +551,8 @@ function install() {
  * Resolves true when it took over (or is reloading for isolation).
  */
 async function serverless() {
-  try {
-    const response = await fetch('/state', {cache: 'no-store'});
-    if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
-  } catch {}
+  // python/play.py marks the page it serves (SERVED); a static site has no game server to ask.
+  if (document.querySelector('meta[name="hexo-play"][content="server"]')) return false;
   if (await isolate()) return true;
   Object.assign(page, original, {openMenu, pickItems});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);

@@ -46,7 +46,8 @@ exported as a network) and publishes `web/` as the site, so the play page opens 
 It runs once the repository is public and Settings > Pages > Build and deployment > Source is set to GitHub Actions.
 `web/coi-sw.js`, scoped to the site's path, adds the cross-origin isolation headers after one reload.
 
-Without a play server the page answers its own requests in a browser session (`web/engine/play-session.mjs` on
+`python/play.py` marks the page it serves with `<meta name="hexo-play" content="server">` (`SERVED`); a page without
+the mark sends no request to a server and answers its own requests in a browser session (`web/engine/play-session.mjs` on
 `offline.mjs`'s rules): seats, analysis with auto-deepening, review, saved games and evaluations in IndexedDB with a
 backup file, import and export, the opening book, tournaments and clocks. It differs from the server in these ways:
 

@@ -4173,6 +4173,8 @@ STATIC_TYPES = {'.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'a
                 '.html': 'text/html; charset=utf-8'}
 # Cross-origin isolation (SharedArrayBuffer for the browser engine's threads) without blocking credentialless subresources
 ISOLATION = (('Cross-Origin-Opener-Policy', 'same-origin'), ('Cross-Origin-Embedder-Policy', 'credentialless'))
+# The mark of a page this server serves; without it the page runs its own game (a static site has no /state).
+SERVED = b'<meta name="hexo-play" content="server">'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4217,7 +4219,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403, dict(error='Host rejected'))
         url, session = urlparse(self.path), self.session
         if url.path == '/':
-            return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8', ISOLATION)
+            # SERVED tells the page's browser engines (web/engine/seat.mjs) that this server plays the game.
+            page = self.page.read_bytes().replace(b'<meta charset="utf-8">', b'<meta charset="utf-8">' + SERVED, 1)
+            return self.respond(200, page, 'text/html; charset=utf-8', ISOLATION)
         if url.path.startswith('/engine/') or url.path == '/coi-sw.js':
             return self.static(url.path)
         if url.path == '/setup' and self.setups:

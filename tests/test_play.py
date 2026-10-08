@@ -1299,6 +1299,9 @@ class Http(unittest.TestCase):
                 self.assertTrue(response.headers['Content-Type'].startswith(kind))
                 self.assertEqual(response.headers['Cross-Origin-Opener-Policy'], 'same-origin')
                 self.assertEqual(response.headers['Cross-Origin-Embedder-Policy'], 'credentialless')
+        # The served page carries the mark that keeps its browser engines from mounting their own game.
+        self.assertIn('<meta name="hexo-play" content="server">', self.get('/'))
+        self.assertNotIn('hexo-play', (Path(__file__).resolve().parents[1] / 'web' / 'index.html').read_text(encoding='utf-8'))
         for path in ('/engine/../../python/play.py', '/engine/%2e%2e/index.html', '/engine/missing.mjs', '/index.html'):
             with self.assertRaises(HTTPError) as caught:
                 urlopen(self.root + path, timeout=5)
