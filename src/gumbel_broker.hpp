@@ -5,6 +5,7 @@
 #include <thread>
 #include <sstream>
 #include <iomanip>
+#include <time.h>
 
 extern "C" {
 void* hxgp_new_rect(void* const*,const int*,int,int);
@@ -26,6 +27,15 @@ const char* hxp_release(void*,int);
 
 namespace inference {
 using Clock=std::chrono::steady_clock;
+// CPU time of the calling thread. Windows charges whole scheduler ticks of
+// about 15.6 ms, so only sums over many seconds are meaningful.
+inline uint64_t thread_cpu_ns(){
+#ifdef __EMSCRIPTEN__
+ return 0;
+#else
+ timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return uint64_t(t.tv_sec)*1000000000ULL+uint64_t(t.tv_nsec);
+#endif
+}
 using Key=std::vector<int64_t>;
 struct Hash {
  size_t operator()(const Key& key)const {uint64_t h=0xcbf29ce484222325ULL;for(auto v:key){h^=uint64_t(v);h*=0x100000001b3ULL;h^=h>>32;}return size_t(h);}
@@ -89,6 +99,14 @@ struct Broker {
  std::atomic<bool> cancelled=false;Clock::time_point cancelled_at{};
  bool started=false,joined=false,continuous=false,paused=false;uint64_t pause_epoch=0;
  uint64_t next=0,created=0,coalesced=0,launched=0,delivered=0,installed_messages=0,withdrawn=0,batches=0,high_water=0;
+ // Supply clocks, always on: time with a free flight slot and no ready row
+ // (inference waits for producers), with no flight at all, and with every
+ // slot in flight and ready rows waiting (producers wait for inference).
+ // Paused, cancelled or unstarted time counts in none. Producers add their
+ // wall, waiting and thread CPU time; detached producers keep their share.
+ enum Supply {Starved=1,Unflown=2,Backlog=4};
+ uint64_t starved_ns=0,unflown_ns=0,backlog_ns=0;int supply_state=0;Clock::time_point supply_mark{};
+ std::atomic<uint64_t> producer_wall_ns=0,producer_wait_ns=0,producer_cpu_ns=0;
  std::string error;
  struct Retired {std::unique_ptr<owner::Pool> pool;std::unique_ptr<owner::Owner> game;};
  std::vector<Retired> garbage;std::thread reclaimer;
@@ -118,6 +136,17 @@ struct Broker {
  void configure_progress(bool enabled){
   std::lock_guard lock(mutex);if(started)throw std::runtime_error("Configure root progress before starting");
   progress_enabled=enabled;
+ }
+ bool ready_rows()const{return std::any_of(ready.begin(),ready.end(),[](const auto& t){return t->live && !t->flight;});}
+ // Charge the elapsed span to the previous supply state, then classify the current one. Hold the mutex.
+ void supply(Clock::time_point now=Clock::now()){
+  now=std::max(now,supply_mark);
+  if(supply_state){auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-supply_mark).count());
+   if(supply_state&Starved)starved_ns+=ns;if(supply_state&Unflown)unflown_ns+=ns;if(supply_state&Backlog)backlog_ns+=ns;}
+  supply_mark=now;supply_state=0;
+  if(!started || paused || cancelled || joined)return;
+  bool rows=ready_rows(),free=flights.size()<size_t(flight_limit);
+  supply_state=(free && !rows?Starved:0)|(flights.empty()?Unflown:0)|(!free && rows?Backlog:0);
  }
  void collected(Clock::time_point start,uint64_t proofs){
   if(!profile_enabled)return;
@@ -274,6 +303,7 @@ struct Broker {
   auto when=Clock::now();
   {std::lock_guard lock(mutex);
    if(!cancelled){cancelled_at=when;cancelled=true;}
+   supply(when);
    for(auto& p:producers)if(p && p->pool.proof_owner)hxp_cancel(p->pool.proof_owner);
   }
   wake.notify_all();
@@ -282,7 +312,7 @@ struct Broker {
  void start(double ms){
   std::unique_lock lock(mutex);
   if(started || std::none_of(producers.begin(),producers.end(),[](const auto& p){return bool(p);}) || !std::isfinite(ms) || ms<0)throw std::runtime_error("Invalid inference service start");
-  started=true;auto now=Clock::now();
+  started=true;auto now=Clock::now();supply(now);
   try{
    for(auto& p:producers)if(p){auto& pool=p->pool;pool.ready_limit=2*quantum;
     if(continuous)pool.stop();
@@ -332,7 +362,7 @@ struct Broker {
  void pause(bool value){
   std::lock_guard lock(mutex);
   if(!continuous || !started || cancelled)throw std::runtime_error("Resumable pause requires a running continuous inference service");
-  if(paused!=value){paused=value;++pause_epoch;}wake.notify_all();
+  if(paused!=value){paused=value;++pause_epoch;}supply();wake.notify_all();
  }
  bool admission(uint64_t& epoch){std::lock_guard lock(mutex);epoch=paused?pause_epoch:0;return !paused;}
  void acknowledge(Producer& p,uint64_t epoch){
@@ -424,7 +454,7 @@ struct Broker {
     tasks.emplace(key,task);ready.push_back(std::move(task));++created;
    }
   }
-  high_water=std::max(high_water,uint64_t(tasks.size()));wake.notify_all();
+  high_water=std::max(high_water,uint64_t(tasks.size()));supply();wake.notify_all();
  }
  void withdraw(const std::shared_ptr<Job>& job,int row){
   std::lock_guard lock(mutex);if(job->results[row])return;
@@ -436,7 +466,7 @@ struct Broker {
   std::erase_if(task->subscribers,[&](const Subscriber& s){return s.job==job && s.row==row;});
   finish_row({job,row},std::make_shared<Prediction>());
   if(task->subscribers.empty() && !task->flight){task->live=false;tasks.erase(found);++withdrawn;}
-  wake.notify_all();
+  supply();wake.notify_all();
  }
  std::vector<Completion> completions(Producer& producer){
   std::lock_guard lock(mutex);std::vector<std::shared_ptr<Job>> jobs(producer.completed.begin(),producer.completed.end());
@@ -475,12 +505,13 @@ struct Broker {
      }
      if(profile_enabled){++schedule[9];if(int(batch.size())>=limit)++schedule[13];
       else {++schedule[10];schedule[11]+=flights.empty();schedule[12]+=Clock::now()>=due;}}
-     uint64_t id=++next;flights.emplace(id,batch);flight_high_water=std::max(flight_high_water,uint64_t(flights.size()));launched+=batch.size();++batches;
+     uint64_t id=++next;flights.emplace(id,batch);flight_high_water=std::max(flight_high_water,uint64_t(flights.size()));launched+=batch.size();++batches;supply();
      lock.unlock();std::vector<void*> sources;std::vector<int> rows;
      for(auto& task:batch){sources.push_back(task->representative->snapshot.get());rows.push_back(task->row);}
      auto packed=hxgp_combine(sources.data(),rows.data(),int(rows.size()),merge_cells);
      if(!packed){std::string message=gumbel::error;lock.lock();flights.erase(id);
       for(auto& task:batch){task->flight=false;if(task->subscribers.empty()){task->live=false;tasks.erase(task->key);}else ready.push_back(task);}
+      supply();
       throw std::runtime_error(message);
      }
      *token=id;*model=selected;*snapshot=packed;return int(rows.size());
@@ -509,12 +540,12 @@ struct Broker {
   for(size_t i=0;i<batch.size();++i){auto& task=batch[i];for(auto s:task->subscribers){finish_row(s,predictions[i]);++delivered;}
    task->live=false;tasks.erase(task->key);
   }
-  flights.erase(found);wake.notify_all();
+  flights.erase(found);supply();wake.notify_all();
  }
  void abort(uint64_t id){
   std::lock_guard lock(mutex);auto found=flights.find(id);if(found==flights.end())throw std::runtime_error("Unknown abandoned service batch");
   for(auto& task:found->second){for(auto s:task->subscribers)finish_row(s,std::make_shared<Prediction>());task->live=false;tasks.erase(task->key);}
-  flights.erase(found);wake.notify_all();
+  flights.erase(found);supply();wake.notify_all();
  }
  void join(){
   cancel();for(auto& p:producers)if(p && p->thread.joinable())p->thread.join();
@@ -525,6 +556,13 @@ struct Broker {
 };
 inline void Producer::run()noexcept{
  std::vector<uint64_t> active;
+ // Supply clocks: this thread's wall, its waits for work and its CPU time.
+ auto mark=Clock::now();uint64_t cpu=thread_cpu_ns();
+ auto clocks=[&](uint64_t waited){
+  auto now=Clock::now();uint64_t used=thread_cpu_ns();
+  broker.producer_wall_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-mark).count());
+  broker.producer_wait_ns+=waited;broker.producer_cpu_ns+=used-cpu;mark=now;cpu=used;
+ };
  try{
   active.resize(pool.games.size());std::vector<uint64_t> retiring(pool.games.size()),progress_passes(pool.games.size());
   while(!broker.cancelled && (broker.continuous || pool.admit())){
@@ -655,7 +693,9 @@ inline void Producer::run()noexcept{
    }
    broker.acknowledge(*this,pause_token);
    if(this->retiring && outstanding.empty())break;
-   if(!progress)broker.wait(*this);
+   uint64_t waited=0;
+   if(!progress){auto start=Clock::now();broker.wait(*this);waited=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count());}
+   clocks(waited);
   }
  }catch(const std::exception& e){broker.fail(e.what());}catch(...){broker.fail("Native inference producer failed");}
  try{
@@ -762,6 +802,12 @@ HX_API int hxb_profile(void* p,int enabled){try{static_cast<inference::Broker*>(
 HX_API int hxb_feedback(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_feedback(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_progress(void* p,int enabled){try{static_cast<inference::Broker*>(p)->configure_progress(enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_progress_rows(void* p,int producer,int game,uint64_t token,uint64_t after,const char** text,const double** edges,int* count){try{return static_cast<inference::Broker*>(p)->progress_rows(producer,game,token,after,text,edges,count)?1:0;}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
+// out: steady-clock now, starved, unflown and backlog ns, ready rows, oldest ready row age ns, flights,
+// producer wall, wait and thread CPU ns. Clocks are cumulative; callers difference two readings.
+HX_API void hxb_supply(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);auto now=inference::Clock::now();b.supply(now);
+ uint64_t rows=0,age=0;for(auto& t:b.ready)if(t->live && !t->flight){++rows;age=std::max(age,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-t->queued).count()));}
+ std::array<uint64_t,10> v{uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()),b.starved_ns,b.unflown_ns,b.backlog_ns,rows,age,uint64_t(b.flights.size()),
+  b.producer_wall_ns.load(),b.producer_wait_ns.load(),b.producer_cpu_ns.load()};std::copy(v.begin(),v.end(),out);}
 HX_API void hxb_schedule_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);out[0]=b.profile_enabled;std::copy(b.schedule.begin(),b.schedule.end(),out+1);}
 HX_API int hxb_attach(void* p,void* pool,int model){try{return static_cast<inference::Broker*>(p)->attach(*static_cast<owner::Pool*>(pool),model)+1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_detach(void* p,int producer){try{static_cast<inference::Broker*>(p)->detach(producer);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}

@@ -42,6 +42,101 @@ def label_prefixes(game, prefixes):
             pending.append((ply-1,exact,bound+1 if bound>0 else 0,[game.moves[ply-1]]))
 
 
+def processor_times():
+    """(busy, total) seconds summed over every logical processor since boot, or None where unreadable.
+
+    Windows reads GetSystemTimes, Linux /proc/stat. The difference of two
+    readings gives the machine's busy share over that span, all processes included.
+    """
+    import os
+    if os.name == 'nt':
+        import ctypes as C
+        idle, kernel, user = C.c_uint64(), C.c_uint64(), C.c_uint64()
+        if not C.windll.kernel32.GetSystemTimes(C.byref(idle), C.byref(kernel), C.byref(user)):
+            return None
+        return (kernel.value+user.value-idle.value)/1e7, (kernel.value+user.value)/1e7
+    try:
+        with open('/proc/stat') as f:
+            ticks = [int(v) for v in f.readline().split()[1:]]
+    except (OSError, ValueError):
+        return None
+    hz = os.sysconf('SC_CLK_TCK')
+    return (sum(ticks)-ticks[3]-ticks[4])/hz, sum(ticks)/hz
+
+
+class ProofSizer:
+    """Serving proof workers sized so the GPU is fed first and spare CPU proves second.
+
+    Each `observe` after `window` seconds differences the service's supply
+    clocks and `processors()` over the window. `starved` is the share of the
+    window in which a batch slot was free and no row was ready, `backlog` the
+    share in which every slot was in flight with rows waiting, `machine` the
+    busy share of all logical processors. Starvation above `starved` on a
+    machine busier than `busy` parks a quarter of the serving workers, at
+    least one, never below `floor`. A machine below `spare`, or starvation
+    below `fed` with backlog of at least `queued`, wakes one, never above the
+    pool. Without processor times only starvation lowers. A change starts a
+    new window and the next comes no sooner than `dwell` seconds later. A
+    floor at the pool size fixes the count. Parked workers keep their solver
+    tables. `reset` discards the window in progress, as after a pause.
+    `summary` reports the count, its changes and the last full window.
+    """
+    def __init__(self, service, workers, floor, *, window=5., dwell=10., starved=.2, fed=.05, queued=.5,
+                 busy=.9, spare=.8, processors=processor_times):
+        self.service, self.workers, self.processors = service, workers, processors
+        self.ceiling = workers.stats()['workers']
+        self.floor = max(1, min(floor, self.ceiling))
+        self.window, self.dwell = window, dwell
+        self.starved, self.fed, self.queued, self.busy, self.spare = starved, fed, queued, busy, spare
+        self.serving, self.changes, self.changed = self.ceiling, 0, None
+        self.history, self.last = deque(maxlen=64), {}
+        self.reset()
+
+    def clocks(self):
+        clocks = dict(self.service.supply(), proof_cpu=self.workers.stats()['worker_cpu_ms']/1e3)
+        times = self.processors()
+        clocks['machine_busy'], clocks['machine_total'] = times if times else (None, None)
+        return clocks
+
+    def reset(self):
+        self.start = self.clocks()
+
+    def observe(self):
+        """Read the clocks; at the end of a window record it and resize at most once."""
+        now = self.clocks()
+        span = now['now']-self.start['now']
+        if span < self.window:
+            return
+        d = {k: now[k]-self.start[k] for k in ('starved', 'unflown', 'backlog', 'producer_wall', 'producer_wait',
+                                                'producer_cpu', 'proof_cpu')}
+        busy = d['producer_wall']-d['producer_wait']
+        total = now['machine_total']-self.start['machine_total'] if now['machine_total'] is not None else 0
+        self.last = dict(seconds=span, starved=d['starved']/span, unflown=d['unflown']/span, backlog=d['backlog']/span,
+                         machine=(now['machine_busy']-self.start['machine_busy'])/total if total > 0 else None,
+                         ready_rows=now['ready_rows'], oldest_ready_ms=now['oldest_ready_s']*1e3,
+                         producer_busy=busy/d['producer_wall'] if d['producer_wall'] > 0 else None,
+                         producer_cpu=d['producer_cpu']/busy if busy > 0 else None,
+                         proof_cores=d['proof_cpu']/span)
+        self.start = now
+        if self.changed is not None and now['now']-self.changed < self.dwell:
+            return
+        w, count = self.last, self.serving
+        loaded = w['machine'] is None or w['machine'] > self.busy
+        if w['starved'] > self.starved and loaded:
+            count = max(self.floor, count-max(1, count//4))
+        elif (w['machine'] is not None and w['machine'] < self.spare) or (w['starved'] < self.fed and w['backlog'] >= self.queued):
+            count = min(self.ceiling, count+1)
+        if count != self.serving:
+            self.workers.serve(count)
+            self.serving, self.changed = count, now['now']
+            self.changes += 1
+            self.history.append((round(now['now'], 3), count))
+
+    def summary(self):
+        return dict(serving=self.serving, floor=self.floor, ceiling=self.ceiling, changes=self.changes,
+                    history=list(self.history), window=dict(self.last))
+
+
 class HybridGames:
     """Replenishable fixed-model slots with native graph ownership and proof retirement.
 
@@ -50,13 +145,15 @@ class HybridGames:
     older games continue; fixed cohorts retain their original model set.
     In dynamic mode `producers` bounds producer threads plus host workers, and
     each model's slots are split over `model_producers` independent producers.
-    `proof_workers` native proof workers serve every producer's live games;
-    `proof_budget` caps each graph owner's share of time in proof work (ProofLoop owner_budget), and
-    `proof_stamps` lets the proof loops reuse the solver's stamps (ProofLoop stamps).
+    Up to `proof_workers` native proof workers serve every producer's live games;
+    a ProofSizer serves between `proof_floor` (default: all of them) and all, from
+    inference starvation. `proof_budget` caps each graph owner's share of time in
+    proof work (ProofLoop owner_budget), and `proof_stamps` lets the proof loops
+    reuse the solver's stamps (ProofLoop stamps).
     """
     def __init__(self, games, *, producers=4, quantum=64, views=8, depth=8, cache=8192,
                  batch_size=128, slice_ms=8, proof_workers=0, proof_package=None, ms=0, progress=None,
-                 dynamic=False, model_producers=1, proof_budget=1., proof_stamps=False):
+                 dynamic=False, model_producers=1, proof_budget=1., proof_stamps=False, proof_floor=None):
         if not games or any(not g.hybrid for g in games) or producers<1:
             raise ValueError('A nonempty cohort of hybrid games is required')
         if not 1<=model_producers<=producers:
@@ -70,7 +167,8 @@ class HybridGames:
         self.views, self.ms, self.progress = views, ms, progress
         self.pools, self.mapping, self.lookup, self.proof_loops = [], {}, {}, []
         self.epochs, self.finished, self.closing, self.warming = {}, set(), {}, {}
-        self.service, self.receipt = None, None
+        self.service, self.receipt, self.sizer = None, None, None
+        self.proof_floor = proof_workers if proof_floor is None else proof_floor
         self.dynamic = dynamic
         self.batch_size = batch_size
         self.groups, self.idle, self.waiting, self.unbound = {}, {}, set(), set()
@@ -101,6 +199,7 @@ class HybridGames:
                     quantum=min(128,batch_size),pending=4)
                 self.service.start(continuous=True)
                 self.service.launch()
+                self.size_proofs()
                 for key in self.idle:
                     self.service.release(*key,expected=0)
             except BaseException:
@@ -135,6 +234,7 @@ class HybridGames:
             self.service = InferenceService(self.pools,[m.evaluator for m in self.models],batch_size=batch_size)
             self.service.start(continuous=True)
             self.service.launch()
+            self.size_proofs()
             for index in range(len(games)):
                 self.next_root(index)
         except BaseException:
@@ -144,6 +244,10 @@ class HybridGames:
     @property
     def done(self):
         return len(self.finished)==len(self.games)
+
+    def size_proofs(self):
+        if self.proof_workers is not None:
+            self.sizer = ProofSizer(self.service,self.proof_workers,self.proof_floor)
 
     def fits(self, shas):
         """Whether these models' producers fit the host allocation."""
@@ -347,6 +451,8 @@ class HybridGames:
 
     def resume(self):
         self.service.resume()
+        if self.sizer:
+            self.sizer.reset()
 
     def step(self, wait_ms=50.):
         """Consume immutable placement/lifecycle events, waiting up to `wait_ms` for one.
@@ -436,6 +542,8 @@ class HybridGames:
                 self.retire(index)
         if self.dynamic:
             self.maintain()
+        if self.sizer:
+            self.sizer.observe()
         return finished
 
     def close(self):
@@ -492,6 +600,7 @@ class ActorEngine:
                     producers=sum(p is not None for p in self.engine.pools) if running else 0,
                     host_workers=sum(g['workers'] for g in self.engine.groups.values()) if running else 0,
                     waiting_games=len(self.engine.waiting) if self.engine else 0,
+                    proof_workers=self.engine.sizer.summary() if running and self.engine.sizer else None,
                     retired_fresh_nodes=self.fresh_nodes,retired_queries=self.queries,
                     retired_missing_fresh=self.missing_fresh)
 
@@ -504,7 +613,7 @@ class ActorEngine:
                 quantum=s.hybrid_quantum,views=s.hybrid_views,depth=s.hybrid_depth,
                 cache=s.cache_positions,batch_size=s.leaf_batch,proof_workers=s.hybrid_proof_workers,
                 slice_ms=s.hybrid_proof_slice_ms,progress=self.progress,model_producers=s.hybrid_model_producers,
-                proof_budget=s.hybrid_proof_budget,proof_stamps=s.hybrid_proof_stamps)
+                proof_budget=s.hybrid_proof_budget,proof_stamps=s.hybrid_proof_stamps,proof_floor=s.hybrid_proof_floor)
         finished = self.engine.step()
         self.account()
         for index,game in finished:
