@@ -1530,8 +1530,9 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
         def ask(history):
             prover = free.get()
             try:
+                # Every wave of root queries ends by the first quarter of the shared clock.
                 return solve(prover, history, solver_nodes, watch, known.facts(history) if known is not None else (),
-                             ms / 4 if ms else None)
+                             max(1., (end - time.monotonic()) * 1000 - .75 * ms) if ms else None)
             finally:
                 free.put(prover)
 
