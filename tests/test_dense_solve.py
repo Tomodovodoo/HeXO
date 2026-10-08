@@ -844,7 +844,6 @@ class ProvenLabelTests(unittest.TestCase):
         settings = dense_config.LearnerSettings()
         self.assertEqual(settings.deblunder_weight, 0.)
         self.assertEqual(dense_config.override(settings, parser.parse_args(['--deblunder-weight', '.25'])).deblunder_weight, .25)
-        self.assertIn('deblunder_weight', dense_learn.KEEP)
         for weight in (-.1, 1.1, float('nan')):
             with self.assertRaises(ValueError):
                 replace(settings, deblunder_weight=weight)

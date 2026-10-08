@@ -881,7 +881,7 @@ class Evaluator:
     step() does one unit of work, played as a `session` of the continuous pool (`Pool`, pool_games in flight).
     publish() maintains evaluator-status.json: {stage ('idle', 'playing', 'throttled' or 'failed'), updated_at,
     comparison ({candidate, opponent, kind 'champion', 'variant', 'evidence', 'previous', 'anchor', 'panel',
-    'incumbent', 'sprt', 'replacement', 'fill' or 'generalization'} of the session's main lane, or null), pool ([{candidate,
+    'incumbent', 'sprt', 'fill' or 'generalization'} of the session's main lane, or null), pool ([{candidate,
     opponent, kind, running, share}] per lane: games in flight and the games in flight it wants), started_at
     (epoch seconds when the session began), games_played (the main lane's report games plus its finished games
     whose colour partner still runs), games_planned (sprt_max_games for the champion, which plays until decided,
@@ -1413,24 +1413,14 @@ class Evaluator:
     def rematches(self):
         """Idle rematches that can change a decision, first applicable only: the newest checkpoint of a variant
         whose SPRT against the current champion ended 'max-games' continues (up to REMATCH_SPRT_LIMIT *
-        sprt_max_games games), then two variant heads whose Elo difference interval straddles +-replace_margin
-        play more (up to sprt_max_games between them) while `close`; reports under another protocol are left alone.
-        [(a, b, kind, games left)]."""
+        sprt_max_games games); reports under another protocol are left alone. [(a, b, kind, games left)]."""
         s, champion = self.settings, self.league['champion']
-        heads = self.heads()
-        for c in heads:
+        for c in self.heads():
             path = report_path(self.run, c['id'], champion)
             report = json.loads(path.read_text()) if c['id'] != champion and path.exists() else None
             if report and same_protocol(report, s) and report['metrics'].get('sprt', {}).get('decision') == 'max-games' \
                     and len(report['games']) < REMATCH_SPRT_LIMIT*s.sprt_max_games:
                 return [(c['id'], champion, 'sprt', REMATCH_SPRT_LIMIT*s.sprt_max_games-len(report['games']))]
-        matrix, margin = payoff(load_reports(self.run, s)), self.config.learner.replace_margin
-        for d in self.league.get('differences', []):
-            lo, hi = d['interval']
-            played = matrix.get(d['a'], {}).get(d['b'], {}).get('games', 0)
-            pair = rematch_pair(self.run, d['a'], d['b'], s)
-            if (lo < margin < hi or lo < -margin < hi) and played < s.sprt_max_games and pair and self.close(d['a'], d['b']):
-                return [(*pair, 'replacement', s.sprt_max_games-played)]
         return []
 
     def heads(self):

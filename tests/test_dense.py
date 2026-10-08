@@ -1885,8 +1885,6 @@ class DenseConfigTests(unittest.TestCase):
         base = dense_config.LearnerSettings()
         self.assertEqual(base.proof_policy_weight, 0.)
         self.assertFalse(base.proof_policy_missing_only)
-        self.assertIn('proof_policy_weight', dense_learn.KEEP)
-        self.assertIn('proof_policy_missing_only', dense_learn.KEEP)
         self.assertEqual(dense_config.override(base, parser.parse_args(['--proof-policy-weight', '.5'])).proof_policy_weight, .5)
         missing = dense_config.override(base, parser.parse_args(['--proof-policy-missing-only']))
         self.assertTrue(dense_data.target_options(missing)['proof_policy_missing_only'])
@@ -1896,7 +1894,6 @@ class DenseConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 replace(base, pair_policy_weight=weight)
         self.assertEqual(base.pair_policy_weight, 0.)
-        self.assertIn('pair_policy_weight', dense_learn.KEEP)
         paired = dense_config.override(base, parser.parse_args(['--pair-policy-weight', '1']))
         self.assertEqual(dense_data.target_options(paired)['pair_policy_weight'], 1.)
         # Old run configs omit these settings and resume with the defaults, so a default change would alter them.
@@ -1925,12 +1922,6 @@ class DenseConfigTests(unittest.TestCase):
         old = {k: v for k, v in asdict(base).items() if k not in ('value_target', 'outcome_lambda', 'outcome_weight', 'calibration_games',
                                                                    'validation_rows', 'validation_quota', 'future_target')}
         self.assertEqual(dense_config.LearnerSettings(**old), base)
-        rng = np.random.default_rng(0)
-        self.assertEqual(dense_learn.perturb(replace(base, outcome_lambda=1.), rng, .2).outcome_lambda, 1.)
-        for _ in range(20):
-            x = dense_learn.perturb(base, rng, .2).outcome_lambda
-            self.assertTrue(.98-.02*.2-1e-12 <= x <= .98+.02*.2+1e-12)
-        self.assertIn('validation_rows', dense_learn.KEEP)
 
     def test_command_line_creates_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3165,11 +3156,10 @@ class CheapRowTests(unittest.TestCase):
                     bench.pooled(tmp, settings, 1, 1, Path(tmp)/'policies', run_seed=6)
             self.assertEqual(pool.call_args.kwargs['run_seed'], 6)
 
-    def test_fraction_is_bounded_and_kept_across_replacement(self):
+    def test_fraction_is_bounded(self):
         for bad in (-.1, 1.5):
             with self.assertRaises(ValueError):
                 dense_config.LearnerSettings(cheap_row_fraction=bad)
-        self.assertIn('cheap_row_fraction', dense_learn.KEEP)
 
     @few_rows
     def test_changing_the_fraction_moves_the_pacing_base_to_the_new_count(self):
@@ -3430,6 +3420,29 @@ class ValidationSourceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dense_data.write_shard(Path(tmp)/'shards'/'2', dict(actor_sha256='a'), [], [], 'other')
 
+    def test_a_shard_that_disappears_leaves_the_window_and_the_subsets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in (1, 2, 3):
+                source_shard(run/'shards'/f'100000000000{k}', k, 'x', checkpoint='main/000010')
+            sets = dense_data.ValidationSets(run, .5, 5, limit=40, quota=4)
+            sets.refresh()
+            window = dense_data.ReplayWindow(run, 1000, 10**6, validation_fraction=.5)
+            gone = '1000000000002'
+            self.assertIn(gone, {r.shard for refs in sets.subsets.values() for r in refs})
+            self.assertIn(gone, [name for name, _ in window.admitted])
+            shutil.move(run/'shards'/gone, run/gone)
+            source_shard(run/'shards'/'1000000000004', 4, 'x', checkpoint='main/000010')
+            sets.refresh()
+            window.refresh()
+            self.assertNotIn(gone, {r.shard for refs in sets.subsets.values() for r in refs})
+            self.assertIn('1000000000004', {r.shard for refs in sets.subsets.values() for r in refs})
+            self.assertEqual([name for name, _ in window.admitted], ['1000000000001', '1000000000003', '1000000000004'])
+            self.assertEqual(window.total_rows, sum(window.manifests[n]['counts']['rows'] for n in window.names))
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertEqual(sorted((e['shard'], e['owner']) for e in events if e['kind'] == 'shard_vanished'),
+                             [(gone, 'ReplayWindow'), (gone, 'ValidationSets')])
+
     def test_fixed_subsets_per_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
@@ -3655,7 +3668,7 @@ class ValidationSourceTests(unittest.TestCase):
             sets = dense_data.ValidationSets(run, .5, config.seed, limit=12, quota=6)
             manifest = learner.export(window, sets)
             self.assertEqual(set(manifest), {'variant', 'step', 'samples_seen', 'created_at', 'optimizer_kind', 'model_sha256', 'ema_sha256',
-                                             'metrics', 'learner', 'model', 'copied_from', 'rows', 'pacing'})
+                                             'metrics', 'learner', 'model', 'rows', 'pacing'})
             aggregate, v = manifest['metrics']['validation'], manifest['metrics']['validation_sources']
             self.assertEqual(v['newest_checkpoint'], 'main/000010')
             for h in ('policy_ce', 'value_bce', 'opponent_ce', 'future_bce'):
@@ -7042,6 +7055,100 @@ class LearnerPipelineTests(unittest.TestCase):
             self.assertEqual([(e['old_optimizer'], e['new_optimizer']) for e in events if e['kind'] == 'optimizer_reset'],
                              [('adamw', 'muon'), ('muon', 'adamw')])
 
+    @staticmethod
+    def checkpoint(run, config, variant, step, seed):
+        """Export `variant` at `step` after three training steps from a seed-`seed` initialisation, so its raw and
+        EMA weights differ."""
+        torch.manual_seed(seed)
+        window = dense_data.ReplayWindow(run, 1000, 10)
+        batch = dense_data.collate(*dense_data.examples(window, window.sample(np.random.default_rng(seed), 8), np.random.default_rng(0)))
+        learner = dense_learn.Learner(run, replace(config.learner, variant=variant), config)
+        learner.step = learner.optimizer_started = step-3
+        for _ in range(3):
+            learner.train_step(batch)
+        learner.export(window)
+        return run/'checkpoints'/variant/f'{step:06d}'
+
+    @staticmethod
+    def distance(a, b):
+        return sum((x-y).pow(2).sum().item() for x, y in zip(a.parameters(), b.parameters()))
+
+    @few_rows
+    def test_a_seed_checkpoint_starts_its_raw_weights_at_the_ema(self):
+        torch.set_num_threads(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.RunConfig(device='cpu', model=dense_config.ModelSettings(**asdict(TINY)),
+                                            learner=dense_config.LearnerSettings(batch=8, validation_fraction=0., lr=.01, warmup_steps=0))
+            source = self.checkpoint(run, config, 'main', 30, 1)
+            raw, ema = (hexnet.load_model(source/name) for name in ('model.pt', 'ema.pt'))
+            self.assertGreater(self.distance(raw, ema), 0)
+            plain = dense_learn.Learner(run, config.learner, config)
+            self.assertEqual(self.distance(plain.model, raw), 0)
+            self.assertEqual(self.distance(plain.ema, ema), 0)
+            copied = run/'checkpoints'/'seeded'/source.name    # copied as it was: its manifest still names main
+            shutil.copytree(source, copied)
+            seeded = dense_learn.Learner(run, replace(config.learner, variant='seeded'), config)
+            self.assertEqual(seeded.settings.variant, 'seeded')
+            self.assertEqual(seeded.step, 30)
+            self.assertEqual(self.distance(seeded.model, ema), 0)
+            self.assertEqual(self.distance(seeded.ema, ema), 0)
+            manifest = json.loads((copied/'manifest.json').read_text())
+            dense_config.write_json(copied/'manifest.json', dict(manifest, variant='seeded', seed_source='main/000030'))
+            marked = dense_learn.Learner(run, replace(config.learner, variant='seeded'), config)
+            self.assertEqual(self.distance(marked.model, ema), 0)
+            started = dense_learn.Learner(run, replace(config.learner, variant='fresh'), config, initial=source)
+            self.assertEqual((started.step, self.distance(started.model, ema), self.distance(started.ema, ema)), (0, 0, 0))
+
+    @slow
+    @few_rows
+    def test_a_league_leader_does_not_change_a_resumed_learner(self):
+        """A resumed variant far below another rated checkpoint keeps its own weights, optimizer state, EMA and
+        learning rate across steps 4000 and 4001, where its manifest's (retired) replacement settings asked for a
+        check every 2000 steps with no protection."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)/'run'
+            made = subprocess.run([sys.executable, str(ROOT/'python/dense_config.py'), '--run', str(run), '--device', 'cpu',
+                                   '--blocks', '1', '--channels', '16', '--validation-fraction', '0', '--lr', '0.001',
+                                   '--warmup-steps', '1', '--batch', '8', '--window-min-rows', '1', '--samples-per-row', '1000',
+                                   '--log-every', '1'], capture_output=True, text=True, cwd=ROOT, timeout=60)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            source_shard(run/'shards'/'1000000000001', 2, 'x')
+            config = dense_config.load(run)
+            leader = self.checkpoint(run, config, 'main', 3999, 1)
+            mine = self.checkpoint(run, config, 'side', 3999, 2)
+            manifest = json.loads((mine/'manifest.json').read_text())
+            manifest['learner'].update(protect_steps=0, replace_interval=2000, replace_margin=50., perturb=.2)
+            dense_config.write_json(mine/'manifest.json', dict(manifest, copied_from=None))
+            dense_config.write_json(run/'league.json', dict(champion='main/003999', checkpoints=[
+                dict(id='main/003999', variant='main', step=3999, elo=500., matches=[]),
+                dict(id='side/003999', variant='side', step=3999, elo=0., matches=[])],
+                differences=[dict(a='main/003999', b='side/003999', elo_delta=500., interval=[400., 600.])]))
+            before = {name: hexnet.load_model(mine/f'{name}.pt') for name in ('model', 'ema')}
+            state = torch.load(mine/'optimizer.pt', weights_only=True)
+            done = subprocess.run([sys.executable, str(ROOT/'python/dense_learn.py'), '--run', str(run), '--variant', 'side',
+                                   '--steps', '4001', '--workers', '1'],
+                                  capture_output=True, text=True, cwd=ROOT, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            after = run/'checkpoints'/'side'/'004001'
+            saved = json.loads((after/'manifest.json').read_text())
+            self.assertNotIn('copied_from', saved)
+            self.assertNotIn('replace_margin', saved['learner'])
+            self.assertEqual(saved['learner']['lr'], .001)
+            lines = [json.loads(line) for line in (run/'metrics'/'learner-side.jsonl').read_text().splitlines()]
+            self.assertEqual([(r['step'], r['lr']) for r in lines if 'lr' in r], [(4000, .001), (4001, .001)])
+            leading = hexnet.load_model(leader/'model.pt')
+            for name in ('model', 'ema'):
+                now = hexnet.load_model(after/f'{name}.pt')
+                self.assertLess(self.distance(now, before[name]), self.distance(now, leading)/100, name)
+            resumed = torch.load(after/'optimizer.pt', weights_only=True)
+            self.assertEqual((resumed['optimizer_started'], resumed['ema_updates']), (state['optimizer_started'], state['ema_updates']+2))
+            steps = lambda s: {int(v['step']) for v in s['optimizer']['state'].values()}
+            self.assertEqual(steps(resumed), {k+2 for k in steps(state)})
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertFalse([e for e in events if e['kind'] in ('replace', 'optimizer_reset')])
+
     def test_each_variant_has_its_own_policy_directory(self):
         run = Path('run')
         self.assertNotEqual(dense_learn.policy_dir(run, 'main'), dense_learn.policy_dir(run, 'b'))
@@ -7106,7 +7213,7 @@ class PhaseTests(unittest.TestCase):
                              (dict(rows=rows, samples=5000), 4., 3.))
             lower.rebase(rows+500)
             self.assertEqual(lower.pacing, dict(rows=rows, samples=5000))
-            lower.settings = replace(lower.settings, samples_per_row=2.)  # a replacement copy's setting
+            lower.settings = replace(lower.settings, samples_per_row=2.)
             lower.rebase(rows+500)
             self.assertEqual(lower.pacing, dict(rows=rows+500, samples=5000))
             lower.settings = replace(lower.settings, samples_per_row=3.)
@@ -7199,7 +7306,6 @@ class PhaseTests(unittest.TestCase):
         del data['learner']['phase_rows'], data['actor']['phase_follow']
         config = dense_config.from_dict(data)
         self.assertEqual((config.learner.phase_rows, config.actor.phase_follow), (0, False))
-        self.assertIn('phase_rows', dense_learn.KEEP)
         with self.assertRaises(ValueError):
             dense_config.LearnerSettings(phase_rows=-1)
 
@@ -7215,7 +7321,6 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual((parsed.phase_export, parsed.phase_actors), (True, 4))
         data = asdict(dense_config.RunConfig())
         for key in ('phase_export', 'phase_actors'):
-            self.assertIn(key, dense_learn.KEEP)
             del data['learner'][key]
         old = dense_config.from_dict(data).learner
         self.assertEqual((old.phase_export, old.phase_actors), (False, 0))
@@ -10083,14 +10188,6 @@ class EvaluatorLoopTests(unittest.TestCase):
         self.assertTrue(evaluator.step())
         self.assertEqual(len(json.loads(path.read_text())['games']), 4)             # not 2 + games
         self.assertIsNone(evaluator.optional())
-        # A replacement rematch is offered only the games left below sprt_max_games.
-        evaluator = self.start(games=4, sprt_max_games=6, idle_rematch=True)
-        evaluator.league['checkpoints'] = []
-        evaluator.league['differences'] = [dict(a='main/000020', b='side/000010', elo_delta=0., interval=[-100., 100.])]
-        played = dict(candidate='side/000010', opponent='main/000020', settings=asdict(evaluator.settings),
-                      summary=dict(wins=1, losses=1, capped=0, games=2), metrics={}, games=[])
-        with unittest.mock.patch.object(dense_eval, 'load_reports', lambda *args: [played]):
-            self.assertEqual(evaluator.rematches(), [('main/000020', 'side/000010', 'replacement', 4)])
 
     def test_rematches_skip_reports_of_another_protocol(self):
         evaluator = self.start(idle_rematch=True)
@@ -10200,8 +10297,6 @@ class EvaluatorLoopTests(unittest.TestCase):
             dict(id='main/000020', variant='main', step=20, elo=90., matches=[], demoted=True),
             dict(id='main/000030', variant='main', step=30, skipped=True, elo=None, matches=[]),
             dict(id='side/000010', variant='side', step=10, elo=10., matches=[])])
-        self.assertEqual({v: c['id'] for v, c in dense_learn.latest_rated(league).items()},
-                         {'main': 'main/000010', 'side': 'side/000010'})
         rated = lambda names, anchor, reports, seed: ({n: 0. for n in names}, {n: [0., 0.] for n in names}, {n: [0.] for n in names})
         self.start()
         with unittest.mock.patch.object(dense_eval, 'rate', rated), unittest.mock.patch.object(dense_eval, 'write_json'):

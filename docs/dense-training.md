@@ -15,6 +15,11 @@ python python/dense_learn.py --run runs/bubble-short --steps 1 --workers 1
 
 The games hit their placement cap, so their outcomes stay masked and the search values supply the value target. It proves nothing about strength.
 
+## Resume and seeds
+
+A learner resumes from the newest checkpoint under `checkpoints/<variant>/`: raw weights, EMA, optimizer state, step and the settings saved in its manifest, with command-line flags on top. Raw and EMA weights stay as saved, so training continues where it stopped.
+
+A seed is a checkpoint copied in from elsewhere: its manifest names another variant, or records the source checkpoint id as `seed_source`. A seed's raw weights start at its EMA weights, and the new EMA starts equal to them. The EMA is the model that was rated; the raw weights of a strong export sit 50 to 100 Elo below it, so training on from them starts from a weaker point. The optimizer state and the step count carry over. `--initial` on a new variant works the same way when it names a checkpoint directory (its `ema.pt` is loaded); a model file is loaded as given.
 ## Rows
 
 An actor writes one row per placement. A full-search row (the `full_fraction` of placements, 128 simulations in the live run) carries the improved search policy as its policy target and a value target. A cheap-search row (12 simulations) carries a value target at weight `cheap_value_weight` (0.25) and no policy target; `--cheap-row-fraction f` keeps a hash-chosen share `f` of them, and `f = 0` is KataGo's choice of not training on them at all. Each placement draws its kind independently, so both stones of a turn are full searches in only `full_fraction` squared of turns; the actor flag `--full-turns` lets a turn's second stone repeat its first stone's draw, which keeps the full share and makes every full first stone a pair that `--pair-policy-weight` can use. Rows with an exact label, from a proof or a forced line, are always kept at value weight `proven_value_weight` (2) and their outcome loss is masked.
@@ -48,7 +53,7 @@ Replay validation's policy CE, target entropy, KL and top-1 use the same policy 
 
 ## Window and pacing
 
-The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. Phases are off in a new run. With `--phase-rows N` on the learner and `--phase-follow` on the actors, the two alternate: actors play until N new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. That is how the live run shared one GPU; without it, all three compete for the card at once. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state.
+The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. Phases are off in a new run. With `--phase-rows N` on the learner and `--phase-follow` on the actors, the two alternate: actors play until N new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. That is how the live run shared one GPU; without it, all three compete for the card at once. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state. A shard directory moved out of `shards/` while the learner runs (a quarantine) leaves the window and the validation subsets at their next refresh, and a `shard_vanished` event records it.
 
 ## Book and restart starts
 
