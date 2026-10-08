@@ -40,12 +40,12 @@ newest by default. Ambiguous names are rejected.
 A seat combines an engine, preset or custom budget, and a device. For example:
 
 ```sh
-python python/bubble.py match "dense-v1@150000{simulations=512,views=4}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
+python python/bubble.py match "dense-v1@150000{simulations=512}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
 ```
 
 `@lightning`, `@quick`, `@standard`, `@strong`, `@deep` and `@dangerous` use the UI's presets; `--preset` supplies the default for both seats.
-Custom keys are the engine's own: Bubble has `simulations` (Nodes), `ms` (Time, `active=ms` or `ms` alone applies it)
-and `views` (Width), Six has `nodes` (positions) or `ms`,
+Custom keys are the engine's own: Bubble has `simulations` (Nodes) or `ms` (Time, `active=ms` or `ms` alone applies
+it), Six has `nodes` (positions) or `ms`,
 Strix/Pulsatrix has `simulations`, and Drip/Seal has `ms`. Unknown keys are rejected. `--a-device` and
 `--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
 
@@ -158,7 +158,7 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `POST /matches/open` with `{"batch":"<id>","game":1}` | Open a saved game on the separate analysis board |
 | `GET /replay`, `GET /htttx` | Export the visible game |
 
-A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"ms":2000,"active":"ms","views":8}}`; root query nodes follow the
+A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"ms":2000,"active":"ms"}}`; root query nodes follow the
 work or the time (see the custom budget above), and a `solver_nodes` key is rejected here.
 Clock JSON is `{"mode":"fixed"}`, `{"mode":"move","ms":5000}`, or `{"mode":"game","tc":"180+2"}`.
 `POST /clock` with the same JSON puts the single game on this board on that clock.
@@ -220,9 +220,13 @@ the seats: off when both are Human, on otherwise (a seat a browser engine plays 
 Bubble's and Six's levels are amounts of work, not time: Bubble's nodes per stone (the hybrid owner's completed
 simulations) with its root query nodes, and Six's positions. The counts were picked so each ladder spans about the
 same wall time on its own device, under half a second at Lightning to a few seconds at Deep. A CPU server gives Bubble
-its own ladder (`CPU_PRESETS`); the browser uses the GPU one. The dial's tooltip names each level's count.
+its own ladder (`CPU_PRESETS`), and so does the browser on WebAssembly (`CPU_PRESETS` in `web/engine/bubble.mjs`, the
+same counts); on WebGPU the browser plays the GPU ladder. The dial's tooltip names each level's count. The slider
+also shows the expected time of a two-stone turn for Bubble and for every browser engine: the times measured below
+(`TURN_MS` in `python/play.py`, `turnTimes` in `web/engine/bubble.mjs`) until the server or the page has timed its own
+engine moves at that level, then those; each move moves the estimate halfway to its own time.
 
-| Preset | Bubble nodes, GPU | Bubble nodes, CPU server | Bubble root query nodes, GPU / CPU | Drip and Seal ms | Six positions | Strix simulations |
+| Preset | Bubble nodes, GPU | Bubble nodes, CPU server and WebAssembly | Bubble root query nodes, GPU / CPU | Drip and Seal ms | Six positions | Strix simulations |
 |---|---|---|---|---|---|---|
 | Lightning | 16 | 4 | 1,024 / 512 | 100 | 120 | 2 |
 | Quick | 64 | 8 | 2,048 / 1,024 | 250 | 240 | 8 |
@@ -230,6 +234,23 @@ its own ladder (`CPU_PRESETS`); the browser uses the GPU one. The dial's tooltip
 | Strong | 512 | 32 | 8,192 / 4,096 | 3,000 | 960 | 128 |
 | Deep | 1,024 | 64 | 16,384 / 8,192 | 10,000 | 1,920 | 512 |
 | Dangerous | 65,536 | 1,024 | 4,000,000 / 131,072 | 60,000 | 2,000,000 | 4,096 |
+
+Seconds per two-stone engine move with network 205000, measured on 2026-10-08 on an RTX 3070 Ti that the training
+run shared, the browser's WebAssembly on 8 threads. The browser columns are fresh searches of three positions of 3 to
+13 stones, two runs each; the served column is the moves of one game. The range is the fastest to the slowest.
+
+| Preset | Served GPU | Browser WebGPU | Browser WebAssembly |
+|---|---|---|---|
+| Lightning | 0.15 to 0.35 | 0.24 to 0.52 | 0.21 to 0.32 |
+| Quick | 0.54 to 0.81 | 0.70 to 1.3 | 0.34 to 0.69 |
+| Standard | 1.1 to 1.7 | 1.5 to 3.6 | 0.53 to 1.8 |
+| Strong | 1.5 to 2.8 | 2.6 to 5.1 | 1.2 to 2.6 |
+| Deep | 3.1 to 5.9 | 4.2 to 7.3 | 2.0 to 4.9 |
+
+Before the WebAssembly ladder the browser played the GPU counts there too, and Lightning took 0.65 to 0.96 s, Quick
+2.3 to 3.2 s and Standard 8.4 to 14 s. A custom Time budget holds its clock: 300 ms turns took 0.30 to 0.50 s served
+and 0.30 to 0.33 s in the browser, 3,000 ms turns 3.0 to 3.1 s served and 3.0 to 3.3 s in the browser, with the
+first stone on the board after about 60% of the time.
 
 Seconds per analysis turn on main/185000, from 3, 5 and 9 stones (the range over the three), RTX 3070 Ti and Ryzen 9
 5900X, measured on 2026-10-08 while the training run shared the GPU and CPU. Old is the ladder before this one
@@ -249,15 +270,21 @@ and 125 s at Quick to Deep. The CPU column was measured with 1,024 root nodes at
 the browser (WebGPU); a served Six on TensorRT or CUDA runs the same counts faster. Dangerous stays a stress level.
 
 A thinking engine's seat shows a progress line (a moving one when the engine reports no progress) and its cancel
-button. The custom budget shows the engine's own fields. Bubble has Time (ms per turn) and Nodes (work per stone),
+button. Bubble puts the first stone of a two-stone turn on the board as soon as that stone's search ends, and the
+seat goes on thinking about the second, with the budget split as before. Undo, grades and the notation see the stone
+like any other. Cancelling then keeps the first stone, and the engine plays the rest of the turn when the game
+resumes. On the served page a turn on a game clock (the timed engine process) still arrives whole. The custom budget shows the engine's own fields. Bubble has Time (ms per turn) and Nodes (work per stone),
 and exactly one of them applies: editing one makes it the budget and greys the other, which keeps its value for
-later. Width is the number of views the owner searches per position (1 to 16, 8 by default). The root queries get 16
+later. Time starts at the expected turn time of the preset the seat had, where the page knows one, else 1,000 ms.
+There is no width field: every Play search runs the hybrid scheduler with 8 views per position (`HYBRID` in
+`python/play.py`), the width the actors and the evaluator search with, so a custom budget changes only the amount of
+work. An older custom budget's Width is dropped. The root queries get 16
 nodes per node of work, or 4 per ms, between 1,024 and 4,000,000; under Time they get at most a quarter of the
 clock, the first of two stones 60% of the rest and Nodes is not a limit (65,536 per stone at most). Six has Positions
 or Time on the same rule. Strix has Search (at least 1), Drip and Seal ms (at least 10). The choice is saved with the
 custom budget. An older custom Bubble budget opens with its simulations as Nodes; its solver nodes are dropped. Any
 larger whole number up to 2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes
-longer. A time budget's evaluations are saved under their own key (`~ms2500`), as are a width other than 8 (`~views4`).
+longer. A time budget's evaluations are saved under their own key (`~ms2500`).
 A Bubble seat, served or in the browser, keeps one search graph for its game (a `GameGraph`, see
 [neural-search.md](neural-search.md)), adding each turn's simulations to the visits already under the position until
 undo, a new or loaded game or a seat change, so its moves are saved with the kept-tree evaluations and never read
@@ -337,9 +364,12 @@ the two most recently used networks stay running. Six searches by nodes, so a pr
 The analysis engine is a Bubble checkpoint with its own preset. Analysis and review run on their own worker and
 model, beside the one that plays engine moves, so they keep up during play. With Auto on it evaluates every
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
-position through every preset, Lightning first, showing each as it lands and starting again when the position
-changes. That deepening runs last in the queue, gives way to any other analysis and holds its network work while
-an engine seat searches. Cancelling an analysis leaves Auto on: Auto and deepening only stop asking for that position
+position through the presets up to the analysis preset, Lightning first, showing each as it lands and starting
+again when the position changes. At Lightning that is one search, so the analysis goes quiet once it lands; a
+custom budget or Deep Solve is not deepened and runs as asked. That deepening runs last in the queue, gives way to any other analysis and holds its network work while
+an engine seat searches. Auto asks for a position once per engine and budget, and again only while the position has
+no evaluation or a stale one; the server decides whether a saved evaluation covers the budget. Cancelling an
+analysis leaves Auto on: Auto and deepening only stop asking for that position
 at those settings until something changes, a move, a step back or forward, another preset or engine, or Analyse
 again. Each preset continues the search of the one before on the same position, adding only the
 simulations it lacks, and keeps a solver proof it already has; these evaluations are saved apart from fresh ones
