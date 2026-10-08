@@ -79,7 +79,7 @@ export class StrixEngine {
   async files(checkpoints = []) {
     await this.refresh();
     const {data, local} = await json('build.json'), chosen = checkpoints.map(id => this.networks.get(id)).filter(Boolean);
-    return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], lines: true, local},
+    return [{path: 'strix/strix.wasm', sha256: data.artefacts['strix/strix.wasm'], local},
       ...(chosen.length ? chosen : [this.network]).map(n => ({path: n.path, sha256: n.sha256, bytes: n.size, local: n.local}))];
   }
 
