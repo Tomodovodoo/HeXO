@@ -3442,6 +3442,23 @@ class ValidationSourceTests(unittest.TestCase):
             events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
             self.assertEqual(sorted((e['shard'], e['owner']) for e in events if e['kind'] == 'shard_vanished'),
                              [(gone, 'ReplayWindow'), (gone, 'ValidationSets')])
+            # A shard moved away while a refresh reads it.
+            late = '1000000000005'
+            source_shard(run/'shards'/late, 5, 'x', checkpoint='main/000010')
+            index = dense_data.shard_index
+            def moving(path, *args):
+                if Path(path).name == late and (run/'shards'/late).exists():
+                    shutil.move(run/'shards'/late, run/late)
+                return index(path, *args)
+            with unittest.mock.patch.object(dense_data, 'shard_index', moving):
+                sets.refresh()
+                source_shard(run/'shards'/late, 5, 'x', checkpoint='main/000010')
+                window.refresh()
+            self.assertNotIn(late, {r.shard for refs in sets.subsets.values() for r in refs})
+            self.assertNotIn(late, [name for name, _ in window.admitted])
+            events = [json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertEqual(sorted(e['owner'] for e in events if e['kind'] == 'shard_vanished' and e['shard'] == late),
+                             ['ReplayWindow', 'ValidationSets'])
 
     def test_fixed_subsets_per_source(self):
         with tempfile.TemporaryDirectory() as tmp:

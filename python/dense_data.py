@@ -711,7 +711,8 @@ def shard_dirs(run_dir):
 def rescan(run_dir, manifests, owner):
     """Bring `manifests` {shard name: manifest} in line with <run>/shards: add new shards, drop shards whose
     directory is gone (moved or deleted since they were listed) and log each drop as a 'shard_vanished' event
-    naming `owner` (the class that held it). Returns the dropped names."""
+    naming `owner` (the class that held it). A shard that goes between the listing and its manifest read is
+    skipped. Returns the dropped names."""
     present = {path.name: path for path in shard_dirs(run_dir)}
     gone = set(manifests) - present.keys()
     for name in sorted(gone):
@@ -720,8 +721,23 @@ def rescan(run_dir, manifests, owner):
                                shard=name, owner=owner)
     for name, path in present.items():
         if name not in manifests:
-            manifests[name] = manifest(path)
+            try:
+                manifests[name] = manifest(path)
+            except FileNotFoundError:
+                if path.is_dir():
+                    raise
     return gone
+
+
+def surviving_vanished(run_dir, manifests, work):
+    """work(), run again while it raises FileNotFoundError and a shard listed in `manifests` has lost its
+    directory (work's own `rescan` then drops it); any other FileNotFoundError propagates."""
+    while True:
+        try:
+            return work()
+        except FileNotFoundError:
+            if all((Path(run_dir)/'shards'/name).is_dir() for name in manifests):
+                raise
 
 
 def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
@@ -842,7 +858,10 @@ class ReplayWindow:
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows. The indices
         are rebuilt only when the admitted shards, their proof labels or the restart buffer changed. A shard whose
-        directory disappeared leaves the window (`rescan`)."""
+        directory disappears, before or during the refresh, leaves the window (`rescan`, `surviving_vanished`)."""
+        return surviving_vanished(self.run_dir, self.manifests, self.update)
+
+    def update(self):
         for name in rescan(self.run_dir, self.manifests, 'ReplayWindow'):
             self.counts.pop(name, None)
         names = self.names = sorted(self.manifests)
@@ -1209,7 +1228,11 @@ class ValidationSets:
 
     def refresh(self):
         """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset. A shard whose directory
-        disappeared (`rescan`) loses its rows from every subset, which then refill from shards not yet walked."""
+        disappears, before or during the refresh (`rescan`, `surviving_vanished`), loses its rows from every subset,
+        which then refill from shards not yet walked."""
+        surviving_vanished(self.run_dir, self.manifests, self.update)
+
+    def update(self):
         gone = rescan(self.run_dir, self.manifests, 'ValidationSets')
         for name in gone:
             self.actors.pop(name, None)
