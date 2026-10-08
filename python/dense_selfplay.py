@@ -744,9 +744,9 @@ class SelfPlayGame:
 
     def plan(self):
         """Draw the next search's kind (full with probability full_fraction), budget and root samples, and set the
-        side to move's root noise: root_noise for a full search, 0 for a cheap one. With full_turns, the second stone
-        of a turn whose first stone this game searched keeps that stone's kind. With pv_check a full search's budget
-        is its first pass (neural_search.Recheck, run by `recheck`)."""
+        side to move's root noise: root_noise at root_noise_concentration for a full search, 0 for a cheap one.
+        With full_turns, the second stone of a turn whose first stone this game searched keeps that stone's kind.
+        With pv_check a full search's budget is its first pass (neural_search.Recheck, run by `recheck`)."""
         s = self.settings
         ply = len(self.moves) if s.full_turns else 0
         if not (ply and ply % 2 == 0 and ply > self.forced_plies):
@@ -759,6 +759,7 @@ class SelfPlayGame:
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
         if s.root_noise and not getattr(self, 'hybrid', False):
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
+            checked(native.hxg_root_concentration(self.tree.ptr, s.root_noise_concentration))
 
     @property
     def checking(self):

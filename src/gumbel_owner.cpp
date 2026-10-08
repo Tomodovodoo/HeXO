@@ -35,7 +35,7 @@ struct Owner {
   for(auto& [key,weak]:game->nodes)if(auto n=weak.lock())if(n->pending)throw std::runtime_error("Game has external pending neural work");
   for(auto& u:source.board.history)focus.push_back(u.c);views.reserve(max_views);
   View root;root.tree=std::make_unique<Tree>(rng(),game);root.tree->shared=root.tree->graph=true;
-  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;root.tree->round_barrier=source.round_barrier;
+  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;root.tree->root_concentration=source.root_concentration;root.tree->round_barrier=source.round_barrier;
   game->primary=root.tree.get();root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
   start(views[0]);game->scheduler_owner=this;
  }
@@ -164,7 +164,7 @@ struct Owner {
   auto history=c->history;double relevance=c->relevance;int depth=c->depth;c->last=allocations;
   if(slot<views.size()){hxgf_detach(feed,views[slot].tree.get());views[slot].tree->cancel();++retired;}
   View v;v.tree=std::make_unique<Tree>(rng(),game);v.tree->shared=v.tree->graph=true;
-  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->round_barrier=views[0].tree->round_barrier;
+  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->root_concentration=views[0].tree->root_concentration;v.tree->round_barrier=views[0].tree->round_barrier;
   v.tree->root_at(history);v.history=std::move(history);v.key=key;v.depth=depth;v.relevance=relevance;v.id=next_id++;++created;
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
   return start(views[slot])?int(slot):-1;
@@ -365,11 +365,11 @@ struct Pool {
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;
   failed[index]=false;stopped=false;++retargets;o.start(root);
  }
- std::unique_ptr<Owner> replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,uint64_t seed){
+ std::unique_ptr<Owner> replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,double concentration,uint64_t seed){
   auto& old=*games[index];int quantum=old.quantum,depth=old.max_depth;
   // Retirement already drained this slot's proof jobs and detached neural
   // subscribers. Device snapshots own copied encodings, not the old store.
-  source.root_noise=noise;
+  source.root_noise=noise;source.root_concentration=concentration;
   auto replacement=std::make_unique<Owner>(source,0,quantum,views,depth,(work || ms)?work:uint64_t(quantum),ms,seed,feed,samples);
   auto retired=std::move(games[index]);games[index]=std::move(replacement);
   if(!work && !ms)games[index]->stop();

@@ -340,7 +340,7 @@ struct GameStore {
   return false;
  }
 };
-struct RootEdge { double gumbel=0,opening_q=0;int epoch=0;uint64_t credits=0; };
+struct RootEdge { double gumbel=0,opening_q=0,noise=0;int epoch=0;uint64_t credits=0; };
 struct RootRound {
  std::vector<int> widths,ends,members,counts,limits;std::vector<double> opening;int active=-1;
 };
@@ -375,7 +375,8 @@ struct Tree {
  std::map<Cell,double> defence;
  double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
   bool round_barrier=false;RootRound round;
-  double root_noise=0;   // uniform share of the root's candidate sampling distribution (sampling)
+  double root_noise=0;   // noise share of the root's candidate sampling distribution (sampling)
+  double root_concentration=0;  // 0: uniform noise; > 0: shaped Dirichlet noise of this total concentration (draw_noise)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  std::vector<double> work;
  explicit Tree(uint64_t seed,std::shared_ptr<GameStore> game=std::make_shared<GameStore>()):
@@ -403,9 +404,28 @@ struct Tree {
   root_edges.assign(root->edges.size(),{});
   if(!budget)return;  // Reading a cold view's metrics must not consume its future sampling randomness.
   for(auto& e:root_edges){double u=std::generate_canonical<double,53>(rng);e.gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
+  if(root_noise>0 && root_concentration>0)draw_noise();
   root_prepared=true;
   schedule(int(std::count_if(root->edges.begin(),root->edges.end(),[](const auto& e){return e.read().eligible;})));
   freeze_root_q();
+ }
+ // KataGo's shaped Dirichlet noise over the eligible root edges, one draw per search, kept in root_edges[i].noise:
+ // half of the concentration is spread evenly, half in proportion to how far each edge's log min(p, 0.01) lies above
+ // the eligible edges' mean, p the softmax of the eligible logits.
+ void draw_noise(){
+  auto& edges=root->edges;double maximum=-1e300,total=0,mean=0,excess=0,sum=0;int n=0;
+  for(auto& e:edges)if(e.read().eligible){maximum=std::max(maximum,e.logit);++n;}
+  if(!n)return;
+  for(auto& e:edges)if(e.read().eligible)total+=std::exp(e.logit-maximum);
+  std::vector<double> shape(edges.size());
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,std::exp(edges[i].logit-maximum)/total)+1e-20);mean+=shape[i];}
+  mean/=n;
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::max(0.,shape[i]-mean);excess+=shape[i];}
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){
+   double alpha=root_concentration*(excess>0?.5*(shape[i]/excess+1./n):1./n);
+   sum+=root_edges[i].noise=std::gamma_distribution<double>(alpha,1.)(rng);
+  }
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)root_edges[i].noise=sum>0?root_edges[i].noise/sum:1./n;
  }
  // Root sampling uses the evidence available at this search's start. Keep it with the view's root session so
  // predictions from early candidates or other views cannot change the remaining Gumbel-top-k draws.
@@ -825,15 +845,17 @@ struct Tree {
   }
   return chosen;
  }
- // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e / N) for the N
- // eligible edges, p their softmax over the eligible logits. Only the opening phase's Gumbel-top-k draws on these;
- // halving, the final choice, the improved policy and every non-root node use the edge logits.
+ // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e d) for the N
+ // eligible edges, p their softmax over the eligible logits and d the noise: 1 / N, or with root_concentration > 0
+ // the search's Dirichlet draw (draw_noise). Only the opening phase's Gumbel-top-k draws on these; halving, the final
+ // choice, the improved policy and every non-root node use the edge logits.
  std::vector<double> sampling(const Node& node)const {
   std::vector<double> out;double maximum=-1e300,total=0;int n=0;
   for(auto& e:node.edges){out.push_back(e.logit);if(e.read().eligible){maximum=std::max(maximum,e.logit);++n;}}
   if(root_noise<=0 || !n)return out;
   for(auto& e:node.edges)if(e.read().eligible)total+=std::exp(e.logit-maximum);
-  for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible)out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise/n);
+  for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible)
+   out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise*(root_concentration>0?root_edges[i].noise:1./n));
   return out;
  }
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
@@ -1134,6 +1156,7 @@ struct Tree {
   // A retained proven loss covers every legal continuation even if this node had not needed expansion yet.
   if(node.exact_winner>=0 && node.exact_winner!=node.player)for(auto& edge:node.edges){edge.write().exact_winner=node.exact_winner;edge.write().distance=node.distance;edge.write().bound=true;}
   if(tactics)classify(path,node);
+  if(at_root && root_noise>0 && root_concentration>0)draw_noise();
   if(graph){
    // A live expanded peer of the position hands over its edge proofs; the shared outcome keeps them when no peer
    // is alive (a win's witnesses, a loss's per-move resistances).
@@ -1324,6 +1347,8 @@ HX_API int hxg_round_barrier(void* p,int enabled){try{auto& t=*static_cast<gumbe
  if((enabled!=0 && enabled!=1) || t.started || !t.requests.empty())throw std::runtime_error("Configure rounds before search work");
  if(t.round_barrier!=bool(enabled))t.root_sessions.clear();t.round_barrier=enabled;if(t.budget)t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](const auto& e){return e.read().eligible;})):int(t.board.legal_moves().size()));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_root_noise(void* p,double noise){if(!(noise>=0 && noise<1)){gumbel::error="Invalid root noise";return 0;}static_cast<gumbel::Tree*>(p)->root_noise=noise;return 1;}
+// Total Dirichlet concentration of the root noise; 0 keeps the uniform share. Applies from the next search.
+HX_API int hxg_root_concentration(void* p,double concentration){if(!(concentration>=0 && std::isfinite(concentration))){gumbel::error="Invalid root noise concentration";return 0;}static_cast<gumbel::Tree*>(p)->root_concentration=concentration;return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
 // context was already expanded elsewhere (tree duplicates; 0 in a graph)}.
 HX_API int hxg_census(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);
@@ -1435,7 +1460,7 @@ extern "C" HX_API void* hxg_view(void* source,const int64_t* history,int count,u
   auto& original=*static_cast<gumbel::Tree*>(source);
   if(!original.shared || count<0)throw std::runtime_error("View needs a shared graph and valid history");
   auto view=std::make_unique<gumbel::Tree>(seed,original.state);view->shared=view->graph=true;
-  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->round_barrier=original.round_barrier;
+  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->root_concentration=original.root_concentration;view->round_barrier=original.round_barrier;
   std::vector<Cell> h;for(int i=0;i<count;++i)h.push_back({history[2*i],history[2*i+1]});view->root_at(h);
   return view.release();
  }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}
