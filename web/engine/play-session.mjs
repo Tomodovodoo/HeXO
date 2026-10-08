@@ -174,8 +174,10 @@ export class BrowserSession extends OfflineSession {
   }
   /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
   engineKey(spec) {
-    const entry = this.entries.get(spec.engine);
-    return [spec.engine, spec.checkpoint, entry?.version || '', entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
+    const entry = this.entries.get(spec.engine), budget = spec.budget || {};
+    // A Bubble budget in time or of another width keeps its own evaluations (python/play.py search_key).
+    const search = entry?.kind === 'bubble' ? (budget.ms ? `~ms${budget.ms}` : '') + ((budget.views ?? WIDTH) !== WIDTH ? `~views${budget.views}` : '') : '';
+    return [spec.engine, spec.checkpoint, (entry?.version || '') + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
   }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }

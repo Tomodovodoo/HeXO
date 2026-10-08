@@ -1189,8 +1189,8 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     `exact_winner`, `proven`, `proof_plies`), its `action` the stone of the highest improved policy, or the owner's
     own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
     verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
-    spent. Each graph is left at its root. With `ms` each owner also stops at that clock, its `simulations` a
-    ceiling; `views` replaces HYBRID['views']."""
+    spent. Each graph is left at its root. With `ms` (one clock, or one per root) each owner also stops at its clock,
+    its `simulations` a ceiling; `views` replaces HYBRID['views']."""
     import numpy as np
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
@@ -1208,7 +1208,8 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
         service.start(continuous=True)
         service.launch()
         for game, (history, (_, simulations)) in enumerate(zip(histories, roots)):
-            service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(ms)) if ms else 0,
+            clock = ms[game] if isinstance(ms, list) else ms
+            service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(clock)) if clock else 0,
                              samples=16, views=views)
         launched, sequence, shown, held = 0, 0, 0., False
         while len(events) < len(roots):
@@ -1557,12 +1558,12 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                     turn.tree = tree
                     searching.append((turn, (tree, max(1, count))))
             if searching:
-                clock = None
+                clocks = None
                 if end is not None:
-                    clock = max(1., (end - time.monotonic()) * 1000)
-                    clock *= .6 if any(turn.local.remaining == 2 for turn, _ in searching) else 1
+                    left = max(1., (end - time.monotonic()) * 1000)
+                    clocks = [left * (.6 if turn.local.remaining == 2 else 1) for turn, _ in searching]
                 for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
-                                                               stamps=stamps, ms=clock, views=views)):
+                                                               stamps=stamps, ms=clocks, views=views)):
                     turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
