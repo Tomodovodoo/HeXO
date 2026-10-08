@@ -460,7 +460,7 @@ const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:
 const STOPS=['lightning','quick','standard','strong','deep','dangerous'],configured=new Set();
 const FIELDS={simulations:'Search',solver_nodes:'Solver',nodes:'Positions',ms:'ms'};
 /* custom budgets whose work and Time exclude each other (python/play.py EXCLUSIVE), and their field names */
-const EXCLUSIVE={bubble:['simulations','ms'],six:['nodes','ms']},LABELS={bubble:{simulations:'Nodes',ms:'Time ms',views:'Width'},six:{nodes:'Positions',ms:'Time ms'}};
+const EXCLUSIVE={bubble:['simulations','ms'],six:['nodes','ms']},formKind=e=>e?.kind==='bubble'||e?.kind==='six'&&(e.badge??'six')==='six'?e.kind:null,LABELS={bubble:{simulations:'Nodes',ms:'Time ms',views:'Width'},six:{nodes:'Positions',ms:'Time ms'}};
 const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
 globalThis.playReady=new Promise(resolve=>{globalThis.resolvePlayReady=resolve});
 const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
@@ -904,8 +904,8 @@ function formOf(kind,budget,standard){const [work]=EXCLUSIVE[kind],time=budget.m
 function budgetFields(entry,seat,change,id){
   const field=(key,label,value,off,send)=>{const i=el('input',{type:'number',inputmode:'numeric',value,min:0,'aria-label':label,...(id?{id:`${id}-${key}`}:{})});
     i.onchange=()=>send(Number(i.value));return el('label',{class:'field'+(off?' off':'')},el('span',{},label),i)};
-  const kind=entry.kind;
-  if(!EXCLUSIVE[kind])return Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>field(k,FIELDS[k]||k,v,false,x=>change({...seat.budget,[k]:x})));
+  const kind=formKind(entry);
+  if(!kind)return Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>field(k,FIELDS[k]||k,v,false,x=>change({...seat.budget,[k]:x})));
   const form=seat.custom||formOf(kind,seat.budget,entry.presets.standard);
   return [...EXCLUSIVE[kind],...(kind==='bubble'?['views']:[])].map(k=>field(k,LABELS[kind][k],form[k],k!=='views'&&k!==form.active,
     x=>change({...form,[k]:x,...(k==='views'?{}:{active:k})})));
@@ -1279,8 +1279,8 @@ function entrantRow(i){
   const id='t'+i,config=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),type:'button','aria-label':'Custom budget',html:icon('config')});
   config.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderTournamentForm()};
   const box=[strength({preset:spec.preset},ch=>{spec.preset=ch.preset;spec.custom=null;renderTournamentForm()},id,config,-1,entry)];
-  if(configured.has(id)&&entry)box.push(el('div',{class:'custom'},budgetFields(entry,{budget,custom:spec.preset==='custom'&&EXCLUSIVE[entry.kind]?spec.custom:null},
-    custom=>{spec.preset='custom';spec.custom=EXCLUSIVE[entry.kind]?custom:Object.fromEntries(Object.entries(custom).filter(([,x])=>typeof x==='number'));renderTournamentForm()},id)));
+  if(configured.has(id)&&entry)box.push(el('div',{class:'custom'},budgetFields(entry,{budget,custom:spec.preset==='custom'&&formKind(entry)?spec.custom:null},
+    custom=>{spec.preset='custom';spec.custom=formKind(entry)?custom:Object.fromEntries(Object.entries(custom).filter(([,x])=>typeof x==='number'));renderTournamentForm()},id)));
   return el('div',{class:'entrant',style:`--c:${COLORS[i]}`},el('div',{class:'row'},el('span',{class:'tag'},'AB'[i]),...parts),...box);
 }
 function renderTournamentForm(){

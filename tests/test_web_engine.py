@@ -420,6 +420,7 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(answer['sixBack']['custom']['ms'], 900)
         self.assertEqual(answer['reloaded'], answer['time'])
         self.assertEqual(answer['bad'], 400)
+        self.assertEqual((answer['shrimp']['budget']['visits'], answer['shrimp'].get('custom')), (64, None))
 
     def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
         answer = node(dict(kind='dismissal'))

@@ -28,6 +28,8 @@ const FIELD_NAMES = {simulations: 'Nodes', solver_nodes: 'Solver', nodes: 'Posit
 /** The custom budgets whose two amounts exclude each other: work (Bubble's Nodes, Six's Positions) or Time in ms
  * (python/play.py EXCLUSIVE); Bubble's Width is at most VIEWS views per position. */
 const EXCLUSIVE = {bubble: ['simulations', 'ms'], six: ['nodes', 'ms']}, VIEWS = 16, WIDTH = 8;
+/** The EXCLUSIVE kind of `entry`, or null: Bubble, and Six itself but not another bot behind Six's protocol (python/play.py form_kind). */
+const formKind = entry => entry?.kind === 'bubble' || entry?.kind === 'six' && (entry.badge ?? 'six') === 'six' ? entry.kind : null;
 
 /** The custom form of a Bubble or a Six from `custom` (python/play.py custom_form): both amounts, `active` naming the
  * one that applies (without it Time when only Time is given, else the work, so an older custom budget keeps its work),
@@ -160,7 +162,7 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || entry.preset || 'standard', exclusive = preset === 'custom' && EXCLUSIVE[entry.kind];
+    const preset = input.preset || entry.preset || 'standard', exclusive = preset === 'custom' && formKind(entry);
     const form = exclusive ? customForm(entry.kind, entry.presets.standard, input.custom ?? input.budget) : null;
     const budget = form ? customBudget(entry.kind, form) : preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
       : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
@@ -177,7 +179,7 @@ export class BrowserSession extends OfflineSession {
   engineKey(spec) {
     const entry = this.entries.get(spec.engine), budget = spec.budget || {};
     // A Bubble or Six budget in time, or a Bubble of another width, keeps its own evaluations (python/play.py search_key).
-    const search = (EXCLUSIVE[entry?.kind] && budget.ms ? `~ms${budget.ms}` : '')
+    const search = (formKind(entry) && budget.ms ? `~ms${budget.ms}` : '')
       + (entry?.kind === 'bubble' && (budget.views ?? WIDTH) !== WIDTH ? `~views${budget.views}` : '');
     return [spec.engine, spec.checkpoint, (entry?.version || '') + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
   }

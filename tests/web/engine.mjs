@@ -757,6 +757,11 @@ if (job.kind === 'encode') {
   back.registerEngine({id: 'bubble', name: 'Bubble', kind: 'bubble', presets: BUBBLE}, {turn});
   answer.reloaded = {budget: back.seats[1].budget, custom: back.seats[1].custom};
   answer.bad = (await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: {views: 40}}, 'POST'))[0];
+  // Shrimp speaks Six's protocol but keeps its own budget.
+  const {PRESETS: SHRIMP} = await import('../../web/engine/shrimp.mjs'), other = new BrowserSession(native);
+  other.registerEngine({id: 'shrimp', name: 'Shrimp', kind: 'six', badge: 'shrimp', presets: SHRIMP}, {turn});
+  await other.request('/seat', {side: 1, engine: 'shrimp', preset: 'custom', custom: {...SHRIMP.standard, visits: 64}}, 'POST');
+  answer.shrimp = {budget: other.seats[1].budget, custom: other.seats[1].custom};
 } else if (job.kind === 'dismissal') {
   // Auto deepening while an engine seat plays, with analyses that run until cancelled: which positions have an
   // analysis running or queued after a cancel, an analysis request and a move.

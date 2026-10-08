@@ -2228,13 +2228,22 @@ def custom_form(kind, standard, custom):
     return form
 
 
-def custom_budget(kind, form):
+def form_kind(entry):
+    """'bubble' or 'six' for an engine whose custom budget is the exclusive form (see `custom_form`): Bubble, and Six
+    itself but not another bot behind Six's protocol, like Shrimp; None otherwise."""
+    six = entry['kind'] == 'six' and entry.get('badge', 'six') == 'six'
+    return entry['kind'] if entry['kind'] == 'bubble' or six else None
+
+
+def custom_budget(kind, form, standard=None):
     """The budget a custom `form` (see `custom_form`) runs: its active amount, and for Bubble its width and root
     query nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Time budget keeps a work
-    ceiling: Bubble's `simulations` of 65,536 per stone, Six's `nodes` of MAX_BUDGET."""
+    ceiling: Bubble's `simulations` of 65,536 per stone, Six's `nodes` of MAX_BUDGET. A Six keeps the `standard`
+    preset's launch `args`."""
     active = form['active']
     if kind == 'six':
-        return dict(ms=form['ms'], nodes=MAX_BUDGET) if active == 'ms' else dict(nodes=form['nodes'])
+        launch = {'args': standard['args']} if standard and 'args' in standard else {}
+        return (dict(ms=form['ms'], nodes=MAX_BUDGET) if active == 'ms' else dict(nodes=form['nodes'])) | launch
     if active == 'ms':
         return dict(simulations=65536, ms=form['ms'], views=form['views'],
                     solver_nodes=min(4_000_000, max(1024, 4 * form['ms'])))
@@ -2242,11 +2251,11 @@ def custom_budget(kind, form):
                 solver_nodes=min(4_000_000, max(1024, 16 * form['simulations'])) if form['simulations'] else 0)
 
 
-def budget_of(presets, preset, custom=None, kind=None):
+def budget_of(presets, preset, custom=None, kind=None, form=None):
     """The budget of `preset` from an entry's `presets`, or the standard budget with `custom` values checked
     against the smallest values in LIMITS and the `kind`'s own (larger budgets only take longer) (a preset's launch `args` are not custom).
-    A Bubble's or a Six's custom budget is the one its form selects (see `custom_form`). A Bubble's 'solver' is the
-    analysis solver preset SOLVER."""
+    With `form` (by default for EXCLUSIVE kinds; see `form_kind`) the custom budget is the one its form selects (see
+    `custom_form`). A Bubble's 'solver' is the analysis solver preset SOLVER."""
     limits = LIMITS | KIND_LIMITS.get(kind, {})
     if preset == 'solver' and kind == 'bubble':
         return dict(SOLVER)
@@ -2254,8 +2263,8 @@ def budget_of(presets, preset, custom=None, kind=None):
         if preset not in presets:
             raise ValueError('Unknown preset')
         return dict(presets[preset])
-    if kind in EXCLUSIVE:
-        return custom_budget(kind, custom_form(kind, presets['standard'], custom))
+    if form if form is not None else kind in EXCLUSIVE:
+        return custom_budget(kind, custom_form(kind, presets['standard'], custom), presets['standard'])
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
     budget = dict(presets['standard'])
@@ -2329,8 +2338,8 @@ class Session:
                 raise ValueError('Unknown checkpoint')
         else:
             checkpoint = None
-        budget = budget_of(entry['presets'], preset, custom, entry['kind'])
-        if preset == 'custom' and entry['kind'] in EXCLUSIVE:
+        budget = budget_of(entry['presets'], preset, custom, entry['kind'], form_kind(entry) is not None)
+        if preset == 'custom' and form_kind(entry):
             form = custom_form(entry['kind'], entry['presets']['standard'], custom)
             return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget, custom=form)
         return dict(engine=engine, checkpoint=checkpoint, preset=preset, budget=budget)
