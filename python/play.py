@@ -3099,6 +3099,9 @@ class Session:
             seat['device'] = specification.get('device', getattr(self.engines, 'device', 'cpu'))
             if seat['device'] not in ('cpu', 'cuda'):
                 raise ValueError('Bubble device must be cpu or cuda')
+            if seat['preset'] in PRESET_NAMES and seat['device'] != getattr(self.engines, 'device', 'cpu'):
+                # A named level follows the seat's own device's ladder, not the server's.
+                seat['budget'] = dict((CPU_PRESETS if seat['device'] == 'cpu' else PRESETS['bubble'])[seat['preset']])
         elif 'device' in specification:
             raise ValueError('Choose the external engine backend from its catalogue entry')
         source['device'] = seat.get('device', entry.get('backend') or entry['name'].rsplit(' · ', 1)[-1]

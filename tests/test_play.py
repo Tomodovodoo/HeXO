@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 import formats
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESET_NAMES, PRESETS, SIX_LIBRARIES, SearchChild, Session,
+from play import (CPU_PRESETS, Cancelled, Engines, Evaluations, Handler, PRESET_NAMES, PRESETS, SIX_LIBRARIES, SearchChild, Session,
                   book_openings, budget_of, command_of, custom_form, export, export_path, file_digest, file_identity,
                   import_history, linked_history, model_key, move_row, pair_elo, pick_opening, position_text, presets_of,
                   proof_turns, read_game, review, review_plies, scan, search_key, six_backend)
@@ -1818,6 +1818,10 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        self.engines.device = 'cuda'   # a CPU seat on a GPU server plays the CPU ladder
+        self.assertEqual(self.session.match_seat(dict(engine='bubble:2@quick', device='cpu'), 'standard')['budget'],
+                         CPU_PRESETS['quick'])
+        del self.engines.device
         self.assertEqual(self.session.match_seat('Drip@lightning', 'standard')['budget'], dict(ms=100))
         custom = self.session.match_seat('bubble:2{simulations=512,views=4}', 'standard')
         self.assertEqual(custom['budget'], dict(simulations=512, views=4, solver_nodes=8192))
