@@ -2217,11 +2217,11 @@ def custom_form(kind, standard, custom):
 
 def custom_budget(kind, form):
     """The budget a custom `form` (see `custom_form`) runs: its active amount, and for Bubble its width and root
-    query nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Bubble Time budget keeps
-    `simulations` as a ceiling of 65,536 per stone."""
+    query nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Time budget keeps a work
+    ceiling: Bubble's `simulations` of 65,536 per stone, Six's `nodes` of MAX_BUDGET."""
     active = form['active']
     if kind == 'six':
-        return {active: form[active]}
+        return dict(ms=form['ms'], nodes=MAX_BUDGET) if active == 'ms' else dict(nodes=form['nodes'])
     if active == 'ms':
         return dict(simulations=65536, ms=form['ms'], views=form['views'],
                     solver_nodes=min(4_000_000, max(1024, 4 * form['ms'])))
@@ -2840,7 +2840,7 @@ class Session:
             job = self.jobs.get(job_id)
             if job and job.status in ('queued', 'running'):
                 job.cancelled = True
-                if job.kind == 'analyse':
+                if job.kind == 'analyse' and tuple(map(tuple, job.history)) == tuple(map(tuple, self.history)):
                     self.dismissed = self.dismissal(job.history)
                 if job.kind == 'move':
                     self.paused = True
@@ -3769,7 +3769,7 @@ class Session:
                 timer.start()
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
-            spent.update({k: refresh[k] for k in ('solver_ms',) if k in refresh})
+            spent.update({k: refresh[k] for k in ('solver_ms', 'ms', 'views') if k in refresh})
             if refresh.get('solver'):
                 found['solver'] = refresh['solver']   # a refresh rereads the graph; the proof work it replaces stays reported
         saved = self.save(history, weights, spent, found, model)

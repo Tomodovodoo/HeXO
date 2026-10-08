@@ -51,7 +51,7 @@ export function customForm(kind, standard, custom = {}) {
 /** The budget a custom `form` runs (python/play.py custom_budget). */
 export function customBudget(kind, form) {
   const active = form.active;
-  if (kind === 'six') return {[active]: form[active]};
+  if (kind === 'six') return active === 'ms' ? {ms: form.ms, nodes: MAX_BUDGET} : {nodes: form.nodes};
   if (active === 'ms') return {simulations: 65536, ms: form.ms, views: form.views, solver_nodes: Math.min(4000000, Math.max(1024, 4 * form.ms))};
   return {simulations: form.simulations, views: form.views, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
 }
@@ -410,7 +410,8 @@ export class BrowserSession extends OfflineSession {
       this.enqueue('review', history, this.reviewSpec(), {plies, cursor: 0, total: plies.length});
     } else if (path === '/cancel') {
       if (this.jobs.some(j => j.id === body.id && j.kind === 'move')) { this.paused = true; this.freezeClock(); }
-      const analysed = this.jobs.find(j => j.id === body.id && j.kind === 'analyse');
+      // Only the live position's analysis is dismissed; a cancelled refresh elsewhere leaves it be.
+      const analysed = this.jobs.find(j => j.id === body.id && j.kind === 'analyse' && position(j.history) === position(this.history));
       if (analysed) this.dismissed = this.dismissal(analysed.history);
       this.cancelJobs(j => j.id === body.id);
     } else if (path === '/pause') {

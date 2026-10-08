@@ -960,7 +960,7 @@ class Jobs(unittest.TestCase):
         self.assertEqual(custom_form('bubble', bubble['standard'], timed)['simulations'], 300)
         back = timed | dict(simulations=600, active='simulations', views=4)
         self.assertEqual(budget_of(bubble, 'custom', back, 'bubble'), dict(simulations=600, views=4, solver_nodes=9600))
-        self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='ms'), 'six'), dict(ms=900))
+        self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='ms'), 'six'), dict(ms=900, nodes=2 ** 31 - 1))
         self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='nodes'), 'six'), dict(nodes=700))
         for bad in (dict(active='nodes'), dict(views=0), dict(views=17), dict(ms=5)):
             with self.assertRaises(ValueError):

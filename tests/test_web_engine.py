@@ -416,7 +416,7 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(answer['time']['custom']['simulations'], 300)
         self.assertEqual(answer['nodes']['budget'], dict(simulations=600, views=4, solver_nodes=9600))
         self.assertEqual(answer['nodes']['custom']['ms'], 2500)
-        self.assertEqual((answer['six']['budget'], answer['sixBack']['budget']), (dict(ms=900), dict(nodes=800)))
+        self.assertEqual((answer['six']['budget'], answer['sixBack']['budget']), (dict(ms=900, nodes=2 ** 31 - 1), dict(nodes=800)))
         self.assertEqual(answer['sixBack']['custom']['ms'], 900)
         self.assertEqual(answer['reloaded'], answer['time'])
         self.assertEqual(answer['bad'], 400)
