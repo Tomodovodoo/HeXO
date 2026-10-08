@@ -139,6 +139,9 @@ function progress() {
   }
 }
 
+/** The key of `task` (`schedule`), by which a running job is told apart from the one the page now needs. */
+const taskKey = task => `${task.kind}|${task.engine}|${task.preset}|${task.checkpoint}|${hk(task.history)}`;
+
 function schedule() {
   const s = state();
   if (!s || posting) return;
@@ -148,7 +151,7 @@ function schedule() {
   const analyse = a && !(s.winner >= 0 && prefix.length === s.history.length) && !analyses.has(analysisKey(a, prefix));
   const task = move ? {kind: 'move', side, ...seat, line: lines[side], history: s.history.map(p => [...p])}
     : analyse ? {kind: 'analyse', ply: prefix.length, ...a, history: prefix.map(p => [...p])} : null;
-  const key = task && `${task.kind}|${task.engine}|${task.preset}|${task.checkpoint}|${hk(task.history)}`;
+  const key = task && taskKey(task);
   if (job?.key === key || (key && key === failed)) return;
   job?.controller.abort();
   job = null;
@@ -192,25 +195,47 @@ async function run(key, task) {
     current.stage = stageText(null);
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
-    const started = performance.now();
-    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
-      progress: (f, live, stage) => { current.fraction = f; current.stage = stageText(stage); progress(); }});
+    const started = performance.now(), shown = [];
+    // Plays `moves` while the board and the seat are still the task's; false when it stopped.
+    const play = async moves => {
+      for (const [q, r] of moves) {
+        const seat = config.seats[task.side];
+        if (state().paused || seat?.engine !== task.engine || seat.preset !== task.preset || seat.checkpoint !== task.checkpoint
+          || hk(state().history) !== hk(task.history)) return false;
+        if (!(await original.post('/play', {q, r}))) {
+          failed = key;
+          return false;
+        }
+        task.history.push([q, r]);
+      }
+      return true;
+    };
+    // A move's stones decided before its last go to the board at once, and the job takes the key of the position they
+    // reach, so `schedule` keeps it running for the rest of the turn.
+    let placing = Promise.resolve();
+    const place = placed => {
+      placing = placing.then(async () => {
+        if (task.kind !== 'move' || job !== current || placed.length <= shown.length) return;
+        posting = true;
+        try {
+          const next = placed.slice(shown.length);
+          if (await play(next)) { shown.push(...next); current.key = taskKey(task); }
+        } finally {
+          posting = false;
+        }
+      });
+    };
+    const result = await engine.turn(task.history.map(p => [...p]), budget, {signal: controller.signal, ms, line: task.line,
+      progress: (f, live, stage, placed) => { current.fraction = f; current.stage = stageText(stage); progress(); if (placed) place(placed); }});
+    await placing;
     if (ms == null && result.actual_completed !== 0) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
     if (task.kind === 'move') {
       posting = true;
       try {
-        for (const [q, r] of result.moves) {
-          const seat = config.seats[task.side];
-          if (state().paused || seat?.engine !== task.engine || seat.preset !== task.preset || seat.checkpoint !== task.checkpoint
-            || hk(state().history) !== hk(task.history)) break;
-          if (!(await original.post('/play', {q, r}))) {
-            failed = key;
-            break;
-          }
-          task.history.push([q, r]);
-        }
+        // A turn that disagrees with the stones already shown leaves them; `schedule` asks for the rest of the turn.
+        if (shown.every((p, i) => hk([p]) === hk([result.moves[i]]))) await play(result.moves.slice(shown.length));
       } finally {
         posting = false;
       }
