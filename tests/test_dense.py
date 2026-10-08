@@ -7518,7 +7518,7 @@ class ActorModelTests(unittest.TestCase):
 
 
 class ProofSizerTests(unittest.TestCase):
-    """The proof pool shrinks while inference waits for rows on a busy machine and grows when CPU is spare."""
+    """The proof pool shrinks while inference waits for rows and grows only when inference is fed."""
     class Service:
         def __init__(self):
             self.clock = dict(now=0., starved=0., unflown=0., backlog=0., ready_rows=0, oldest_ready_s=0., flights=0,
@@ -7545,8 +7545,9 @@ class ProofSizerTests(unittest.TestCase):
         self.service, self.workers, self.times = self.Service(), self.Workers(workers), [0., 0.]
         return ProofSizer(self.service, self.workers, floor, processors=lambda: tuple(self.times))
 
-    def advance(self, seconds, starved=0., backlog=0., machine=.5):
+    def advance(self, seconds, starved=0., backlog=0., machine=.5, rows=0):
         clock = self.service.clock
+        clock['ready_rows'] = rows
         clock['now'] += seconds
         clock['starved'] += starved*seconds
         clock['backlog'] += backlog*seconds
@@ -7563,37 +7564,62 @@ class ProofSizerTests(unittest.TestCase):
             seen.append(sizer.serving)
         return seen
 
-    def test_starved_inference_on_a_busy_machine_parks_workers_down_to_the_floor(self):
-        sizer = self.sizer()
-        seen = self.windows(sizer, 30, starved=.5, machine=.95)
-        self.assertEqual(seen[-1], 2)
-        self.assertEqual(min(seen), 2)
-        self.assertEqual(seen, sorted(seen, reverse=True))
-        # One change per window at most, and none within the ten-second dwell after one.
-        times = [t for t, _ in sizer.summary()['history']]
-        self.assertTrue(all(b-a >= 10 for a, b in zip(times, times[1:])))
-        self.assertEqual(self.workers.calls, [n for _, n in sizer.summary()['history']])
-        self.assertEqual(self.workers.serving, 2)
+    def test_starved_inference_parks_workers_down_to_the_floor_whatever_the_machine_reads(self):
+        for machine in (.3, .7, .99):
+            with self.subTest(machine=machine):
+                sizer = self.sizer()
+                seen = self.windows(sizer, 30, starved=.5, machine=machine)
+                self.assertEqual(seen[-1], 2)
+                self.assertEqual(seen, sorted(seen, reverse=True))
+                # One change per window at most, and none within the ten-second dwell after one.
+                times = [t for t, _ in sizer.summary()['history']]
+                self.assertTrue(all(b-a >= 10 for a, b in zip(times, times[1:])))
+                self.assertEqual(self.workers.calls, [n for _, n in sizer.summary()['history']])
 
-    def test_fed_inference_with_queued_rows_or_a_spare_machine_wakes_workers_up_to_the_pool(self):
-        for window in (dict(starved=0., backlog=.8, machine=.95), dict(starved=.5, backlog=0., machine=.6)):
+    def test_only_fed_inference_with_queued_rows_wakes_workers_up_to_the_pool(self):
+        for window in (dict(backlog=.8), dict(rows=300)):
             with self.subTest(**window):
                 sizer = self.sizer()
-                self.windows(sizer, 30, starved=.5, machine=.95)
+                self.windows(sizer, 30, starved=.5)
                 self.assertEqual(sizer.serving, 2)
-                seen = self.windows(sizer, 40, **window)
+                seen = self.windows(sizer, 40, starved=.01, machine=.95, **window)
                 self.assertEqual(seen[-1], 12)
                 self.assertEqual(seen, sorted(seen))
-                self.assertLessEqual(max(seen), 12)
+
+    def test_starvation_never_raises_even_on_an_idle_machine(self):
+        sizer = self.sizer()
+        self.windows(sizer, 30, starved=.5)
+        for window in (dict(starved=.5, machine=.1, backlog=.8, rows=300), dict(starved=.1, machine=.1, backlog=.8)):
+            self.windows(sizer, 10, **window)
+            self.assertEqual(sizer.serving, 2, window)
 
     def test_inside_the_thresholds_the_count_holds(self):
         sizer = self.sizer()
-        for window in (dict(starved=.5, machine=.85),               # starved, machine neither busy nor spare
-                       dict(starved=.1, machine=.95),               # starvation between fed and starved
-                       dict(starved=.01, backlog=.2, machine=.95)):  # fed, but rows barely queue
+        for window in (dict(starved=.1, machine=.95),                 # starvation between fed and starved
+                       dict(starved=.01, backlog=.2, rows=10, machine=.5)):  # fed, but rows barely queue
             self.windows(sizer, 4, **window)
             self.assertEqual(sizer.serving, 12, window)
         self.assertEqual(self.workers.calls, [])
+
+    def test_quick_reversals_double_the_hold_and_a_steady_change_resets_it(self):
+        sizer = self.sizer()
+        holds, times = [], []
+        for _ in range(12):
+            # Alternate between starved and fed until each opposite window has changed the count once.
+            for window in (dict(starved=.5), dict(starved=.01, backlog=.8)):
+                changes = sizer.changes
+                while sizer.changes == changes:
+                    self.windows(sizer, 1, **window)
+                holds.append(sizer.summary()['hold'])
+        self.assertEqual(holds[:5], [10, 20, 40, 80, 160])
+        self.assertEqual(max(holds), 160)
+        times = [t for t, _ in sizer.summary()['history']]
+        self.assertTrue(all(b-a >= h for a, b, h in zip(times, times[1:], holds)))
+        # A change in the same direction as the last one goes back to the plain dwell.
+        changes = sizer.changes
+        while sizer.changes < changes+2:
+            self.windows(sizer, 1, starved=.01, backlog=.8)
+        self.assertEqual(sizer.summary()['hold'], 10)
 
     def test_partial_windows_and_a_reset_discard_the_span_in_progress(self):
         sizer = self.sizer()
@@ -7616,7 +7642,7 @@ class ProofSizerTests(unittest.TestCase):
         self.assertAlmostEqual(summary['window']['machine'], 1.)
         self.assertEqual(self.workers.calls, [])
 
-    def test_without_processor_times_only_starvation_lowers(self):
+    def test_without_processor_times_the_rule_is_unchanged(self):
         from hybrid_selfplay import ProofSizer
         self.service, self.workers = self.Service(), self.Workers(4)
         sizer = ProofSizer(self.service, self.workers, 1, processors=lambda: None)
@@ -7624,8 +7650,8 @@ class ProofSizerTests(unittest.TestCase):
         self.windows(sizer, 10, starved=.5)
         self.assertEqual(sizer.serving, 1)
         self.assertIsNone(sizer.summary()['window']['machine'])
-        self.windows(sizer, 10, starved=.5)
-        self.assertEqual(sizer.serving, 1)
+        self.windows(sizer, 20, starved=0., backlog=.8)
+        self.assertEqual(sizer.serving, 4)
 
     def test_a_failed_processor_reading_leaves_that_window_without_a_machine_share(self):
         sizer = self.sizer()
