@@ -113,7 +113,8 @@ class ProofSizer:
         d = {k: now[k]-self.start[k] for k in ('starved', 'unflown', 'backlog', 'producer_wall', 'producer_wait',
                                                 'producer_cpu', 'proof_service')}
         busy = d['producer_wall']-d['producer_wait']
-        total = now['machine_total']-self.start['machine_total'] if now['machine_total'] is not None else 0
+        known = now['machine_total'] is not None and self.start['machine_total'] is not None
+        total = now['machine_total']-self.start['machine_total'] if known else 0
         self.last = dict(seconds=span, starved=d['starved']/span, unflown=d['unflown']/span, backlog=d['backlog']/span,
                          machine=(now['machine_busy']-self.start['machine_busy'])/total if total > 0 else None,
                          ready_rows=now['ready_rows'], oldest_ready_ms=now['oldest_ready_s']*1e3,

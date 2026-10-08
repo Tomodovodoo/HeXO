@@ -7627,6 +7627,17 @@ class ProofSizerTests(unittest.TestCase):
         self.windows(sizer, 10, starved=.5)
         self.assertEqual(sizer.serving, 1)
 
+    def test_a_failed_processor_reading_leaves_that_window_without_a_machine_share(self):
+        sizer = self.sizer()
+        readings = [None, (0., 0.)]
+        sizer.processors = lambda: readings.pop(0) if readings else tuple(self.times)
+        sizer.reset()
+        self.times[:] = [0., 0.]
+        self.windows(sizer, 1, machine=.95)
+        self.assertIsNone(sizer.summary()['window']['machine'])
+        self.windows(sizer, 1, machine=.95)
+        self.assertAlmostEqual(sizer.summary()['window']['machine'], .95)
+
 
 class PacerTests(unittest.TestCase):
     def test_busy_pacer_waits_for_gpu_before_yielding(self):
