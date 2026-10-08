@@ -96,8 +96,9 @@ class TacticalResults(unittest.TestCase):
 class ResumedReports(unittest.TestCase):
     """A checkpoint without a league entry, or a pending variant, still shows the games its report against its
     opponent already holds, scored like the live tally (capped games count half), with a provisional Elo on the
-    opponent's rating and the match's planned games, until the evaluator reaches it again. The comparison in
-    play, decided variants and reports under another protocol are left out."""
+    opponent's rating and the match's planned games, until the evaluator reaches it again; so does a skipped
+    checkpoint with such games, which the evaluator rates on them. The comparison in play, decided variants and
+    reports under another protocol are left out."""
 
     def test_unrated_checkpoint_with_games_on_disk_gets_a_provisional_row(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -121,12 +122,14 @@ class ResumedReports(unittest.TestCase):
             report('new-schedule/207500', [game(0, 0, 0), game(0, 1, 1)])
             report('new-schedule/192500', [])
             report('new-schedule/180000', [game(0, 0, 0), game(0, 1, 1)], opening_book='book-before-refresh')
+            league['checkpoints'].append(dict(id='new-schedule/202500', skipped=True, elo=None, matches=[]))
+            report('new-schedule/202500', [game(0, 0, 0), game(0, 1, 0)])
             report('main/185000@policy', [game(0, 0, 1), game(0, 1, 0)])
             report('main/170000@puct', [game(0, 0, 0), game(0, 1, 0)], opponent='main/170000')
             playing = dict(stage='playing', settings=protocol, comparison=dict(candidate='new-schedule/207500', opponent='main/185000'))
             rows = dashboard.resumed(run, league, playing)
-            self.assertEqual([r['id'] for r in rows], ['main/170000@puct', 'new-schedule/205000'])
-            row = rows[1]
+            self.assertEqual([r['id'] for r in rows], ['main/170000@puct', 'new-schedule/202500', 'new-schedule/205000'])
+            row = rows[2]
             self.assertEqual((row['wins'], row['losses'], row['capped'], row['games'], row['games_planned']), (11, 0, 1, 12, 64))
             self.assertGreater(row['elo'], 1700.+300.)
             self.assertLess(row['elo_interval'][0], row['elo'])
@@ -136,13 +139,13 @@ class ResumedReports(unittest.TestCase):
             self.assertGreater(variant['elo'], 1600.)
             idle = dict(stage='idle', settings=protocol)
             self.assertEqual([r['id'] for r in dashboard.resumed(run, league, idle)],
-                             ['main/170000@puct', 'new-schedule/205000', 'new-schedule/207500'])
+                             ['main/170000@puct', 'new-schedule/202500', 'new-schedule/205000', 'new-schedule/207500'])
             self.assertEqual(dashboard.resumed(run, league, dict(stage='idle')), [])
             league['checkpoints'].append(dict(id='new-schedule/205000', elo=2000.))
             league['variants'][1]['verdict'] = dict(decision='better')
             (run/'league.json').write_text(json.dumps(league), encoding='utf-8')
             (run/'evaluator-status.json').write_text(json.dumps(idle), encoding='utf-8')
-            self.assertEqual([r['id'] for r in dashboard.dense_run(run, {})['evaluator']['resumed']], ['new-schedule/207500'])
+            self.assertEqual([r['id'] for r in dashboard.dense_run(run, {})['evaluator']['resumed']], ['new-schedule/202500', 'new-schedule/207500'])
 
 
 class ExternalRatings(unittest.TestCase):

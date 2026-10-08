@@ -488,7 +488,8 @@ def provisional(league, evaluator):
 
 def resumed(run, league, evaluator):
     """League-shaped rows, like `provisional`, of every checkpoint without a league entry whose report against the
-    champion already holds games (an evaluation waiting to resume, or one un-rated for more games), and of every
+    champion already holds games (an evaluation waiting to resume, or one un-rated for more games), of every skipped
+    checkpoint with such games (the evaluator rates it on them at its next step), and of every
     pending variant (no verdict) whose report against its bound checkpoint does, oldest step first; the comparison
     the evaluator is playing now is left to `provisional`. The score is dense_stats.tally of the report's games
     (capped games count half a point) and games_planned the report's sprt_max_games setting. Reports without games
@@ -513,7 +514,7 @@ def resumed(run, league, evaluator):
         if candidate in wanted:
             if opponent != wanted[candidate]:
                 continue
-        elif candidate in entries or any(v['id'] == candidate for v in variants) or opponent != champion:
+        elif (candidate in entries and not entries[candidate].get('skipped')) or any(v['id'] == candidate for v in variants) \n                or opponent != champion:
             continue
         base = (anchors[opponent] if opponent in anchors else entries.get(opponent) or {}).get('elo')
         score = dense_stats.tally(games)
