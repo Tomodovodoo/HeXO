@@ -3878,9 +3878,10 @@ class Session:
 
     def retry(self, history):
         """Analyse `history` again after a solver failure, when automatic analysis is on; at most three times for
-        one position, model, solver build and budget."""
+        one position, model, solver build and budget, unless that analysis was cancelled since (see `dismissal`)."""
         with self.lock:
-            if self.analysis and self.analysis['auto'] and tuple(history) == tuple(self.history[:len(history)]):
+            if (self.analysis and self.analysis['auto'] and tuple(history) == tuple(self.history[:len(history)])
+                    and self.dismissed != self.dismissal(history)):
                 self.request_analysis(history, 1)
 
     def run(self, job):
