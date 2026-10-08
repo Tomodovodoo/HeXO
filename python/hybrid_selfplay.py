@@ -69,29 +69,30 @@ class ProofSizer:
     """Serving proof workers sized so the GPU is fed first and spare CPU proves second.
 
     Each `observe` after `window` seconds differences the service's supply
-    clocks and `processors()` over the window. `starved` is the share of the
-    window in which a batch slot was free and no row was ready, `backlog` the
-    share in which every slot was in flight with rows waiting, `machine` the
-    busy share of all logical processors, `proof_busy` the mean number of
-    workers holding a job. Starvation above `starved` on a
-    machine busier than `busy` parks a quarter of the serving workers, at
-    least one, never below `floor`. A machine below `spare`, or starvation
-    below `fed` with backlog of at least `queued`, wakes one, never above the
-    pool. Without processor times only starvation lowers. A change starts a
-    new window and the next comes no sooner than `dwell` seconds later. A
-    floor at the pool size fixes the count. Parked workers keep their solver
-    tables. `reset` discards the window in progress, as after a pause.
-    `summary` reports the count, its changes as (seconds since start, count)
-    and the last full window.
+    clocks over the window. `starved` is the share of the window in which a
+    batch slot was free and no row was ready, `backlog` the share in which
+    every slot was in flight with rows waiting, `proof_busy` the mean number
+    of workers holding a job, `machine` the busy share of all logical
+    processors from `processors()`, reported only. Starvation above `starved`
+    parks a quarter of the serving workers, at least one, never below `floor`.
+    Starvation below `fed`, with backlog of at least `queued` or at least
+    `rows` ready rows at the window's end, wakes one, never above the pool.
+    Anything between holds. A change starts a new window and the next comes no
+    sooner than the hold, `dwell` seconds. A change against the direction of
+    the last one, within `flip` seconds after its hold ended, doubles the hold
+    up to `longest`; any other change resets it. A floor at the pool size fixes the count.
+    Parked workers keep their solver tables. `reset` discards the window in
+    progress, as after a pause. `summary` reports the count, its changes as
+    (seconds since start, count), the current hold and the last full window.
     """
-    def __init__(self, service, workers, floor, *, window=5., dwell=10., starved=.2, fed=.05, queued=.5,
-                 busy=.9, spare=.8, processors=processor_times):
+    def __init__(self, service, workers, floor, *, window=5., dwell=10., flip=60., longest=160., starved=.2, fed=.05,
+                 queued=.5, rows=128, processors=processor_times):
         self.service, self.workers, self.processors = service, workers, processors
         self.ceiling = workers.stats()['workers']
         self.floor = max(1, min(floor, self.ceiling))
-        self.window, self.dwell = window, dwell
-        self.starved, self.fed, self.queued, self.busy, self.spare = starved, fed, queued, busy, spare
-        self.serving, self.changes, self.changed = self.ceiling, 0, None
+        self.window, self.dwell, self.flip, self.longest = window, dwell, flip, longest
+        self.starved, self.fed, self.queued, self.rows = starved, fed, queued, rows
+        self.serving, self.changes, self.changed, self.direction, self.hold = self.ceiling, 0, None, 0, dwell
         self.history, self.last = deque(maxlen=64), {}
         self.reset()
         self.origin = self.start['now']
@@ -123,23 +124,25 @@ class ProofSizer:
                          producer_cpu=d['producer_cpu']/busy if busy > 0 else None,
                          proof_busy=d['proof_service']/span)
         self.start = now
-        if self.changed is not None and now['now']-self.changed < self.dwell:
+        if self.changed is not None and now['now']-self.changed < self.hold:
             return
         w, count = self.last, self.serving
-        loaded = w['machine'] is None or w['machine'] > self.busy
-        if w['starved'] > self.starved and loaded:
+        if w['starved'] > self.starved:
             count = max(self.floor, count-max(1, count//4))
-        elif (w['machine'] is not None and w['machine'] < self.spare) or (w['starved'] < self.fed and w['backlog'] >= self.queued):
+        elif w['starved'] < self.fed and (w['backlog'] >= self.queued or w['ready_rows'] >= self.rows):
             count = min(self.ceiling, count+1)
         if count != self.serving:
+            direction = 1 if count > self.serving else -1
+            reversal = direction == -self.direction and now['now']-self.changed < self.hold+self.flip
+            self.hold = min(self.longest, 2*self.hold) if reversal else self.dwell
             self.workers.serve(count)
-            self.serving, self.changed = count, now['now']
+            self.serving, self.changed, self.direction = count, now['now'], direction
             self.changes += 1
             self.history.append((round(now['now']-self.origin, 1), count))
 
     def summary(self):
         return dict(serving=self.serving, floor=self.floor, ceiling=self.ceiling, changes=self.changes,
-                    history=list(self.history), window=dict(self.last))
+                    hold=self.hold, history=list(self.history), window=dict(self.last))
 
 
 class HybridGames:

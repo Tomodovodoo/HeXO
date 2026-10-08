@@ -134,7 +134,7 @@ The code is still in `python/legacy/`. `tests/benchmark_policy.py`, `benchmark_r
 | `test_dense.LearnerPipelineTests` | 4 | Muon/AdamW split covers every parameter; both train on CPU and reset on a kind change | 0.7 | 0.0 | two exports | MaskedFutureLearnerTests | keep |
 | `test_dense.PhaseTests` | 13 | Backlog and pacing base; phased training; the learner waits for every actor's acknowledgement | 2.0 | 0.0 | exports, dense_learn.main in process | CheapRowTests rebase | keep |
 | `test_dense.ActorModelTests` | 6 | The model pointer resolves; workers switch checkpoints between games; hybrid workers publish rows the learner reads | 3.5 | 0.0 | hybrid workers, 6 games | EngineTests | keep |
-| `test_dense.ProofSizerTests` | 7 | The actor's proof pool shrinks while inference starves on a busy machine, grows when fed or the machine is spare, within floor, pool, dwell and thresholds | 0.0 | 0.0 | - | - | keep |
+| `test_dense.ProofSizerTests` | 9 | The actor's proof pool shrinks while inference starves whatever the machine reads, grows only when inference is fed with queued rows, within floor, pool and thresholds; quick reversals double the hold | 0.0 | 0.0 | - | - | keep |
 | `test_dense.PacerTests` | 3 | Evaluator busy and share pacing on fake clocks | 0.0 | 0.0 | - | - | keep |
 | `test_dense.PosteriorTests` | 9 | Rating posterior: direct and pooled evidence, sweeps, value of information | 0.0 | 0.0 | 128-sample posteriors | - | keep |
 | `test_dense.OpponentSchedulerTests` | 8 | Report reload, payoff matrix, panel and veto, PFSP weights, opponent plies masked from training | 0.6 | 0.0 | one 4-game engine run | - | keep |
