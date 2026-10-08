@@ -1189,8 +1189,8 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     `exact_winner`, `proven`, `proof_plies`), its `action` the stone of the highest improved policy, or the owner's
     own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
     verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
-    spent. Each graph is left at its root. With `ms` (one clock, or one per root) each owner also stops at its clock,
-    its `simulations` a ceiling; `views` replaces HYBRID['views']."""
+    spent. Each graph is left at its root. With `ms` each owner also stops at that clock, its `simulations` a
+    ceiling; `views` replaces HYBRID['views']."""
     import numpy as np
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
@@ -1208,8 +1208,7 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
         service.start(continuous=True)
         service.launch()
         for game, (history, (_, simulations)) in enumerate(zip(histories, roots)):
-            clock = ms[game] if isinstance(ms, list) else ms
-            service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(clock)) if clock else 0,
+            service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(ms)) if ms else 0,
                              samples=16, views=views)
         launched, sequence, shown, held = 0, 0, 0., False
         while len(events) < len(roots):
@@ -1306,8 +1305,12 @@ class TurnSearch:
             self.tree.at(history)
         return self.tree, simulations
 
+    def finished(self):
+        """True once the turn is complete."""
+        return self.local.player != self.player or self.local.winner >= 0 or self.given and self.played >= len(self.moves)
+
     def request(self):
-        if self.local.player != self.player or self.local.winner >= 0 or self.given and self.played >= len(self.moves):
+        if self.finished():
             return None
         if not self.simulations:
             return None, 0
@@ -1550,7 +1553,11 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
             if a is None:
                 turns.append(TurnSearch(bubble, network, history, simulations, solved.get(k) or solve(None, history, 0),
                                         q_range_floor=q_range_floor, known=known))
-        while asked := [(turn, request) for turn in turns if (request := turn.request()) is not None]:
+        while live := [turn for turn in turns if not turn.finished()]:
+            if end is not None and any(turn.local.remaining == 2 for turn in live):
+                # Under a clock one-stone turns wait for the second phase, so no owner holds the first one past 60%.
+                live = [turn for turn in live if turn.local.remaining == 2]
+            asked = [(turn, turn.request()) for turn in live]
             searching = []
             for turn, (tree, count) in asked:
                 if tree is None:
@@ -1559,12 +1566,12 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                     turn.tree = tree
                     searching.append((turn, (tree, max(1, count))))
             if searching:
-                clocks = None
-                if end is not None:
-                    left = max(1., (end - time.monotonic()) * 1000)
-                    clocks = [left * (.6 if turn.local.remaining == 2 else 1) for turn, _ in searching]
+                clock = None
+                if end is not None:   # a round is all first stones of two, or all last stones
+                    clock = max(1., (end - time.monotonic()) * 1000)
+                    clock *= .6 if any(turn.local.remaining == 2 for turn, _ in searching) else 1
                 for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
-                                                               stamps=stamps, ms=clocks, views=views)):
+                                                               stamps=stamps, ms=clock, views=views)):
                     turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
@@ -3085,6 +3092,8 @@ class Session:
                 if len(found) != 1:
                     raise ValueError('Choose a full, unambiguous checkpoint id')
                 checkpoint = found[0]
+        if entry['kind'] == 'bubble' and 'solver_nodes' in (specification.get('custom') or {}):
+            raise ValueError('solver_nodes is not a custom Bubble budget: root query nodes follow its simulations or ms')
         seat = self.seat(entry['id'], checkpoint, specification.get('preset', preset),
                          specification.get('custom'))
         source = {k: str(v) if isinstance(v, Path) else v for k, v in entry.items()

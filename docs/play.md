@@ -40,11 +40,12 @@ newest by default. Ambiguous names are rejected.
 A seat combines an engine, preset or custom budget, and a device. For example:
 
 ```sh
-python python/bubble.py match "dense-v1@150000{simulations=512,solver_nodes=131072}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
+python python/bubble.py match "dense-v1@150000{simulations=512,views=4}" "Six@standard" --port 8772 --unique-openings 16 --a-device cpu
 ```
 
 `@lightning`, `@quick`, `@standard`, `@strong`, `@deep` and `@dangerous` use the UI's presets; `--preset` supplies the default for both seats.
-Custom keys are the engine's own: Bubble has `simulations` and `solver_nodes`, Six has `nodes` (positions),
+Custom keys are the engine's own: Bubble has `simulations` (Nodes), `ms` (Time, `active=ms` or `ms` alone applies it)
+and `views` (Width), Six has `nodes` (positions) or `ms`,
 Strix/Pulsatrix has `simulations`, and Drip/Seal has `ms`. Unknown keys are rejected. `--a-device` and
 `--b-device` choose CPU or CUDA for a Bubble seat. Six uses the backend in its catalogue entry.
 
@@ -157,7 +158,8 @@ curl -X POST http://127.0.0.1:8772/match -H "Content-Type: application/json" -d 
 | `POST /matches/open` with `{"batch":"<id>","game":1}` | Open a saved game on the separate analysis board |
 | `GET /replay`, `GET /htttx` | Export the visible game |
 
-A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"solver_nodes":32768}}`.
+A player specification can also be `{"engine":"dense-v1","checkpoint":"main/150000","preset":"custom","custom":{"simulations":128,"ms":2000,"active":"ms","views":8}}`; root query nodes follow the
+work or the time (see the custom budget above), and a `solver_nodes` key is rejected here.
 Clock JSON is `{"mode":"fixed"}`, `{"mode":"move","ms":5000}`, or `{"mode":"game","tc":"180+2"}`.
 `POST /clock` with the same JSON puts the single game on this board on that clock.
 The API is loopback-only. Each player port holds one visible game; use a separate port for another simultaneous match.
