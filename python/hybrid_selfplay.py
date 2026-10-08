@@ -79,7 +79,8 @@ class ProofSizer:
     new window and the next comes no sooner than `dwell` seconds later. A
     floor at the pool size fixes the count. Parked workers keep their solver
     tables. `reset` discards the window in progress, as after a pause.
-    `summary` reports the count, its changes and the last full window.
+    `summary` reports the count, its changes as (seconds since start, count)
+    and the last full window.
     """
     def __init__(self, service, workers, floor, *, window=5., dwell=10., starved=.2, fed=.05, queued=.5,
                  busy=.9, spare=.8, processors=processor_times):
@@ -91,6 +92,7 @@ class ProofSizer:
         self.serving, self.changes, self.changed = self.ceiling, 0, None
         self.history, self.last = deque(maxlen=64), {}
         self.reset()
+        self.origin = self.start['now']
 
     def clocks(self):
         clocks = dict(self.service.supply(), proof_cpu=self.workers.stats()['worker_cpu_ms']/1e3)
@@ -130,7 +132,7 @@ class ProofSizer:
             self.workers.serve(count)
             self.serving, self.changed = count, now['now']
             self.changes += 1
-            self.history.append((round(now['now'], 3), count))
+            self.history.append((round(now['now']-self.origin, 1), count))
 
     def summary(self):
         return dict(serving=self.serving, floor=self.floor, ceiling=self.ceiling, changes=self.changes,

@@ -5,7 +5,17 @@
 #include <thread>
 #include <sstream>
 #include <iomanip>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <time.h>
+#endif
 
 extern "C" {
 void* hxgp_new_rect(void* const*,const int*,int,int);
@@ -30,8 +40,13 @@ using Clock=std::chrono::steady_clock;
 // CPU time of the calling thread. Windows charges whole scheduler ticks of
 // about 15.6 ms, so only sums over many seconds are meaningful.
 inline uint64_t thread_cpu_ns(){
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
  return 0;
+#elif defined(_WIN32)
+ FILETIME created,exited,kernel,user;
+ if(!GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user))return 0;
+ auto ticks=[](const FILETIME& f){return uint64_t(f.dwHighDateTime)<<32|f.dwLowDateTime;};
+ return 100*(ticks(kernel)+ticks(user));
 #else
  timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return uint64_t(t.tv_sec)*1000000000ULL+uint64_t(t.tv_nsec);
 #endif
