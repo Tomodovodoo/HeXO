@@ -114,7 +114,7 @@ struct Worker {void* native=nullptr;
 #ifndef __EMSCRIPTEN__
  std::thread thread;
 #endif
- std::shared_ptr<Job> active;uint64_t token=0;double service=0,cpu=0;bool sleeping=false;};
+ std::shared_ptr<Job> active;uint64_t token=0;double service=0;bool sleeping=false;};
 // Native proof workers and their resident solver tables, shared by the proof
 // loops of one or more producers. Loops queue immutable jobs in their owners'
 // priority order; workers share their time among the loops with queued jobs
@@ -611,7 +611,7 @@ void Service::run(size_t i)noexcept{
      std::string payload=loop.request(*job,ms,worker.token);
      // The loop stays attached while this worker holds its job, and its
      // frontier endpoint changes only while it has no live jobs.
-     job->info[4]=0;lock.unlock();auto cpu=inference::thread_cpu_ns();answer=api.query(worker.native,payload.c_str());
+     job->info[4]=0;lock.unlock();answer=api.query(worker.native,payload.c_str());
      if(!answer || !api.info(answer,job->info.data()))job->error="missing typed native answer";
      else{job->move_count=api.moves(answer,job->moves.data(),2);if(job->move_count<0)throw std::runtime_error("Invalid typed proof witness");
       if(loop.endpoint && !job->side){int count=loop.endpoint(answer,nullptr,0);if(count<0 || count>loop.endpoint_limit*130)throw std::runtime_error("Invalid neural frontier size");job->neural.resize(count);if(count && loop.endpoint(answer,job->neural.data(),count)!=count)throw std::runtime_error("Invalid neural frontier payload");}
@@ -620,7 +620,7 @@ void Service::run(size_t i)noexcept{
      if(answer){api.answer_free(answer);answer=nullptr;}
      // A deadline may return before cooperative background cancellation finishes.
      while(api.busy(worker.native))std::this_thread::sleep_for(std::chrono::microseconds(100));
-     double used=double(inference::thread_cpu_ns()-cpu)/1e6;lock.lock();worker.cpu+=used;
+     lock.lock();
     }
    }
   }catch(...){if(answer)api.answer_free(answer);if(raw)api.buffer_free(raw);if(!lock.owns_lock())lock.lock();job->error="native proof worker failure";}
@@ -640,10 +640,10 @@ extern "C" HX_API void* hxps_new(const uint64_t* functions,int workers,int capac
 extern "C" HX_API void* hxp_join(void* pool,void* service,int slice,int table,int tasks,int stamps){try{if(!pool || !service)throw std::runtime_error("Missing proof pool or service");return new proving::Loop(*static_cast<owner::Pool*>(pool),static_cast<proving::Service*>(service),nullptr,slice,table,tasks,stamps!=0);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 extern "C" HX_API int hxps_free(void* p){auto* service=static_cast<proving::Service*>(p);{std::lock_guard lock(service->mutex);if(!service->loops.empty()){gumbel::error="Free every proof loop before its worker service";return 0;}}delete service;return 1;}
 // out: workers, busy workers, queued jobs, live jobs, attached loops, serving workers;
-// times: service, idle and solver thread CPU ms summed over workers.
+// times: service and idle ms summed over workers.
 extern "C" HX_API void hxps_stats(void* p,uint64_t* out,double* times){auto& service=*static_cast<proving::Service*>(p);std::lock_guard lock(service.mutex);service.account(proving::Clock::now());
- uint64_t busy=0,live=0;double work=0,cpu=0;for(auto& w:service.workers){busy+=bool(w->active);work+=w->service;cpu+=w->cpu;}for(auto* loop:service.loops)live+=loop->live.size();
- std::array<uint64_t,6> values{uint64_t(service.workers.size()),busy,uint64_t(service.waiting),live,uint64_t(service.loops.size()),uint64_t(service.serving)};std::copy(values.begin(),values.end(),out);times[0]=work;times[1]=service.idle_ms;times[2]=cpu;}
+ uint64_t busy=0,live=0;double work=0;for(auto& w:service.workers){busy+=bool(w->active);work+=w->service;}for(auto* loop:service.loops)live+=loop->live.size();
+ std::array<uint64_t,6> values{uint64_t(service.workers.size()),busy,uint64_t(service.waiting),live,uint64_t(service.loops.size()),uint64_t(service.serving)};std::copy(values.begin(),values.end(),out);times[0]=work;times[1]=service.idle_ms;}
 // Serve jobs on the first `count` workers and park the rest, keeping their solver tables.
 extern "C" HX_API int hxps_serve(void* p,int count){try{auto& service=*static_cast<proving::Service*>(p);std::lock_guard lock(service.mutex);service.resize(size_t(std::max(count,0)));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API int hxp_neural(void* p,uint64_t callback,int limit){try{

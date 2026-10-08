@@ -120,11 +120,11 @@ class ProofWorkers:
         checked(native.hxps_serve(self.ptr, count))
 
     def stats(self):
-        """Busy and serving workers, queued and live jobs over all loops, and worker wall and solver CPU time."""
-        out, times = np.empty(6, np.uint64), np.empty(3, np.float64)
+        """Busy and serving workers, queued and live jobs over all loops, and worker wall time."""
+        out, times = np.empty(6, np.uint64), np.empty(2, np.float64)
         native.hxps_stats(self.ptr, out.ctypes.data, times.ctypes.data)
         result = dict(zip(('workers', 'active', 'queued', 'live', 'loops', 'serving'), map(int, out)))
-        result.update(zip(('worker_service_ms', 'worker_idle_ms', 'worker_cpu_ms'), map(float, times)))
+        result.update(zip(('worker_service_ms', 'worker_idle_ms'), map(float, times)))
         return result
 
     def close(self):

@@ -71,7 +71,8 @@ class ProofSizer:
     clocks and `processors()` over the window. `starved` is the share of the
     window in which a batch slot was free and no row was ready, `backlog` the
     share in which every slot was in flight with rows waiting, `machine` the
-    busy share of all logical processors. Starvation above `starved` on a
+    busy share of all logical processors, `proof_busy` the mean number of
+    workers holding a job. Starvation above `starved` on a
     machine busier than `busy` parks a quarter of the serving workers, at
     least one, never below `floor`. A machine below `spare`, or starvation
     below `fed` with backlog of at least `queued`, wakes one, never above the
@@ -95,7 +96,7 @@ class ProofSizer:
         self.origin = self.start['now']
 
     def clocks(self):
-        clocks = dict(self.service.supply(), proof_cpu=self.workers.stats()['worker_cpu_ms']/1e3)
+        clocks = dict(self.service.supply(), proof_service=self.workers.stats()['worker_service_ms']/1e3)
         times = self.processors()
         clocks['machine_busy'], clocks['machine_total'] = times if times else (None, None)
         return clocks
@@ -110,7 +111,7 @@ class ProofSizer:
         if span < self.window:
             return
         d = {k: now[k]-self.start[k] for k in ('starved', 'unflown', 'backlog', 'producer_wall', 'producer_wait',
-                                                'producer_cpu', 'proof_cpu')}
+                                                'producer_cpu', 'proof_service')}
         busy = d['producer_wall']-d['producer_wait']
         total = now['machine_total']-self.start['machine_total'] if now['machine_total'] is not None else 0
         self.last = dict(seconds=span, starved=d['starved']/span, unflown=d['unflown']/span, backlog=d['backlog']/span,
@@ -118,7 +119,7 @@ class ProofSizer:
                          ready_rows=now['ready_rows'], oldest_ready_ms=now['oldest_ready_s']*1e3,
                          producer_busy=busy/d['producer_wall'] if d['producer_wall'] > 0 else None,
                          producer_cpu=d['producer_cpu']/busy if busy > 0 else None,
-                         proof_cores=d['proof_cpu']/span)
+                         proof_busy=d['proof_service']/span)
         self.start = now
         if self.changed is not None and now['now']-self.changed < self.dwell:
             return

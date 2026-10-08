@@ -4651,7 +4651,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(windows)
         for window in windows:
             self.assertTrue(0<=window['starved']<=1+1e-6 and 0<=window['backlog']<=1+1e-6, window)
-            self.assertGreaterEqual(window['proof_cores'],0)
+            self.assertGreaterEqual(window['proof_busy'],0)
         engine.drain()
         self.assertIsNone(engine.summary()['proof_workers'])
 
@@ -7532,7 +7532,7 @@ class ProofSizerTests(unittest.TestCase):
             self.count, self.serving, self.calls = count, count, []
 
         def stats(self):
-            return dict(workers=self.count, serving=self.serving, worker_cpu_ms=0.)
+            return dict(workers=self.count, serving=self.serving, worker_service_ms=0.)
 
         def serve(self, count):
             if not 1 <= count <= self.count:
