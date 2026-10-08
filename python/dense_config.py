@@ -235,10 +235,6 @@ class LearnerSettings:
     validation_quota: int = 128   # rows each shard may contribute to a subset (ValidationSets quota)
     export_every: int = 500
     log_every: int = 20           # steps per metrics/learner-<variant>.jsonl line
-    protect_steps: int = 3000     # no replacement for this many steps after start or copy
-    replace_interval: int = 2000  # steps between replacement checks
-    replace_margin: float = 50.   # Elo the source must lead by beyond interval overlap
-    perturb: float = .2           # relative perturbation of copied continuous settings
     # Cap in MB on the learner's CUDA caching allocator (dense_learn.Learner.cap_vram); 0 = unlimited. Reaching it
     # raises out-of-memory instead of spilling into shared system memory (the intended failure on Windows).
     vram_reserved_mb: int = 0
@@ -377,7 +373,8 @@ class RunConfig:
 
 SECTIONS = dict(model=ModelSettings, actor=ActorSettings, learner=LearnerSettings, evaluation=EvaluationSettings)
 # Settings of earlier versions, ignored when a config or a checkpoint manifest is read.
-RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'), learner=('policy_cache_mb',))
+RETIRED = dict(evaluation=('round_games', 'model_cache', 'uncertainty_parity'),
+               learner=('policy_cache_mb', 'protect_steps', 'replace_interval', 'replace_margin', 'perturb'))
 # Settings older configs and manifests store under another name, read as their current one.
 RENAMED = dict(actor={'native_'+key: 'hybrid_'+key for key in ('scheduler', 'round_barrier', 'producers', 'model_producers',
                'quantum', 'views', 'depth', 'proof_workers', 'proof_slice_ms', 'proof_budget')})

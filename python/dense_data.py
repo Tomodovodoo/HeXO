@@ -74,6 +74,7 @@ import types
 
 import numpy as np
 
+import dense_config
 import hexcrop
 from legacy.train import digest, write_json
 
@@ -707,6 +708,38 @@ def shard_dirs(run_dir):
         return sorted(root/e.name for e in entries if e.name.isdigit() and e.is_dir())
 
 
+def rescan(run_dir, manifests, owner):
+    """Bring `manifests` {shard name: manifest} in line with <run>/shards: add new shards, drop shards whose
+    directory is gone (moved or deleted since they were listed) and log each drop as a 'shard_vanished' event
+    naming `owner` (the class that held it). A shard that goes between the listing and its manifest read is
+    skipped. Returns the dropped names."""
+    present = {path.name: path for path in shard_dirs(run_dir)}
+    gone = set(manifests) - present.keys()
+    for name in sorted(gone):
+        del manifests[name]
+        dense_config.log_event(run_dir, 'data', 'shard_vanished', f'shard {name} disappeared; {owner} dropped it',
+                               shard=name, owner=owner)
+    for name, path in present.items():
+        if name not in manifests:
+            try:
+                manifests[name] = manifest(path)
+            except FileNotFoundError:
+                if path.is_dir():
+                    raise
+    return gone
+
+
+def surviving_vanished(run_dir, manifests, work):
+    """work(), run again while it raises FileNotFoundError and a shard listed in `manifests` has lost its
+    directory (work's own `rescan` then drops it); any other FileNotFoundError propagates."""
+    while True:
+        try:
+            return work()
+        except FileNotFoundError:
+            if all((Path(run_dir)/'shards'/name).is_dir() for name in manifests):
+                raise
+
+
 def window_size(total, min_rows=20000, expand_per_row=.4, taper_exponent=.65):
     """KataGo shuffle window: every row up to min_rows, then min_rows*(1 + e*((N/min_rows)^t - 1)/t)."""
     if total <= min_rows:
@@ -824,10 +857,13 @@ class ReplayWindow:
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows. The indices
-        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed."""
-        for path in shard_dirs(self.run_dir):
-            if path.name not in self.manifests:
-                self.manifests[path.name] = manifest(path)
+        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed. A shard whose
+        directory disappears, before or during the refresh, leaves the window (`rescan`, `surviving_vanished`)."""
+        return surviving_vanished(self.run_dir, self.manifests, self.update)
+
+    def update(self):
+        for name in rescan(self.run_dir, self.manifests, 'ReplayWindow'):
+            self.counts.pop(name, None)
         names = self.names = sorted(self.manifests)
         self.pacing_rows = None
         for name in [n for n, (_, labelled) in self.counts.items() if not labelled]:
@@ -1154,7 +1190,8 @@ class ValidationSets:
     its source's shards in name order and takes from each at most `quota` rows, in the order of a permutation
     seeded by (seed, crc32(shard name)), until it holds `limit` rows. Shards are immutable and named in
     creation order, so a subset only grows, by rows of newer shards, until it is full, and a restart rebuilds
-    it exactly; the 'newest' subsets start over when the newest actor changes. refresh() updates them.
+    it exactly; a shard that disappears from the run takes its rows with it; the 'newest' subsets start over
+    when the newest actor changes. refresh() updates them.
     `subsets[source, split]` lists Refs; policy, value_targets and following serve examples() like
     ReplayWindow. Retained between refreshes: the chosen rows with their next-ply rows and episodes, the names
     of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
@@ -1190,10 +1227,18 @@ class ValidationSets:
         return scanned[name]
 
     def refresh(self):
-        """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset."""
-        for path in shard_dirs(self.run_dir):
-            if path.name not in self.manifests:
-                self.manifests[path.name] = manifest(path)
+        """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset. A shard whose directory
+        disappears, before or during the refresh (`rescan`, `surviving_vanished`), loses its rows from every subset,
+        which then refill from shards not yet walked."""
+        surviving_vanished(self.run_dir, self.manifests, self.update)
+
+    def update(self):
+        gone = rescan(self.run_dir, self.manifests, 'ValidationSets')
+        for name in gone:
+            self.actors.pop(name, None)
+        for key, chosen in self.picks.items():
+            chosen[:] = [pick for pick in chosen if pick[0] not in gone]
+            self.walked[key] -= gone
         names = sorted(self.manifests)
         actors = [n for n in names if origin(self.manifests[n]) == 'actor']
         published = {}

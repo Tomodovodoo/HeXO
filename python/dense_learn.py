@@ -35,11 +35,6 @@ STATUS_SECONDS = 2.
 REFRESH_SECONDS = 30.
 ACTOR_WAIT_SECONDS = 120.
 SURVEY_PROCESSES = 8  # startup shard survey workers (dense_data.survey); they only parse shard files
-# Settings a replacement copy keeps from this learner rather than the source checkpoint's manifest.
-KEEP = ('variant', 'protect_steps', 'replace_interval', 'replace_margin', 'validation_fraction', 'validation_rows',
-        'validation_quota', 'export_every', 'log_every', 'vram_reserved_mb', 'phase_rows', 'deblunder_weight',
-        'optimizer', 'proof_policy_weight', 'proof_policy_missing_only', 'pair_policy_weight', 'future_target',
-        'regret_fraction', 'cheap_row_fraction', 'phase_export', 'phase_actors')
 LOGGED = dict(zip(HEADS, ('policy_ce', 'value_bce', 'short_value_bce', 'next_ce', 'future_bce', 'outcome_bce')))  # metrics log names
 REMAINING_GRID = tuple(range(0, 161, 4))  # plies remaining at which value curves are sampled
 REMAINING_SIGMA = 4.
@@ -52,10 +47,6 @@ CALIBRATION_V = tuple(np.linspace(-1, 1, 9).tolist())  # calibration_report tabl
 CALIBRATION_H = tuple(range(0, 161, 8))
 SURFACE_WIDTH, SURFACE_LIMIT, SURFACE_MIN = 16, 384, 8  # surfaces: cell width, axis limit, rows per reported cell
 NEAR_END, FAR_END = 20, 60  # value_regret: early rows have remaining < NEAR_END, late rows remaining >= FAR_END
-# (low, high) for replacement perturbations; td_lambda, outcome_lambda and ema are perturbed through 1 - x.
-BOUNDS = dict(lr=(1e-5, 3e-3), weight_decay=(1e-5, 1e-1), bootstrap_weight=(0., 1.), td_lambda=(0., .995),
-              outcome_lambda=(0., 1.), ema=(.99, .9999))
-COMPLEMENTED = ('td_lambda', 'outcome_lambda', 'ema')
 
 
 def validation_fields(metrics):
@@ -597,23 +588,10 @@ def update_ema(ema, model, decay):
     torch._foreach_lerp_([e for e, _ in pairs], [p for _, p in pairs], 1-decay)
 
 
-def perturb(settings, factor_rng, amount):
-    """Multiply each BOUNDS setting (1 - x for COMPLEMENTED ones) by a factor in [1-amount, 1+amount], clipped to
-    BOUNDS."""
-    values = {}
-    for name, (low, high) in BOUNDS.items():
-        x, f = getattr(settings, name), factor_rng.uniform(1-amount, 1+amount)
-        values[name] = float(np.clip(1-(1-x)*f if name in COMPLEMENTED else x*f, low, high))
-    return replace(settings, **values)
-
-
-def latest_rated(league):
-    """{variant: league entry} of each variant's newest rated checkpoint that was not demoted for a regression."""
-    latest = {}
-    for c in league['checkpoints']:
-        if c.get('elo') is not None and not c.get('demoted') and c['step'] >= latest.get(c['variant'], {'step': -1})['step']:
-            latest[c['variant']] = c
-    return latest
+def is_seed(manifest, variant):
+    """True when a checkpoint under checkpoints/<variant> was copied from elsewhere: its manifest names another
+    variant or records the source checkpoint id as seed_source."""
+    return manifest['variant'] != variant or manifest.get('seed_source') is not None
 
 
 def checkpoints(run, variant):
@@ -624,8 +602,9 @@ def checkpoints(run, variant):
 class Learner:
     def __init__(self, run, settings, config, initial=None, overrides=None, net_kernels='reference'):
         """Resume from the newest checkpoint of settings.variant if any (its saved settings under the explicit
-        `overrides`), else start from `initial` or random weights. The VRAM cap of the effective settings is
-        installed before any CUDA allocation."""
+        `overrides`, variant kept), else start from `initial` or random weights. `initial` is a hexnet file, or a
+        checkpoint directory whose ema.pt is loaded. A seed checkpoint (`is_seed`) starts the raw weights at its
+        EMA weights. The VRAM cap of the effective settings is installed before any CUDA allocation."""
         self.run, self.settings, self.config, self.overrides = run, settings, config, overrides or {}
         self.net_kernels = net_kernels
         self.device = torch.device(config.device)
@@ -633,22 +612,20 @@ class Learner:
         saved = checkpoints(run, settings.variant)
         manifest = json.loads((saved[-1]/'manifest.json').read_text(encoding='utf-8')) if saved else None
         if saved:
-            # Settings saved by the last export (including replacement perturbations) under explicit CLI overrides.
-            self.settings = replace(dense_config.section('learner', manifest['learner']), **self.overrides)
+            # Settings saved by the last export under explicit CLI overrides; a seed's manifest may name another variant.
+            self.settings = replace(dense_config.section('learner', manifest['learner']), **self.overrides | dict(variant=settings.variant))
         self.cap_vram()
         self.model = self.place(hexnet.HexNet(hexnet.HexNetConfig(**asdict(config.model)), self.settings.future_target))
         self.step = self.samples_seen = self.optimizer_started = self.ema_updates = 0
-        self.copied_from = None
         self.pacing, self.pacing_per_row, self.resumed_rows = dict(NO_BASE), self.settings.samples_per_row, None
         self.pacing_fraction = self.settings.cheap_row_fraction
         if saved:
             self.resume(saved[-1], manifest)
         else:
             if initial:
-                self.load_weights(initial)
+                self.load_weights(initial/'ema.pt' if initial.is_dir() else initial)
             self.ema = copy.deepcopy(self.model)
             self.optimizer = make_optimizer(self.model, self.settings)
-        self.start_step = self.last_copy = self.step
         self.last_export = self.step if saved else None
         self.metrics = None
         self.calibration = self.calibration_report = None
@@ -691,9 +668,12 @@ class Learner:
         self.model.load_state_dict(source.state_dict())
 
     def resume(self, path, manifest):
-        """Load weights and counters; with the same optimizer kind, retain shared states across future-head changes."""
+        """Load weights and counters; with the same optimizer kind, retain shared states across future-head changes.
+        A seed checkpoint (`is_seed`) loads ema.pt as both the raw and the EMA weights, so training continues from
+        the averaged weights that were rated; a checkpoint of this variant keeps its raw and EMA weights apart."""
         changed = manifest['learner'].get('future_target', 'legacy') != self.settings.future_target
-        self.model = self.place(hexnet.load_model(path/'model.pt', future_target=self.settings.future_target))
+        seed = is_seed(manifest, self.settings.variant)
+        self.model = self.place(hexnet.load_model(path/('ema.pt' if seed else 'model.pt'), future_target=self.settings.future_target))
         self.ema = self.place(hexnet.load_model(path/'ema.pt', future_target=self.settings.future_target))
         if changed and self.settings.future_target == 'masked' and self.model.config.aux_heads:
             self.ema.future_masked.load_state_dict(self.model.future_masked.state_dict())
@@ -719,7 +699,6 @@ class Learner:
         if changed:
             dense_config.log_event(self.run, 'learner', 'info',
                                    f'future target switched to {self.settings.future_target}; EMA update count retained')
-        self.copied_from = manifest.get('copied_from')
         self.pacing, self.pacing_per_row = dict(manifest.get('pacing', NO_BASE)), manifest['learner']['samples_per_row']
         self.pacing_fraction = manifest['learner'].get('cheap_row_fraction', 1.)
         self.resumed_rows = manifest.get('rows')
@@ -727,12 +706,14 @@ class Learner:
             dense_config.log_event(self.run, 'learner', 'optimizer_reset',
                   f'{self.settings.variant} optimizer changed from {saved_kind} to {self.settings.optimizer} at step {self.step}',
                   variant=self.settings.variant, step=self.step, old_optimizer=saved_kind, new_optimizer=self.settings.optimizer)
-        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}', variant=self.settings.variant, step=self.step)
+        dense_config.log_event(self.run, 'learner', 'info', f'{self.settings.variant} resumed from step {self.step}'
+                               + (f', seeded from {manifest.get("seed_source") or manifest["variant"]} EMA weights' if seed else ''),
+                               variant=self.settings.variant, step=self.step, seed=seed)
 
     def rebase(self, total_rows):
         """Keep the pacing base {rows, samples} (self.pacing) tied to settings.samples_per_row and
         settings.cheap_row_fraction; called before every pacing check with the window's pacing count. When either
-        differs from the one the base was set under (the resumed checkpoint's, or a replacement copy's), the base
+        differs from the one the base was set under (the resumed checkpoint's), the base
         becomes (rows, samples_seen) and an info event records it with the old and new settings. rows is the
         resumed checkpoint's manifest rows on the first call after a resume when cheap_row_fraction is unchanged (so
         restarts from the same checkpoint agree on the base), else total_rows (a changed fraction changes how rows
@@ -1030,7 +1011,7 @@ class Learner:
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
                         metrics=dict(self.metrics or {h: None for h in self.heads}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
-                        learner=asdict(s), model=asdict(self.config.model), copied_from=self.copied_from,
+                        learner=asdict(s), model=asdict(self.config.model),
                         rows=window.total_rows, pacing=self.pacing)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)
@@ -1039,61 +1020,11 @@ class Learner:
               checkpoint=f'{s.variant}/{self.step:06d}', metrics=manifest['metrics'])
         return manifest
 
-    def maybe_replace(self, factor_rng, before_copy=None):
-        """Population replacement (exploit/explore). Candidates are the latest rated, not demoted checkpoints of
-        other variants (`latest_rated`); a candidate qualifies when league["differences"] holds its pair with
-        this variant's latest such checkpoint and the lower bound of the (candidate minus mine) Elo interval
-        exceeds replace_margin. The best qualifying candidate's raw weights and manifest learner settings are
-        copied (KEEP fields stay this learner's), the continuous settings are perturbed from the copied values,
-        the optimizer is reset and the EMA restarts from the copied weights. Checked before a step is trained,
-        so a copy is always followed by training and recorded in the next manifest."""
-        s = self.settings
-        if self.step % s.replace_interval or self.step-self.last_copy < s.protect_steps or not (self.run/'league.json').exists():
-            return False
-        league = json.loads((self.run/'league.json').read_text(encoding='utf-8'))
-        latest = latest_rated(league)
-        mine = latest.get(s.variant)
-        # Compare only once a checkpoint trained after the last copy has been rated.
-        if mine is None or (self.copied_from and mine['step'] <= self.copied_from['at_step']):
-            return False
-        # (lo, hi, delta) of source minus mine, from either orientation of a difference entry.
-        pairs = {}
-        for d in league.get('differences', []):
-            pairs[d['a'], d['b']] = (d['interval'][0], d['interval'][1], d['elo_delta'])
-            pairs[d['b'], d['a']] = (-d['interval'][1], -d['interval'][0], -d['elo_delta'])
-        others = [c for v, c in latest.items() if v != s.variant]
-        missing = [c['id'] for c in others if (c['id'], mine['id']) not in pairs]
-        if missing:
-            dense_config.log_event(self.run, 'learner', 'info', f'{s.variant} replacement check at step {self.step}: no Elo difference entry for '
-                  f'{", ".join(missing)} against {mine["id"]}', variant=s.variant, step=self.step, missing=missing)
-        leaders = [c for c in others if (c['id'], mine['id']) in pairs and pairs[c['id'], mine['id']][0] > s.replace_margin]
-        if not leaders:
-            return False
-        source = max(leaders, key=lambda c: pairs[c['id'], mine['id']][2])
-        path = self.run/'checkpoints'/source['id']
-        copied = json.loads((path/'manifest.json').read_text(encoding='utf-8'))['learner']
-        if before_copy is not None:
-            before_copy()
-        self.load_weights(path/'model.pt')
-        self.ema = copy.deepcopy(self.model)
-        base = replace(dense_config.section('learner', copied), **{k: getattr(s, k) for k in KEEP})
-        old, self.settings = s, perturb(base, factor_rng, s.perturb)
-        self.optimizer = make_optimizer(self.model, self.settings)
-        self.optimizer_started = self.last_copy = self.step
-        self.ema_updates = 0
-        lo, hi, delta = pairs[source['id'], mine['id']]
-        self.copied_from = dict(checkpoint=source['id'], at_step=self.step, mine=mine['id'],
-                                elo_delta=delta, interval=[lo, hi], source_learner=copied, perturbed=asdict(self.settings))
-        dense_config.log_event(self.run, 'learner', 'replace', f'{s.variant} copied {self.copied_from["checkpoint"]} at step {self.step}',
-              variant=s.variant, step=self.step, copied_from=self.copied_from, old=asdict(old), source_settings=copied,
-              new=asdict(self.settings))
-        return True
-
 
 def main():
     parser = argparse.ArgumentParser(description='Train one dense HexNet variant on a run directory')
     parser.add_argument('--run', type=Path, required=True)
-    parser.add_argument('--initial', type=Path, help='hexnet checkpoint to warm start from (ignored when resuming)')
+    parser.add_argument('--initial', type=Path, help='hexnet file, or checkpoint directory whose EMA weights are used, to warm start from (ignored when resuming)')
     parser.add_argument('--steps', type=int, help='stop once the step count reaches this (default: endless)')
     parser.add_argument('--workers', type=int, default=2, help='render worker processes')
     parser.add_argument('--threads', type=int, default=1, help='torch CPU threads of this process when training on CUDA')
@@ -1122,13 +1053,13 @@ def main():
                       rows_available=window.total_rows, window_rows=window.rows, full_rows_available=window.total_full_rows,
                       window_full_rows=window.full_rows, retained_rows=window.retained_rows, retained_fraction=window.retained_fraction,
                       regret_rows=window.regret_rows, regret_effective_share=window.regret_share(
-                          learner.settings.batch, learner.settings.regret_fraction, learner.settings.recency),
+                          s.batch, s.regret_fraction, s.recency),
                       samples_per_row=(learner.samples_seen-base['samples'])/max(1, window.total_rows-base['rows']),
-                      samples_per_row_target=learner.settings.samples_per_row,
-                      phase_rows=phase.rows or max(int(bool(phase_request)), phase_budget(learner.settings, learner.step, args.steps)[0]),
-                      phase_export=learner.settings.phase_export, phase_actors=learner.settings.phase_actors,
+                      samples_per_row_target=s.samples_per_row,
+                      phase_rows=phase.rows or max(int(bool(phase_request)), phase_budget(s, learner.step, args.steps)[0]),
+                      phase_export=s.phase_export, phase_actors=s.phase_actors,
                       phase_request=phase_request, phase_end_step=phase.end_step,
-                      backlog_rows=backlog(learner.samples_seen, window.total_rows, learner.settings.samples_per_row, base),
+                      backlog_rows=backlog(learner.samples_seen, window.total_rows, s.samples_per_row, base),
                       pacing_rows=base['rows'], pacing_samples=base['samples'],
                       lr=learner.lr(), data_wait_fraction=wait_fraction(rate),
                       last_export_step=learner.last_export, policy_ce=(learner.metrics or {}).get('policy_ce'),
@@ -1137,18 +1068,18 @@ def main():
 
     def await_actors():
         nonlocal phase_request
-        if not learner.settings.phase_actors or phase_request is not None:
+        if not s.phase_actors or phase_request is not None:
             return
         phase_request = f'{os.getpid()}:{time.time_ns()}'
         deadline = time.monotonic()+ACTOR_WAIT_SECONDS
         while True:
-            waiting = waiting_actors(args.run, learner.settings.phase_actors, s.variant, phase_request)
+            waiting = waiting_actors(args.run, s.phase_actors, s.variant, phase_request)
             write_status(stage='waiting-for-actors', samples_per_second=0., phase_waiting=waiting)
             if not waiting:
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'Actor workers {waiting} did not acknowledge the training phase within '
-                                   f'{ACTOR_WAIT_SECONDS:g} seconds. Start all {learner.settings.phase_actors} workers '
+                                   f'{ACTOR_WAIT_SECONDS:g} seconds. Start all {s.phase_actors} workers '
                                    'with updated code and --phase-follow, or disable the handoff with --phase-actors 0.')
             time.sleep(.25)
         write_status(stage='training', samples_per_second=0., phase_waiting=[])
@@ -1172,20 +1103,15 @@ def main():
     try:
         torch.manual_seed(config.seed+learner.step)
         variant_seed = zlib.crc32(s.variant.encode())
-        def replay(survey=None):
-            s = learner.settings
-            return dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
-                                           s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant),
-                                           s.cheap_row_fraction, config.seed, survey)
         survey = dense_data.survey(args.run, config.seed, s.cheap_row_fraction, SURVEY_PROCESSES)
-        window = replay(survey)
+        window = dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
+                                         s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant),
+                                         s.cheap_row_fraction, config.seed, survey)
         sets = validation_sets(args.run, s, config.seed, survey)
         learner.calibrate(window)
-        renderers = lambda: dense_data.Renderers(args.run, learner.settings, [config.seed, variant_seed, learner.step], args.workers,
-                                                 calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
-                                                 regret_entries=window.regret_entries, run_seed=config.seed)
-        stream = renderers()
-        factor_rng = np.random.default_rng([config.seed, variant_seed, learner.step, 1])
+        stream = dense_data.Renderers(args.run, s, [config.seed, variant_seed, learner.step], args.workers,
+                                      calibration=learner.calibration, policy_dir=policy_dir(args.run, s.variant),
+                                      regret_entries=window.regret_entries, run_seed=config.seed)
         dense_config.log_event(args.run, 'learner', 'info', f'{s.variant} learner started at step {learner.step}', variant=s.variant, step=learner.step,
               learner=asdict(s))
         print(f'future loss: {learner.heads[4]}', flush=True)
@@ -1193,9 +1119,6 @@ def main():
         sums = torch.zeros(len(HEADS), device=learner.device); counts = torch.zeros(len(HEADS), device=learner.device)
         last_status = last_refresh = time.time()
         while args.steps is None or learner.step < args.steps:
-            if learner.maybe_replace(factor_rng, before_copy=await_actors):
-                stream.close(); window = replay(); learner.calibrate(window); stream = renderers(); last_refresh = time.time()
-            s = learner.settings
             if time.time()-last_refresh > REFRESH_SECONDS:
                 window.refresh(); last_refresh = time.time()
             learner.rebase(window.total_rows)
