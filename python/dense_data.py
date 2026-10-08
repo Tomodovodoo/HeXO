@@ -824,8 +824,14 @@ class ReplayWindow:
 
     def refresh(self):
         """Rescan manifests, recompute the window and load newly admitted shards; returns window rows. The indices
-        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed."""
-        for path in shard_dirs(self.run_dir):
+        are rebuilt only when the admitted shards, their proof labels or the restart buffer changed. A shard whose
+        directory is gone (moved out of the run) leaves the window and the pacing count."""
+        paths = shard_dirs(self.run_dir)
+        present = {path.name for path in paths}
+        for name in set(self.manifests) - present:
+            del self.manifests[name]
+            self.counts.pop(name, None)
+        for path in paths:
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
         names = self.names = sorted(self.manifests)
@@ -1190,8 +1196,16 @@ class ValidationSets:
         return scanned[name]
 
     def refresh(self):
-        """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset."""
-        for path in shard_dirs(self.run_dir):
+        """Rescan shard manifests and extend (for a new newest actor, rebuild) every subset. Rows of a shard whose
+        directory is gone (moved out of the run) leave their subsets, which refill from shards not yet walked."""
+        paths = shard_dirs(self.run_dir)
+        present = {path.name for path in paths}
+        for name in set(self.manifests) - present:
+            del self.manifests[name]
+            self.actors.pop(name, None)
+        for chosen in self.picks.values():
+            chosen[:] = [(name, i) for name, i in chosen if name in present]
+        for path in paths:
             if path.name not in self.manifests:
                 self.manifests[path.name] = manifest(path)
         names = sorted(self.manifests)

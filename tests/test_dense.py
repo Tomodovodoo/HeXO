@@ -3602,6 +3602,27 @@ class ValidationSourceTests(unittest.TestCase):
             again.refresh()
             self.assertEqual(again.newest, 'y')
 
+    def test_shard_moved_out_of_the_run_leaves_window_and_panels(self):
+        """An operator quarantines a shard while the learner runs: the next refreshes drop its rows instead of failing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for k in range(3):
+                source_shard(run/'shards'/f'{1000000000001+k}', k, 'x', checkpoint='main/000010', winner=k % 2)
+            window = dense_data.ReplayWindow(run, 10**6, 10**6, validation_fraction=.5)
+            sets = dense_data.ValidationSets(run, .5, 5, limit=40, quota=12)
+            sets.refresh()
+            moved = '1000000000002'
+            self.assertIn(moved, {name for name, _ in window.index} | {r.shard for refs in sets.subsets.values() for r in refs})
+            rows = window.total_rows
+            shutil.move(run/'shards'/moved, run/moved)
+            window.refresh(); sets.refresh()
+            self.assertNotIn(moved, {name for name, _ in window.index} | {name for name, _ in window.validation})
+            self.assertNotIn(moved, {r.shard for refs in sets.subsets.values() for r in refs})
+            self.assertLess(window.total_rows, rows)
+            refs = window.sample(np.random.default_rng(0), 16)
+            dense_data.examples(window, refs, np.random.default_rng(1))
+            dense_data.examples(sets, sets.subsets['fresh', 'held'], np.random.default_rng(1))
+
     def test_retained_state_is_bounded(self):
         """Many shards: full subsets stop consuming shards, and per shard only actor row counts are kept."""
         with tempfile.TemporaryDirectory() as tmp:
