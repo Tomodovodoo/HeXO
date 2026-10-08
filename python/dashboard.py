@@ -514,7 +514,8 @@ def resumed(run, league, evaluator):
         if candidate in wanted:
             if opponent != wanted[candidate]:
                 continue
-        elif (candidate in entries and not entries[candidate].get('skipped')) or any(v['id'] == candidate for v in variants) \n                or opponent != champion:
+        elif (candidate in entries and not entries[candidate].get('skipped')) or any(v['id'] == candidate for v in variants) \
+                or opponent != champion:
             continue
         base = (anchors[opponent] if opponent in anchors else entries.get(opponent) or {}).get('elo')
         score = dense_stats.tally(games)

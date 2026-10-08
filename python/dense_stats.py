@@ -18,8 +18,8 @@ def same_protocol(report_settings, settings):
     evaluator's published status settings). Under the live book that includes opening_book (dense_openings.Book.digest
     of its openings), which changes only at a book refresh: a report is reused while the book keeps its openings,
     and a refresh that changes them starts every comparison afresh. A frozen suite's name fixes its openings
-    (opening_book ''); a report without a PROTOCOL_DEFAULTS field was played at its default."""
-    return all(report_settings.get(k, PROTOCOL_DEFAULTS.get(k)) == settings.get(k) for k in PROTOCOL)
+    (opening_book ''); either side without a PROTOCOL_DEFAULTS field is taken at its default."""
+    return all(report_settings.get(k, PROTOCOL_DEFAULTS.get(k)) == settings.get(k, PROTOCOL_DEFAULTS.get(k)) for k in PROTOCOL)
 
 
 def pair_scores(records):

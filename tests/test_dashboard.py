@@ -125,7 +125,7 @@ class ResumedReports(unittest.TestCase):
             league['checkpoints'].append(dict(id='new-schedule/202500', skipped=True, elo=None, matches=[]))
             report('new-schedule/202500', [game(0, 0, 0), game(0, 1, 0)])
             report('main/185000@policy', [game(0, 0, 1), game(0, 1, 0)])
-            report('main/170000@puct', [game(0, 0, 0), game(0, 1, 0)], opponent='main/170000')
+            report('main/170000@puct', [game(0, 0, 0), game(0, 1, 1)], opponent='main/170000')
             playing = dict(stage='playing', settings=protocol, comparison=dict(candidate='new-schedule/207500', opponent='main/185000'))
             rows = dashboard.resumed(run, league, playing)
             self.assertEqual([r['id'] for r in rows], ['main/170000@puct', 'new-schedule/202500', 'new-schedule/205000'])
