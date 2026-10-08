@@ -471,7 +471,7 @@ export class BrowserSession extends OfflineSession {
     const record = source === saved && !result.proofs?.length ? saved : {...source,
       ...(strategy && source.proof?.winner === saved.proof?.winner && !source.proof?.certificate?.nodes.some(n => n.kind !== 'exact') ? {strategy} : {}),
       ...(facts.size ? {proofs: [...facts.values()]} : {}), id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
-      simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
+      simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false && !spec.budget.ms ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     if (record !== saved) {
       this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`);
       if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;

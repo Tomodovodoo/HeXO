@@ -1674,7 +1674,8 @@ class Engines:
                          solved, floor, known, solver_ms=spent.get('solver_ms', 0) if solver else 0,
                          package=self.tactical_package, proofs=self.proof_workers() if solver else None,
                          stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
-        if not found.pop('solved'):
+        # A budget in time ends its root queries at its clock on purpose: that still counts as spending them.
+        if not found.pop('solved') and not spent.get('ms'):
             spent = spent | dict(solver_nodes=0)
         weights = search_key(bubble.sha256[:16], entry, spent)
         kept = ':kept' if keep or line is not None else ''
@@ -1742,7 +1743,7 @@ class Engines:
                               stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
         out = []
         for record in found:
-            used = spent if record.pop('solved') else spent | dict(solver_nodes=0)
+            used = spent if record.pop('solved') or spent.get('ms') else spent | dict(solver_nodes=0)
             weights = search_key(bubble.sha256[:16], entry, used)
             out.append((record, used, f"{weights}:{build if used['solver_nodes'] else 'none'}"))
         return out
