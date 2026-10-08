@@ -10466,7 +10466,7 @@ class DenseTimedWorker(unittest.TestCase):
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False),
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
-                    _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1., 8)))
+                    _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None

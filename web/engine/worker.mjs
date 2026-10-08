@@ -1,6 +1,6 @@
 /* Bubble in a Web Worker: network (network.mjs), native search (gumbel.wasm) and the tactical solver (solver-worker.mjs).
  * In: {type: 'load', options} | {type: 'use', id, model, proofWorkers}
- *     | {type: 'turn', id, history, model, simulations, solverNodes, solverWorkers, batchSize, qRangeFloor, ms, views, line, known}
+ *     | {type: 'turn', id, history, model, simulations, solverNodes, solverWorkers, batchSize, qRangeFloor, ms, line, known}
  *     | {type: 'cancel', id} | {type: 'bench', id, batches, sizes, repeats} | {type: 'evaluate', id, histories}.
  * Out: {type: 'progress', id?, fraction, stage?} | {type: 'ready', device} | {type: 'result', id, result} | {type: 'cancelled', id}
  *     | {type: 'error', id?, message, stage?}: stages.mjs's loading stages; a stage in an error is where it stopped.
@@ -261,7 +261,8 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
  * plus `solver_error` when the solver's worker could not run, so the turn has no proof or threat. Under a clock `ms` is the
  * turn's time, as the timed engine spends it: the solver gets at most a quarter, the first stone 60% of the rest and the
  * simulations are a ceiling; a stone whose search has not finished by its time plays the search's choice so far, or the
- * network's policy before any. */
+ * network's policy before any. Each searched stone before the turn's last is posted as soon as it is decided, as a
+ * progress message whose `placed` holds the turn's stones so far. */
 async function turn(request) {
   const previous = gameTurn;
   let release = null;
@@ -284,7 +285,7 @@ async function turn(request) {
  * or search, gives a position it proves lost for the mover its proof and line, and marks the proven stones of each
  * search root exact before it searches (NeuralSearch.settle); a stone the graph does not take is applied to the
  * search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, views = 8, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
+async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
@@ -425,7 +426,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         if (line != null && edges.size) touched = tree.id;
         check();
         let searchedResult;
-        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(64, simulations)), work: simulations, views,
+        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(64, simulations)), work: simulations, views: 8,
           ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
         try {
           searchedResult = await owner.search({network, batchSize, choice,
@@ -468,6 +469,9 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
       moves.push([action[0], action[1]]);
       current.push([action[0], action[1]]);
       tree?.advance(action);
+      // A decided stone before the turn's last: the page may show it while the next stone's search runs.
+      if (native.game(current).player === player) postMessage({type: 'progress', id, placed: moves.map(m => [...m]),
+        fraction: timed ? Math.min(1, (performance.now() - start) / ms) : moves.length / state.remaining});
     }
     if (line != null && tree && moves.length > 1 && !given) {
       // The later stones' searches changed the graph under the first root: read that root again.

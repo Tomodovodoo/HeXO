@@ -17,7 +17,7 @@
  * evaluation record the analysis panel shows for that turn. A seat or the analysis shows the stage of its job next to
  * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
  * engine's choices to lightning. */
-import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
+import {BubbleEngine, CPU_PRESETS, NETWORKS, PRESETS, isolate, networkManifest, turnTimes} from './bubble.mjs';
 import {drip} from './drip.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
@@ -32,10 +32,10 @@ import {stageText} from './stages.mjs';
 import {savedIds} from './storage.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, pace: turnTimes(PRESETS), preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
-  record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
-    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
+  record: (result, history, preset) => ({...result, simulations: bubble.entry.presets[preset].simulations,
+    solver_nodes: result.solved ? bubble.entry.presets[preset].solver_nodes : 0, engine: BUBBLE}),
   build: 'python tools/build_web.py ort model'};
 const ENGINES = new Map([bubble, drip, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
@@ -139,6 +139,9 @@ function progress() {
   }
 }
 
+/** The key of `task` (`schedule`), by which a running job is told apart from the one the page now needs. */
+const taskKey = task => `${task.kind}|${task.engine}|${task.preset}|${task.checkpoint}|${hk(task.history)}`;
+
 function schedule() {
   const s = state();
   if (!s || posting) return;
@@ -148,7 +151,7 @@ function schedule() {
   const analyse = a && !(s.winner >= 0 && prefix.length === s.history.length) && !analyses.has(analysisKey(a, prefix));
   const task = move ? {kind: 'move', side, ...seat, line: lines[side], history: s.history.map(p => [...p])}
     : analyse ? {kind: 'analyse', ply: prefix.length, ...a, history: prefix.map(p => [...p])} : null;
-  const key = task && `${task.kind}|${task.engine}|${task.preset}|${task.checkpoint}|${hk(task.history)}`;
+  const key = task && taskKey(task);
   if (job?.key === key || (key && key === failed)) return;
   job?.controller.abort();
   job = null;
@@ -192,25 +195,47 @@ async function run(key, task) {
     current.stage = stageText(null);
     const budget = {...entry.presets[task.preset], ...(task.checkpoint ? {checkpoint: task.checkpoint} : {})}, s = state();
     const ms = task.kind === 'move' && s?.clock && s.clock_spec?.mode !== 'fixed' ? turnTime(s.clock_spec, s.clock, task.side) : null;
-    const started = performance.now();
-    const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
-      progress: (f, live, stage) => { current.fraction = f; current.stage = stageText(stage); progress(); }});
-    if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
+    const started = performance.now(), shown = [];
+    // Plays `moves` while the board and the seat are still the task's; false when it stopped.
+    const play = async moves => {
+      for (const [q, r] of moves) {
+        const seat = config.seats[task.side];
+        if (state().paused || seat?.engine !== task.engine || seat.preset !== task.preset || seat.checkpoint !== task.checkpoint
+          || hk(state().history) !== hk(task.history)) return false;
+        if (!(await original.post('/play', {q, r}))) {
+          failed = key;
+          return false;
+        }
+        task.history.push([q, r]);
+      }
+      return true;
+    };
+    // A move's stones decided before its last go to the board at once, and the job takes the key of the position they
+    // reach, so `schedule` keeps it running for the rest of the turn.
+    let placing = Promise.resolve();
+    const place = placed => {
+      placing = placing.then(async () => {
+        if (task.kind !== 'move' || job !== current || placed.length <= shown.length) return;
+        posting = true;
+        try {
+          const next = placed.slice(shown.length);
+          if (await play(next)) { shown.push(...next); current.key = taskKey(task); }
+        } finally {
+          posting = false;
+        }
+      });
+    };
+    const result = await engine.turn(task.history.map(p => [...p]), budget, {signal: controller.signal, ms, line: task.line,
+      progress: (f, live, stage, placed) => { current.fraction = f; current.stage = stageText(stage); progress(); if (placed) place(placed); }});
+    await placing;
+    if (ms == null && result.actual_completed !== 0) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
     if (task.kind === 'move') {
       posting = true;
       try {
-        for (const [q, r] of result.moves) {
-          const seat = config.seats[task.side];
-          if (state().paused || seat?.engine !== task.engine || seat.preset !== task.preset || seat.checkpoint !== task.checkpoint
-            || hk(state().history) !== hk(task.history)) break;
-          if (!(await original.post('/play', {q, r}))) {
-            failed = key;
-            break;
-          }
-          task.history.push([q, r]);
-        }
+        // A turn that disagrees with the stones already shown leaves them; `schedule` asks for the rest of the turn.
+        if (shown.every((p, i) => hk([p]) === hk([result.moves[i]]))) await play(result.moves.slice(shown.length));
       } finally {
         posting = false;
       }
@@ -375,26 +400,18 @@ function recheck(entry, force = false) {
     config = fixed;
     save();
   }
-  const session = page.browserPlay, choices = session && [...session.seats, session.analysis, ...session.match?.players ?? []];
-  const stale = choices?.filter(c => c?.engine === entry.id && c.checkpoint && entry.checkpoints.length && !entry.checkpoints.includes(c.checkpoint));
-  if (stale?.length) {
-    for (const choice of stale) choice.checkpoint = entry.checkpoints[0];
-    session.cancelJobs(job => job.spec.engine === entry.id && !entry.checkpoints.includes(job.spec.checkpoint));
-    session.jobs = session.jobs.filter(job => job.status !== 'failed' || job.spec.engine !== entry.id);
-    session.persist();
-    page.accept(session.state());
-    session.pump();
-  } else if (state()) page.renderPanels();
+  if (!page.browserPlay?.relist(entry.id) && state()) page.renderPanels();
 }
 
-/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, and the saved
- * choices (or the static page's session) that use it at another preset move to lightning, ending a job of it at
- * another preset. */
+/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, a Bubble takes
+ * the WebAssembly ladder (bubble.mjs CPU_PRESETS), and the saved choices (or the static page's session) that use it
+ * at another preset move to lightning, ending a job of it at another preset. */
 function lighten(engine) {
   const found = [...ENGINES.values()].find(e => e.engine === engine);
   if (!found) return;
   const id = found.entry.id;
   found.entry.preset = 'lightning';
+  if (found.entry.kind === 'bubble') Object.assign(found.entry, {presets: CPU_PRESETS, pace: turnTimes(CPU_PRESETS)});
   if (page.browserPlay) { page.browserPlay.lighten(id); return; }
   const light = choice => choice?.engine === id ? {...choice, preset: 'lightning'} : choice;
   config = {seats: config.seats.map(light), analysis: light(config.analysis)};
@@ -525,10 +542,8 @@ function install() {
  * Resolves true when it took over (or is reloading for isolation).
  */
 async function serverless() {
-  try {
-    const response = await fetch('/state', {cache: 'no-store'});
-    if (response.ok && (response.headers.get('Content-Type') || '').includes('json')) return false;
-  } catch {}
+  // python/play.py marks the page it serves (SERVED); a static site has no game server to ask.
+  if (document.querySelector('meta[name="hexo-play"][content="server"]')) return false;
   if (await isolate()) return true;
   Object.assign(page, original, {openMenu, pickItems});
   const [manifest, build] = await Promise.all([json(networkManifest()).then(found => found.data, () => ({})), json('build.json').then(found => found.data)]);

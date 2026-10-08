@@ -194,6 +194,43 @@ class PlayPage(unittest.TestCase):
 
 
 @unittest.skipUnless(NODE, 'needs node')
+class AutoAnalysis(unittest.TestCase):
+    """The play page's Auto asks for a finished analysis once per position and settings, even when the saved
+    evaluation records less work than the budget names (a time budget that ended early, solver nodes a position did
+    not need); a stale evaluation or new settings ask again."""
+
+    SCRIPT = """
+let now = 0; Date.now = () => now;
+const posts = [], post = (path, body) => posts.push(body.ply);
+const finished = () => false, asked = new Map(); let dismissed = null, view = 3;
+const timed = {simulations: 65536, ms: 300, solver_nodes: 1200};
+let S = {importing: false, failedJobs: [], jobs: [], stale: [], history: [[0, 0], [1, 1], [2, 2]],
+  analysis: {engine: 'bubble', checkpoint: null, preset: 'custom', budget: timed, auto: true},
+  evaluations: {3: {simulations: 65536, ms: 290, solver_nodes: 0, value: .5}}};
+const counts = [];
+for (let i = 0; i < 5; i++) { autoAnalyse(); now += 4000; }
+counts.push(posts.length);
+S.stale = [3]; for (let i = 0; i < 2; i++) { autoAnalyse(); now += 4000; }
+counts.push(posts.length);
+S.stale = []; S.analysis = {...S.analysis, preset: 'lightning', budget: {simulations: 16, solver_nodes: 1024}};
+for (let i = 0; i < 3; i++) { autoAnalyse(); now += 4000; }
+counts.push(posts.length);
+delete S.evaluations[3]; S.analysis = {...S.analysis, preset: 'quick', budget: {simulations: 64, solver_nodes: 2048}};
+for (let i = 0; i < 3; i++) { autoAnalyse(); now += 4000; }
+counts.push(posts.length);
+console.log(JSON.stringify(counts));
+"""
+
+    def test_a_finished_analysis_at_a_time_budget_is_not_asked_for_again(self):
+        import re
+        page = (ROOT/'web'/'index.html').read_text(encoding='utf-8')
+        code = re.search(r'function autoAnalyse\(\)\{.*?\n\}\n', page, re.S).group(0) + re.search(r'function autoTag\(\).*\n', page).group(0)
+        out = subprocess.run([NODE, '-e', code + self.SCRIPT], capture_output=True, text=True, check=True).stdout
+        # Once for the timed analysis, again for each stale look, once for new settings, then every 3 s without one.
+        self.assertEqual(json.loads(out), [1, 3, 4, 7])
+
+
+@unittest.skipUnless(NODE, 'needs node')
 class BoardPerspective(unittest.TestCase):
     """web/engine/symmetry.mjs: the 12 views of the play page's board and the steps between them."""
     cells = [[0, 0], [1, 0], [0, 1], [2, -1], [-3, 5], [4, 2], [-1, -1]]
@@ -408,19 +445,37 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(browser[1]['top'][0][:2], [6,-4])
         self.assertEqual([r['proof']['plies'] for r in browser], [52]*3)
 
+    def test_an_engine_turn_shows_its_first_stone_while_the_second_is_searched(self):
+        answer = node(dict(kind='stream'))
+        self.assertEqual((answer['during'], answer['moves'], answer['player']), ([[0, 0], [1, 0]], [['running', 1]], 1))
+        self.assertEqual((answer['after'], answer['left']), ([[0, 0], [1, 0], [2, 0]], 0))
+
     def test_custom_budgets_apply_the_amount_last_edited_and_keep_the_other(self):
         answer = node(dict(kind='custom-forms'))
-        self.assertEqual(answer['old'], dict(budget=dict(simulations=300, views=8, solver_nodes=4800),
-                                             custom=dict(simulations=300, ms=1000, active='simulations', views=8)))
-        self.assertEqual(answer['time']['budget'], dict(simulations=65536, ms=2500, views=8, solver_nodes=10000))
+        self.assertEqual(answer['old'], dict(budget=dict(simulations=300, solver_nodes=4800),
+                                             custom=dict(simulations=300, ms=1000, active='simulations')))
+        self.assertEqual(answer['time']['budget'], dict(simulations=65536, ms=2500, solver_nodes=10000))
         self.assertEqual(answer['time']['custom']['simulations'], 300)
-        self.assertEqual(answer['nodes']['budget'], dict(simulations=600, views=4, solver_nodes=9600))
+        self.assertEqual(answer['nodes']['budget'], dict(simulations=600, solver_nodes=9600))
         self.assertEqual(answer['nodes']['custom']['ms'], 2500)
         self.assertEqual((answer['six']['budget'], answer['sixBack']['budget']), (dict(ms=900, nodes=2 ** 31 - 1), dict(nodes=800)))
         self.assertEqual(answer['sixBack']['custom']['ms'], 900)
         self.assertEqual(answer['reloaded'], answer['time'])
         self.assertEqual(answer['bad'], 400)
         self.assertEqual((answer['shrimp']['budget']['visits'], answer['shrimp'].get('custom')), (64, None))
+
+    def test_a_retired_or_unlisted_checkpoint_plays_as_the_engines_first(self):
+        answer = node(dict(kind='retired-checkpoints'))
+        restored = answer['restored']
+        self.assertEqual((restored['seat'], restored['analysis']), ('strix-237000', 'strix-237000'))
+        self.assertEqual((restored['played'][0], restored['history']), ('strix-237000', [[0, 0]]))
+        self.assertEqual((answer['early'], answer['empty']), ([200, 200], [None, 'pulsatrix-10-best']))
+        self.assertEqual((answer['moved'], answer['again']), (True, False))
+        self.assertEqual(answer['filled'], ['strix-237000', 'strix-237000'])
+        self.assertEqual(answer['players'], [['strix-237000', True], ['strix-237000', True]])
+        self.assertEqual(answer['reloaded'], ['strix-237000', 'strix-237000'])
+        self.assertEqual(answer['bubble'], [200, 'b1', 200, 'b1', 200, 'b2', 200, None])
+        self.assertFalse(answer['untouched'])
 
     def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
         answer = node(dict(kind='dismissal'))
