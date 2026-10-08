@@ -178,6 +178,18 @@ out.unpublished = {
   seal: await kind(() => engines.seal.files()),
   strix: await kind(async () => new (await import('../../web/engine/strix.mjs')).StrixEngine([]).files()),
 };
+// A build whose available.json says it has neither: their manifests are not asked for, even where they exist.
+for (const path of ['seal/manifest.json', 'strix/networks.json']) site.set(path, JSON.stringify(manifests[path]));
+site.set('available.json', JSON.stringify({seal: false, strix_network: false}));
+requests.length = 0;
+out.unavailable = {seal: await kind(() => engines.seal.files()),
+  strix: await kind(async () => new (await import('../../web/engine/strix.mjs')).StrixEngine([]).files())};
+out.unavailable.asked = requests.filter(r => /seal\/manifest|strix\/networks/.test(r)).length;
+// A local build without them still reads them from a site that has them.
+here.set('available.json', JSON.stringify({seal: false, strix_network: false}));
+site.set('available.json', JSON.stringify({seal: true, strix_network: true}));
+out.unavailable.listed = await kind(() => engines.seal.files());
+here.delete('available.json'); site.delete('available.json'); site.delete('seal/manifest.json'); site.delete('strix/networks.json');
 offline = true;
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => { if (!String(input).startsWith(BASE)) throw new TypeError('Failed to fetch'); return realFetch(input, init); };

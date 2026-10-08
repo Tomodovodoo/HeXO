@@ -90,6 +90,22 @@ export async function json(path) {
   }
 }
 
+/** available.json at `url` (written by every tools/build_web.py run), or null when it cannot be read. */
+async function availability(url, init = {}) {
+  const response = await request(url, {cache: 'no-cache', ...init}).catch(() => null);
+  return response?.ok ? bounded(response.json(), 'available.json').catch(() => null) : null;
+}
+
+/** Whether optional `part` ('seal', 'strix_network') may be asked for: true when this origin's build has it, else what
+ * the site's record says, or this origin's when it is the site; true when no record says either way. A part that
+ * neither origin has is never asked for, so its manifest's 404 is not logged. */
+export async function published(part) {
+  const here = await availability(new URL('available.json', BASE));
+  if (here?.[part]) return true;
+  const there = remote('available.json');
+  return (there ? await availability(there, {mode: 'cors'}) : here)?.[part] !== false;
+}
+
 /** The `files` pins ({name: SHA-256}) of manifest `found` (a json() result for `path`). A local manifest written before
  * builds pinned their files borrows the site's pins when `same(site manifest)` says both describe one build. */
 export async function pins(path, {data, local}, same) {

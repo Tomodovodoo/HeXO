@@ -215,6 +215,15 @@ class ProofLoop:
         cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
         checked(native.hxp_offer(self.ptr, game, cells.ctypes.data, len(cells), relevance))
 
+    def progress(self):
+        """{finished, fresh_nodes}: answered jobs and fresh solver nodes so far. Readable while a native inference
+        service owns the pool, since hxp_stats takes the loop's lock; `stats` is not."""
+        if not self._ptr:
+            raise ValueError('Proof loop is closed')
+        out, times = np.empty(16, np.uint64), np.empty(5, np.float64)
+        native.hxp_stats(self._ptr, out.ctypes.data, times.ctypes.data)
+        return dict(finished=int(out[3]), fresh_nodes=int(out[8]))
+
     def stats(self):
         out, times = np.empty(16, np.uint64), np.empty(5, np.float64)
         native.hxp_stats(self.ptr, out.ctypes.data, times.ctypes.data)

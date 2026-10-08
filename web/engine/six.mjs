@@ -5,8 +5,8 @@ import {json, workerUrl} from './assets.mjs';
 import {loadFiles, probe} from './network.mjs';
 import {NEURAL_PRESET} from './device.mjs';
 
-export const PRESETS = {lightning: {nodes: 240}, quick: {nodes: 960}, standard: {nodes: 3840}, strong: {nodes: 15360},
-  deep: {nodes: 61440}, dangerous: {nodes: 2000000}};
+export const PRESETS = {lightning: {nodes: 120}, quick: {nodes: 240}, standard: {nodes: 480}, strong: {nodes: 960},
+  deep: {nodes: 1920}, dangerous: {nodes: 2000000}};
 const ID = 'browser:six', LABEL = 'Six (browser)', MANIFEST = 'six/networks/manifest.json';
 
 export class SixEngine extends EngineWorker {
@@ -23,13 +23,13 @@ export class SixEngine extends EngineWorker {
     return this.call({type: 'use', network: checkpoint}, options);
   }
 
-  /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions, with network `budget.checkpoint` (a
-   * manifest name; the newest when absent): the fields of python/play.py evaluate. Under a clock `options.ms` is Six's
-   * movetime, the nodes a ceiling. Aborting `options.signal` cancels it at the search's next network batch and rejects
-   * with an AbortError. */
+  /** Six's turn at `history` ([[q, r], ...]) within `budget.nodes` new positions and `budget.ms` (a budget in time), with
+   * network `budget.checkpoint` (a manifest name; the newest when absent): the fields of python/play.py evaluate. Under a
+   * clock `options.ms` is Six's movetime, the nodes a ceiling. Aborting `options.signal` cancels it at the search's next
+   * network batch and rejects with an AbortError. */
   turn(history, budget, options = {}) {
     return this.call({type: 'turn', history, nodes: budget.nodes, network: budget.checkpoint ?? null,
-      ms: options.ms == null ? 0 : Math.max(1, Math.floor(options.ms))}, options);
+      ms: (options.ms ?? budget.ms) == null ? 0 : Math.max(1, Math.floor(options.ms ?? budget.ms))}, options);
   }
 
   /** {data, local}: six/networks/manifest.json (assets.mjs json()), whose network names refresh `checkpoints`. A changed

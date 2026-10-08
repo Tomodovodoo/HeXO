@@ -24,7 +24,40 @@ const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human
 const MAX_TIMER = 2 ** 31 - 1;
 /** The engines take budgets as 32-bit signed integers. */
 const MAX_BUDGET = 2 ** 31 - 1;
-const FIELD_NAMES = {simulations: 'Search', solver_nodes: 'Solver', nodes: 'Positions'};
+const FIELD_NAMES = {simulations: 'Nodes', solver_nodes: 'Solver', nodes: 'Positions', ms: 'Time', views: 'Width'};
+/** The custom budgets whose two amounts exclude each other: work (Bubble's Nodes, Six's Positions) or Time in ms
+ * (python/play.py EXCLUSIVE); Bubble's Width is at most VIEWS views per position. */
+const EXCLUSIVE = {bubble: ['simulations', 'ms'], six: ['nodes', 'ms']}, VIEWS = 16, WIDTH = 8;
+/** The EXCLUSIVE kind of `entry`, or null: Bubble, and Six itself but not another bot behind Six's protocol (python/play.py form_kind). */
+const formKind = entry => entry?.kind === 'bubble' || entry?.kind === 'six' && (entry.badge ?? 'six') === 'six' ? entry.kind : null;
+
+/** The custom form of a Bubble or a Six from `custom` (python/play.py custom_form): both amounts, `active` naming the
+ * one that applies (without it Time when only Time is given, else the work, so an older custom budget keeps its work),
+ * and Bubble's Width `views`; Bubble's old solver nodes are dropped. Throws on a value out of range. */
+export function customForm(kind, standard, custom = {}) {
+  const [work] = EXCLUSIVE[kind], timed = custom && 'ms' in custom && !(work in custom);
+  const form = {[work]: standard[work], ms: 1000, active: timed ? 'ms' : work, ...(kind === 'bubble' ? {views: WIDTH} : {})};
+  for (const [key, value] of Object.entries(custom || {})) {
+    if (kind === 'bubble' && key === 'solver_nodes' || key === 'args') continue;
+    if (key === 'active') {
+      if (!EXCLUSIVE[kind].includes(value)) throw Error(`active must be one of ${EXCLUSIVE[kind].join(', ')}`);
+    } else if (!(key in form)) throw Error(`${FIELD_NAMES[key] || key} is not a budget of this engine`);
+    else {
+      const least = {ms: 10, nodes: 1, views: 1}[key] ?? 0, most = key === 'views' ? VIEWS : MAX_BUDGET;
+      if (!Number.isInteger(value) || value < least || value > most) throw Error(`${FIELD_NAMES[key] || key} must be a whole number from ${least} to ${most}`);
+    }
+    form[key] = value;
+  }
+  return form;
+}
+
+/** The budget a custom `form` runs (python/play.py custom_budget). */
+export function customBudget(kind, form) {
+  const active = form.active;
+  if (kind === 'six') return active === 'ms' ? {ms: form.ms, nodes: MAX_BUDGET} : {nodes: form.nodes};
+  if (active === 'ms') return {simulations: 65536, ms: form.ms, views: form.views, solver_nodes: Math.min(4000000, Math.max(1024, 4 * form.ms))};
+  return {simulations: form.simulations, views: form.views, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
+}
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
@@ -102,6 +135,7 @@ export class BrowserSession extends OfflineSession {
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {generation: null, searches: 0};
+    this.dismissed = null;   // the dismissal() of the analysis a person cancelled, or null
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
@@ -128,7 +162,9 @@ export class BrowserSession extends OfflineSession {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
-    const preset = input.preset || entry.preset || 'standard', budget = preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
+    const preset = input.preset || entry.preset || 'standard', exclusive = preset === 'custom' && formKind(entry);
+    const form = exclusive ? customForm(entry.kind, entry.presets.standard, input.custom ?? input.budget) : null;
+    const budget = form ? customBudget(entry.kind, form) : preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
       : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
@@ -137,12 +173,15 @@ export class BrowserSession extends OfflineSession {
     }
     const checkpoint = input.checkpoint ?? entry.checkpoints?.[0] ?? null;
     if (entry.checkpoints?.length && !entry.checkpoints.includes(checkpoint)) throw Error('Unknown checkpoint');
-    return {engine: input.engine, checkpoint, preset, budget: copy(budget), auto: input.auto ?? false};
+    return {engine: input.engine, checkpoint, preset, budget: copy(budget), ...(form ? {custom: form} : {}), auto: input.auto ?? false};
   }
   /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
   engineKey(spec) {
-    const entry = this.entries.get(spec.engine);
-    return [spec.engine, spec.checkpoint, entry?.version || '', entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
+    const entry = this.entries.get(spec.engine), budget = spec.budget || {};
+    // A Bubble or Six budget in time, or a Bubble of another width, keeps its own evaluations (python/play.py search_key).
+    const search = (formKind(entry) && budget.ms ? `~ms${budget.ms}` : '')
+      + (entry?.kind === 'bubble' && (budget.views ?? WIDTH) !== WIDTH ? `~views${budget.views}` : '');
+    return [spec.engine, spec.checkpoint, (entry?.version || '') + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
   }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }
@@ -208,7 +247,7 @@ export class BrowserSession extends OfflineSession {
   reviewSpec() {
     if (!this.analysis || !this.entries.has(this.analysis.engine)) return null;
     const preset = this.analysis.preset === 'solver' ? 'standard' : this.analysis.preset;
-    return this.spec({...this.analysis, preset, custom: this.analysis.budget});
+    return this.spec({...this.analysis, preset, custom: this.analysis.custom ?? this.analysis.budget});
   }
   deepening() {
     return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
@@ -218,7 +257,8 @@ export class BrowserSession extends OfflineSession {
   deepen() {
     const active = this.deepening(), current = position(this.history);
     this.cancelJobs(j => j.tier && (!active || position(j.history) !== current));
-    if (!active || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
+    if (this.dismissed !== null && this.dismissed !== this.dismissal(this.history)) this.dismissed = null;
+    if (!active || this.dismissed !== null || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
     if (!entry || !this.adapters.has(entry.id)) return;
     const tiers = Object.keys(entry.presets), last = entry.device === 'GPU' ? tiers.length : tiers.indexOf('strong') + 1;
@@ -229,6 +269,10 @@ export class BrowserSession extends OfflineSession {
       }
     }
   }
+  /** The key a cancelled analysis of `history` leaves in `dismissed`: the position and the analysis settings without
+   * Auto. While it matches, deepening does not queue that position again; any move, settings change or analysis
+   * request clears it (python/play.py Session.dismissal). */
+  dismissal(history) { return `${position(history)}|${JSON.stringify({...this.analysis, auto: undefined})}`; }
   snapshot() {
     // Match metadata is mutable; its saved record versions are not.
     const match = this.match && copy({...this.match, position: this.match.position && {...this.match.position, records: []}});
@@ -361,6 +405,7 @@ export class BrowserSession extends OfflineSession {
       const ply = body.ply ?? this.history.length;
       if (!Number.isInteger(ply) || ply < 0 || ply > this.history.length) throw Error('Invalid analysis position');
       const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history);
+      this.dismissed = null;
       // A position viewed again whose graph another analysis has searched since: search the graph there again.
       if (!body.force && this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine});
       else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
@@ -371,6 +416,9 @@ export class BrowserSession extends OfflineSession {
       this.enqueue('review', history, this.reviewSpec(), {plies, cursor: 0, total: plies.length});
     } else if (path === '/cancel') {
       if (this.jobs.some(j => j.id === body.id && j.kind === 'move')) { this.paused = true; this.freezeClock(); }
+      // Only the live position's analysis is dismissed; a cancelled refresh elsewhere leaves it be.
+      const analysed = this.jobs.find(j => j.id === body.id && j.kind === 'analyse' && position(j.history) === position(this.history));
+      if (analysed) this.dismissed = this.dismissal(analysed.history);
       this.cancelJobs(j => j.id === body.id);
     } else if (path === '/pause') {
       this.paused = Boolean(body.paused);
@@ -426,7 +474,7 @@ export class BrowserSession extends OfflineSession {
     const record = source === saved && !result.proofs?.length ? saved : {...source,
       ...(strategy && source.proof?.winner === saved.proof?.winner && !source.proof?.certificate?.nodes.some(n => n.kind !== 'exact') ? {strategy} : {}),
       ...(facts.size ? {proofs: [...facts.values()]} : {}), id, position: position(history), engine: spec.engine, engine_key: this.engineKey(spec),
-      simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
+      simulations: spec.budget.simulations ?? result.simulations ?? spec.budget.visits ?? 0, solver_nodes: result.solved === false && !spec.budget.ms ? 0 : spec.budget.solver_nodes ?? result.solver_nodes ?? 0, budget: copy(spec.budget), saved_at: new Date().toISOString()};
     if (record !== saved) {
       this.indexRecord(record); this.proofs.add(history, record, `${record.id}|${record.saved_at}`);
       if (result.solver_error) this.notice = `The solver could not run in this browser (${result.solver_error}), so evaluations have no proofs`;
@@ -590,7 +638,8 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0}
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0,
+        ...(job.spec.budget.ms ? {ms: Math.max(10, Math.round(REFRESH_SHARE * job.spec.budget.ms))} : {})}
         : job.spec.budget;
       try {
         result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,

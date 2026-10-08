@@ -125,6 +125,9 @@ class Resolver(unittest.TestCase):
         self.assertEqual(self.out['unpublished'], {'manifest': 'not on site', 'status': 'not on site', 'seal': 'not on site',
                                                    'strix': 'not on site', 'unreachable': 'error'})
 
+    def test_optional_engines_a_build_lacks_are_not_asked_for(self):
+        self.assertEqual(self.out['unavailable'], {'seal': 'not on site', 'strix': 'not on site', 'asked': 0, 'listed': 'ok'})
+
     def test_engine_lists_leave_out_engines_whose_files_no_origin_has(self):
         self.assertEqual(self.out['offered'], ['browser:bubble', 'browser:strix', 'browser:six', 'six'])
 

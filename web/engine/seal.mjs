@@ -1,6 +1,6 @@
 /* Seal (Ramora0/HexTicTacToe) running in the browser: tools/seal_adapter.cpp compiled to seal/engine.wasm
  * (tools/build_web.py seal), searched in seal-worker.mjs. Seal's budget is a clock in ms. */
-import {json, pins, workerUrl} from './assets.mjs';
+import {NotOnSite, json, pins, published, workerUrl} from './assets.mjs';
 import {watchdog, workerError} from './stages.mjs';
 
 export const PRESETS = {lightning: {ms: 100}, quick: {ms: 250}, standard: {ms: 1000}, strong: {ms: 3000}, deep: {ms: 10000},
@@ -51,8 +51,10 @@ export function sealTurn(module, history, ms) {
   }
 }
 
-/** {revision, files}: Seal's revision and its module and wasm (assets.mjs records) as seal/manifest.json pins them. */
+/** {revision, files}: Seal's revision and its module and wasm (assets.mjs records) as seal/manifest.json pins them;
+ * NotOnSite when the build has no Seal. */
 export async function files() {
+  if (!await published('seal')) throw new NotOnSite('seal/manifest.json');
   const found = await json('seal/manifest.json'), {data, local} = found;
   const files = await pins('seal/manifest.json', found, other => other.revision === data.revision && other.files?.['engine.wasm'] === data.sha256);
   return {revision: data.revision, files: ['engine.mjs', 'engine.wasm'].map(name => ({path: `seal/${name}`,

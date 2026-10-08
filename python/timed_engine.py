@@ -38,7 +38,7 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
-SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor'},
+SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'views'},
                 solver={'enabled', 'stamps', 'workers', 'budget'})
 
 
@@ -51,6 +51,8 @@ def check_settings(search, solver):
     cap = search.get('max_simulations', search.get('simulations'))
     if cap is not None and (type(cap) is not int or cap <= 0):
         raise ValueError('simulation cap must be a positive integer')
+    if type(search.get('views', 8)) is not int or not 1 <= search.get('views', 8) <= 16:
+        raise ValueError('views must be an integer from 1 to 16')
     if search.get('enabled', True) and solver.get('enabled', True):
         proof_settings(solver)
     elif {'workers', 'budget'} & solver.keys():
@@ -293,7 +295,8 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
             result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline'
             return result
         signature = (player.model_sha256, player.options['solver'],
-                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget)
+                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget,
+                     limits.get('views', 8))
         kept = getattr(player, '_timed_hybrid', None)
         if kept is not None and kept[2] != signature:
             player.set_history(history)
@@ -303,7 +306,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                               cache=player.cache, tactics=True, q_range_floor=signature[3], round_barrier=True)
             pool = None
             try:
-                pool = SearchPool([graph], quantum=64, views=8, depth=8, work=1, seed=1740)
+                pool = SearchPool([graph], quantum=64, views=signature[6], depth=8, work=1, seed=1740)
                 if player.options['solver']:
                     pool.enable_proofs(player.tactical_package, workers=workers, queue=8*workers,
                                        slice_ms=8, stamps=signature[2], owner_budget=budget)
@@ -340,7 +343,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                                queued_ms=(time.monotonic()-started)*1000)
             result['root_searches'].append(root_search)
             service.retarget(0, 0, current, expected=token, work=work, ms=ms,
-                             samples=limits.get('root_samples', 16), views=8)
+                             samples=limits.get('root_samples', 16), views=signature[6])
             found = progress_candidate = None
             progress_sequence = 0
             progress_context = None
@@ -504,7 +507,7 @@ def _worker(connection, cancellation, config):
                     budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
-                                 q_range_floor=search.get('q_range_floor', 0.))
+                                 q_range_floor=search.get('q_range_floor', 0.), views=search.get('views', 8))
             search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
             if player.options['search'] and player.evaluator.cuda:
                 # CUDA capture alone does not initialize packed inference,

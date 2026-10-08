@@ -81,6 +81,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .field span{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:700;letter-spacing:.08em;
   text-transform:uppercase;color:var(--dim);opacity:.55;pointer-events:none}
 .field input{position:relative;width:100%;font:12px var(--mono);text-align:right;background:transparent}
+.field.off{opacity:.45}
 .bar{position:relative;height:3px;border-radius:2px;background:var(--line);overflow:hidden}
 .bar i{display:block;height:100%;background:var(--c,var(--text));transform-origin:left;transform:scaleX(0);transition:transform .3s ease-out}
 .bar.running::after{content:"";position:absolute;top:0;bottom:0;left:0;width:30%;
@@ -458,6 +459,8 @@ const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:
   inaccuracy:['?!','--inaccuracy'],mistake:['?','--mistake'],blunder:['??','--blunder'],missed:['✗','--proof'],allowed:['⚑','--proof'],lost:['·','--dim']};
 const STOPS=['lightning','quick','standard','strong','deep','dangerous'],configured=new Set();
 const FIELDS={simulations:'Search',solver_nodes:'Solver',nodes:'Positions',ms:'ms'};
+/* custom budgets whose work and Time exclude each other (python/play.py EXCLUSIVE), and their field names */
+const EXCLUSIVE={bubble:['simulations','ms'],six:['nodes','ms']},formKind=e=>e?.kind==='bubble'||e?.kind==='six'&&(e.badge??'six')==='six'?e.kind:null,LABELS={bubble:{simulations:'Nodes',ms:'Time ms',views:'Width'},six:{nodes:'Positions',ms:'Time ms'}};
 const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
 globalThis.playReady=new Promise(resolve=>{globalThis.resolvePlayReady=resolve});
 const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
@@ -867,11 +870,17 @@ function pace(entry,preset){
   return key==='ms'?budget.ms/2000:null;
 }
 const paceText=s=>s==null?'':s<10?`~${s.toFixed(1)} s`:`~${Math.round(s)} s`;
+/* a level's budget as the dial's tooltip names it: Bubble's nodes, Six's positions, Strix's simulations or a time */
+function levelText(entry,preset){const b=entry?.presets?.[preset],n=v=>v.toLocaleString(),name=preset[0].toUpperCase()+preset.slice(1);
+  if(!b)return name;
+  return name+': '+(b.simulations!=null?`${n(b.simulations)} ${entry.kind==='bubble'?'nodes':'simulations'} per stone`
+    :b.nodes!=null?`${n(b.nodes)} positions`:b.ms!=null?`${b.ms/1000} s`:'')}
 function strength(seat,send,id,config,landed=-1,entry=null){
   const at=STOPS.indexOf(seat.preset),thumb=el('b',{class:'thumb',html:STOP_ICON[Math.max(0,at)]}),fill=el('i',{class:'fill'});
-  const stops=STOPS.map((p,i)=>el('span',{class:'stop'+(i===landed?' landed':''),html:STOP_ICON[i]}));
+  const stops=STOPS.map((p,i)=>el('span',{class:'stop'+(i===landed?' landed':''),html:STOP_ICON[i],title:levelText(entry,p)}));
   const track=el('div',{class:'track'+(at<0?' off':''),id:'strength-'+id,role:'slider',tabindex:0,'aria-label':'Strength',
-    'aria-valuemin':0,'aria-valuemax':STOPS.length-1,'aria-valuenow':Math.max(0,at),'aria-valuetext':STOPS[Math.max(0,at)]},fill,...stops,thumb);
+    'aria-valuemin':0,'aria-valuemax':STOPS.length-1,'aria-valuenow':Math.max(0,at),'aria-valuetext':STOPS[Math.max(0,at)],
+    title:at<0?'Custom':levelText(entry,STOPS[at])},fill,...stops,thumb);
   const spot=i=>`calc(${i/(STOPS.length-1)} * (100% - 26px) + 13px)`;
   const place=i=>{thumb.style.left=fill.style.width=spot(i);thumb.innerHTML=STOP_ICON[i];
     stops.forEach((s,j)=>s.style.opacity=at<0&&!track.classList.contains('dragging')?.45:Math.max(.2,1-.5*Math.abs(i-j)))};
@@ -887,16 +896,27 @@ function strength(seat,send,id,config,landed=-1,entry=null){
   const note=entry&&entry.id.startsWith('browser:')?paceText(pace(entry,seat.preset)):'';
   return el('div',{class:'strength'},el('div',{class:'ends'},el('span',{},'Faster'),el('span',{class:'spacer'}),...(note?[el('span',{class:'pace'},note),el('span',{class:'spacer'})]:[]),el('span',{},'Smarter'),config),track);
 }
+/* the custom form of an EXCLUSIVE `kind` behind `budget` when a seat has none saved: its work active, Time 1 s */
+function formOf(kind,budget,standard){const [work]=EXCLUSIVE[kind],time=budget.ms;
+  return {[work]:time?standard[work]:budget[work]??standard[work],ms:budget.ms??1000,active:time?'ms':work,...(kind==='bubble'?{views:budget.views??8}:{})}}
+/* the custom budget fields of `seat` ({budget, custom}) for `entry`; `change(custom)` applies an edit. A Bubble or a Six
+   shows its work and Time, the one not applied greyed but kept (editing it applies it), and Bubble its Width */
+function budgetFields(entry,seat,change,id){
+  const field=(key,label,value,off,send)=>{const i=el('input',{type:'number',inputmode:'numeric',value,min:0,'aria-label':label,...(id?{id:`${id}-${key}`}:{})});
+    i.onchange=()=>send(Number(i.value));return el('label',{class:'field'+(off?' off':'')},el('span',{},label),i)};
+  const kind=formKind(entry);
+  if(!kind)return Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>field(k,FIELDS[k]||k,v,false,x=>change({...seat.budget,[k]:x})));
+  const form=seat.custom||formOf(kind,seat.budget,entry.presets.standard);
+  return [...EXCLUSIVE[kind],...(kind==='bubble'?['views']:[])].map(k=>field(k,LABELS[kind][k],form[k],k!=='views'&&k!==form.active,
+    x=>change({...form,[k]:x,...(k==='views'?{}:{active:k})})));
+}
 function seatControls(seat,send,id,config,landed){
   const box=[],entry=entryOf(seat.engine);if(!entry)return box;
   if(entry.checkpoints?.length>1){const sel=el('select',{'aria-label':entry.kind==='six'?'Network':'Checkpoint'},
       entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0&&entry.kind==='bubble'&&!entry.id.startsWith('browser:')?' ★':''))));
     sel.value=seat.checkpoint;sel.onchange=()=>send({checkpoint:sel.value});box.push(sel)}
   box.push(strength(seat,send,id,config,landed,entry));
-  if(configured.has(id))box.push(el('div',{class:'custom'},Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{
-    const i=el('input',{type:'number',inputmode:'numeric',value:v,'aria-label':FIELDS[k]||k,min:0});
-    i.onchange=()=>send({preset:'custom',custom:{...seat.budget,[k]:Number(i.value)}});
-    return el('label',{class:'field'},el('span',{},FIELDS[k]||k),i)})));
+  if(configured.has(id))box.push(el('div',{class:'custom'},budgetFields(entry,seat.preset==='custom'?seat:{budget:seat.budget},custom=>send({preset:'custom',custom}))));
   return box;
 }
 function renderSeat(side){
@@ -906,7 +926,7 @@ function renderSeat(side){
   const pick=el('button',{class:'pick'},...badge(...shown(seat)));
   const items=[{id:'human',ids:['human'],kind:'human',label:null},...pickItems(()=>true)];
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,seat.engine,it=>post('/seat',{side,engine:it.id}));
-  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.budget,...ch});
+  const send=ch=>post('/seat',{side,engine:seat.engine,checkpoint:seat.checkpoint,preset:seat.preset,custom:seat.custom??seat.budget,...ch});
   const controls=seat.engine==='human'?[]:seatControls(seat,send,'seat'+side,configButton('seat'+side,seat));
   if(seat.engine!=='human'&&entryOf(seat.engine)?.clocks)controls.push(clockPicker(S.clock_spec,spec=>post('/clock',spec),'clock-seat'+side));
   box.replaceChildren(el('div',{class:'seat-head'},el('i',{class:'hexdot',id:'dot'+side}),pick,el('span',{class:'clock',id:'clock'+side}),el('span',{id:'cancel'+side})),
@@ -931,7 +951,7 @@ function renderCard(){
 }
 function sendAnalysis(change){
   const a=S.analysis;
-  return post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:a.auto,...change}).then(done=>{
+  return post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.custom??a.budget,auto:a.auto,...change}).then(done=>{
     if(done&&!finished()&&Object.keys(change).some(k=>k!=='auto'))post('/analyse',{ply:view});return done});
 }
 function renderEngineHead(){
@@ -940,9 +960,9 @@ function renderEngineHead(){
   const pick=el('button',{class:'pick'},...badge(...shown(a)));
   const items=pickItems(e=>e.kind==='bubble'||e.analysis);
   pick.onclick=()=>menuFor===pick?closeMenu():openMenu(pick,items,a.engine,it=>sendAnalysis({engine:it.id,checkpoint:null,preset:entryOf(it.id)?.preset||'standard',custom:undefined}));
-  const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto analysis',el('i'));
+  const auto=el('div',{class:'switch'+(a.auto?' on':''),role:'switch','aria-checked':a.auto,tabindex:0},'Auto',el('i'));
   auto.onclick=()=>sendAnalysis({auto:!a.auto});
-  const solving=a.preset==='solver',solver=entryOf(a.engine)?.kind!=='bubble'?null:el('div',{class:'switch'+(solving?' on':''),role:'switch','aria-checked':solving,tabindex:0,title:'Spend the analysis on proof search until a verified proof or two minutes'},'Solver',el('i'));
+  const solving=a.preset==='solver',solver=entryOf(a.engine)?.kind!=='bubble'?null:el('div',{class:'switch'+(solving?' on':''),role:'switch','aria-checked':solving,tabindex:0,title:'Spend the analysis on proof search until a verified proof or two minutes'},'Deep Solve',el('i'));
   if(solver)solver.onclick=()=>sendAnalysis({preset:solving?'standard':'solver',custom:undefined});
   const again=el('button',{class:'ib',id:'again','aria-label':'Analyse again'});setIcon(again,S.jobs.some(j=>j.kind==='analyse')?'close':'again');
   const ev=S.evaluations[view],landed=ev?STOPS.findIndex(p=>entryOf(a.engine)?.presets?.[p]?.simulations===ev.simulations):-1;
@@ -959,11 +979,13 @@ function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.liv
 function renderSolving(ev,job){
   const box=$('solving'),on=S.analysis?.preset==='solver'&&!finished();box.hidden=!on;$('evalbar').hidden=on;if(!on)return;
   const live=job?.live?.solver,done=ev?.solver,n=v=>Number(v||0).toLocaleString(),s=ms=>(ms/1000).toFixed(1)+' s';
-  const proof=ev?.proof;
+  const proof=ev?.proof,mover=playerAt(view)?'O':'X',ruled=f=>f?.root==='no forcing win'?`${mover} has no forcing win here. `:'';
   box.replaceChildren(...(proof&&!live?[el('b',{style:`--c:${COLORS[proof.winner]}`},(proof.winner?'O':'X')+' wins'),
       el('span',{},`in ${proof.plies||'+'+proof.turns} placements`+(done?`, ${s(done.elapsed_ms)}, ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`:''))]
-    :live?[el('span',{},`Proving ${s(live.elapsed_ms)}: root ${n(live.root_nodes)} nodes, frontier ${n(live.frontier)} jobs, ${live.busy}/${live.workers} workers busy`)]
-    :done?[el('span',{},`No proof in ${s(done.elapsed_ms)}: ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`)]
+    :live?[el('span',{},ruled(live)+(live.root==='no forcing win'?`Proving the replies ${s(live.elapsed_ms)}`
+        :`Proving ${s(live.elapsed_ms)}: root ${n(live.root_nodes)} nodes, asking ${n(live.root_budget)}`)
+      +`; ${n(live.checked)} positions checked, ${n(live.frontier_nodes)} frontier nodes, ${n(live.frontier)} jobs, ${live.busy}/${live.workers} workers busy`)]
+    :done?[el('span',{},ruled(done)+`No proof in ${s(done.elapsed_ms)}: ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`)]
     :[el('span',{},job?'Starting the solver':'Not analysed yet')]));
 }
 function shownEval(p){const saved=S.evaluations[p],e=saved?.proof?saved:liveAt(p)||saved;if(!e)return e;
@@ -1006,12 +1028,18 @@ function renderStudy(){
 function autoAnalyse(){
   if(S.importing)return;
   if(S.failedJobs?.some(j=>j.kind==='analyse'&&j.ply===view))return;
+  const tag=autoTag();if(dismissed!==null&&dismissed!==tag)dismissed=null;
   const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
   const short=!ev||(S.stale||[]).includes(view)||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
-  if(!short||!S.analysis||!S.analysis.auto||job||finished()||S.analysis.preset==='solver'&&ev?.proof)return;
-  const a=S.analysis,tag=[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'),now=Date.now();
+  if(!short||!S.analysis||!S.analysis.auto||job||finished()||S.analysis.preset==='solver'&&ev?.proof||tag===dismissed)return;
+  const now=Date.now();
   if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}
 }
+/* the shown position and analysis settings, as Auto asks for them */
+function autoTag(){const a=S.analysis;return a?[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'):''}
+/* Cancel keeps Auto on but sets `dismissed` to autoTag(): Auto does not ask for that position and settings again until
+   the tag changes (a move, a step, other settings) or the analysis is asked for again */
+let dismissed=null;
 function renderGraph(){
   const g=$('graph'),W=300,H=84,n=Math.max(1,S.history.length),X=p=>p/n*W,Y=v=>(1-v)*H;
   const pts=Object.entries(S.evaluations).filter(([p,e])=>e.value!=null).map(([p,e])=>[+p,playerAt(+p)===0?e.value:1-e.value]).sort((a,b)=>a[0]-b[0]);
@@ -1143,9 +1171,9 @@ function renderJobs(){
   const stage=$('analysis-stage');stage.textContent=failed?`Analysis failed: ${failed.error}`:ajob?.status==='queued'?'Waiting for engine':ajob?.stage||'';stage.title=stage.textContent;
   const again=$('again');if(again){setIcon(again,!failed&&analysing.length?'close':'again');
     again.setAttribute('aria-label',failed?'Retry analysis':analysing.length?'Cancel analysis':'Analyse again');
-    again.onclick=async()=>{if(failed||!analysing.length){const ply=view,data=await post('/analyse',{ply,force:true});
+    again.onclick=async()=>{if(failed||!analysing.length){dismissed=null;const ply=view,data=await post('/analyse',{ply,force:true});
       if(data&&failed&&S.instance===data.instance){S.failedJobs=S.failedJobs.filter(j=>j.id!==failed.id);renderJobs()}return data}
-      const a=S.analysis;if(a.auto)await post('/analysis',{engine:a.engine,checkpoint:a.checkpoint,preset:a.preset,custom:a.budget,auto:false});
+      dismissed=autoTag();
       for(const j of analysing)await post('/cancel',{id:j.id})}}
 }
 
@@ -1251,10 +1279,8 @@ function entrantRow(i){
   const id='t'+i,config=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),type:'button','aria-label':'Custom budget',html:icon('config')});
   config.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderTournamentForm()};
   const box=[strength({preset:spec.preset},ch=>{spec.preset=ch.preset;spec.custom=null;renderTournamentForm()},id,config,-1,entry)];
-  if(configured.has(id))box.push(el('div',{class:'custom'},Object.entries(budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>{
-    const input=el('input',{type:'number',inputmode:'numeric',value:v,min:0,'aria-label':FIELDS[k]||k,id:`${id}-${k}`});
-    input.onchange=()=>{spec.preset='custom';spec.custom={...Object.fromEntries(Object.entries(budget).filter(([,x])=>typeof x==='number')),[k]:Number(input.value)};renderTournamentForm()};
-    return el('label',{class:'field'},el('span',{},FIELDS[k]||k),input)})));
+  if(configured.has(id)&&entry)box.push(el('div',{class:'custom'},budgetFields(entry,{budget,custom:spec.preset==='custom'&&formKind(entry)?spec.custom:null},
+    custom=>{spec.preset='custom';spec.custom=formKind(entry)?custom:Object.fromEntries(Object.entries(custom).filter(([,x])=>typeof x==='number'));renderTournamentForm()},id)));
   return el('div',{class:'entrant',style:`--c:${COLORS[i]}`},el('div',{class:'row'},el('span',{class:'tag'},'AB'[i]),...parts),...box);
 }
 function renderTournamentForm(){

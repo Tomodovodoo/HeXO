@@ -17,3 +17,4 @@ web/engine/shrimp/model/
 web/engine/seal/
 web/engine/strix/*.safetensors
 web/engine/strix/networks.json
+web/engine/available.json

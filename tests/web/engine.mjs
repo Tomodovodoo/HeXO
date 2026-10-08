@@ -541,7 +541,9 @@ if (job.kind === 'encode') {
       if (reply?.type !== 'result') throw Error(reply?.message || 'Worker did not answer');
       return reply.result;
     };
-    session.registerEngine({id: 'test', kind: 'bubble', name: 'Bubble', presets: PRESETS}, adapter);
+    // Without a preset the job's simulations and root nodes are the standard level, so a test can set both.
+    session.registerEngine({id: 'test', kind: 'bubble', name: 'Bubble',
+      presets: job.preset ? PRESETS : {...PRESETS, standard: {simulations: job.simulations, solver_nodes: job.nodes}}}, adapter);
     const imported = await session.request('/import', {text: JSON.stringify({history: job.history, records: job.restore ? [] : job.records || []})}, 'POST');
     if (imported[0] !== 200) throw Error(JSON.stringify(imported));
     if (job.restore) {
@@ -549,9 +551,7 @@ if (job.kind === 'encode') {
       for (const record of job.records) await session.storage.put('evaluations', record);
       await session.persist(); await session.saving; await session.restore({paused: true});
     }
-    const configured = await session.request('/analysis', job.preset ? {engine: 'test', preset: job.preset, auto: false}
-      : {engine: 'test', preset: 'custom', auto: false, custom: {
-      simulations: job.simulations, solver_nodes: job.nodes}}, 'POST');
+    const configured = await session.request('/analysis', {engine: 'test', preset: job.preset ?? 'standard', auto: false}, 'POST');
     if (configured[0] !== 200) throw Error(JSON.stringify(configured));
     const requested = await session.request('/analyse', {ply: job.history.length}, 'POST');
     if (requested[0] !== 200) throw Error(JSON.stringify(requested));
@@ -593,7 +593,39 @@ if (job.kind === 'encode') {
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
     progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root}))}))
-    : {...messages.find(m => m.type === 'result').result, solver_frames: messages.filter(m => m.live?.solver).length};
+    : {...messages.find(m => m.type === 'result').result, solver_frames: messages.filter(m => m.live?.solver).length,
+      solver_live: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
+} else if (job.kind === 'page-dismissal') {
+  // The page with Auto on: the analysis requests it sends after Cancel, after stepping back and after stepping forward.
+  const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
+  session.registerEngine({id:'test',kind:'bubble',presets:{standard:{simulations:4,solver_nodes:0}}},{turn:(history,budget,options)=>
+    new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(new DOMException('cancelled','AbortError'))))});
+  session.history = [[0,0]]; session.analysis = session.spec({engine:'test',preset:'standard',auto:true});
+  const elements = new Map(), requests = [];
+  const element = () => ({classList:{toggle(){}},style:{setProperty(){}},firstChild:{style:{}},children:[],
+    replaceChildren(){},append(){},setAttribute(k,v){this[k]=v;}});
+  const page = {S:null,view:1,COLORS:['yellow','blue'],STOPS:['standard'],STOP_ICON:[''],asked:new Map(),
+    performance,placing:[],placed:new Set(),landed:new Map(),seenLabels:new Map(),fitted:false,
+    $:id=>{if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+    setIcon:(e,icon)=>{e.icon=icon;},toast(){},fit(){},draw(){},tickClocks(){},renderPanels(){},renderAnalysis(){},
+    post:async(path,body)=>{requests.push([path,body]);return (await session.request(path,body,'POST'))[1];},key:(q,r)=>`${q},${r}`};
+  runInNewContext(source.match(/^const playerAt=.*$/m)[0]+'\n'
+    + source.slice(source.indexOf('const failures='),source.indexOf('/* board geometry:'))
+    + source.slice(source.indexOf('function finished('),source.indexOf('function renderAnalysis('))
+    + source.slice(source.indexOf('function autoAnalyse('),source.indexOf('function renderGraph('))
+    + source.slice(source.indexOf('function renderJobs('),source.indexOf('/* game actions */')),page);
+  let shown = 0;
+  const show = () => { page.accept({...session.state(),revision:session.revision+ ++shown}); };
+  const sent = () => requests.splice(0).map(([path,body]) => path === '/analyse' ? `${path} ${body.ply}` : path);
+  show(); await new Promise(resolve => setTimeout(resolve, 5));
+  answer = {opened: sent()};
+  // Each step clears the page's 3 s spacing between requests for one position, so only Auto's rules decide.
+  show(); await elements.get('again').onclick(); page.asked.clear(); show();
+  answer.cancelled = sent();
+  answer.auto = session.analysis.auto;
+  page.view = 0; page.asked.clear(); show(); answer.back = sent();
+  page.view = 1; page.asked.clear(); show(); answer.forward = sent();
+  session.cancelJobs();
 } else if (job.kind === 'analysis-failure') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);
   let calls = 0;
@@ -705,6 +737,54 @@ if (job.kind === 'encode') {
   const table = new Proofs();
   table.add(job.history, job.found);
   answer.given = answered(native, job.history.slice(0, job.ply - 1), table);
+} else if (job.kind === 'custom-forms') {
+  // Custom seats on the browser session: what each runs as the page edits Time, Nodes and Width, and what a reload keeps.
+  const s = new BrowserSession(native), turn = async () => ({moves: [[0, 0]], value: .5, top: []});
+  const {PRESETS: BUBBLE} = await import('../../web/engine/bubble.mjs'), {PRESETS: SIX} = await import('../../web/engine/six.mjs');
+  s.registerEngine({id: 'bubble', name: 'Bubble', kind: 'bubble', presets: BUBBLE}, {turn});
+  s.registerEngine({id: 'six', name: 'Six', kind: 'six', presets: SIX}, {turn});
+  const seat = async (custom, engine = 'bubble') => {
+    await s.request('/seat', {side: 1, engine, preset: 'custom', custom}, 'POST');
+    return {budget: s.seats[1].budget, custom: s.seats[1].custom};
+  };
+  answer = {old: await seat({simulations: 300, solver_nodes: 9})};
+  answer.time = await seat({...answer.old.custom, ms: 2500, active: 'ms'});
+  answer.nodes = await seat({...answer.time.custom, simulations: 600, views: 4, active: 'simulations'});
+  answer.six = await seat({nodes: 700, ms: 900, active: 'ms'}, 'six');
+  answer.sixBack = await seat({...answer.six.custom, nodes: 800, active: 'nodes'}, 'six');
+  await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: answer.time.custom}, 'POST'); await s.saving;
+  const back = new BrowserSession(native); back.storage = s.storage; await back.restore();
+  back.registerEngine({id: 'bubble', name: 'Bubble', kind: 'bubble', presets: BUBBLE}, {turn});
+  answer.reloaded = {budget: back.seats[1].budget, custom: back.seats[1].custom};
+  answer.bad = (await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: {views: 40}}, 'POST'))[0];
+  // Shrimp speaks Six's protocol but keeps its own budget.
+  const {PRESETS: SHRIMP} = await import('../../web/engine/shrimp.mjs'), other = new BrowserSession(native);
+  other.registerEngine({id: 'shrimp', name: 'Shrimp', kind: 'six', badge: 'shrimp', presets: SHRIMP}, {turn});
+  await other.request('/seat', {side: 1, engine: 'shrimp', preset: 'custom', custom: {...SHRIMP.standard, visits: 64}}, 'POST');
+  answer.shrimp = {budget: other.seats[1].budget, custom: other.seats[1].custom};
+} else if (job.kind === 'dismissal') {
+  // Auto deepening while an engine seat plays, with analyses that run until cancelled: which positions have an
+  // analysis running or queued after a cancel, an analysis request and a move.
+  const s = new BrowserSession(native), wait = () => new Promise(resolve => setTimeout(resolve, 5));
+  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [], device: 'GPU',
+    presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 2, solver_nodes: 0}}};
+  s.registerEngine(entry, {turn: (history, budget, options) => new Promise((_, reject) =>
+    options.signal.addEventListener('abort', () => reject(new DOMException('cancelled', 'AbortError'))))});
+  await s.request('/import', {text: JSON.stringify({history: [[0, 0], [1, 0], [1, 1]]})}, 'POST');
+  s.seats = [{engine: 'human'}, s.spec({engine: 'test'})]; s.paused = false;
+  await s.request('/analysis', {engine: 'test', preset: 'standard', auto: true}, 'POST');
+  const analysing = () => s.jobs.filter(j => j.kind === 'analyse').map(j => j.history.length);
+  const settle = async () => { for (let i = 0; i < 20; i++) await wait(); return analysing(); };
+  answer = {before: await settle()};
+  await s.request('/cancel', {id: s.jobs.find(j => j.kind === 'analyse').id}, 'POST');
+  answer.cancelled = await settle(); answer.auto = s.analysis.auto;
+  await s.request('/analyse', {ply: 3}, 'POST');
+  answer.asked = await settle();
+  await s.request('/cancel', {id: s.jobs.find(j => j.kind === 'analyse').id}, 'POST');
+  answer.again = await settle();
+  await s.request('/play', {q: 2, r: 2}, 'POST');
+  answer.moved = await settle();
+  s.cancelJobs();
 } else if (job.kind === 'restore-pause') {
   const make = async clock => {
     const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};

@@ -16,10 +16,10 @@ from urllib.request import Request, urlopen
 
 import formats
 from hexo import Game
-from play import (Cancelled, Engines, Evaluations, Handler, PRESETS, SIX_LIBRARIES, SearchChild, Session, book_openings,
-                  budget_of, command_of, export, export_path, file_digest, file_identity, import_history, linked_history,
-                  model_key, move_row, pair_elo, pick_opening, position_text, presets_of, proof_turns, read_game, review,
-                  review_plies, scan, six_backend)
+from play import (CPU_PRESETS, Cancelled, Engines, Evaluations, Handler, PRESET_NAMES, PRESETS, SIX_LIBRARIES, SearchChild, Session,
+                  book_openings, budget_of, command_of, custom_form, export, export_path, file_digest, file_identity,
+                  import_history, linked_history, model_key, move_row, pair_elo, pick_opening, position_text, presets_of,
+                  proof_turns, read_game, review, review_plies, scan, search_key, six_backend)
 from process_tree import TreeProcess
 from tests import PATIENCE, slow
 
@@ -175,11 +175,11 @@ class Store(unittest.TestCase):
             self.assertEqual((reloaded.best([], 'e')['value'], reloaded.best([(0, 0)], 'e')['value']), (.1, .2))
 
     def test_reuse_needs_every_budget_dimension(self):
-        store = Evaluations()
+        store, wanted = Evaluations(), dict(simulations=128, solver_nodes=32768)
         store.add([], 'e', dict(simulations=512, solver_nodes=0), dict(value=.1, moves=[], top=[]))
-        self.assertIsNone(store.covering([], 'e', STANDARD))
+        self.assertIsNone(store.covering([], 'e', wanted))
         store.add([], 'e', dict(simulations=128, solver_nodes=131072), dict(value=.2, moves=[], top=[]))
-        self.assertEqual(store.covering([], 'e', STANDARD)['value'], .2)
+        self.assertEqual(store.covering([], 'e', wanted)['value'], .2)
         self.assertEqual(store.covering([], 'e', dict(simulations=64, solver_nodes=0))['value'], .1)
         self.assertEqual(store.best([], 'e')['value'], .1)
         store.add([], 'e', dict(simulations=32, solver_nodes=131072), dict(value=1., moves=[], top=[], proof=dict(winner=0, turns=2)))
@@ -672,7 +672,7 @@ class Jobs(unittest.TestCase):
         self.session.configure_seat(1, six['id'], 'gen-1', 'lightning')
         self.session.play(0, 0)
         wait(lambda: len(self.history()) == 3)
-        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', dict(nodes=240)))
+        self.assertEqual(self.engines.turns[-1], (six['id'], 'gen-1', PRESETS['six']['lightning']))
         with self.assertRaises(ValueError):
             self.session.configure_seat(1, six['id'], 'gen-3')
 
@@ -717,6 +717,27 @@ class Jobs(unittest.TestCase):
         time.sleep(.2)
         self.assertFalse([j for j in self.session.state()['jobs'] if j['ply'] == 1 and j['kind'] == 'analyse'
                           and j['status'] == 'queued'])
+
+    def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
+        def running(ply):
+            return [j for j in self.session.state()['jobs'] if j['kind'] == 'analyse' and j['ply'] == ply
+                    and j['status'] in ('queued', 'running')]
+        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        self.engines.hold = True
+        self.session.load([(0, 0), (1, 0), (1, 1)], False)
+        wait(lambda: running(3))
+        self.session.cancel(running(3)[0]['id'])
+        wait(lambda: not running(3))
+        time.sleep(.2)
+        self.assertFalse(running(3))
+        self.assertTrue(self.session.state()['analysis']['auto'])
+        self.session.analyse(3)   # asking again clears the dismissal
+        wait(lambda: running(3))
+        self.session.cancel(running(3)[0]['id'])
+        wait(lambda: not running(3))
+        self.session.play(2, 2)   # so does a move
+        wait(lambda: running(4))
+        self.engines.release.set()
 
     def test_a_preset_without_a_solver_verdict_is_not_deepened_again(self):
         def unsolved(entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None, game=None,
@@ -927,12 +948,39 @@ class Jobs(unittest.TestCase):
                 first.abort.assert_called_once()
                 self.assertEqual(isolated.call_count, 2)
 
+    def test_exclusive_custom_budgets_apply_the_amount_last_edited(self):
+        bubble, six = PRESETS['bubble'], PRESETS['six']
+        # An older custom budget moves its simulations onto Nodes and drops its solver nodes.
+        form = custom_form('bubble', bubble['standard'], dict(simulations=300, solver_nodes=9))
+        self.assertEqual(form, dict(simulations=300, ms=1000, active='simulations', views=8))
+        self.assertEqual(budget_of(bubble, 'custom', form, 'bubble'), dict(simulations=300, views=8, solver_nodes=4800))
+        timed = form | dict(ms=2500, active='ms')   # editing Time applies it; Nodes keeps its value
+        self.assertEqual(budget_of(bubble, 'custom', timed, 'bubble'),
+                         dict(simulations=65536, ms=2500, views=8, solver_nodes=10000))
+        self.assertEqual(custom_form('bubble', bubble['standard'], timed)['simulations'], 300)
+        back = timed | dict(simulations=600, active='simulations', views=4)
+        self.assertEqual(budget_of(bubble, 'custom', back, 'bubble'), dict(simulations=600, views=4, solver_nodes=9600))
+        self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='ms'), 'six'), dict(ms=900, nodes=2 ** 31 - 1))
+        self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='nodes'), 'six'), dict(nodes=700))
+        launched = presets_of('six', dict(standard=dict(nodes=1, args=['--visits', '128'])))
+        self.assertEqual(budget_of(launched, 'custom', dict(ms=900), 'six'), dict(ms=900, nodes=2 ** 31 - 1, args=['--visits', '128']))
+        # Another bot behind Six's protocol keeps the plain custom budget and its launch arguments.
+        self.assertEqual(budget_of(launched, 'custom', dict(nodes=9), 'six', form=False), dict(nodes=9, args=['--visits', '128']))
+        for bad in (dict(active='nodes'), dict(views=0), dict(views=17), dict(ms=5)):
+            with self.assertRaises(ValueError):
+                custom_form('bubble', bubble['standard'], bad)
+        session = Session(entries(), FakeEngines(), Evaluations())
+        seat = session.seat('bubble:fake', None, 'custom', timed)
+        self.assertEqual((seat['custom'], seat['budget']['ms']), (timed, 2500))
+        self.assertNotEqual(search_key('w', dict(kind='bubble'), seat['budget']), search_key('w', dict(kind='bubble'), bubble['deep']))
+        session.close()
+
     def test_budgets(self):
         bubble = PRESETS['bubble']
         for extra in (dict(leaf_nodes=2048), dict(leaf_ms=10)):
             with self.assertRaisesRegex(ValueError, 'not a budget'):
                 budget_of(bubble, 'custom', extra, 'bubble')
-        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=32768))
+        self.assertEqual(budget_of(bubble, 'custom', dict(simulations=0)), dict(simulations=0, solver_nodes=4096))
         self.assertEqual(budget_of(bubble, 'custom', dict(simulations=10 ** 6))['simulations'], 10 ** 6)
         for custom in (dict(simulations=-1), dict(simulations=2 ** 31), dict(ms=5), dict(simulations='8')):
             with self.assertRaises(ValueError):
@@ -940,15 +988,21 @@ class Jobs(unittest.TestCase):
         with self.assertRaises(ValueError):
             budget_of(PRESETS['drip'], 'heavy')
         self.assertEqual(presets_of('six', dict(quick=dict(args=['--visits', '8'])))['quick'],
-                         dict(nodes=960, args=['--visits', '8']))
+                         dict(nodes=240, args=['--visits', '8']))
         shrimp = presets_of('six', dict(quick=dict(nodes=1, args=['--visits', '32'])))
         self.assertEqual(budget_of(shrimp, 'custom', dict(nodes=9, args=['--visits', '1'])), dict(nodes=9))
         self.assertEqual(budget_of(shrimp, 'quick'), dict(nodes=1, args=['--visits', '32']))
         lightning = {kind: presets_of(kind, None)['lightning'] for kind in PRESETS}
-        self.assertEqual(lightning, dict(bubble=dict(simulations=8, solver_nodes=2048), drip=dict(ms=100),
-                                         seal=dict(ms=100), six=dict(nodes=240), strix=dict(simulations=2)))
+        self.assertEqual(lightning, dict(bubble=dict(simulations=16, solver_nodes=1024), drip=dict(ms=100),
+                                         seal=dict(ms=100), six=dict(nodes=120), strix=dict(simulations=2)))
+        self.assertEqual(presets_of('bubble', None, 'cpu')['lightning'], dict(simulations=4, solver_nodes=512))
+        for device in ('cuda', 'cpu'):
+            ladder = [presets_of('bubble', None, device)[name] for name in PRESET_NAMES]
+            for low, high in zip(ladder, ladder[1:]):
+                self.assertLess(low['simulations'], high['simulations'])
+                self.assertLess(low['solver_nodes'], high['solver_nodes'])
         self.assertEqual([list(PRESETS[kind]) for kind in PRESETS], [['lightning', 'quick', 'standard', 'strong', 'deep', 'dangerous']] * 5)
-        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=240))
+        self.assertEqual(presets_of('six', dict(quick=dict(nodes=1)))['lightning'], dict(nodes=120))
         self.assertEqual({kind: presets_of(kind, None)['dangerous'] for kind in PRESETS},
                          dict(bubble=dict(simulations=65536, solver_nodes=4_000_000), drip=dict(ms=60000),
                               seal=dict(ms=60000), six=dict(nodes=2_000_000), strix=dict(simulations=4096)))
@@ -1768,9 +1822,15 @@ class Matches(unittest.TestCase):
         seat = self.session.match_seat('bubble:2@quick', 'standard')
         self.assertEqual((seat['engine'], seat['checkpoint'], seat['device']), ('bubble:fake', 'main/000002', 'cpu'))
         self.assertEqual(seat['budget'], PRESETS['bubble']['quick'])
+        self.engines.device = 'cuda'   # a CPU seat on a GPU server plays the CPU ladder
+        self.assertEqual(self.session.match_seat(dict(engine='bubble:2@quick', device='cpu'), 'standard')['budget'],
+                         CPU_PRESETS['quick'])
+        del self.engines.device
         self.assertEqual(self.session.match_seat('Drip@lightning', 'standard')['budget'], dict(ms=100))
-        custom = self.session.match_seat('bubble:2{simulations=512,solver_nodes=0}', 'standard')
-        self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=0))
+        custom = self.session.match_seat('bubble:2{simulations=512,views=4}', 'standard')
+        self.assertEqual(custom['budget'], dict(simulations=512, views=4, solver_nodes=8192))
+        for selector in ('bubble:2{ms=2500}', 'bubble:2{simulations=64,ms=2500,active=ms}'):
+            self.assertEqual(self.session.match_seat(selector, 'standard')['budget']['ms'], 2500)
         with self.assertRaisesRegex(ValueError, 'not a budget'):
             self.session.match_seat('Drip{simulations=128}', 'standard')
 
@@ -2195,6 +2255,23 @@ class TurnTrees(unittest.TestCase):
             self.assertTrue(game.winner == mover or game.player != mover)
             game.close()
 
+    def test_deep_solve_reports_running_frontier_work_after_the_root_has_no_forcing_win(self):
+        import tactical_proof
+        from play import Bubble, evaluate
+        if not tactical_proof.library().exists():
+            self.skipTest('Build tools/tactical with tools/build_tactical.py first')
+        prover = tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE, priority='below_normal')
+        self.addCleanup(prover.close)
+        frames = []
+        found = evaluate(Bubble(self.path, 'cpu'), prover, [(0, 0), (1, 0), (0, 1)], 8, 2048, solver_ms=4000,
+                         live=lambda seen: frames.append(seen['solver']) if 'solver' in seen else None)
+        self.assertEqual(found['solver']['root'], 'no forcing win')
+        ruled = [f for f in frames if f['root'] == 'no forcing win']
+        self.assertGreaterEqual(len(ruled), 2)
+        self.assertGreater(ruled[-1]['elapsed_ms'], ruled[0]['elapsed_ms'])
+        work = lambda frame: frame['checked'] + frame['frontier_nodes']
+        self.assertGreater(work(ruled[-1]), work(ruled[0]))
+
     def test_a_position_after_the_first_stone_ranks_the_second(self):
         import tactical_proof
         from play import evaluate
@@ -2594,7 +2671,9 @@ class GameProofs(unittest.TestCase):
         history = self.start + [(-1, -11), *line]
         self.session.load(history, True)
         inside = self.analyse(81, 0)
-        self.assertEqual((inside['proof'], inside['value']), (self.label(history[:81], plies - 1), 0.))
+        # The root query may prove it again, with its certificate as evidence; the verdict is the line's.
+        verdict = {k: inside['proof'][k] for k in ('winner', 'turns', 'plies')}
+        self.assertEqual((verdict, inside['value']), (self.label(history[:81], plies - 1), 0.))
         self.assertEqual(self.session.state()['evaluations'][83]['proof'], self.label(history, plies - 3))
         self.assertEqual(self.session.state()['evaluations'][79]['proof']['plies'], plies + 1)
 
