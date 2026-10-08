@@ -19,6 +19,7 @@ import urllib.parse
 
 import dense_config
 import dense_openings
+import dense_stats
 from legacy.rating_compat import audited_prior, scheduled_revision
 
 
@@ -488,25 +489,28 @@ def provisional(league, evaluator):
 def resumed(run, league, evaluator):
     """League-shaped rows, like `provisional`, of every checkpoint without a league entry whose report against the
     champion already holds games (an evaluation waiting to resume, or one un-rated for more games), oldest step
-    first; the checkpoint the evaluator is playing now is left to `provisional`. games_planned is the report's
-    planned_games. Reports without games, of other opponents or of league checkpoints are ignored."""
+    first; the checkpoint the evaluator is playing now is left to `provisional`, and decided variants to their
+    league verdict. The score is dense_stats.tally of the report's games (capped games count half a point) and
+    games_planned the report's sprt_max_games setting. Reports without games or of other opponents are ignored."""
     champion = league.get('champion')
     if not isinstance(champion, str):
         return []
     entries = {c.get('id'): c for c in league.get('checkpoints') or [] if isinstance(c, dict)}
+    decided = {v.get('id') for v in league.get('variants') or [] if isinstance(v, dict) and v.get('verdict')}
     live = (evaluator.get('comparison') or {}).get('candidate') if evaluator.get('stage') in ('playing', 'throttled') else None
     base = (league.get('anchors') or {}).get(champion, entries.get(champion) or {}).get('elo')
     rows = []
     for path in (run/'evaluations').glob(f'*-vs-{champion.replace("/", "-")}/report.json'):
         report = read_json(path, {})
-        candidate, metrics = report.get('candidate'), report.get('metrics') or {}
-        if not isinstance(candidate, str) or candidate in entries or candidate == live or report.get('opponent') != champion                 or not report.get('games'):
+        candidate, games = report.get('candidate'), report.get('games')
+        if not isinstance(candidate, str) or candidate in entries or candidate in decided or candidate == live                 or report.get('opponent') != champion or not isinstance(games, list) or not games:
             continue
-        interval = metrics.get('elo_delta_95pct')
-        known = finite(base) and finite(metrics.get('elo_delta'))
-        rows.append(dict(id=candidate, opponent=champion, wins=metrics.get('wins'), losses=metrics.get('losses'),
-                         capped=metrics.get('incomplete'), games=len(report['games']), games_planned=metrics.get('planned_games'),
-                         elo=base+metrics['elo_delta'] if known else None,
+        score = dense_stats.tally(games)
+        known = finite(base) and finite(score['elo_delta'])
+        interval = score['elo_interval']
+        rows.append(dict(id=candidate, opponent=champion, **{k: score[k] for k in ('wins', 'losses', 'capped', 'games')},
+                         games_planned=(report.get('settings') or {}).get('sprt_max_games'),
+                         elo=base+score['elo_delta'] if known else None,
                          elo_interval=[base+v for v in interval] if known and isinstance(interval, list) and all(map(finite, interval)) else None))
     return sorted(rows, key=lambda row: (row['id'].rsplit('/', 1)[0], int(row['id'].rsplit('/', 1)[1]) if row['id'].rsplit('/', 1)[-1].isdigit() else 0))
 
