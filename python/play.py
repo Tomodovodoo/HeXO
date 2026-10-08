@@ -1439,6 +1439,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     two stones 60% of what is left, the last stone the rest, with `simulations` a ceiling per stone. `views` is the
     owners' width (HYBRID['views'] when None)."""
     from hybrid_scheduler import ProofWorkers
+    end = time.monotonic() + ms / 1000 if ms else None
     game = replay(history)
     finished = game.winner >= 0
     game.close()
@@ -1471,7 +1472,6 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 # The frontier's verified positions settle the follow-up search's edges.
                 known = known if known is not None else Proofs()
                 known.add(history, dict(proofs=solved['proofs']))
-        end = time.monotonic() + ms / 1000 if ms else None
         turn = TurnSearch(bubble, network, history, simulations,
                           solved or solve(prover, history, solver_nodes, watch, facts, ms / 4 if ms else None),
                           trees, q_range_floor, known)
@@ -1663,6 +1663,8 @@ class Engines:
         if refresh is not None:
             build = self.solver_build() if budget['solver_nodes'] else 'none'
             share = max(1, round(REFRESH_SHARE * refresh['simulations']))
+            if spent.get('ms'):   # a refresh in time gets the same share of the clock
+                spent = spent | dict(ms=max(LIMITS['ms'], round(REFRESH_SHARE * spent['ms'])))
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
             solved = dict(moves=[], pv=[], proof=None, threat=refresh.get('threat') or [], solved=True, used=0)
         elif line is not None or game is not None:
@@ -3440,7 +3442,8 @@ class Session:
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
-                        max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
+                        max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.),
+                        views=budget.get('views', HYBRID['views'])),
                         solver=dict(enabled=budget['solver_nodes'] > 0, stamps=getattr(self.engines, 'proof_stamps', False)))
         if kind == 'six':
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
