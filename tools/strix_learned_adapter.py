@@ -55,7 +55,7 @@ class StrixLearned(StrixReference):
         self.last_result = None
         self.metadata = dict(revision=REVISION, model_sha256=self.model_sha256,
             model_bytes=len(self.model_content), model_metadata=header["__metadata__"],
-            checkpoint_license="hosted with the author's permission", source_license="MIT",
+            source_license="MIT",
             backend="InferModel.eval_states + gumbel_mcts, native CPU",
             simulations_per_placement=simulations, m_actions=actions, c_visit=50, c_scale=1,
             gumbel_noise=False, timeout_ms=timeout_ms, seed=seed, equal_wall_budget=False,
