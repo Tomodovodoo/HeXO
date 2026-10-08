@@ -739,7 +739,7 @@ if (job.kind === 'encode') {
   table.add(job.history, job.found);
   answer.given = answered(native, job.history.slice(0, job.ply - 1), table);
 } else if (job.kind === 'custom-forms') {
-  // Custom seats on the browser session: what each runs as the page edits Time, Nodes and Width, and what a reload keeps.
+  // Custom seats on the browser session: what each runs as the page edits Time and Nodes, and what a reload keeps.
   const s = new BrowserSession(native), turn = async () => ({moves: [[0, 0]], value: .5, top: []});
   const {PRESETS: BUBBLE} = await import('../../web/engine/bubble.mjs'), {PRESETS: SIX} = await import('../../web/engine/six.mjs');
   s.registerEngine({id: 'bubble', name: 'Bubble', kind: 'bubble', presets: BUBBLE}, {turn});
@@ -748,16 +748,16 @@ if (job.kind === 'encode') {
     await s.request('/seat', {side: 1, engine, preset: 'custom', custom}, 'POST');
     return {budget: s.seats[1].budget, custom: s.seats[1].custom};
   };
-  answer = {old: await seat({simulations: 300, solver_nodes: 9})};
+  answer = {old: await seat({simulations: 300, solver_nodes: 9, views: 4})};
   answer.time = await seat({...answer.old.custom, ms: 2500, active: 'ms'});
-  answer.nodes = await seat({...answer.time.custom, simulations: 600, views: 4, active: 'simulations'});
+  answer.nodes = await seat({...answer.time.custom, simulations: 600, active: 'simulations'});
   answer.six = await seat({nodes: 700, ms: 900, active: 'ms'}, 'six');
   answer.sixBack = await seat({...answer.six.custom, nodes: 800, active: 'nodes'}, 'six');
   await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: answer.time.custom}, 'POST'); await s.saving;
   const back = new BrowserSession(native); back.storage = s.storage; await back.restore();
   back.registerEngine({id: 'bubble', name: 'Bubble', kind: 'bubble', presets: BUBBLE}, {turn});
   answer.reloaded = {budget: back.seats[1].budget, custom: back.seats[1].custom};
-  answer.bad = (await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: {views: 40}}, 'POST'))[0];
+  answer.bad = (await s.request('/seat', {side: 1, engine: 'bubble', preset: 'custom', custom: {ms: 5}}, 'POST'))[0];
   // Shrimp speaks Six's protocol but keeps its own budget.
   const {PRESETS: SHRIMP} = await import('../../web/engine/shrimp.mjs'), other = new BrowserSession(native);
   other.registerEngine({id: 'shrimp', name: 'Shrimp', kind: 'six', badge: 'shrimp', presets: SHRIMP}, {turn});
@@ -815,6 +815,23 @@ if (job.kind === 'encode') {
   await s.request('/play', {q: 2, r: 2}, 'POST');
   answer.moved = await settle();
   s.cancelJobs();
+} else if (job.kind === 'stream') {
+  // An engine turn whose first stone is decided: it is on the board while the second is searched, and the finished
+  // turn adds only the second.
+  const s = new BrowserSession(native), wait = () => new Promise(resolve => setTimeout(resolve, 5));
+  let finish = null;
+  const entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [], presets: {standard: {simulations: 1, solver_nodes: 0}}};
+  s.registerEngine(entry, {turn: (history, budget, options) => new Promise(resolve => {
+    options.progress(.5, null, null, [[1, 0]]);
+    finish = () => resolve({moves: [[1, 0], [2, 0]], value: .5, top: []});
+  })});
+  s.seats = [{engine: 'human'}, s.spec({engine: 'test'})]; s.changed();
+  await s.request('/play', {q: 0, r: 0}, 'POST');
+  for (let i = 0; i < 40 && !finish; i++) await wait();
+  answer = {during: structuredClone(s.history), moves: s.jobs.filter(j => j.kind === 'move').map(j => [j.status, j.history.length]), player: s.state().player};
+  finish();
+  for (let i = 0; i < 40 && s.jobs.some(j => j.kind === 'move'); i++) await wait();
+  answer.after = s.history; answer.left = s.jobs.filter(j => j.kind === 'move').length;
 } else if (job.kind === 'restore-pause') {
   const make = async clock => {
     const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};
@@ -934,7 +951,7 @@ if (job.kind === 'encode') {
   const calls = [];
   const adapter = {turn: async (history, budget) => { calls.push([history.length, budget.simulations]); return {moves: history.length ? [[1, 0], [2, 0]] : [[0, 0]], value: .5, top: []}; }};
   s.registerEngine(entry, adapter);
-  s.seats = [s.spec({engine: 'test'}), {engine: 'human'}]; s.analysis = s.spec({engine: 'test', auto: true}); s.changed(); s.pump();
+  s.seats = [s.spec({engine: 'test'}), {engine: 'human'}]; s.analysis = s.spec({engine: 'test', preset: 'deep', auto: true}); s.changed(); s.pump();
   for (let i = 0; s.running || s.jobs.some(j => j.status === 'queued'); i++) { if (i > 1000) throw Error('Analysis did not finish'); await new Promise(r => setTimeout(r, 1)); }
   const moved = s.lookup([], s.spec({engine: 'test', preset: 'standard'}), true);
   await s.request('/analyse', {ply: 0}, 'POST');
@@ -945,7 +962,7 @@ if (job.kind === 'encode') {
   await study.request('/play', {q: 1, r: 0}, 'POST');
   const reopened = new BrowserSession(native); reopened.storage = s.storage; await reopened.restore(); reopened.registerEngine(entry, adapter); await reopened.saving;
   for (let i = 0; i < 40; i++) await reopened.persist();
-  const imported = new BrowserSession(native); imported.registerEngine(entry, adapter); imported.analysis = imported.spec({engine: 'test'});
+  const imported = new BrowserSession(native); imported.registerEngine(entry, adapter); imported.analysis = imported.spec({engine: 'test', preset: 'deep'});
   await imported.request('/import', {text: JSON.stringify((await s.request('/replay'))[1])}, 'POST');
   const label = imported.state().review[0].label;
   imported.registerEngine({...entry, version: 'v2'}, adapter);

@@ -24,27 +24,27 @@ const uid = () => globalThis.crypto.randomUUID(), human = () => ({engine: 'human
 const MAX_TIMER = 2 ** 31 - 1;
 /** The engines take budgets as 32-bit signed integers. */
 const MAX_BUDGET = 2 ** 31 - 1;
-const FIELD_NAMES = {simulations: 'Nodes', solver_nodes: 'Solver', nodes: 'Positions', ms: 'Time', views: 'Width'};
+const FIELD_NAMES = {simulations: 'Nodes', solver_nodes: 'Solver', nodes: 'Positions', ms: 'Time'};
 /** The custom budgets whose two amounts exclude each other: work (Bubble's Nodes, Six's Positions) or Time in ms
- * (python/play.py EXCLUSIVE); Bubble's Width is at most VIEWS views per position. */
-const EXCLUSIVE = {bubble: ['simulations', 'ms'], six: ['nodes', 'ms']}, VIEWS = 16, WIDTH = 8;
+ * (python/play.py EXCLUSIVE). */
+const EXCLUSIVE = {bubble: ['simulations', 'ms'], six: ['nodes', 'ms']};
 /** The EXCLUSIVE kind of `entry`, or null: Bubble, and Six itself but not another bot behind Six's protocol (python/play.py form_kind). */
 const formKind = entry => entry?.kind === 'bubble' || entry?.kind === 'six' && (entry.badge ?? 'six') === 'six' ? entry.kind : null;
 
-/** The custom form of a Bubble or a Six from `custom` (python/play.py custom_form): both amounts, `active` naming the
- * one that applies (without it Time when only Time is given, else the work, so an older custom budget keeps its work),
- * and Bubble's Width `views`; Bubble's old solver nodes are dropped. Throws on a value out of range. */
+/** The custom form of a Bubble or a Six from `custom` (python/play.py custom_form): both amounts and `active` naming
+ * the one that applies (without it Time when only Time is given, else the work, so an older custom budget keeps its
+ * work); Bubble's old solver nodes and Width are dropped. Throws on a value out of range. */
 export function customForm(kind, standard, custom = {}) {
   const [work] = EXCLUSIVE[kind], timed = custom && 'ms' in custom && !(work in custom);
-  const form = {[work]: standard[work], ms: 1000, active: timed ? 'ms' : work, ...(kind === 'bubble' ? {views: WIDTH} : {})};
+  const form = {[work]: standard[work], ms: 1000, active: timed ? 'ms' : work};
   for (const [key, value] of Object.entries(custom || {})) {
-    if (kind === 'bubble' && key === 'solver_nodes' || key === 'args') continue;
+    if (kind === 'bubble' && (key === 'solver_nodes' || key === 'views') || key === 'args') continue;
     if (key === 'active') {
       if (!EXCLUSIVE[kind].includes(value)) throw Error(`active must be one of ${EXCLUSIVE[kind].join(', ')}`);
     } else if (!(key in form)) throw Error(`${FIELD_NAMES[key] || key} is not a budget of this engine`);
     else {
-      const least = {ms: 10, nodes: 1, views: 1}[key] ?? 0, most = key === 'views' ? VIEWS : MAX_BUDGET;
-      if (!Number.isInteger(value) || value < least || value > most) throw Error(`${FIELD_NAMES[key] || key} must be a whole number from ${least} to ${most}`);
+      const least = {ms: 10, nodes: 1}[key] ?? 0;
+      if (!Number.isInteger(value) || value < least || value > MAX_BUDGET) throw Error(`${FIELD_NAMES[key] || key} must be a whole number from ${least} to ${MAX_BUDGET}`);
     }
     form[key] = value;
   }
@@ -55,8 +55,8 @@ export function customForm(kind, standard, custom = {}) {
 export function customBudget(kind, form) {
   const active = form.active;
   if (kind === 'six') return active === 'ms' ? {ms: form.ms, nodes: MAX_BUDGET} : {nodes: form.nodes};
-  if (active === 'ms') return {simulations: 65536, ms: form.ms, views: form.views, solver_nodes: Math.min(4000000, Math.max(1024, 4 * form.ms))};
-  return {simulations: form.simulations, views: form.views, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
+  if (active === 'ms') return {simulations: 65536, ms: form.ms, solver_nodes: Math.min(4000000, Math.max(1024, 4 * form.ms))};
+  return {simulations: form.simulations, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
 }
 /** The spec a /seat or /analysis `body` asks of the slot holding `current`: `current` with `body`'s fields, without its
  * checkpoint when `body` names another engine. */
@@ -198,9 +198,8 @@ export class BrowserSession extends OfflineSession {
   /** Evaluations are keyed by the engine, its checkpoint, its build `version` and the checkpoint's weights (`models`). */
   engineKey(spec) {
     const entry = this.entries.get(spec.engine), budget = spec.budget || {};
-    // A Bubble or Six budget in time, or a Bubble of another width, keeps its own evaluations (python/play.py search_key).
-    const search = (formKind(entry) && budget.ms ? `~ms${budget.ms}` : '')
-      + (entry?.kind === 'bubble' && (budget.views ?? WIDTH) !== WIDTH ? `~views${budget.views}` : '');
+    // A Bubble or Six budget in time keeps its own evaluations (python/play.py search_key).
+    const search = formKind(entry) && budget.ms ? `~ms${budget.ms}` : '';
     return [spec.engine, spec.checkpoint, (entry?.version || '') + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
   }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
@@ -269,11 +268,13 @@ export class BrowserSession extends OfflineSession {
     const preset = this.analysis.preset === 'solver' ? 'standard' : this.analysis.preset;
     return this.spec({...this.analysis, preset, custom: this.analysis.custom ?? this.analysis.budget});
   }
+  /** True while the current position deepens (see `deepen`): Auto is on at a preset (not custom, not the solver), an
+   * engine seat plays and the game is neither paused, finished nor a match (python/play.py Session.deepening). */
   deepening() {
-    return this.analysis?.auto && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
+    return this.analysis?.auto && this.entries.get(this.analysis.engine)?.presets[this.analysis.preset] && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
   /** While Auto is on and an engine seat plays, evaluates the current position at each preset in turn, fastest first,
-   * up to strong unless the analysis engine runs on WebGPU. */
+   * up to the analysis preset. */
   deepen() {
     const active = this.deepening(), current = position(this.history);
     this.cancelJobs(j => j.tier && (!active || position(j.history) !== current));
@@ -281,8 +282,8 @@ export class BrowserSession extends OfflineSession {
     if (!active || this.dismissed !== null || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
     if (!entry || !this.adapters.has(entry.id)) return;
-    const tiers = Object.keys(entry.presets), last = entry.device === 'GPU' ? tiers.length : tiers.indexOf('strong') + 1;
-    for (const tier of tiers.slice(0, last || tiers.length)) {
+    const tiers = Object.keys(entry.presets);
+    for (const tier of tiers.slice(0, tiers.indexOf(this.analysis.preset) + 1)) {
       const spec = this.spec({...this.analysis, preset: tier});
       if (!this.lookup(this.history, spec, true) && !this.jobs.some(j => j.tier === tier && j.key === `analyse|${this.cacheKey(this.history, spec)}` && j.status === 'failed')) {
         this.enqueue('analyse', this.history, spec, {tier, line: this.analysisLine}); return;
@@ -543,6 +544,23 @@ export class BrowserSession extends OfflineSession {
     const key = `${record.engine_key}|${record.position}`, values = (this.index.get(key) || []).filter(r => r.id !== record.id);
     values.push(record); this.index.set(key, values);
   }
+  /** Puts the stones of `job`'s turn decided so far (`placed`, a worker's progress) on the board before the turn ends,
+   * while the board is still where the move left it and the turn's stones are legal and do not end it; the next
+   * stone's search goes on, and the finished move adds only the stones not shown (`job.placed`). */
+  place(job, placed) {
+    const shown = job.placed ?? [], at = [...job.history, ...shown];
+    if (job.controller.signal.aborted || this.paused || placed.length <= shown.length || position(this.history) !== position(at)
+      || shown.some((p, i) => position([p]) !== position([placed[i]]))) { this.onchange(this.state()); return; }
+    const player = this.native.game(job.history).player, next = placed.slice(shown.length);
+    for (const p of next) {
+      if (!Array.isArray(p) || p.length !== 2 || !p.every(Number.isSafeInteger)) return;
+      const state = this.native.game([...at, p]);
+      if (state.winner >= 0 || state.player !== player || position(at).split(';').includes(position([p]))) return;
+      at.push(p);
+    }
+    if (!this.match?.active) this.forkGame();
+    this.history.push(...copy(next)); job.placed = copy(placed); this.changed();
+  }
   checkedTurn(history, moves) {
     const player = this.native.game(history).player, out = [];
     for (const p of moves) {
@@ -662,10 +680,13 @@ export class BrowserSession extends OfflineSession {
         ...(job.spec.budget.ms ? {ms: Math.max(10, Math.round(REFRESH_SHARE * job.spec.budget.ms))} : {})}
         : job.spec.budget;
       try {
-        result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line,
+        result ||= await adapter.turn(copy(history), copy(budget), {signal, checkpoint: job.spec.checkpoint, preset: job.spec.preset, ms, line: job.line, kind: job.kind,
           known: job.kind === 'move' ? null : (this.extendProofs(), this.proofs.list()),
           replay: job.kind === 'move' || !budget.solver_nodes ? [] : this.proofs.replay(history),
-          progress: (f, live, stage) => { job.done = job.kind === 'review' ? job.cursor + f : .1 + .9 * f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live; this.onchange(this.state()); }});
+          progress: (f, live, stage, placed) => {
+            job.done = job.kind === 'review' ? job.cursor + f : .1 + .9 * f; job.stage = stageText(stage); if (live && job.kind !== 'review') job.live = live;
+            if (placed && job.kind === 'move') this.place(job, placed); else this.onchange(this.state());
+          }});
       } catch (e) { if (!timeout) throw e; }
       clearTimeout(timer);
       const at = Date.now(), elapsed = this.clock?.started != null ? at - this.clock.started : null;
@@ -695,9 +716,14 @@ export class BrowserSession extends OfflineSession {
         }
       }
       if (job.kind === 'move') {
-        if (job.controller.signal.aborted || position(this.history) !== position(history) || this.paused) { this.armFlag(); return; }
+        const shown = job.placed ?? [];
+        if (job.controller.signal.aborted || position(this.history) !== position([...history, ...shown]) || this.paused) { this.armFlag(); return; }
+        const turn = this.checkedTurn(history, result.moves);
+        // A turn that disagrees with the stones already shown (a restarted worker searched again) leaves them, and the
+        // next pump searches the rest of the turn from the board.
+        if (shown.some((p, i) => position([p]) !== position([turn[i]]))) { this.changed(); return; }
         if (!this.match?.active) this.forkGame();
-        this.history.push(...copy(this.checkedTurn(history, result.moves)));
+        this.history.push(...copy(turn.slice(shown.length)));
         this.chargeTurn(job.side, at);
         if (this.match?.active) {
           this.match.timings.push({ply: history.length, side: job.side, engine: job.spec.engine, elapsed_ms: elapsed});

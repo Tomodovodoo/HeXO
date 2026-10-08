@@ -460,7 +460,7 @@ const LABEL={win:['◆','--best'],found:['!','--best'],kept:['=','--best'],best:
 const STOPS=['lightning','quick','standard','strong','deep','dangerous'],configured=new Set();
 const FIELDS={simulations:'Search',solver_nodes:'Solver',nodes:'Positions',ms:'ms'};
 /* custom budgets whose work and Time exclude each other (python/play.py EXCLUSIVE), and their field names */
-const EXCLUSIVE={bubble:['simulations','ms'],six:['nodes','ms']},formKind=e=>e?.kind==='bubble'||e?.kind==='six'&&(e.badge??'six')==='six'?e.kind:null,LABELS={bubble:{simulations:'Nodes',ms:'Time ms',views:'Width'},six:{nodes:'Positions',ms:'Time ms'}};
+const EXCLUSIVE={bubble:['simulations','ms'],six:['nodes','ms']},formKind=e=>e?.kind==='bubble'||e?.kind==='six'&&(e.badge??'six')==='six'?e.kind:null,LABELS={bubble:{simulations:'Nodes',ms:'Time ms'},six:{nodes:'Positions',ms:'Time ms'}};
 const PAGE=new URLSearchParams(location.search),STUDY=PAGE.has('study');
 globalThis.playReady=new Promise(resolve=>{globalThis.resolvePlayReady=resolve});
 const endpoint=path=>(STUDY&&!path.startsWith('/matches')?'/study':'')+path;
@@ -860,14 +860,15 @@ function configButton(id,seat){
   const b=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),'aria-label':'Custom budget',html:icon('config')});
   b.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderPanels()};return b;
 }
-/* the expected seconds per stone of `entry` at `preset`: measured at that preset, else scaled by budget from one it has
-   played, else for a timed engine half its turn time; null when nothing is known */
+/* the expected seconds per two-stone turn of `entry` at `preset` (its `pace`, device.mjs notePace): measured or
+   expected at that preset, else scaled by budget from one it has, else a timed engine's turn time; null when nothing
+   is known */
 function pace(entry,preset){
   const ms=entry?.pace?.[preset];if(ms!=null)return ms/1000;const budget=entry?.presets?.[preset];if(!budget)return null;
   const key=['simulations','nodes','visits','ms'].find(k=>typeof budget[k]==='number');
   const known=Object.entries(entry.pace||{}).find(([p])=>entry.presets[p]?.[key]>0);
   if(known)return known[1]*budget[key]/entry.presets[known[0]][key]/1000;
-  return key==='ms'?budget.ms/2000:null;
+  return key==='ms'?budget.ms/1000:null;
 }
 const paceText=s=>s==null?'':s<10?`~${s.toFixed(1)} s`:`~${Math.round(s)} s`;
 /* a level's budget as the dial's tooltip names it: Bubble's nodes, Six's positions, Strix's simulations or a time */
@@ -893,22 +894,22 @@ function strength(seat,send,id,config,landed=-1,entry=null){
   track.onkeydown=e=>{const step={ArrowLeft:-1,ArrowDown:-1,ArrowRight:1,ArrowUp:1}[e.key],end={Home:0,End:STOPS.length-1}[e.key];
     if(step==null&&end==null)return;e.preventDefault();
     const i=end??Math.max(0,Math.min(STOPS.length-1,(at<0?2:at)+step));place(i);choose(i)};
-  const note=entry&&entry.id.startsWith('browser:')?paceText(pace(entry,seat.preset)):'';
+  const note=entry&&(entry.id.startsWith('browser:')||entry.pace)?paceText(pace(entry,seat.preset)):'';
   return el('div',{class:'strength'},el('div',{class:'ends'},el('span',{},'Faster'),el('span',{class:'spacer'}),...(note?[el('span',{class:'pace'},note),el('span',{class:'spacer'})]:[]),el('span',{},'Smarter'),config),track);
 }
-/* the custom form of an EXCLUSIVE `kind` behind `budget` when a seat has none saved: its work active, Time 1 s */
-function formOf(kind,budget,standard){const [work]=EXCLUSIVE[kind],time=budget.ms;
-  return {[work]:time?standard[work]:budget[work]??standard[work],ms:budget.ms??1000,active:time?'ms':work,...(kind==='bubble'?{views:budget.views??8}:{})}}
-/* the custom budget fields of `seat` ({budget, custom}) for `entry`; `change(custom)` applies an edit. A Bubble or a Six
-   shows its work and Time, the one not applied greyed but kept (editing it applies it), and Bubble its Width */
+/* the custom form of `entry` (an EXCLUSIVE kind) behind `seat` ({budget, preset}) when it has none saved: its work
+   active, and Time the turn time `pace` expects at the seat's preset (1 s when nothing is known) */
+function formOf(entry,seat){const kind=formKind(entry),[work]=EXCLUSIVE[kind],standard=entry.presets.standard,budget=seat.budget,time=budget.ms,expected=pace(entry,seat.preset);
+  return {[work]:time?standard[work]:budget[work]??standard[work],ms:budget.ms??(expected?Math.max(10,Math.round(expected*1000)):1000),active:time?'ms':work}}
+/* the custom budget fields of `seat` ({budget, custom, preset}) for `entry`; `change(custom)` applies an edit. A Bubble
+   or a Six shows its work and Time, the one not applied greyed but kept (editing it applies it) */
 function budgetFields(entry,seat,change,id){
   const field=(key,label,value,off,send)=>{const i=el('input',{type:'number',inputmode:'numeric',value,min:0,'aria-label':label,...(id?{id:`${id}-${key}`}:{})});
     i.onchange=()=>send(Number(i.value));return el('label',{class:'field'+(off?' off':'')},el('span',{},label),i)};
   const kind=formKind(entry);
   if(!kind)return Object.entries(seat.budget).filter(([k,v])=>typeof v==='number').map(([k,v])=>field(k,FIELDS[k]||k,v,false,x=>change({...seat.budget,[k]:x})));
-  const form=seat.custom||formOf(kind,seat.budget,entry.presets.standard);
-  return [...EXCLUSIVE[kind],...(kind==='bubble'?['views']:[])].map(k=>field(k,LABELS[kind][k],form[k],k!=='views'&&k!==form.active,
-    x=>change({...form,[k]:x,...(k==='views'?{}:{active:k})})));
+  const form=seat.custom||formOf(entry,seat);
+  return EXCLUSIVE[kind].map(k=>field(k,LABELS[kind][k],form[k],k!==form.active,x=>change({...form,[k]:x,active:k})));
 }
 function seatControls(seat,send,id,config,landed){
   const box=[],entry=entryOf(seat.engine);if(!entry)return box;
@@ -916,7 +917,7 @@ function seatControls(seat,send,id,config,landed){
       entry.checkpoints.map((c,i)=>el('option',{value:c},c+(i===0&&entry.kind==='bubble'&&!entry.id.startsWith('browser:')?' ★':''))));
     sel.value=seat.checkpoint;sel.onchange=()=>send({checkpoint:sel.value});box.push(sel)}
   box.push(strength(seat,send,id,config,landed,entry));
-  if(configured.has(id))box.push(el('div',{class:'custom'},budgetFields(entry,seat.preset==='custom'?seat:{budget:seat.budget},custom=>send({preset:'custom',custom}))));
+  if(configured.has(id))box.push(el('div',{class:'custom'},budgetFields(entry,seat.preset==='custom'?seat:{budget:seat.budget,preset:seat.preset},custom=>send({preset:'custom',custom}))));
   return box;
 }
 function renderSeat(side){
@@ -1025,15 +1026,19 @@ function renderStudy(){
   renderAnalysis();autoAnalyse();
   renderGraph();renderMoves();renderDetail();
 }
+/* Auto asks for the shown position once per autoTag(), and again (at most every 3 s) while it has no evaluation or
+   a stale one. Whether an evaluation already covers the analysis budget is the server's call (it skips a covered
+   request): the saved fields record the work done, which can stay below the budget for good (a time budget, solver
+   nodes a position did not need). */
 function autoAnalyse(){
   if(S.importing)return;
   if(S.failedJobs?.some(j=>j.kind==='analyse'&&j.ply===view))return;
   const tag=autoTag();if(dismissed!==null&&dismissed!==tag)dismissed=null;
-  const ev=S.evaluations[view],need=S.analysis&&S.analysis.budget,job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
-  const short=!ev||(S.stale||[]).includes(view)||need&&Object.entries(need).some(([k,v])=>typeof v==='number'&&(ev.budget?.[k]??ev[k]??0)<v);
-  if(!short||!S.analysis||!S.analysis.auto||job||finished()||S.analysis.preset==='solver'&&ev?.proof||tag===dismissed)return;
-  const now=Date.now();
-  if(now-(asked.get(tag)||0)>3000){asked.set(tag,now);post('/analyse',{ply:view})}
+  const ev=S.evaluations[view],job=S.jobs.some(j=>j.kind==='analyse'&&j.ply===view);
+  if(!S.analysis||!S.analysis.auto||job||finished()||S.analysis.preset==='solver'&&ev?.proof||tag===dismissed)return;
+  const now=Date.now(),last=asked.get(tag);
+  if(last!=null&&ev&&!(S.stale||[]).includes(view)||now-(last||0)<=3000)return;
+  asked.set(tag,now);post('/analyse',{ply:view});
 }
 /* the shown position and analysis settings, as Auto asks for them */
 function autoTag(){const a=S.analysis;return a?[a.engine,a.checkpoint,JSON.stringify(a.budget),S.history.slice(0,view).join(';')].join('|'):''}
@@ -1279,7 +1284,7 @@ function entrantRow(i){
   const id='t'+i,config=el('button',{class:'ib ghost'+(configured.has(id)?' on':''),type:'button','aria-label':'Custom budget',html:icon('config')});
   config.onclick=()=>{configured.has(id)?configured.delete(id):configured.add(id);renderTournamentForm()};
   const box=[strength({preset:spec.preset},ch=>{spec.preset=ch.preset;spec.custom=null;renderTournamentForm()},id,config,-1,entry)];
-  if(configured.has(id)&&entry)box.push(el('div',{class:'custom'},budgetFields(entry,{budget,custom:spec.preset==='custom'&&formKind(entry)?spec.custom:null},
+  if(configured.has(id)&&entry)box.push(el('div',{class:'custom'},budgetFields(entry,{budget,preset:spec.preset,custom:spec.preset==='custom'&&formKind(entry)?spec.custom:null},
     custom=>{spec.preset='custom';spec.custom=formKind(entry)?custom:Object.fromEntries(Object.entries(custom).filter(([,x])=>typeof x==='number'));renderTournamentForm()},id)));
   return el('div',{class:'entrant',style:`--c:${COLORS[i]}`},el('div',{class:'row'},el('span',{class:'tag'},'AB'[i]),...parts),...box);
 }

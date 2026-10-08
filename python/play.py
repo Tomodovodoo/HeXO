@@ -59,6 +59,11 @@ CPU_PRESETS = dict(lightning=dict(simulations=4, solver_nodes=512), quick=dict(s
                    standard=dict(simulations=16, solver_nodes=2048), strong=dict(simulations=32, solver_nodes=4096),
                    deep=dict(simulations=64, solver_nodes=8192), dangerous=dict(simulations=1024, solver_nodes=131072))
 PRESET_NAMES = list(PRESETS['bubble'])
+# Milliseconds per two-stone Bubble turn at each level of the GPU and the CPU ladder, measured on 2026-10-08 with
+# network 205000 (RTX 3070 Ti, Ryzen 9 5900X, the training run sharing both): the strength slider's estimate until
+# this server has timed moves of its own (`Session.note_pace`).
+TURN_MS = dict(GPU=dict(lightning=250, quick=650, standard=1400, strong=2000, deep=4100),
+               CPU=dict(lightning=750, quick=850, standard=1700, strong=3100, deep=6600))
 HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
 PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
 SEEDS = itertools.count(1740)  # owner seeds: repeated searches of a position draw new root samples
@@ -70,8 +75,7 @@ REVIEW_SOLVERS = 4                      # tactical workers a review queries at o
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
 SOLVER = dict(simulations=128, solver_nodes=32768, solver_ms=120_000)  # the analysis solver preset (see `prove`)
 SOLVER_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 4))  # its native proof workers
-LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1, views=1)
-VIEWS = 16  # the widest custom Bubble search: views per position (HYBRID['views'] by default)
+LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
 # The custom budgets whose two amounts exclude each other: work (Bubble's Nodes, Six's Positions) or Time in ms.
 EXCLUSIVE = dict(bubble=('simulations', 'ms'), six=('nodes', 'ms'))
 # The engines take budgets as 32-bit signed integers.
@@ -478,14 +482,13 @@ def model_key(path):
 
 
 def search_key(weights, entry, budget=None):
-    """The weights with the entry's Q floor, the solver preset's clock and a Bubble budget's Time and Width when they
-    are not the defaults, so saved searches cannot mix."""
+    """The weights with the entry's Q floor, the solver preset's clock and a Bubble budget's Time, so saved searches
+    cannot mix."""
     key = weights + (f"~q{entry['q_range_floor']!r}" if entry.get('q_range_floor') else '')
     if budget and budget.get('solver_ms'):
         key += f"~solver{budget['solver_ms']}"
     if budget and entry.get('kind') == 'bubble':
-        key += (f"~ms{budget['ms']}" if budget.get('ms') else '') + (
-            f"~views{budget['views']}" if budget.get('views', HYBRID['views']) != HYBRID['views'] else '')
+        key += f"~ms{budget['ms']}" if budget.get('ms') else ''
     return key
 
 
@@ -1180,7 +1183,7 @@ def frontier_facts(records):
     return facts
 
 
-def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=False, ms=None, views=None):
+def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=False, ms=None):
     """Hybrid scheduler work on the game graphs of `roots` ([(graph, simulations)], each graph at its root), in one
     SearchPool whose games share `bubble`'s packed network batches. Each graph's native owner completes
     `simulations` simulations over up to HYBRID['views'] views: its root and the positions below it, at most
@@ -1195,14 +1198,13 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     own choice at an exact or policy-free root; `completed`, the simulations the owner completed; `proofs`, the
     verified positions its frontier proved (frontier_facts); and `frontier_nodes`, the solver nodes that frontier
     spent. Each graph is left at its root. With `ms` each owner also stops at that clock, its `simulations` a
-    ceiling; `views` replaces HYBRID['views']."""
+    ceiling."""
     import numpy as np
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
-    views = views or HYBRID['views']
     histories = [[list(p) for p in graph.history] for graph, _ in roots]
     quantum = max(4, min(HYBRID['quantum'], max(simulations for _, simulations in roots)))
-    pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=views, depth=HYBRID['depth'],
+    pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=HYBRID['views'], depth=HYBRID['depth'],
                       work=1, seed=next(SEEDS))
     service, events, records, effort = None, {}, [], {}
     try:
@@ -1214,7 +1216,7 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
         service.launch()
         for game, (history, (_, simulations)) in enumerate(zip(histories, roots)):
             service.retarget(0, game, history, expected=0, work=max(1, simulations), ms=max(1, int(ms)) if ms else 0,
-                             samples=16, views=views)
+                             samples=16, views=HYBRID['views'])
         launched, sequence, shown, held = 0, 0, 0., False
         while len(events) < len(roots):
             rows = service.stats()['launched_rows']
@@ -1422,7 +1424,7 @@ class TurnSearch:
 
 def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n: None, live=None, trees=None,
              solved=None, q_range_floor=0., known=None, solver_ms=0, package=None, proofs=None, stamps=False, ms=0,
-             views=None):
+             placed=None):
     """Bubble's turn from `history` and what it thinks of the position.
 
     Returns `moves` (the turn it plays), `value` (win probability of the side to move), `top` (five best first
@@ -1444,8 +1446,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
     `solver_ms` (the solver preset) replaces the root queries with `prove` for up to that long; the search then
     plays the proven turn or, without a proof, searches as usual, and the result carries `prove`'s `solver`
     totals. `ms` (a budget in time) is the turn's clock: the root queries get at most a quarter of it, the first of
-    two stones 60% of what is left, the last stone the rest, with `simulations` a ceiling per stone. `views` is the
-    owners' width (HYBRID['views'] when None)."""
+    two stones 60% of what is left, the last stone the rest, with `simulations` a ceiling per stone. `placed(moves)`
+    receives the turn's stones so far as each searched stone before the last is decided."""
     from hybrid_scheduler import ProofWorkers
     end = time.monotonic() + ms / 1000 if ms else None
     game = replay(history)
@@ -1488,6 +1490,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             tree, count = asked
             if tree is None:
                 turn.take(None)
+                if placed and not turn.finished():
+                    placed([list(m) for m in turn.moves])
                 continue
             turn.tree = tree
             show = None
@@ -1499,8 +1503,10 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
             if end is not None:
                 clock = max(1., (end - time.monotonic()) * 1000)
                 clock *= .6 if turn.local.remaining == 2 else 1
-            [result] = search(bubble, [(tree, max(1, count))], frontier, watch, show, stamps, clock, views)
+            [result] = search(bubble, [(tree, max(1, count))], frontier, watch, show, stamps, clock)
             turn.take(result)
+            if placed and not turn.finished():
+                placed([list(m) for m in turn.moves])
         found = turn.record()
         if solved and 'solver' in solved:
             found['solver'] = solved['solver']
@@ -1517,7 +1523,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, q_range_floor=0.,
-                  known=None, proofs=None, stamps=False, ms=0, views=None):
+                  known=None, proofs=None, stamps=False, ms=0):
     """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
     position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
     proof table `known`; then fresh game graphs, one per position, search together with that table in one
@@ -1576,7 +1582,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
                     clock = max(1., (end - time.monotonic()) * 1000)
                     clock *= .6 if any(turn.local.remaining == 2 for turn, _ in searching) else 1
                 for (turn, _), result in zip(searching, search(bubble, [root for _, root in searching], frontier, watch,
-                                                               stamps=stamps, ms=clock, views=views)):
+                                                               stamps=stamps, ms=clock)):
                     turn.take(result)
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
@@ -1656,7 +1662,7 @@ class Engines:
         return self.prover, build
 
     def evaluate(self, entry, checkpoint, budget, history, watch, device=None, live=None, keep=False, line=None,
-                 known=None, game=None, refresh=None, used=None):
+                 known=None, game=None, refresh=None, used=None, placed=None):
         """`evaluate` with the entry's export and the proof table `known`; returns the evaluation, the budget it
         really had (no solver nodes when the solver is not built) and the key of the weights it used (see
         `model_key`). `line` (a seat's game, see `Session.lines`) or `game` (the analysis board's game, see
@@ -1685,7 +1691,7 @@ class Engines:
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, floor, known, solver_ms=spent.get('solver_ms', 0) if solver else 0,
                          package=self.tactical_package, proofs=self.proof_workers() if solver else None,
-                         stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
+                         stamps=self.proof_stamps, ms=spent.get('ms', 0), placed=placed)
         # A budget in time ends its root queries at its clock on purpose: that still counts as spending them.
         if not found.pop('solved') and not spent.get('ms'):
             spent = spent | dict(solver_nodes=0)
@@ -1752,7 +1758,7 @@ class Engines:
         spent = budget if provers else budget | dict(solver_nodes=0)
         found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
                               entry.get('q_range_floor', 0.), known, proofs=self.proof_workers() if provers else None,
-                              stamps=self.proof_stamps, ms=spent.get('ms', 0), views=spent.get('views'))
+                              stamps=self.proof_stamps, ms=spent.get('ms', 0))
         out = []
         for record in found:
             used = spent if record.pop('solved') or spent.get('ms') else spent | dict(solver_nodes=0)
@@ -2033,7 +2039,7 @@ class Evaluations:
         record = dict(position=position_text(history), engine=engine, simulations=budget['simulations'],
                       solver_nodes=budget['solver_nodes'], **evaluation,
                       at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-        record.update({k: budget[k] for k in ('solver_ms', 'ms', 'views') if k in budget})
+        record.update({k: budget[k] for k in ('solver_ms', 'ms') if k in budget})
         with self.lock:
             saved = self.order.get((self.key(history), engine, (budget['simulations'], budget['solver_nodes'])))
             saved, facts = json.loads(saved) if saved else {}, {}
@@ -2192,13 +2198,19 @@ def lane(job):
 
 
 class Job:
-    """One unit of engine work. `kind` is move, analyse or review; progress is `done` of `total`."""
+    """One unit of engine work. `kind` is move, analyse or review; progress is `done` of `total`. A move's `placed`
+    holds the stones of its turn already on the board (see `Session.place`)."""
     ids = itertools.count(1)
 
     def __init__(self, kind, priority, history, **fields):
         self.id, self.kind, self.priority, self.history = next(Job.ids), kind, priority, tuple(history)
         self.status, self.done, self.total, self.error, self.cancelled, self.ended = 'queued', 0, 1, None, False, None
+        self.placed = ()
         self.__dict__.update(fields)
+
+    def reached(self):
+        """The position the job's board stands at: its history and the stones it has placed."""
+        return self.history + self.placed
 
     def summary(self):
         return dict(id=self.id, kind=self.kind, status=self.status, done=self.done, total=self.total,
@@ -2211,15 +2223,15 @@ class Job:
 
 def custom_form(kind, standard, custom):
     """The custom budget form of a Bubble or a Six (EXCLUSIVE kinds): both amounts, the work (Bubble's `simulations`,
-    shown as Nodes; Six's `nodes`, shown as Positions) and Time `ms`, with `active` naming the one that applies, and for
-    Bubble the Width `views`. Missing values come from the `standard` preset, 1000 ms and HYBRID['views']. Without
-    `active`, Time applies when only it is given and the work otherwise, so a custom budget saved before the form keeps
-    its work; a Bubble's old `solver_nodes` is dropped."""
+    shown as Nodes; Six's `nodes`, shown as Positions) and Time `ms`, with `active` naming the one that applies.
+    Missing values come from the `standard` preset and 1000 ms. Without `active`, Time applies when only it is given
+    and the work otherwise, so a custom budget saved before the form keeps its work; a Bubble's old `solver_nodes`
+    and `views` are dropped (every Bubble search has HYBRID['views'] views)."""
     work, _ = EXCLUSIVE[kind]
     if custom is not None and not isinstance(custom, dict):
         raise ValueError('A custom budget is an object of numbers')
-    custom = {k: v for k, v in (custom or {}).items() if not (kind == 'bubble' and k == 'solver_nodes')}
-    form = {work: standard[work], 'ms': 1000, 'active': 'ms' if 'ms' in custom and work not in custom else work} | ({'views': HYBRID['views']} if kind == 'bubble' else {})
+    custom = {k: v for k, v in (custom or {}).items() if not (kind == 'bubble' and k in ('solver_nodes', 'views'))}
+    form = {work: standard[work], 'ms': 1000, 'active': 'ms' if 'ms' in custom and work not in custom else work}
     for key, value in custom.items():
         if key == 'args':
             continue
@@ -2228,8 +2240,8 @@ def custom_form(kind, standard, custom):
                 raise ValueError(f'active must be one of {", ".join(EXCLUSIVE[kind])}')
         elif key not in form:
             raise ValueError(f'{key} is not a budget of this engine')
-        elif type(value) is not int or not LIMITS[key] <= value <= (VIEWS if key == 'views' else MAX_BUDGET):
-            raise ValueError(f"{key} must be an integer from {LIMITS[key]} to {VIEWS if key == 'views' else MAX_BUDGET}")
+        elif type(value) is not int or not LIMITS[key] <= value <= MAX_BUDGET:
+            raise ValueError(f"{key} must be an integer from {LIMITS[key]} to {MAX_BUDGET}")
         form[key] = value
     return form
 
@@ -2242,8 +2254,8 @@ def form_kind(entry):
 
 
 def custom_budget(kind, form, standard=None):
-    """The budget a custom `form` (see `custom_form`) runs: its active amount, and for Bubble its width and root
-    query nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Time budget keeps a work
+    """The budget a custom `form` (see `custom_form`) runs: its active amount, and for Bubble its root query
+    nodes, sixteen per simulation or four per ms between 1,024 and 4,000,000. A Time budget keeps a work
     ceiling: Bubble's `simulations` of 65,536 per stone, Six's `nodes` of MAX_BUDGET. A Six keeps the `standard`
     preset's launch `args`."""
     active = form['active']
@@ -2251,9 +2263,8 @@ def custom_budget(kind, form, standard=None):
         launch = {'args': standard['args']} if standard and 'args' in standard else {}
         return (dict(ms=form['ms'], nodes=MAX_BUDGET) if active == 'ms' else dict(nodes=form['nodes'])) | launch
     if active == 'ms':
-        return dict(simulations=65536, ms=form['ms'], views=form['views'],
-                    solver_nodes=min(4_000_000, max(1024, 4 * form['ms'])))
-    return dict(simulations=form['simulations'], views=form['views'],
+        return dict(simulations=65536, ms=form['ms'], solver_nodes=min(4_000_000, max(1024, 4 * form['ms'])))
+    return dict(simulations=form['simulations'],
                 solver_nodes=min(4_000_000, max(1024, 16 * form['simulations'])) if form['simulations'] else 0)
 
 
@@ -2319,6 +2330,7 @@ class Session:
         self.outcome, self.clock_turns, self.notice, self.clock_partial_ms = None, [], None, 0
         self.match_file = None
         self.retries = {}
+        self.paces = {}   # engine id -> {preset: ms per two-stone turn} measured from its moves (see `note_pace`)
         # The position and analysis settings whose analysis was cancelled (see `dismissal`), or None.
         self.dismissed = None
         self.jobs, self.queues, self.order = OrderedDict(), dict(move=[], analysis=[]), itertools.count()
@@ -2485,11 +2497,12 @@ class Session:
                 played = history[ply] if ply < len(history) else None
                 if (found := self.proven(history[:ply], self.lookup(history[:ply], keys), played)) is not None:
                     evaluations[ply] = {k: found.get(k) for k in
-                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'solver_ms', 'ms', 'views', 'refuted', 'solver')}
+                                        ('value', 'node_value', 'moves', 'top', 'proof', 'pv', 'threat', 'simulations', 'solver_nodes', 'solver_ms', 'ms', 'refuted', 'solver')}
                     if self.stale(found, ply):
                         stale.append(ply)
             device = getattr(self.engines, 'device', 'cpu')
             entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e), device='Server ' + device_of(e, device))
+                       | (dict(pace=TURN_MS[device_of(e, device)] | self.paces.get(e['id'], {})) if e['kind'] == 'bubble' else {})
                        for e in self.entries.values()]
             return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
@@ -2549,7 +2562,7 @@ class Session:
             winner = self.outcome['winner']
         seat = self.seats[player]
         busy = any(j.kind == 'move' and j.status in ('queued', 'running') and not j.cancelled
-                   and j.history == tuple(self.history) for j in self.jobs.values())
+                   and j.reached() == tuple(self.history) for j in self.jobs.values())
         waiting = self.match and self.match['active'] and (self.match['between'] or self.match['preparing'] or
                                                           self.match.get('outcome') or
                                                           self.match['max_placements'] and len(self.history) >= self.match['max_placements'])
@@ -2578,17 +2591,18 @@ class Session:
         self.lock.notify_all()
 
     def deepening(self, winner):
-        """True while the current position deepens (see `deepen`): Auto is on, an engine seat plays, the game is
-        neither paused, finished nor a batch. The configured analysis budget then waits for the deepening, so the
-        fast presets land first."""
-        return bool(self.analysis and self.analysis['auto'] and not self.paused and winner < 0
+        """True while the current position deepens (see `deepen`): Auto is on at a preset (not custom, not the
+        solver), an engine seat plays, the game is neither paused, finished nor a batch. The configured analysis
+        then comes from the deepening, so the faster presets land first."""
+        return bool(self.analysis and self.analysis['auto'] and self.analysis['preset'] in PRESET_NAMES
+                    and not self.paused and winner < 0
                     and any(seat['engine'] != 'human' for seat in self.seats)
                     and not (self.match and self.match['active']))
 
     def deepen(self, winner):
         """While an engine seat plays, the game is not paused and Auto is on, evaluate the current position with the analysis
-        model at each preset in turn, fastest first: the first preset not yet saved is queued at the lowest
-        priority, and `changed` queues the next when it lands. Deepening of other positions, and all of it once
+        model at each preset in turn, fastest first, up to the analysis preset: the first preset not yet saved is
+        queued at the lowest priority, and `changed` queues the next when it lands. Deepening of other positions, and all of it once
         deepening stops, is dropped; a preset that failed for this position, or whose solver gave no verdict, is
         skipped."""
         current, active = tuple(self.history), self.deepening(winner)
@@ -2601,7 +2615,7 @@ class Session:
                    for job in self.jobs.values())
         if not active or busy or self.dismissed == self.dismissal(current):
             return
-        for tier in PRESET_NAMES:
+        for tier in PRESET_NAMES[:PRESET_NAMES.index(self.analysis['preset']) + 1]:
             failed = any(getattr(job, 'tier', None) == tier and job.history == current
                          and (job.status == 'failed' or getattr(job, 'incomplete', False))
                          for job in self.jobs.values())
@@ -3474,8 +3488,7 @@ class Session:
             return dict(kind=kind, model=str(export_path(entry, seat['checkpoint']).resolve()),
                         tactical_package=str(self.engines.tactical_package) if getattr(self.engines, 'tactical_package', None) else None,
                         device=seat.get('device', getattr(self.engines, 'device', 'cpu')), search=dict(enabled=budget['simulations'] > 0,
-                        max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.),
-                        views=budget.get('views', HYBRID['views'])),
+                        max_simulations=max(1, budget['simulations']), q_range_floor=entry.get('q_range_floor', 0.)),
                         solver=dict(enabled=budget['solver_nodes'] > 0, stamps=getattr(self.engines, 'proof_stamps', False)))
         if kind == 'six':
             return dict(kind=kind, command=command_of(entry, seat['checkpoint']) + budget.get('args', []),
@@ -3517,7 +3530,11 @@ class Session:
                             self.stop_moves()
                     if match['outcome']:
                         winner = match['outcome']['winner']
-                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']):
+                    # A turn whose first stone is on the board (Session.place) is capped once it is complete.
+                    streaming = any(j.kind == 'move' and j.placed and j.status in ('queued', 'running') and not j.cancelled
+                                    for j in self.jobs.values())
+                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']
+                                       or streaming):
                         self.lock.wait(timeout=.1 if self.game_clock else None)
                         continue
                     number = match['current']
@@ -3710,7 +3727,12 @@ class Session:
                         self.save_match_position()
                 else:
                     job.status = 'cancelled' if job.cancelled else 'done'
-                    if job.kind == 'move' and not job.cancelled and list(job.history) == self.history:
+                    turn = [tuple(p) for p in result or ()] if job.kind == 'move' else []
+                    shown = list(job.placed)
+                    # A turn that disagrees with the stones already shown leaves them; `changed` then queues a move
+                    # for the rest of the turn.
+                    if job.kind == 'move' and not job.cancelled and list(job.reached()) == self.history \
+                            and turn[:len(shown)] == shown:
                         expired = self.game_clock and self.game_clock.expired(job.received)
                         if self.match and self.match['active']:
                             if expired:
@@ -3730,7 +3752,7 @@ class Session:
                         if not expired:
                             if not (self.match and self.match['active']):
                                 self.fork_freeplay()
-                            self.history.extend(tuple(p) for p in result)
+                            self.history.extend(turn[len(shown):])
                             if freeplay:
                                 self.clock_turn(job.side, job.received)
                         if self.match and self.match['active']:
@@ -3782,7 +3804,8 @@ class Session:
                 self.entries[seat['engine']], seat['checkpoint'], budget, history, self.watcher(job, job.kind != 'review'),
                 live=live, keep=keep, line=line, known=self.proofs if job.kind != 'move' else None,
                 **({'device': seat['device']} if 'device' in seat else {}), **({'game': game} if game is not None else {}),
-                **({'refresh': refresh} if refresh is not None else {}), used=used)
+                **({'refresh': refresh} if refresh is not None else {}), used=used,
+                **({'placed': lambda moves: self.place(job, moves)} if job.kind == 'move' else {}))
             if job.cancelled:
                 raise Cancelled()
         finally:
@@ -3805,7 +3828,7 @@ class Session:
                 timer.start()
         if refresh is not None:
             weights, spent = refresh['engine'], dict(simulations=refresh['simulations'], solver_nodes=refresh['solver_nodes'])
-            spent.update({k: refresh[k] for k in ('solver_ms', 'ms', 'views') if k in refresh})
+            spent.update({k: refresh[k] for k in ('solver_ms', 'ms') if k in refresh})
             if refresh.get('solver'):
                 found['solver'] = refresh['solver']   # a refresh rereads the graph; the proof work it replaces stays reported
         saved = self.save(history, weights, spent, found, model)
@@ -3859,6 +3882,39 @@ class Session:
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
                     self.submit(Job('analyse', 2, history[:ply], seat=dict(seat), force=True, game=game, refresh=saved))
+
+    def note_pace(self, seat, ms, stones):
+        """Record that Bubble `seat` searched a turn of `stones` stones at its preset in `ms`: the page shows the entry's
+        `pace` (ms per two-stone turn, a one-stone turn counted twice) by the strength slider, and each move moves it
+        halfway to its own time. A custom budget records nothing."""
+        if seat['preset'] not in PRESET_NAMES or not stones:
+            return
+        with self.lock:
+            paces, turn = self.paces.setdefault(seat['engine'], {}), ms * 2 / stones
+            old = paces.get(seat['preset'])
+            paces[seat['preset']] = round(turn if old is None else (old + turn) / 2)
+
+    def place(self, job, moves):
+        """Put the stones of move `job`'s turn decided so far (`moves`, from `evaluate`) on the board before the turn
+        ends, while the board still stands where the job left it and the game is not paused: the next stone's search
+        goes on, and the finished move adds only the stones not shown (`Job.placed`)."""
+        with self.lock:
+            stones = tuple(tuple(p) for p in moves)
+            shown, at = job.placed, list(job.reached())
+            if job.cancelled or self.paused or len(stones) <= len(shown) or stones[:len(shown)] != shown or self.history != at:
+                return
+            game = replay(at + list(stones[len(shown):]))
+            try:
+                ongoing = game.winner < 0 and game.player == job.side
+            finally:
+                game.close()
+            if not ongoing:
+                return
+            if not (self.match and self.match['active']):
+                self.fork_freeplay()
+            self.history.extend(stones[len(shown):])
+            job.placed = stones
+            self.changed()
 
     def save_timed(self, seat, history, moves, found):
         """Save a timed Bubble move's search as a kept-tree evaluation of `history` at the work it completed: shown in
@@ -3966,6 +4022,8 @@ class Session:
                 job.total = max(1, seat['budget']['simulations']) * 2
                 found = self.evaluation(job, seat, history)
                 moves = found['moves']
+                if found.get('actual_completed'):
+                    self.note_pace(seat, (time.monotonic() - started) * 1000, len(moves))
                 counts = dict(completed=found.get('actual_completed'), solver_nodes=found.get('actual_solver_nodes'))
             else:
                 moves = self.engines.turn(entry, seat['budget'], history, lambda: job.cancelled, seat['checkpoint'])
@@ -4119,6 +4177,8 @@ STATIC_TYPES = {'.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'a
                 '.html': 'text/html; charset=utf-8'}
 # Cross-origin isolation (SharedArrayBuffer for the browser engine's threads) without blocking credentialless subresources
 ISOLATION = (('Cross-Origin-Opener-Policy', 'same-origin'), ('Cross-Origin-Embedder-Policy', 'credentialless'))
+# The mark of a page this server serves; without it the page runs its own game (a static site has no /state).
+SERVED = b'<meta name="hexo-play" content="server">'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4163,7 +4223,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403, dict(error='Host rejected'))
         url, session = urlparse(self.path), self.session
         if url.path == '/':
-            return self.respond(200, self.page.read_bytes(), 'text/html; charset=utf-8', ISOLATION)
+            # SERVED tells the page's browser engines (web/engine/seat.mjs) that this server plays the game.
+            page = self.page.read_bytes().replace(b'<meta charset="utf-8">', b'<meta charset="utf-8">' + SERVED, 1)
+            return self.respond(200, page, 'text/html; charset=utf-8', ISOLATION)
         if url.path.startswith('/engine/') or url.path == '/coi-sw.js':
             return self.static(url.path)
         if url.path == '/setup' and self.setups:

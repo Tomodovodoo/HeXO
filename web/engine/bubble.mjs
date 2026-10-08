@@ -1,9 +1,25 @@
 /* Bubble running in the browser: the page-side handle of worker.mjs. */
 
-/** Work per stone and root query nodes per level, as the served page's GPU ladder (python/play.py PRESETS). */
-export const PRESETS = {lightning: {simulations: 16, solver_nodes: 1024}, quick: {simulations: 64, solver_nodes: 2048},
+import {WEBGPU} from './device.mjs';
+
+/** Work per stone and root query nodes per level on WebGPU, as the served page's GPU ladder (python/play.py PRESETS). */
+export const GPU_PRESETS = {lightning: {simulations: 16, solver_nodes: 1024}, quick: {simulations: 64, solver_nodes: 2048},
   standard: {simulations: 256, solver_nodes: 4096}, strong: {simulations: 512, solver_nodes: 8192},
   deep: {simulations: 1024, solver_nodes: 16384}, dangerous: {simulations: 65536, solver_nodes: 4000000}};
+/** The same levels on WebAssembly, as the CPU server's ladder (python/play.py CPU_PRESETS): a simulation costs about
+ * seven times as long there, so Lightning stays near a quarter of a second a turn. */
+export const CPU_PRESETS = {lightning: {simulations: 4, solver_nodes: 512}, quick: {simulations: 8, solver_nodes: 1024},
+  standard: {simulations: 16, solver_nodes: 2048}, strong: {simulations: 32, solver_nodes: 4096},
+  deep: {simulations: 64, solver_nodes: 8192}, dangerous: {simulations: 1024, solver_nodes: 131072}};
+/** The ladder of this device: GPU_PRESETS on WebGPU, CPU_PRESETS on WebAssembly. */
+export const PRESETS = WEBGPU ? GPU_PRESETS : CPU_PRESETS;
+/** Milliseconds per two-stone turn at each level of `presets`, measured on 2026-10-08 (RTX 3070 Ti, ONNX Runtime
+ * Web on 8 WebAssembly threads, network 205000) over three positions of 3 to 13 stones: the strength slider shows
+ * these until the page has timed its own turns (device.mjs notePace). */
+export function turnTimes(presets) {
+  return presets === GPU_PRESETS ? {lightning: 340, quick: 1000, standard: 2600, strong: 4100, deep: 4900}
+    : {lightning: 270, quick: 500, standard: 1100, strong: 1900, deep: 3400};
+}
 
 /** The proof workers of every Bubble search with solver nodes, the solver preset included: half the browser's threads
  * less one, from 1 to 8, so the page's main thread and inference keep the other half. */
@@ -62,7 +78,7 @@ export class BubbleEngine extends EngineWorker {
 
   /**
    * Bubble's turn at `history` ([[q, r], ...]) with `budget` {simulations, solver_nodes, optional ms (a budget in
-   * time: the turn's clock, simulations its ceiling), views (the owner's width, 8 by default), q_range_floor and
+   * time: the turn's clock, simulations its ceiling), q_range_floor and
    * checkpoint, a NETWORKS name} (a PRESETS entry or a custom budget): the fields of python/play.py evaluate. Every stone runs the hybrid
    * scheduler (worker.mjs playTurn): `simulations` is its work per stone, and `solver_nodes` above 0 adds the root
    * queries at that node budget and the owner's proof frontier on PROOF_WORKERS proof workers (`solver_workers`
@@ -78,7 +94,7 @@ export class BubbleEngine extends EngineWorker {
       solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4, proveMs: budget.solver_ms ?? 0,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      ms: options.ms ?? budget.ms ?? null, views: budget.views ?? 8, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
+      ms: options.ms ?? budget.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
   /** Loads network `checkpoint` (a NETWORKS name, the default when null) and starts the PROOF_WORKERS proof workers, so

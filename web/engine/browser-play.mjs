@@ -32,10 +32,11 @@ export async function mountPlay(engines, legacy) {
         await engine.prepare?.(checkpoint, {progress: (fraction, live, stage) => report(fraction, stage)});
       },
       turn: async (history, budget, options) => {
-        const started = performance.now(), progress = (f, live, stage) => { tag(stage); options.progress(f, live, stage); };
+        const started = performance.now(), progress = (f, live, stage, placed) => { tag(stage); options.progress(f, live, stage, placed); };
         const result = await engine.turn(history, {...budget, ...(options.checkpoint ? {checkpoint: options.checkpoint} : {})}, {...options, progress});
         const preset = options.preset === 'custom' ? 'standard' : options.preset;
-        if (options.ms == null && options.preset !== 'custom') notePace(entry, options.preset, performance.now() - started, result.moves?.length);
+        // A move's own search: a clock's turn, a custom budget and a turn the proofs or the solver answered say nothing of the preset.
+        if (options.kind === 'move' && options.ms == null && options.preset !== 'custom' && result.actual_completed !== 0) notePace(entry, options.preset, performance.now() - started, result.moves?.length);
         return record ? {...record(result, history, preset), ...result} : result;
       }
     });
