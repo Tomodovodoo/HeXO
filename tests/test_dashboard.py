@@ -511,5 +511,38 @@ class OpeningBookPages(unittest.TestCase):
         self.assertAlmostEqual(row['mean_plies'], 130/6)
 
 
+class ProjectSmoothing(unittest.TestCase):
+    """The comparison page's smoothing spans the same share of the x-axis for every series, however densely it was
+    logged: a variant logged every 20 steps and one downsampled to every 220 steps smooth to the same curve."""
+
+    SCRIPT = """
+const signal = x => 1.5 + 0.3 * Math.sin(x / 7000) + 0.2 * Math.sin(x / 900);
+const dense = Array.from({length: 2001}, (_, i) => [i * 20, signal(i * 20)]);
+const sparse = dense.filter((q, i) => i % 11 === 0);
+const unit = 40000 / 1000;
+const d = ema(dense, 0.95, unit), s = ema(sparse, 0.95, unit);
+const at = pts => x => pts.reduce((best, q) => Math.abs(q[0] - x) < Math.abs(best[0] - x) ? q : best)[1];
+const xs = [12000, 20000, 30000, 39000];
+const gap = Math.max(...xs.map(x => Math.abs(at(d)(x) - at(s)(x))));
+const dPoint = ema(dense, 0.95, 0), sPoint = ema(sparse, 0.95, 0);
+const gapPerPoint = Math.max(...xs.map(x => Math.abs(at(dPoint)(x) - at(sPoint)(x))));
+console.log(JSON.stringify({gap, gapPerPoint, first: d[0][1], firstSignal: dense[0][1]}));
+"""
+
+    def test_series_of_different_density_smooth_alike(self):
+        import re
+        import shutil
+        import subprocess
+        node = shutil.which('node')
+        if node is None:
+            raise unittest.SkipTest('node is required to run the page script')
+        page = (Path(__file__).resolve().parents[1] / 'web' / 'project.html').read_text(encoding='utf-8')
+        ema = re.search(r'const ema=\(pts,w,unit\)=>\{.*?\};', page).group(0)
+        out = json.loads(subprocess.run([node, '-e', ema + self.SCRIPT], capture_output=True, text=True, check=True).stdout)
+        self.assertLess(out['gap'], 0.05)
+        self.assertGreater(out['gapPerPoint'], out['gap'] * 2)
+        self.assertAlmostEqual(out['first'], out['firstSignal'], places=9)
+
+
 if __name__ == '__main__':
     unittest.main()
