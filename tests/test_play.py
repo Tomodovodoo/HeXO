@@ -70,7 +70,7 @@ class FakeEngines:
         self.games, self.refreshes, self.graph = [], [], (None, 0)
 
     def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None,
-                 game=None, refresh=None, used=None, placed=None):
+                 game=None, refresh=None, used=None, placed=None, device=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
         moves = legal_turn(history)
         if placed and len(moves) > 1:   # a move's first stone is decided before the second is searched
@@ -413,7 +413,7 @@ class Jobs(unittest.TestCase):
     def test_cancel_stops_a_thinking_engine_and_pauses(self):
         self.engines.hold = True
         self.session.play(0, 0)
-        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']))
+        wait(lambda: any(j['status'] == 'running' for j in self.session.state()['jobs']) and len(self.history()) == 2)
         started = time.time()
         state = self.session.state()
         self.assertLess(time.time() - started, 1)
@@ -1574,6 +1574,17 @@ class Matches(unittest.TestCase):
         self.assertEqual([r['game'] for r in recovered['results']], [1, 2])
         self.assertEqual(len(self.session.match_catalogue()), 1)
         self.assertFalse(recovered['single'])
+
+    def test_a_match_caps_a_bubble_game_after_the_turn_whose_first_stone_reached_the_limit(self):
+        self.engines.hold = True
+        self.session.start_match(['bubble:fake', 'bubble:fake'], output=self.output, max_placements=2)
+        wait(lambda: len(self.session.history) == 2)   # the first stone of the reply is shown, the second searched
+        time.sleep(.3)
+        self.assertEqual(self.session.match['completed'], 0)
+        self.engines.release.set()
+        wait(lambda: not self.session.match_worker.is_alive())
+        games = [json.loads((self.output / f'game-000{n}.json').read_text()) for n in (1, 2)]
+        self.assertEqual([(len(g['history']), g['reason']) for g in games], [(3, 'capped')] * 2)
 
     def test_pause_holds_the_next_game_and_settings_cannot_change_mid_match(self):
         self.session.start_match(['Drip', 'Other'], output=self.output, max_placements=3)

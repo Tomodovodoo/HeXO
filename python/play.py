@@ -3530,7 +3530,11 @@ class Session:
                             self.stop_moves()
                     if match['outcome']:
                         winner = match['outcome']['winner']
-                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']):
+                    # A turn whose first stone is on the board (Session.place) is capped once it is complete.
+                    streaming = any(j.kind == 'move' and j.placed and j.status in ('queued', 'running') and not j.cancelled
+                                    for j in self.jobs.values())
+                    if winner < 0 and (not match['max_placements'] or len(self.history) < match['max_placements']
+                                       or streaming):
                         self.lock.wait(timeout=.1 if self.game_clock else None)
                         continue
                     number = match['current']
