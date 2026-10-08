@@ -1,33 +1,21 @@
-# Public learned Strix opponent
+# Learned Strix opponent
 
 This adapter uses `InferModel::eval_states` and `gumbel_mcts` directly from
 [SootyOwl/hexo-strix at 5a771e57](https://github.com/SootyOwl/hexo-strix/tree/5a771e572553a8bd8e010112b2ce65f16e5afa1b).
-The direct evaluator constructs the relational graph, including edge types,
-distances, and global relations required by this checkpoint. The HX04 server
-path is not used because its batch reconstruction omits those relations.
+The direct evaluator builds the graph each network's metadata asks for, including the
+relational edge types, distances and global relations. The HX04 server path is not
+used because its batch reconstruction omits those relations.
 
-The source is MIT-licensed. The separately downloaded checkpoint's license is
-unknown. We do not redistribute its weights or claim that public availability
-grants redistribution permission. Include upstream and dependency license
-notices if distributing compiled code.
+The source is MIT-licensed. Include upstream and dependency license notices if
+distributing compiled code.
 
-## Pinned checkpoint
+## Network
 
-Download [the public model](https://hexo.tyto.cc/model.safetensors) to an external
-file. The adapter requires exactly these bytes:
-
-```text
-SHA256 aec92391c66050e737d9b769757248b520ffc1bf44fa039db7c8abd3ef720185
-Size   2810120 bytes
-Source checkpoint_000010.pt
-Steps  10
-```
-
-Its metadata identifies a four-layer, hidden-128 relational graph network with
-JK concatenation, axis window8, compact stone encoding and no node coordinates.
-This is the public step-10 artifact, not a private Pulsatrix-246 checkpoint or
-a claim about the strongest Strix bot. If the URL changes, the hash check fails;
-do not silently substitute another model.
+The adapter loads any `hexo-safetensors-v1` file and checks that the wrapper reports
+the `source_checkpoint` the file's metadata names. The network this repository plays,
+`strix-237000` (the Strix network at training step 237000), is pinned by SHA-256 in
+`tools/engines.json` and hosted in the `strix-networks-v1` release with the permission
+of its author, Tyto, who trained it.
 
 ## Build
 

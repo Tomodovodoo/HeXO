@@ -191,7 +191,7 @@ class Setups:
         with self.lock:
             if engine in self.jobs and self.jobs[engine].state == 'running':
                 return self.jobs[engine]
-            steps = dict(six=3, strix=3, shrimp=len(self.manifest['shrimp']['files']) + 3,
+            steps = dict(six=3, strix=len(self.manifest['strix']['networks']) + 2, shrimp=len(self.manifest['shrimp']['files']) + 3,
                          seal=len(self.manifest['seal']['files']) + 2)[engine]
             job = self.jobs[engine] = Job(steps)
             self.threads[engine] = threading.Thread(target=self.work, args=(engine, job), daemon=True)
@@ -319,7 +319,8 @@ class Setups:
         job.advance()
 
     def strix(self, job, work):
-        """The pinned Strix wrapper, built here or from the release, and the public model from its site."""
+        """The pinned Strix wrapper, built here or from the release, and every pinned network; the entry lists the
+        networks in the manifest's order, the default first."""
         spec = self.manifest['strix']
         staged = work / 'strix'
         staged.mkdir()
@@ -340,10 +341,11 @@ class Setups:
             self.published(job, lambda n: n == f"{spec['executable']}-{system()}{'.exe' if WINDOWS else ''}",
                            staged / name, failure)
             (staged / name).chmod((staged / name).stat().st_mode | 0o111)
-        model = spec['model']
-        self.download(job, model['url'], staged / 'model.safetensors', model['sha256'], model['size'])
-        self.place(staged, 'strix', dict(name=spec['name'], kind='strix', model='strix/model.safetensors',
-                                         engine=f'strix/{name}'))
+        for network in spec['networks']:
+            self.download(job, network['url'], staged / f"{network['id']}.safetensors", network['sha256'],
+                          network['size'])
+        networks = {network['id']: f"strix/{network['id']}.safetensors" for network in spec['networks']}
+        self.place(staged, 'strix', dict(name=spec['name'], kind='strix', networks=networks, engine=f'strix/{name}'))
         job.advance()
 
     def shrimp(self, job, work):

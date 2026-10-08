@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WASM = ROOT/'web'/'engine'/'strix'/'strix.wasm'
 RUNNER = ROOT/'tests'/'web'/'strix.mjs'
 NODE = shutil.which('node')
-MODEL = Path(os.environ.get('HEXO_STRIX_PUBLIC_MODEL', ROOT/'web'/'engine'/'strix'/'pulsatrix-10-best.safetensors'))
+MODEL = Path(os.environ.get('HEXO_STRIX_PUBLIC_MODEL', ROOT/'web'/'engine'/'strix'/'strix-237000.safetensors'))
 EXECUTABLE = (ROOT/'tools'/'strix_learned'/'target'/'release'/'hexo-strix-learned').with_suffix('.exe' if os.name == 'nt' else '')
 
 

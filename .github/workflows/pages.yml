@@ -33,8 +33,9 @@ jobs:
       - run: python tools/build_web.py ort model shrimp six --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
         env:
           GH_TOKEN: ${{ github.token }}
-      # Seal and the Strix network have no licence of their own. The site serves them only while the repository
-      # variables say so; a local build (`python tools/build_web.py seal strix-network`) always makes them.
+      # Seal has no licence of its own, and the Strix network is hosted with its author's permission. The site serves
+      # them only while the repository variables say so; a local build (`python tools/build_web.py seal strix-network`)
+      # always makes them.
       - if: ${{ vars.PUBLISH_SEAL == 'true' }}
         run: python tools/build_web.py seal --emxx "$RUNNER_TEMP/emsdk/upstream/emscripten/em++"
       - if: ${{ vars.PUBLISH_STRIX_NETWORK == 'true' }}

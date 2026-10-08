@@ -80,6 +80,13 @@ class Recipes(unittest.TestCase):
             self.rescans += 1
         return Setups(self.models, rescan, lambda: scan(self.models), path, self.web, which, cargo)
 
+    def strix_networks(self, model):
+        """Pins two Strix networks, `model` and a second one, and returns their downloads by URL."""
+        files = {f'https://example.test/{n}': data for n, data in (('a', model), ('b', model + b' b'))}
+        self.manifest['strix']['networks'] = [dict(id=url.rsplit('/', 1)[1], url=url, sha256=sha(data), size=len(data))
+                                              for url, data in files.items()]
+        return files
+
     def finish(self, setups, engine):
         setups.start(engine)
         return setups.wait(engine, 30)
@@ -134,30 +141,32 @@ class Recipes(unittest.TestCase):
         executable, model = b'strix executable', b'strix model'
         name = f"hexo-strix-learned-{system()}{'.exe' if WINDOWS else ''}"
         self.manifest['release']['files'] = {name: sha(executable)}
-        self.manifest['strix']['model'] |= dict(url='https://example.test/model', sha256=sha(model), size=len(model))
+        networks = self.strix_networks(model)
         setups = self.setups({f'https://github.com/Tomodovodoo/HeXO/releases/download/engines-v1/{name}': executable,
-                              'https://example.test/model': model})
+                              **networks})
         job = self.finish(setups, 'strix')
         self.assertEqual(job.state, 'done', job.error)
         local = 'hexo-strix-learned.exe' if WINDOWS else 'hexo-strix-learned'
         self.assertEqual((self.models / 'strix' / local).read_bytes(), executable)
         entry = json.loads((self.models / 'strix.json').read_text(encoding='utf-8'))
-        self.assertEqual(entry, dict(name='Strix', kind='strix', model='strix/model.safetensors',
-                                     engine=f'strix/{local}', setup='strix'))
+        self.assertEqual(entry, dict(name='Strix', kind='strix', engine=f'strix/{local}', setup='strix',
+                                     networks=dict(a='strix/a.safetensors', b='strix/b.safetensors')))
         strix = next(e for e in scan(self.models).values() if e['kind'] == 'strix')
-        self.assertEqual((strix['model'].read_bytes(), strix['engine'].read_bytes()), (model, executable))
+        self.assertEqual(strix['checkpoints'], ['a', 'b'])
+        self.assertEqual([strix['networks'][n].read_bytes() for n in 'ab'], [model, model + b' b'])
+        self.assertEqual(strix['engine'].read_bytes(), executable)
 
     def test_an_unpinned_release_is_checked_against_its_own_sums(self):
         executable, model = b'strix executable', b'strix model'
         name = f"hexo-strix-learned-{system()}{'.exe' if WINDOWS else ''}"
-        self.manifest['strix']['model'] |= dict(url='https://example.test/model', sha256=sha(model), size=len(model))
+        networks = self.strix_networks(model)
         release = 'https://github.com/Tomodovodoo/HeXO/releases/download/engines-v1/'
         sums = f'{sha(executable)}  {name}\n{"0" * 64}  other-file\n'.encode()
         job = self.finish(self.setups({release + 'SHA256SUMS': sums, release + name: executable,
-                                       'https://example.test/model': model}), 'strix')
+                                       **networks}), 'strix')
         self.assertEqual(job.state, 'done', job.error)
         job = self.finish(self.setups({release + 'SHA256SUMS': sums, release + name: b'tampered',
-                                       'https://example.test/model': model}), 'strix')
+                                       **networks}), 'strix')
         self.assertIn('SHA-256', job.error)
 
     def test_without_a_toolchain_or_a_published_build_the_setup_says_so(self):
@@ -173,9 +182,9 @@ class Recipes(unittest.TestCase):
         executable, model = b'published', b'model'
         name = f"hexo-strix-learned-{system()}{'.exe' if WINDOWS else ''}"
         self.manifest['release']['files'] = {name: sha(executable)}
-        self.manifest['strix']['model'] |= dict(url='https://example.test/model', sha256=sha(model), size=len(model))
+        networks = self.strix_networks(model)
         setups = self.setups({f'https://github.com/Tomodovodoo/HeXO/releases/download/engines-v1/{name}': executable,
-                              'https://example.test/model': model}, which=lambda name: name, cargo=lambda: 'cargo')
+                              **networks}, which=lambda name: name, cargo=lambda: 'cargo')
         with unittest.mock.patch('engine_setup.build_strix', side_effect=SetupError('linker missing')):
             job = self.finish(setups, 'strix')
         self.assertEqual(job.state, 'done', job.error)
