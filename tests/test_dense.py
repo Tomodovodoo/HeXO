@@ -7656,7 +7656,8 @@ class ActorModelTests(unittest.TestCase):
                 'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
             actor=dense_config.ActorSettings(games_in_flight=1, leaf_batch=64, full_sims=2, cheap_sims=2, root_samples=2,
                                              max_plies=6, cache_positions=256, shard_games=3, opening_random_plies=0.,
-                                             fork_early_fraction=1., fork_early_plies=1e-9))
+                                             fork_early_fraction=1., fork_early_plies=1e-9),
+            learner=dense_config.LearnerSettings(validation_fraction=0.))  # validation games never fork
         dense_config.save(self.run, config)
         (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010', reason='newest', vetoed=[])))
         dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=3, initial_model=None))
