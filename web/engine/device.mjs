@@ -7,9 +7,11 @@ export const WEBGPU = (await probe()).provider === 'webgpu';
 /** The preset a neural engine starts at: its server-sized default on WebGPU, the lightest one on the CPU. */
 export const NEURAL_PRESET = WEBGPU ? 'standard' : 'lightning';
 
-/** Records that `entry` played `stones` stones at `preset` in `ms`; the page shows `entry.pace` (ms per stone at each
- * preset it has played) next to the strength slider. */
+/** Records that `entry` searched a turn of `stones` stones at `preset` in `ms`. The page shows `entry.pace` (ms per
+ * two-stone turn at each preset, a one-stone turn counted twice) next to the strength slider; each turn moves it
+ * halfway to the new time. */
 export function notePace(entry, preset, ms, stones) {
   if (!stones || !entry.presets[preset]) return;
-  entry.pace = {...entry.pace, [preset]: ms / stones};
+  const turn = ms * 2 / stones, old = entry.pace?.[preset];
+  entry.pace = {...entry.pace, [preset]: old == null ? turn : (old + turn) / 2};
 }

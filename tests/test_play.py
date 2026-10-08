@@ -19,7 +19,7 @@ from hexo import Game
 from play import (CPU_PRESETS, Cancelled, Engines, Evaluations, Handler, PRESET_NAMES, PRESETS, SIX_LIBRARIES, SearchChild, Session,
                   book_openings, budget_of, command_of, custom_form, export, export_path, file_digest, file_identity,
                   import_history, linked_history, model_key, move_row, pair_elo, pick_opening, position_text, presets_of,
-                  proof_turns, read_game, review, review_plies, scan, search_key, six_backend)
+                  proof_turns, read_game, review, review_plies, scan, search_key, six_backend, TURN_MS)
 from process_tree import TreeProcess
 from tests import PATIENCE, slow
 
@@ -70,8 +70,11 @@ class FakeEngines:
         self.games, self.refreshes, self.graph = [], [], (None, 0)
 
     def evaluate(self, entry, checkpoint, budget, history, watch, live=None, keep=False, line=None, known=None,
-                 game=None, refresh=None, used=None):
+                 game=None, refresh=None, used=None, placed=None):
         self.calls.append((checkpoint, dict(budget), [tuple(p) for p in history]))
+        moves = legal_turn(history)
+        if placed and len(moves) > 1:   # a move's first stone is decided before the second is searched
+            placed([list(moves[0])])
         self.lines.append(line)
         self.games.append(game)
         if refresh is not None:
@@ -84,9 +87,9 @@ class FakeEngines:
             watch(1)
             time.sleep(.01)
         watch(budget['simulations'])
-        moves = legal_turn(history)
         value = .5 + getattr(self, 'drift', 0) * len(self.refreshes) if refresh is not None else .5
-        found = dict(moves=moves, value=value, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1)
+        found = dict(moves=moves, value=value, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1,
+                     actual_completed=budget['simulations'])
         return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, known=None):
@@ -332,6 +335,10 @@ class Jobs(unittest.TestCase):
         self.assertEqual(state['player'], 0)
         self.assertEqual(state['evaluations'][1]['value'], .5)
         self.assertEqual(self.engines.calls[0][:2], ('main/000002', STANDARD))
+        # The slider's estimate for the preset is now this server's own move time, far below the measured default.
+        pace = next(e['pace'] for e in state['engines'] if e['id'] == 'bubble:fake')
+        self.assertLess(pace['standard'], TURN_MS['CPU']['standard'] / 2)
+        self.assertEqual(pace['deep'], TURN_MS['CPU']['deep'])
         with self.assertRaises(ValueError):
             self.session.configure_seat(1, 'bubble:fake', 'main/000009')
 
@@ -379,6 +386,30 @@ class Jobs(unittest.TestCase):
             finally:
                 engines.close()
 
+    def test_an_engine_turn_shows_its_first_stone_while_the_second_is_searched(self):
+        self.engines.hold = True
+        self.session.play(0, 0)
+        wait(lambda: len(self.history()) == 2)
+        moves = lambda: [j for j in self.session.state()['jobs'] if j['kind'] == 'move']
+        self.assertEqual([(j['status'], j['ply']) for j in moves()], [('running', 1)])
+        self.assertEqual(self.session.state()['player'], 1)
+        self.engines.release.set()
+        wait(lambda: len(self.history()) == 3 and not moves())
+        self.assertEqual(self.history(), [(0, 0), *map(tuple, legal_turn([(0, 0)]))])
+        # A cancelled turn keeps its shown stone; the resumed move plays only the rest of the turn.
+        self.engines.release.clear()
+        for q, r in [(1, 1), (2, 2)]:
+            self.session.play(q, r)
+        wait(lambda: len(self.history()) == 6)
+        self.session.cancel(moves()[0]['id'])
+        wait(lambda: not moves())
+        self.assertEqual(len(self.history()), 6)
+        self.engines.hold = False
+        self.session.pause(False)
+        wait(lambda: len(self.history()) == 7 and not moves())
+        self.assertEqual(self.session.state()['player'], 0)
+        self.assertEqual(len(set(self.history())), 7)
+
     def test_cancel_stops_a_thinking_engine_and_pauses(self):
         self.engines.hold = True
         self.session.play(0, 0)
@@ -389,7 +420,7 @@ class Jobs(unittest.TestCase):
         self.session.cancel(state['jobs'][0]['id'])
         wait(lambda: not self.session.state()['jobs'])
         self.assertTrue(self.session.paused)
-        self.assertEqual(self.history(), [(0, 0)])
+        self.assertEqual(self.history(), [(0, 0), tuple(legal_turn([(0, 0)])[0])])   # the shown first stone stays
         self.engines.hold = False
         self.session.pause(False)
         wait(lambda: len(self.history()) == 3)
@@ -699,14 +730,21 @@ class Jobs(unittest.TestCase):
         self.assertEqual([c[2] for c in started], ['gen-2.onnx', 'gen-1.onnx', 'gen-0.onnx'])
         self.assertEqual([c[2] for c in closed], ['gen-1.onnx'])
 
-    def test_analysis_deepens_through_every_preset_while_an_engine_plays(self):
-        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
-        budgets = [PRESETS['bubble'][name] for name in PRESETS['bubble']]
+    def test_analysis_deepens_up_to_its_preset_while_an_engine_plays(self):
+        self.session.configure_analysis('bubble:fake', preset='strong', auto=True)
+        budgets = [PRESETS['bubble'][name] for name in ('lightning', 'quick', 'standard', 'strong')]
         wait(lambda: all(self.session.store.covering([], key, budget) for budget in budgets
                          for key in [self.session.engine_key(self.session.analysis) + ':kept']))
+        wait(lambda: not self.session.state()['jobs'])
         deep = [budget for checkpoint, budget, history in self.engines.calls if not history]
         self.assertEqual(deep, budgets)
         self.assertIsNone(self.session.analyse(0))
+        # A custom analysis does not deepen: Auto evaluates the position at that budget.
+        self.session.configure_analysis('bubble:fake', preset='custom', custom=dict(ms=300, active='ms'), auto=True)
+        self.session.analyse(0)
+        wait(lambda: any(not history and budget.get('ms') == 300 for _, budget, history in self.engines.calls))
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(len([c for c in self.engines.calls if not c[2]]), len(budgets) + 1)
         self.engines.hold = True
         self.session.load([(0, 0), (1, 0), (1, 1)], False)
         wait(lambda: any(j['status'] == 'running' and j['ply'] == 3 and j['kind'] == 'analyse' for j in self.session.state()['jobs']))
@@ -746,9 +784,9 @@ class Jobs(unittest.TestCase):
                                                      line=line, game=game, used=used)
             return found, spent | dict(solver_nodes=0), key
         self.engines.evaluate = unsolved
-        self.session.configure_analysis('bubble:fake', preset='quick', auto=True)
+        self.session.configure_analysis('bubble:fake', preset='deep', auto=True)
         wait(lambda: not self.session.state()['jobs'])
-        self.assertEqual(len([c for c in self.engines.calls if not c[2]]), len(PRESETS['bubble']))
+        self.assertEqual(len([c for c in self.engines.calls if not c[2]]), len(PRESETS['bubble']) - 1)
 
     def test_finished_positions_are_not_analysed(self):
         final = [(0, 0), (0, 5), (1, 5), (5, 0), (-5, 0), (2, 5), (3, 5), (0, -5), (0, -6), (4, 5), (5, 5)]
@@ -950,23 +988,23 @@ class Jobs(unittest.TestCase):
 
     def test_exclusive_custom_budgets_apply_the_amount_last_edited(self):
         bubble, six = PRESETS['bubble'], PRESETS['six']
-        # An older custom budget moves its simulations onto Nodes and drops its solver nodes.
-        form = custom_form('bubble', bubble['standard'], dict(simulations=300, solver_nodes=9))
-        self.assertEqual(form, dict(simulations=300, ms=1000, active='simulations', views=8))
-        self.assertEqual(budget_of(bubble, 'custom', form, 'bubble'), dict(simulations=300, views=8, solver_nodes=4800))
+        # An older custom budget moves its simulations onto Nodes and drops its solver nodes and Width.
+        form = custom_form('bubble', bubble['standard'], dict(simulations=300, solver_nodes=9, views=4))
+        self.assertEqual(form, dict(simulations=300, ms=1000, active='simulations'))
+        self.assertEqual(budget_of(bubble, 'custom', form, 'bubble'), dict(simulations=300, solver_nodes=4800))
         timed = form | dict(ms=2500, active='ms')   # editing Time applies it; Nodes keeps its value
         self.assertEqual(budget_of(bubble, 'custom', timed, 'bubble'),
-                         dict(simulations=65536, ms=2500, views=8, solver_nodes=10000))
+                         dict(simulations=65536, ms=2500, solver_nodes=10000))
         self.assertEqual(custom_form('bubble', bubble['standard'], timed)['simulations'], 300)
-        back = timed | dict(simulations=600, active='simulations', views=4)
-        self.assertEqual(budget_of(bubble, 'custom', back, 'bubble'), dict(simulations=600, views=4, solver_nodes=9600))
+        back = timed | dict(simulations=600, active='simulations')
+        self.assertEqual(budget_of(bubble, 'custom', back, 'bubble'), dict(simulations=600, solver_nodes=9600))
         self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='ms'), 'six'), dict(ms=900, nodes=2 ** 31 - 1))
         self.assertEqual(budget_of(six, 'custom', dict(nodes=700, ms=900, active='nodes'), 'six'), dict(nodes=700))
         launched = presets_of('six', dict(standard=dict(nodes=1, args=['--visits', '128'])))
         self.assertEqual(budget_of(launched, 'custom', dict(ms=900), 'six'), dict(ms=900, nodes=2 ** 31 - 1, args=['--visits', '128']))
         # Another bot behind Six's protocol keeps the plain custom budget and its launch arguments.
         self.assertEqual(budget_of(launched, 'custom', dict(nodes=9), 'six', form=False), dict(nodes=9, args=['--visits', '128']))
-        for bad in (dict(active='nodes'), dict(views=0), dict(views=17), dict(ms=5)):
+        for bad in (dict(active='nodes'), dict(ms=5), dict(simulations=-1)):
             with self.assertRaises(ValueError):
                 custom_form('bubble', bubble['standard'], bad)
         session = Session(entries(), FakeEngines(), Evaluations())
@@ -1827,8 +1865,8 @@ class Matches(unittest.TestCase):
                          CPU_PRESETS['quick'])
         del self.engines.device
         self.assertEqual(self.session.match_seat('Drip@lightning', 'standard')['budget'], dict(ms=100))
-        custom = self.session.match_seat('bubble:2{simulations=512,views=4}', 'standard')
-        self.assertEqual(custom['budget'], dict(simulations=512, views=4, solver_nodes=8192))
+        custom = self.session.match_seat('bubble:2{simulations=512}', 'standard')
+        self.assertEqual(custom['budget'], dict(simulations=512, solver_nodes=8192))
         for selector in ('bubble:2{ms=2500}', 'bubble:2{simulations=64,ms=2500,active=ms}'):
             self.assertEqual(self.session.match_seat(selector, 'standard')['budget']['ms'], 2500)
         with self.assertRaisesRegex(ValueError, 'not a budget'):

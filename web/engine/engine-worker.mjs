@@ -1,7 +1,8 @@
 /* The page side of a browser engine's Web Worker. The worker answers {type: 'load', options} with 'progress'
  * ({fraction, stage}) messages and then 'ready' ({device}) or 'error' ({message, stage?}); each call {type, id, ...}
- * with 'progress' ({id, fraction, live?, stage?}: `live` a running search's root rows, passed to progress as its
- * second argument, `stage` a loading stage while the call loads a network, its third) messages and then 'result'
+ * with 'progress' ({id, fraction, live?, stage?, placed?}: `live` a running search's root rows, passed to progress as
+ * its second argument, `stage` a loading stage while the call loads a network, its third, `placed` a turn's stones
+ * decided so far, its fourth) messages and then 'result'
  * ({id, result}), 'error' ({id, message, stage?}) or, after {type: 'cancel', id}, 'cancelled' ({id}). Stages are
  * stages.mjs's. */
 import {deviceThreads} from './network.mjs';
@@ -160,7 +161,7 @@ export class EngineWorker {
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { if (!wait.cancelled) { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage); } return; }
+        if (data.type === 'progress') { if (!wait.cancelled) { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage, data.placed); } return; }
         this.watch(data.id, null);
         if (!wait.cancelled && data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);

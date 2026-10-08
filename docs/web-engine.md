@@ -2,17 +2,21 @@
 
 Bubble runs entirely in the browser: the network under ONNX Runtime Web (WebGPU, else WebAssembly), the native
 Gumbel search (`src/gumbel.cpp`) and the tactical solver (`tools/tactical`) compiled to WebAssembly, in Web Workers.
-On the play page pick **Bubble (browser)** for a seat or for analysis; presets are lightning 16/1024, quick 64/2048,
-standard 256/4096, strong 512/8192, deep 1024/16384 and dangerous 65536/4000000 (nodes of work per stone / root query
-nodes), the served page's GPU ladder (docs/play.md has their times). A custom budget runs Nodes or Time with a
-Width (`customForm` and `customBudget` in `play-session.mjs`); under Time the turn runs on the timed path below.
+On the play page pick **Bubble (browser)** for a seat or for analysis. On WebGPU the presets are lightning 16/1024,
+quick 64/2048, standard 256/4096, strong 512/8192, deep 1024/16384 and dangerous 65536/4000000 (nodes of work per
+stone / root query nodes), the served page's GPU ladder; on WebAssembly they are 4/512, 8/1024, 16/2048, 32/4096,
+64/8192 and 1024/131072, the CPU server's ladder (`GPU_PRESETS` and `CPU_PRESETS` in `bubble.mjs`; docs/play.md has
+their times). An engine that falls back from WebGPU to WebAssembly takes the WebAssembly ladder. A custom budget runs
+Nodes or Time (`customForm` and `customBudget` in `play-session.mjs`); under Time the turn runs on the timed path
+below. A stone decided before the turn's last is posted at once (a progress message with `placed`), and the
+session puts it on the board while the next stone is searched.
 Analysis also has the solver preset (`SOLVER` in `play-session.mjs`, docs/play.md): up to two minutes of proof work
 before the turn, the root solver beside a native owner whose frontier feeds the proof workers, stopping at the first
 verified proof (`proveRoot` in `worker.mjs`).
 
 Every Bubble search on the page runs the hybrid scheduler, for analysis, review, refreshes, seats and matches. That
 is the native graph owner (`NativeOwner` in `search.mjs`, `src/gumbel_owner.cpp`) on the game's `GameGraph`, with the
-served page's settings of 8 views (a custom Width changes it), depth 8, 16 root samples and the round barrier on. The preset's simulations are
+served page's settings of 8 views, depth 8, 16 root samples and the round barrier on. The preset's simulations are
 the owner's work per stone, counted as completed simulations over all its views, in quanta of 64, or of the
 stone's work when that is smaller (the owner takes 4 at least). With solver nodes above 0 the root queries (a win for the side to move, the opponent's
 threat, the defence) run first at that node budget, and then the owner's proof frontier runs on the proof workers

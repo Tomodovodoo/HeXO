@@ -17,7 +17,7 @@
  * evaluation record the analysis panel shows for that turn. A seat or the analysis shows the stage of its job next to
  * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
  * engine's choices to lightning. */
-import {BubbleEngine, NETWORKS, PRESETS, isolate, networkManifest} from './bubble.mjs';
+import {BubbleEngine, CPU_PRESETS, NETWORKS, PRESETS, isolate, networkManifest, turnTimes} from './bubble.mjs';
 import {drip} from './drip.mjs';
 import {shrimp} from './shrimp.mjs';
 import {mountPlay, deviceLabel} from './browser-play.mjs';
@@ -32,10 +32,10 @@ import {stageText} from './stages.mjs';
 import {savedIds} from './storage.mjs';
 
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
-const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
+const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, pace: turnTimes(PRESETS), preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
-  record: (result, history, preset) => ({...result, simulations: PRESETS[preset].simulations,
-    solver_nodes: result.solved ? PRESETS[preset].solver_nodes : 0, engine: BUBBLE}),
+  record: (result, history, preset) => ({...result, simulations: bubble.entry.presets[preset].simulations,
+    solver_nodes: result.solved ? bubble.entry.presets[preset].solver_nodes : 0, engine: BUBBLE}),
   build: 'python tools/build_web.py ort model'};
 const ENGINES = new Map([bubble, drip, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
@@ -195,7 +195,7 @@ async function run(key, task) {
     const started = performance.now();
     const result = await engine.turn(task.history, budget, {signal: controller.signal, ms, line: task.line,
       progress: (f, live, stage) => { current.fraction = f; current.stage = stageText(stage); progress(); }});
-    if (ms == null) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
+    if (ms == null && result.actual_completed !== 0) notePace(entry, task.preset, performance.now() - started, result.moves?.length);
     if (job !== current) return;
     job = null;
     if (task.kind === 'move') {
@@ -387,14 +387,15 @@ function recheck(entry, force = false) {
   } else if (state()) page.renderPanels();
 }
 
-/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, and the saved
- * choices (or the static page's session) that use it at another preset move to lightning, ending a job of it at
- * another preset. */
+/** After browser engine `engine` left WebGPU for WebAssembly: lightning becomes its starting preset, a Bubble takes
+ * the WebAssembly ladder (bubble.mjs CPU_PRESETS), and the saved choices (or the static page's session) that use it
+ * at another preset move to lightning, ending a job of it at another preset. */
 function lighten(engine) {
   const found = [...ENGINES.values()].find(e => e.engine === engine);
   if (!found) return;
   const id = found.entry.id;
   found.entry.preset = 'lightning';
+  if (found.entry.kind === 'bubble') Object.assign(found.entry, {presets: CPU_PRESETS, pace: turnTimes(CPU_PRESETS)});
   if (page.browserPlay) { page.browserPlay.lighten(id); return; }
   const light = choice => choice?.engine === id ? {...choice, preset: 'lightning'} : choice;
   config = {seats: config.seats.map(light), analysis: light(config.analysis)};
