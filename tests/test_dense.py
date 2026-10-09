@@ -3207,7 +3207,7 @@ class DenseBootstrapTests(unittest.TestCase):
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
                                                  proven_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
-                                                 restart_games=0, book_games=0, forced_plies=0))
+                                                 restart_games=0, book_games=0, fork_games=0, forced_plies=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
             self.assertEqual({r['game'] for r in stored}, {0, 1})
@@ -6235,6 +6235,92 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dense_config.ActorSettings(book_fraction=.95, restart_fraction=.1)
 
+    def test_fork_plays_the_value_heads_best_random_move_for_the_forking_side(self):
+        moves = [[0, 0], [7, 0], [8, 0], [1, 0], [2, 0], [7, 1]]
+        scored = []
+
+        def evaluate(histories):
+            scored.append([h.tolist() for h in histories])
+            return [(None, None, np.full(1, np.sin(1.3*h[-1][0]+.7*h[-1][1]))) for h in histories]
+        model = SimpleNamespace(evaluator=SimpleNamespace(evaluate=evaluate))
+        settings = dense_config.ActorSettings(fork_early_fraction=1., fork_min_choices=5, fork_early_choices=5,
+                                              max_plies=8)
+        for ply, same_mover in ((1, True), (2, False)):
+            scored.clear()
+            rng = SimpleNamespace(random=lambda: 0., exponential=lambda mean: ply+.5,
+                                  integers=np.random.default_rng(ply).integers)
+            forks = dense_selfplay.Forks(settings, 0., rng)
+            metadata, start = forks.offer(dict(moves=moves), model)
+            self.assertEqual(forks.take(), (metadata, start))
+            self.assertIsNone(forks.take())
+            self.assertEqual(metadata, dict(kind='early', ply=ply, choices=5))
+            self.assertEqual(start[:ply], moves[:ply])
+            (histories,) = scored
+            self.assertEqual(len(histories), 5)
+            self.assertTrue(all(h[:-1] == moves[:ply] for h in histories))
+            # The value head scores the position for its side to move: the forker after a first stone, the
+            # opponent after a second stone.
+            sign = 1 if same_mover else -1
+            values = [sign*np.sin(1.3*h[-1][0]+.7*h[-1][1]) for h in histories]
+            self.assertEqual(start[-1], histories[int(np.argmax(values))][-1])
+        rng = lambda: SimpleNamespace(random=lambda: 0., exponential=lambda mean: 2.5,
+                                      integers=np.random.default_rng(0).integers)
+        self.assertIsNone(dense_selfplay.Forks(settings, 1., rng()).offer(dict(moves=moves), model))
+        self.assertIsNone(dense_selfplay.Forks(replace(settings, max_plies=3), 0., rng()).offer(dict(moves=moves), model))
+        self.assertIsNone(dense_selfplay.Forks(settings, 0., rng()).offer(dict(moves=moves[:2]), model))
+        never = SimpleNamespace(random=lambda: .5, exponential=None, integers=None)
+        self.assertIsNone(dense_selfplay.Forks(replace(settings, fork_early_fraction=.4, fork_anywhere_fraction=.1), 0.,
+                                               never).offer(dict(moves=moves), model))
+        # Player 1 holds five in a row with one stone left to place; drawing the open end means the best move wins.
+        five = [[0, 0], [0, 1], [0, 2], [5, 5], [5, 6], [0, 3], [0, 4], [6, 5], [6, 6], [0, 5]]
+        game = Game([tuple(m) for m in five])
+        winning = [i for i, (q, r) in enumerate(game.legal_moves()) if (q, r) == (0, 6)]
+        game.close()
+        for index, forked in ((winning[0], False), (winning[0]+1, True)):
+            drawn = SimpleNamespace(random=lambda: 0., exponential=lambda mean: len(five)+.5,
+                                    integers=lambda low, high=None, size=None: 3 if size is None else np.full(size, index))
+            offered = dense_selfplay.Forks(replace(settings, max_plies=20), 0., drawn).offer(dict(moves=five+[[9, 9]]), model)
+            self.assertEqual(offered is not None, forked)
+        anywhere = SimpleNamespace(random=iter([.5, .05]).__next__, exponential=None,
+                                   integers=np.random.default_rng(0).integers)
+        metadata, _ = dense_selfplay.Forks(replace(settings, fork_early_fraction=.4, fork_anywhere_fraction=.1), 0.,
+                                           anywhere).offer(dict(moves=moves), model)
+        self.assertEqual(metadata['kind'], 'anywhere')
+        for bad in (dict(fork_anywhere_fraction=1.5), dict(fork_early_plies=0.),
+                    dict(fork_min_choices=13)):
+            with self.assertRaisesRegex(ValueError, 'fork fractions'):
+                dense_config.ActorSettings(**bad)
+
+    def test_fork_start_searches_only_after_the_forked_move_and_records_its_point(self):
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, full_fraction=1., full_sims=2, root_samples=2,
+                                              opening_random_plies=5., tactics=False, max_plies=6)
+        fork = dict(kind='anywhere', ply=2, choices=7)
+        slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, fork=(fork, [[0, 0], [7, 0], [8, 0]]))
+        engine = dense_selfplay.Engine(8)
+        try:
+            engine.add(slot)
+            while engine.slots:
+                engine.step()
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        self.assertEqual((episode['origin'], episode['fork'], episode['opening_plies']), ('fork', fork, 3))
+        self.assertEqual(episode['root_values'][:3], [None]*3)
+        self.assertTrue(all(v is not None for v in episode['root_values'][3:]))
+        self.assertEqual([r['ply'] for r in rows], [3, 4, 5])
+        self.assertEqual(dense_data.forced_plies(episode), 3)
+        with tempfile.TemporaryDirectory() as run:
+            manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'),
+                                             [episode], [dict(r, game=0) for r in rows])
+            self.assertEqual((manifest['counts']['fork_games'], manifest['counts']['forced_plies']), (1, 3))
+            self.assertEqual(manifest['move_geometry']['groups']['forced-prefix/opening']['placements'], 3)
+            window = dense_data.ReplayWindow(run, capacity_rows=100, validation_fraction=0.)
+            self.assertEqual(sorted(window.ref(*ref).row['ply'] for ref in window.index), [3, 4, 5])
+        with self.assertRaisesRegex(ValueError, 'at most one'):
+            dense_selfplay.SelfPlayGame([model, model], settings, 1, fork=(fork, [[0, 0]]), book=({}, [[0, 0]]))
+
     def test_cheap_search_can_descend_with_fewer_root_samples(self):
         slot = SimpleNamespace(settings=dense_config.ActorSettings(full_fraction=0.), rng=np.random.default_rng(1))
         dense_selfplay.SelfPlayGame.plan(slot)
@@ -7592,6 +7678,28 @@ class ActorModelTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
         self.assertEqual([(e['previous'], e['checkpoint']) for e in events if e['kind'] == 'actor_model'],
                          [('main/000010', 'main/000020')])
+
+    def test_worker_plays_each_fork_as_its_next_game(self):
+        self.export('main/000010', 1.)
+        config = dense_config.RunConfig(
+            device='cpu', model=dense_config.ModelSettings(**{k: getattr(TINY, k) for k in (
+                'blocks', 'channels', 'pool_every', 'line_length', 'value_hidden', 'head_channels')}),
+            actor=dense_config.ActorSettings(games_in_flight=1, leaf_batch=64, full_sims=2, cheap_sims=2, root_samples=2,
+                                             max_plies=6, cache_positions=256, shard_games=3, opening_random_plies=0.,
+                                             fork_early_fraction=1., fork_early_plies=1e-9),
+            learner=dense_config.LearnerSettings(validation_fraction=0.))  # validation games never fork
+        dense_config.save(self.run, config)
+        (self.run/'actor.json').write_text(json.dumps(dict(checkpoint='main/000010', reason='newest', vetoed=[])))
+        dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=3, initial_model=None))
+        (shard,) = dense_data.shard_dirs(self.run)
+        episodes = json.loads((shard/'episodes.json').read_text())
+        # Each finished game forks at its first placement, the only legal move of an empty board.
+        self.assertEqual([e['origin'] for e in episodes], ['selfplay', 'fork', 'fork'])
+        self.assertTrue(all(e['fork'] == dict(kind='early', ply=0, choices=e['fork']['choices'])
+                            and 3 <= e['fork']['choices'] <= 12 and e['moves'][0] == [0, 0] for e in episodes[1:]))
+        counts = dense_data.manifest(shard)['counts']
+        self.assertEqual((counts['fork_games'], counts['forced_plies']), (2, 2))
+        self.assertEqual(json.loads((self.run/'events.jsonl').read_text().splitlines()[-1])['fork_games'], 2)
 
     def test_hybrid_worker_publishes_rotating_checkpoint_rows_that_learner_can_read(self):
         self.export('main/000010',1.)
