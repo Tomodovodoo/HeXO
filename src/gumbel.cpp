@@ -377,6 +377,7 @@ struct Tree {
   bool round_barrier=false;RootRound round;
   double root_noise=0;   // noise share of the root's candidate sampling distribution (sampling)
   double root_concentration=0;  // 0: uniform noise; > 0: shaped Dirichlet noise of this total concentration (draw_noise)
+  double root_temperature=1;    // divides the logits the root's candidate sampling draws on (sampling, draw_noise)
  double bonus(const Edge& e)const {auto i=defence.find(e.action);return i==defence.end()?0:i->second;}
  std::vector<double> work;
  explicit Tree(uint64_t seed,std::shared_ptr<GameStore> game=std::make_shared<GameStore>()):
@@ -411,14 +412,14 @@ struct Tree {
  }
  // KataGo's shaped Dirichlet noise over the eligible root edges, one draw per search, kept in root_edges[i].noise:
  // half of the concentration is spread evenly, half in proportion to how far each edge's log min(p, 0.01) lies above
- // the eligible edges' mean, p the softmax of the eligible logits.
+ // the eligible edges' mean, p the softmax of the eligible logits divided by root_temperature.
  void draw_noise(){
   auto& edges=root->edges;double maximum=-1e300,total=0,mean=0,excess=0,sum=0;int n=0;
-  for(auto& e:edges)if(e.read().eligible){maximum=std::max(maximum,e.logit);++n;}
+  for(auto& e:edges)if(e.read().eligible){maximum=std::max(maximum,e.logit/root_temperature);++n;}
   if(!n)return;
-  for(auto& e:edges)if(e.read().eligible)total+=std::exp(e.logit-maximum);
+  for(auto& e:edges)if(e.read().eligible)total+=std::exp(e.logit/root_temperature-maximum);
   std::vector<double> shape(edges.size());
-  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,std::exp(edges[i].logit-maximum)/total)+1e-20);mean+=shape[i];}
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,std::exp(edges[i].logit/root_temperature-maximum)/total)+1e-20);mean+=shape[i];}
   mean/=n;
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::max(0.,shape[i]-mean);excess+=shape[i];}
   // Gamma(a) draws as log Gamma(a + 1) + log(U) / a, normalized in log space: tiny shapes underflow as plain draws.
@@ -849,14 +850,15 @@ struct Tree {
   }
   return chosen;
  }
- // Root candidate sampling logits: each edge's logit, or with root_noise e > 0 log((1 - e) p + e d) for the N
- // eligible edges, p their softmax over the eligible logits and d the noise: 1 / N, or with root_concentration > 0
+ // Root candidate sampling logits: each edge's logit divided by root_temperature, or with root_noise e > 0
+ // log((1 - e) p + e d) for the N eligible edges, p the softmax of those tempered logits over the eligible edges and d
+ // the noise: 1 / N, or with root_concentration > 0
  // the search's Dirichlet draw (draw_noise) renormalized over the edges still eligible, so proofs that remove edges
  // after the draw leave the noise weight at e. Only the opening phase's Gumbel-top-k draws on these; halving, the final
  // choice, the improved policy and every non-root node use the edge logits.
  std::vector<double> sampling(const Node& node)const {
   std::vector<double> out;double maximum=-1e300,total=0;int n=0;
-  for(auto& e:node.edges){out.push_back(e.logit);if(e.read().eligible){maximum=std::max(maximum,e.logit);++n;}}
+  for(auto& e:node.edges){out.push_back(e.logit/root_temperature);if(e.read().eligible){maximum=std::max(maximum,out.back());++n;}}
   if(root_noise<=0 || !n)return out;
   double mass=0;
   for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible){total+=std::exp(out[i]-maximum);if(root_concentration>0)mass+=root_edges[i].noise;}
@@ -1353,6 +1355,8 @@ HX_API int hxg_round_barrier(void* p,int enabled){try{auto& t=*static_cast<gumbe
  if((enabled!=0 && enabled!=1) || t.started || !t.requests.empty())throw std::runtime_error("Configure rounds before search work");
  if(t.round_barrier!=bool(enabled))t.root_sessions.clear();t.round_barrier=enabled;if(t.budget)t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](const auto& e){return e.read().eligible;})):int(t.board.legal_moves().size()));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_root_noise(void* p,double noise){if(!(noise>=0 && noise<1)){gumbel::error="Invalid root noise";return 0;}static_cast<gumbel::Tree*>(p)->root_noise=noise;return 1;}
+// Softmax temperature of the root's candidate sampling prior, before noise; 1 keeps the prior. Applies from the next search.
+HX_API int hxg_root_temperature(void* p,double temperature){if(!(temperature>0 && std::isfinite(temperature))){gumbel::error="Invalid root temperature";return 0;}static_cast<gumbel::Tree*>(p)->root_temperature=temperature;return 1;}
 // Total Dirichlet concentration of the root noise; 0 keeps the uniform share. Applies from the next search.
 HX_API int hxg_root_concentration(void* p,double concentration){if(!(concentration>=0 && std::isfinite(concentration))){gumbel::error="Invalid root noise concentration";return 0;}static_cast<gumbel::Tree*>(p)->root_concentration=concentration;return 1;}
 // Diagnostic census of the structure reachable from the root: out = {nodes, expanded, exact, expanded nodes whose turn
@@ -1468,7 +1472,7 @@ extern "C" HX_API void* hxg_view(void* source,const int64_t* history,int count,u
   auto& original=*static_cast<gumbel::Tree*>(source);
   if(!original.shared || count<0)throw std::runtime_error("View needs a shared graph and valid history");
   auto view=std::make_unique<gumbel::Tree>(seed,original.state);view->shared=view->graph=true;
-  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->root_concentration=original.root_concentration;view->round_barrier=original.round_barrier;
+  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->root_concentration=original.root_concentration;view->root_temperature=original.root_temperature;view->round_barrier=original.round_barrier;
   std::vector<Cell> h;for(int i=0;i<count;++i)h.push_back({history[2*i],history[2*i+1]});view->root_at(h);
   return view.release();
  }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}

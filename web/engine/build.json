@@ -1,12 +1,12 @@
 {
  "sources": {
-  "src/gumbel.cpp": "f60e9ef16582e57f96cd4892dee93ee2694318ab14e469de73dd3f24c732115e",
-  "src/gumbel_owner.cpp": "819478e0e0b9e6e532866e0bb3ece72c14ff3c0f351234798dc9b5c317ff994e",
+  "src/gumbel.cpp": "0c591746cdbd92efde393354e690ca68d85678aba139b051e86fd66e7b0805ac",
+  "src/gumbel_owner.cpp": "90571c2d50adfffce9a98a51795931b37cf9d22847eae2522eee5b06497fc7e5",
   "src/gumbel_proof.cpp": "f6dfc96902c899ddd8a550b562707f3740d1cec62f9097866f51ae4ebe49e66b",
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
   "src/gumbel_batch.cpp": "a5defcd282fd94191c9db41ba069ecff5b11ee058f5b91dcb6523ef551bebf28",
   "src/gumbel_parallel.hpp": "123bee0c1cecbd53fc4bed49e3f9d574f40530dcd34579afc34578378e975e4a",
-  "src/gumbel_broker.hpp": "ea963a6b9df919129e45bf9bf95654bb936b896b3a1f466e08aa595289a3cfc7",
+  "src/gumbel_broker.hpp": "b46c7e1821e13f8e60e5e9bbabebef5c96ab9381415defbd0c18d334900acaf7",
   "src/hexo.cpp": "9c55ee1a4575df4caa738d0bfff566a0a5c7ad43ff1e3ad7898ead6eb0876853",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
@@ -91,7 +91,7 @@
  },
  "artefacts": {
   "gumbel.mjs": "c38bfb3600ad3ecb05d7844cfe696461d3a2511a8682fe51752704cb33a3fb37",
-  "gumbel.wasm": "cc1f7581f77d0de3e220292c09f7dda053e967ed1d36aaef8724eaea70a74855",
+  "gumbel.wasm": "3fe54b6cf5fc9bd2aa4695ea2e150753779bd7be615bc14bbf13cdd2071e7b8d",
   "tactical.wasm": "8701ab6f52ce7b9ca8c07e29ea030facbf532849b163a0e747a09aa4aff336b2",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "371a7e1214b7ad14eaa4f3127e910555799b67d67b68f6fecf2c1d8cc57b2ea4",

@@ -62,6 +62,11 @@ class ActorSettings:
     q_range_floor: float = 0.    # least Q range of the completed-Q rescale, 0 to 2 (neural_search); 0 keeps mctx's
     root_noise: float = 0.       # full searches' noise share of root sampling, [0, 1) (neural_search); 0 = prior
     root_noise_concentration: float = 0.  # 0: uniform noise; > 0: shaped Dirichlet noise of this total concentration
+    # Full searches' root sampling temperature (dense_selfplay.root_temperature): root_temperature_early at ply 0,
+    # decaying toward root_temperature with a half-life of root_temperature_halflife placements; 1 and 1 = the prior.
+    root_temperature_early: float = 1.
+    root_temperature: float = 1.
+    root_temperature_halflife: float = 38.
     # game_graph > 0: each game's trees are shared game graphs (neural_search.GameGraph) keeping at most that many
     # expanded nodes between searches; 0 keeps one tree per model, pruned on every advance. pv_check (needs a game
     # graph): share of a full search's simulations its principal-variation check takes (neural_search.Recheck).
@@ -177,6 +182,9 @@ class ActorSettings:
             raise ValueError('root_noise must lie in [0, 1)')
         if not 0 <= self.root_noise_concentration < float('inf'):
             raise ValueError('root_noise_concentration must be finite and nonnegative')
+        if not all(0 < t < float('inf') for t in (self.root_temperature_early, self.root_temperature,
+                                                 self.root_temperature_halflife)):
+            raise ValueError('root temperatures and their half-life must be finite and positive')
         if self.game_graph < 0 or not 0 <= self.pv_check < .5 or self.pv_check and not self.game_graph:
             raise ValueError('game_graph must be nonnegative and pv_check in [0, 0.5) with a game graph')
         if self.cheap_root_samples < 1 or self.solver_leaf_nodes < 0:

@@ -422,7 +422,7 @@ class HybridGames:
                               ms=self.ms if game.is_full else 0,samples=game.samples,
                               views=self.views if game.is_full else 1,
                               noise=game.settings.root_noise if game.is_full else 0.,
-                              concentration=game.settings.root_noise_concentration)
+                              concentration=game.settings.root_noise_concentration,temperature=game.temperature)
 
     def retire(self, index):
         keys = {self.mapping[index,m] for m in self.slot_models[index]}

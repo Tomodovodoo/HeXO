@@ -35,6 +35,7 @@ bind('hxg_graph', C.c_int, ptr, C.c_int)
 bind('hxg_q_range_floor', C.c_int, ptr, C.c_double)
 bind('hxg_root_noise', C.c_int, ptr, C.c_double)
 bind('hxg_root_concentration', C.c_int, ptr, C.c_double)
+bind('hxg_root_temperature', C.c_int, ptr, C.c_double)
 bind('hxg_round_barrier', C.c_int, ptr, C.c_int)
 bind('hxg_census', C.c_int, ptr, ptr)
 bind('hxg_exact', C.c_int, ptr)
@@ -102,7 +103,8 @@ class NeuralSearch:
     the N eligible moves instead of the prior p, while halving, the final choice and the policy target keep p.
     `root_concentration` c > 0 replaces the uniform 1 / N by KataGo's shaped Dirichlet noise, drawn once per search
     at total concentration c: half of c spread evenly over the eligible moves, half in proportion to how far each
-    move's log min(p, 0.01) lies above their mean.
+    move's log min(p, 0.01) lies above their mean. `root_temperature` T > 0 divides the logits that sampling and
+    that noise shape read, before the noise is mixed in; halving, the final choice and the policy target keep them.
     `limit`, when given, makes the tree a shared game graph (see GameGraph) keeping at most that many expanded nodes
     between searches (0: no bound). `archive_bytes` optionally retains up to 256 dormant expansions under a managed
     payload/index byte allowance (at least 64 KiB); it does not bound allocator residency or the active graph.
@@ -111,7 +113,8 @@ class NeuralSearch:
     within each halving round while permitting concurrent work across visit layers; default false."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
                  tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
-                 root_concentration=0., limit=None, archive_bytes=0, archive_forward=False, round_barrier=False):
+                 root_concentration=0., limit=None, archive_bytes=0, archive_forward=False, round_barrier=False,
+                 root_temperature=1.):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -133,6 +136,7 @@ class NeuralSearch:
             checked(native.hxg_q_range_floor(self.ptr, q_range_floor))
             checked(native.hxg_root_noise(self.ptr, root_noise))
             checked(native.hxg_root_concentration(self.ptr, root_concentration))
+            checked(native.hxg_root_temperature(self.ptr, root_temperature))
             checked(native.hxg_round_barrier(self.ptr, int(round_barrier)))
             for point in history:
                 self.advance(point)
@@ -360,9 +364,10 @@ class GameGraph(NeuralSearch):
 
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
                  proof_ms=100, q_range_floor=0., root_noise=0., root_concentration=0., limit=GRAPH_LIMIT, archive_bytes=0,
-                 archive_forward=False, round_barrier=False):
+                 archive_forward=False, round_barrier=False, root_temperature=1.):
         super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
                          q_range_floor=q_range_floor, root_noise=root_noise, root_concentration=root_concentration,
+                         root_temperature=root_temperature,
                          limit=limit, archive_bytes=archive_bytes,
                          archive_forward=archive_forward, round_barrier=round_barrier)
 
