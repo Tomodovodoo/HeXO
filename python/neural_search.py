@@ -50,6 +50,8 @@ bind('hxg_share', C.c_int, ptr, C.c_int64)
 bind('hxg_archive', C.c_int, ptr, C.c_int64)
 bind('hxg_archive_forward', C.c_int, ptr, C.c_int)
 bind('hxg_archive_stats', C.c_int, ptr, ptr)
+bind('hxg_memory', None, ptr, ptr)
+bind('hxg_edge_bytes', C.c_int64)
 bind('hxg_root_at', C.c_int, ptr, ints, C.c_int)
 bind('hxg_store', C.c_int, ptr, ptr)
 bind('hxg_root_version', C.c_int64, ptr)
@@ -68,6 +70,11 @@ PV_DROP = .05       # completed-Q fall (value units, -1 to 1) of the chosen ston
 def checked(ok):
     if not ok:
         raise ValueError(native.hxg_error().decode())
+
+
+def edge_bytes():
+    """Bytes the edge memory of every native game in this process holds (legal-action buffers and edge states)."""
+    return int(native.hxg_edge_bytes())
 
 class EvaluationCache:
     """Colored stones, turn context and model keys. No visit statistics are shared."""
@@ -423,6 +430,13 @@ class GameGraph(NeuralSearch):
         out = np.zeros(6, np.int64)
         native.hxg_store(self.ptr, out.ctypes.data)
         return dict(zip(('nodes', 'expanded', 'evicted', 'limit', 'summaries', 'outcomes'), map(int, out)))
+
+    def memory(self):
+        """{nodes, edges: the stored nodes' legal actions, bytes, peak_bytes: what the game's edge memory holds now
+        and at most so far} (native hxg_memory). Call between searches."""
+        out = np.zeros(4, np.int64)
+        native.hxg_memory(self.ptr, out.ctypes.data)
+        return dict(zip(('nodes', 'edges', 'bytes', 'peak_bytes'), map(int, out)))
 
     def archive(self):
         """Dormant evidence payload, estimated index bytes and reuse counts; excludes pool overhead/RSS."""

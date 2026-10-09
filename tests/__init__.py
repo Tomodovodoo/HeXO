@@ -11,3 +11,22 @@ slow = unittest.skipUnless(SLOW, 'slow tier (set HEXO_SLOW=1)')
 PATIENCE = 60.
 # Solver time cap (the most a query accepts) for queries whose node budget must decide the answer.
 QUERY_MS = 60_000
+
+
+def resident_bytes():
+    """This process's resident memory: its working set on Windows, its resident pages elsewhere."""
+    if os.name == 'nt':
+        import ctypes as C
+        class Counters(C.Structure):
+            _fields_ = [('cb', C.c_uint32), ('faults', C.c_uint32)] + [(name, C.c_size_t) for name in (
+                'peak_resident', 'resident', 'peak_paged_pool', 'paged_pool', 'peak_nonpaged_pool', 'nonpaged_pool',
+                'pagefile', 'peak_pagefile')]
+        counters = Counters(cb=C.sizeof(Counters))
+        current, read = C.windll.kernel32.GetCurrentProcess, C.windll.psapi.GetProcessMemoryInfo
+        current.restype = C.c_void_p
+        read.argtypes = (C.c_void_p, C.POINTER(Counters), C.c_uint32)
+        if not read(current(), C.byref(counters), counters.cb):
+            raise C.WinError()
+        return counters.resident
+    with open('/proc/self/statm') as f:
+        return int(f.read().split()[1])*os.sysconf('SC_PAGE_SIZE')

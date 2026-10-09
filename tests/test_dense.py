@@ -38,7 +38,7 @@ import dense_learn
 import dense_posterior
 import dense_selfplay
 from neural_search import NeuralSearch
-from tests import PATIENCE, slow
+from tests import PATIENCE, resident_bytes, slow
 
 ROOT = Path(__file__).resolve().parents[1]
 # Seal has no licence, so no build or CI ships it; tests that play it need a local -DHEXO_SEAL_SOURCE build.
@@ -4596,6 +4596,69 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(engine.paused)
         self.assertEqual(capture.call_count,2)
         self.assertTrue(all(c.kwargs==dict(max_incremental_bytes=123,max_batch=128) for c in capture.call_args_list))
+
+    @staticmethod
+    def waves(engine, model, settings, waves, games, measure=None):
+        """Play `waves` rounds of `games` fresh games each to the end; call measure(engine) after every step and
+        return the number of games played."""
+        played, end = 0, time.monotonic()+PATIENCE*waves
+        for wave in range(waves):
+            for i in range(games):
+                engine.add(dense_selfplay.SelfPlayGame([model]*2,settings,100*wave+i,hybrid=True))
+            while engine.slots and time.monotonic()<end:
+                for game in engine.step():
+                    game.episode()
+                    played += 1
+                if measure:
+                    measure(engine)
+        return played
+
+    def test_hybrid_actor_returns_every_retired_game_graph(self):
+        from hybrid_selfplay import ActorEngine
+        from neural_search import edge_bytes
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'returned','fixed','cpu',64,128)
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,game_graph=64,hybrid_quantum=8,
+            hybrid_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=12,opening_random_plies=0.,
+            hybrid_proof_workers=0)
+        before = edge_bytes()
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        def bounded(engine):
+            stats = engine.engine.service.stats()
+            # Retired graphs and pools wait for one background reclaimer, at most two at a time.
+            self.assertLessEqual(stats['reclaim_queued']+stats['reclaim_active'],2)
+        self.assertEqual(self.waves(engine,model,settings,3,4,bounded),12)
+        engine.drain()
+        self.assertGreaterEqual(engine.engine.receipt['inference']['reclaimed_games'],12)
+        self.assertEqual(edge_bytes(),before)
+
+    @slow
+    def test_hybrid_actor_resident_memory_stays_flat_over_many_games(self):
+        from hybrid_selfplay import ActorEngine
+        from neural_search import edge_bytes
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'flat','fixed','cpu',64,128)
+        settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,game_graph=256,hybrid_quantum=8,
+            hybrid_views=2,full_sims=16,cheap_sims=4,leaf_batch=64,max_plies=24,opening_random_plies=0.,
+            hybrid_proof_workers=0)
+        before = edge_bytes()
+        engine = ActorEngine(settings)
+        self.addCleanup(engine.close)
+        graph = [0]
+        def largest(engine):
+            if engine.slots:
+                graph[0] = max(graph[0],(edge_bytes()-before)/len(engine.slots))
+        # Allocator and cache warm-up first; then a retained game would add its whole graph per game.
+        self.waves(engine,model,settings,3,8,largest)
+        warm = resident_bytes()
+        games = self.waves(engine,model,settings,6,8,largest)
+        grown = resident_bytes()-warm
+        self.assertEqual(games,48)
+        self.assertGreater(graph[0],1<<20)
+        self.assertLess(grown,.1*graph[0]*games,(grown,graph[0]))
+        engine.drain()
+        self.assertEqual(edge_bytes(),before)
 
     def test_hot_producer_retirement_keeps_old_device_snapshot_and_new_model_separate(self):
         from hybrid_scheduler import InferenceService
