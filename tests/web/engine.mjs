@@ -19,7 +19,8 @@
 // {kind: 'threads', contexts: [{isolated, cores}]} -> the WebAssembly thread count the loader would pick
 // {kind: 'table', records: [[history, record]], queries: [history], result, lost, exact, mover} -> {known, edges} per query
 //   from a proof.mjs Proofs and `settled` of `result`, `lost` and `exact` with the edges of the first query
-// {kind: 'retired-checkpoints'} -> the checkpoints a BrowserSession gives Strix and Bubble seats naming networks it does not offer
+// {kind: 'retired-checkpoints'} -> the checkpoints, presets and budgets a BrowserSession gives Strix and Bubble seats
+//   whose saved or carried-over network or budget their engine does not offer
 // {kind: 'proofs', history, ply, found} -> a BrowserSession whose engine proves `found` at `ply` and searches other positions
 //   with the stones the proof table it is sent proves marked (see `searched`): the evaluations at ply - 1 after analysis,
 //   undo, another preset and a reload, and `given`, the turn proof.mjs answered gives at ply - 1 from `found`'s table
@@ -792,6 +793,17 @@ if (job.kind === 'encode') {
   answer.bubble = [await seat(0, {engine: 'bubble', checkpoint: 'b1'}), late.seats[0].checkpoint, await seat(0, {engine: 'bubble', preset: 'standard'}), late.seats[0].checkpoint,
     await seat(1, {engine: 'bubble'}), late.seats[1].checkpoint, await seat(1, {engine: 'plain'}), late.seats[1].checkpoint];
   answer.untouched = late.relist('bubble');
+  // Bubble's seat and analysis at a custom budget with Time active and Nodes blank, then switched to Strix; a Strix
+  // custom budget without Strix's own field; a saved Strix seat holding Bubble's budget.
+  const timed = {preset: 'custom', custom: {simulations: 0, ms: 2500, active: 'ms'}};
+  await seat(0, {engine: 'bubble', ...timed}); await late.request('/analysis', {engine: 'bubble', ...timed, auto: true}, 'POST');
+  answer.switched = [await seat(0, {engine: 'strix'}), (await late.request('/analysis', {engine: 'strix'}, 'POST'))[0]];
+  answer.strix = [late.seats[0], late.analysis].map(({preset, budget, custom, auto}) => ({preset, budget, custom: custom ?? null, auto}));
+  answer.partial = [await seat(0, {engine: 'strix', preset: 'custom', custom: {ms: 2500}}), late.seats[0].budget];
+  const leftover = new BrowserSession(native);
+  leftover.seats = [{engine: 'human'}, {engine: 'strix', checkpoint: 'strix-237000', preset: 'custom', budget: {simulations: 0, ms: 2500, active: 'ms'}}];
+  leftover.registerEngine(strix(['strix-237000']), adapter);
+  answer.leftover = {preset: leftover.seats[1].preset, budget: leftover.seats[1].budget};
 } else if (job.kind === 'dismissal') {
   // Auto deepening while an engine seat plays, with analyses that run until cancelled: which positions have an
   // analysis running or queued after a cancel, an analysis request and a move.
