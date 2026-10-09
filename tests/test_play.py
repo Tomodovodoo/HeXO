@@ -2324,6 +2324,43 @@ class TurnTrees(unittest.TestCase):
         work = lambda frame: frame['checked'] + frame['frontier_nodes']
         self.assertGreater(work(ruled[-1]), work(ruled[0]))
 
+    def lost_game(self):
+        """The 50 stones through 25. [4,7] of a game whose side to move is lost to a quiet-defender proof, and a solver."""
+        import tactical_proof
+        from play import read_game
+        if not tactical_proof.library().exists():
+            self.skipTest('Build tools/tactical with tools/build_tactical.py first')
+        prover = tactical_proof.IsolatedTactics(package=tactical_proof.PACKAGE, priority='below_normal', stamps=True)
+        self.addCleanup(prover.close)
+        text = (Path(__file__).parent/'fixtures'/'lost-quiet-defence.htttx').read_text(encoding='utf-8')
+        return [tuple(p) for p in read_game(text)], prover
+
+    def test_deep_solve_proves_the_side_to_move_lost_and_recognises_the_positions_after_it(self):
+        from play import SOLVER, evaluate
+        history, prover = self.lost_game()
+        bubble = self.bubble()
+        found = evaluate(bubble, prover, history, 8, 4096, solver_ms=SOLVER['solver_ms'], stamps=True)
+        self.assertEqual(found['proof']['winner'], 0)
+        self.assertEqual(found['value'], 0)
+        self.assertLess(found['solver']['elapsed_ms'], SOLVER['solver_ms'] / 4)
+        self.assertTrue(found['threat'])
+        # The opponent's win after the stone the game went on with comes from the stamps the proof left.
+        after = evaluate(bubble, prover, history + [(-1, 6)], 8, 4096, solver_ms=SOLVER['solver_ms'], stamps=True)
+        self.assertEqual(after['proof']['winner'], 0)
+        self.assertEqual(after['value'], 1)
+        self.assertLess(after['solver']['root_nodes'], 500)
+        self.assertEqual(after['solver']['native_nodes'], 0)
+        self.assertLess(after['solver']['elapsed_ms'], 1500)
+
+    def test_a_standard_analysis_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
+        from play import evaluate
+        history, prover = self.lost_game()
+        bubble = self.bubble()
+        for ply in (len(history), len(history) - 1):
+            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True)
+            self.assertEqual(found['proof']['winner'], 0, ply)
+            self.assertEqual(found['value'], 0, ply)
+
     def test_a_position_after_the_first_stone_ranks_the_second(self):
         import tactical_proof
         from play import evaluate

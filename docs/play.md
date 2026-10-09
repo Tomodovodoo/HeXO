@@ -449,8 +449,11 @@ position feeds the analysis lane's proof workers (up to 12, four fewer than the 
 neural search reaches, with the whole owner budget. The panel shows that work in place of the evaluation bar, read
 from the running solver and proof loop about twice a second: time, the root query's nodes and its current budget,
 the frontier's answered jobs and nodes, its queued and running jobs and busy workers. When the root query stops
-before spending its nodes, the side to move has no forcing win there; the panel says so and goes on showing the
-frontier's work on the replies. Then it shows the winner and distance, or the nodes and certificates spent without
+before spending its nodes, the side to move has no forcing win there. The panel says so, and the root query turns
+to the other question: if the opponent would win moving now, it asks whether the side to move is lost, with
+`defender` queries of 16,384 nodes and four times as many each round. A lost position ends the analysis at the first
+verified proof, with the opponent's threat and the line. Without a proof the frontier's work on the replies goes on.
+Then the panel shows the winner and distance, or the nodes and certificates spent without
 a proof. The turn and candidates are searched afterwards at the Standard simulations, from the proven turn
 when there is one. Solver evaluations are saved under their own key (`~solver120000`) and their proofs join the
 game's proof table like any other; engine seats cannot use the preset. The static page has the same switch. Its

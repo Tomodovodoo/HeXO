@@ -74,6 +74,7 @@ REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still
 REFRESH_MOVE = .05  # a refresh moved its result when its value changed by more than this, or its stones changed
 REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
+RETRY = 4  # an untimed defender query that spends all its nodes against a verified threat runs again with this many times as many
 SOLVER = dict(simulations=128, solver_nodes=32768, solver_ms=120_000)  # the analysis solver preset (see `prove`)
 SOLVER_WORKERS = max(2, min(12, (os.cpu_count() or 4) - 4))  # its native proof workers
 LIMITS = dict(simulations=0, solver_nodes=0, ms=10, nodes=1)
@@ -766,6 +767,15 @@ def solve(prover, history, solver_nodes, watch=lambda n: None, known=(), limit_m
     defended = interruptible(lambda stop: prover.history(history, attacker='defender', nodes=solver_nodes, ms=deadline(),
                                                         cancel_event=stop, **options), watch, prover.abort)
     found.update(solved=found['solved'] and searched(defended), used=found['used'] + defended.get('nodes_used', 0))
+    if (end is None and verified(theirs) and searched(defended) and defended.get('status') != 'PROVEN_LOSS'
+            and defended.get('nodes_used', 0) >= solver_nodes):
+        # Without a clock: the opponent wins moving now and the query spent its whole budget. A cold quiet-defender
+        # proof can need several times a Standard budget, and what this query learned makes the retry cheaper.
+        retried = interruptible(lambda stop: prover.history(history, attacker='defender', nodes=min(RETRY * solver_nodes, 65536),
+                                                           ms=deadline(), cancel_event=stop, **options), watch, prover.abort)
+        found.update(used=found['used'] + retried.get('nodes_used', 0))
+        if searched(retried):
+            defended = retried
     if defended.get('status') == 'PROVEN_LOSS' and defended.get('native_verified'):
         cert = defended.get('certificate') or json.loads(defended['certificate_json'])
         pv, _ = principal_variation(history, cert, attacker=1-player, known=known)
@@ -805,7 +815,7 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
         if len(f['history']) != len(history) or f['winner'] != player:
             premises.append({k: f[k] for k in ('history', 'winner', 'plies')})
             cells += len(f['history'])
-    root, stop = dict(nodes=0, budget=32768, result=None, ruled=False), threading.Event()
+    root, stop = dict(nodes=0, budget=32768, result=None, ruled=False, lost=None, threat=None), threading.Event()
 
     def ask():
         nodes = 32768
@@ -823,8 +833,35 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
                 continue
             if result.get('nodes_used', 0) < nodes:   # the solver ruled the root out before spending its nodes
                 root['ruled'] = True
+                refute()
                 return
             nodes = min(4 * nodes, tactical_proof.MAX_NODES)
+
+    def refute():
+        """With no mover win, ask whether the opponent would win moving now and, if it would, whether the mover is
+        lost: `defender` queries from 16,384 nodes, four times as many each round. A search that learned
+        stamps resumes from them in the next round."""
+        options = dict(known=premises) if premises else {}
+        left = lambda: max(1, min(int((end - time.monotonic()) * 1000), 60_000))
+        theirs = prover.history(history, attacker='opponent', nodes=32768, ms=left(), cancel_event=stop, **options)
+        root['nodes'] += theirs.get('nodes_used', 0)
+        if not verified(theirs):
+            return
+        root['threat'] = theirs
+        nodes = 16384
+        while not stop.is_set() and time.monotonic() < end:
+            root['budget'] = nodes
+            lost = prover.history(history, attacker='defender', nodes=nodes, ms=left(), cancel_event=stop, **options)
+            root['nodes'] += lost.get('nodes_used', 0)
+            if lost.get('status') == 'PROVEN_LOSS' and lost.get('native_verified'):
+                root['lost'] = lost
+                return
+            if not searched(lost):
+                stop.wait(.05)
+            elif lost.get('nodes_used', 0) < nodes or nodes >= tactical_proof.MAX_NODES:
+                return
+            else:
+                nodes = min(4 * nodes, tactical_proof.MAX_NODES)
     asking = threading.Thread(target=ask, daemon=True)
     evaluator = bubble.scheduler()
     graph = GameGraph(evaluator, bubble.sha256, history, seed=1740, cache=bubble.cache, tactics=True, round_barrier=True)
@@ -839,7 +876,7 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
         service.retarget(0, 0, [list(p) for p in history], expected=0, work=0, ms=max(1, int(ms)), samples=16, views=8)
         asking.start()
         sequence = 0
-        while root['result'] is None and time.monotonic() < end:
+        while root['result'] is None and root['lost'] is None and time.monotonic() < end:
             watch(0)
             if (event := service.event()) is not None:
                 break
@@ -879,6 +916,13 @@ def prove(bubble, prover, proofs, history, ms, watch=lambda n: None, live=None, 
     if root['result'] is not None:
         found.update(winning_line(history, root['result'], [f for f in known if len(f['history']) != len(history)
                                                                or f['winner'] != player]))
+    elif root['lost'] is not None:
+        lost = root['lost']
+        cert = lost.get('certificate') or json.loads(lost['certificate_json'])
+        found['threat'] = [list(m) for m in root['threat']['moves']]
+        found['pv'], _ = principal_variation(history, cert, attacker=1-player, known=known)
+        found['proof'] = dict(winner=1-player, turns=lost['proof_turns'], plies=remaining + 2 + 4 * (lost['proof_turns'] - 1),
+                              **proof_evidence(lost, cert))
     elif native is not None and native.get('exact_winner', -1) >= 0:
         winner, plies = native['exact_winner'], int(native['proof_plies'])
         if winner == player and native['winning_turn']:

@@ -41,6 +41,7 @@ function unlessCancelled(id, promise) {
 }
 
 const GRACE_MS = 500;
+const RETRY = 4;   // python/play.py RETRY
 const unknown = reason => ({status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 0, reason});
 
 /** One outstanding slice per worker. Ordinary cancellation drains its short
@@ -202,14 +203,36 @@ function frontierProofs(records, table, found) {
  * forcing win' once the solver rules out a mover win before spending its nodes), root_nodes, root_budget (the current
  * query's nodes), frontier (queued and running proof jobs), busy, workers, frontier_nodes, checked (frontier jobs
  * answered), proof}}, read from the running owner and solver, at most twice a second after a neural batch or a root
- * query. Resolves to {mine (a verified root answer, or null), proof ({winner, turns, plies} the native search proved,
- * or null), records (the frontier's verified answers), used (nodes), solver (totals), error}.
+ * query. With no mover win it asks whether the opponent would win moving now and, if so, whether the mover is lost.
+ * Resolves to {mine (a verified root answer, or null), lost and threat (the verified defender and opponent answers
+ * when the mover is lost, else null), proof ({winner, turns, plies} the native search proved, or null), records (the
+ * frontier's verified answers), used (nodes), solver (totals), error}.
  */
 async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool}) {
   const start = performance.now(), end = start + ms, remaining = native.game(history).remaining;
   const premises = facts.filter(f => f.history.length !== history.length || f.winner !== player).map(({history, winner, plies}) => ({history, winner, plies}));
-  const root = {nodes: 0, budget: 32768, mine: null, done: false, error: null, ruled: false};
+  const root = {nodes: 0, budget: 32768, mine: null, lost: null, threat: null, done: false, error: null, ruled: false};
   let report = () => {};
+  // With no mover win: does the opponent win moving now, and is the mover lost? `defender` queries from 16,384 nodes, four
+  // times as many each round; the worker keeps the stamps a round learned for the next.
+  const refute = async () => {
+    const left = () => Math.max(1, Math.floor(Math.min(end - performance.now(), 60000)));
+    const theirs = await solve(id, history, {attacker: 'opponent', nodes: 32768, ms: left(), stamps, known: premises});
+    root.nodes += theirs.nodes_used || 0;
+    if (!verified(theirs)) return;
+    root.threat = theirs;
+    for (let nodes = 16384; !root.done && !cancelled.has(id) && performance.now() < end;) {
+      root.budget = nodes;
+      const lost = await solve(id, history, {attacker: 'defender', nodes, ms: left(), stamps, known: premises});
+      root.nodes += lost.nodes_used || 0;
+      report();
+      if (lost.status === 'PROVEN_LOSS' && lost.native_verified) { root.lost = lost; return; }
+      if (lost.reason?.startsWith(FAILED)) { root.error = lost.reason; return; }
+      if (!searched(lost)) continue;
+      if ((lost.nodes_used || 0) < nodes || nodes >= 10000000) return;
+      nodes = Math.min(4 * nodes, 10000000);
+    }
+  };
   const asking = (async () => {
     for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
       root.budget = nodes;
@@ -220,7 +243,7 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
       if (verified(found) && found.moves.length) { root.mine = found; return; }
       if (found.reason?.startsWith(FAILED)) { root.error = found.reason; return; }   // no solver worker in this browser
       if (!searched(found)) continue;   // the solver worker was replaced: ask again
-      if ((found.nodes_used || 0) < nodes) { root.ruled = true; report(true); return; }   // ruled out before spending its nodes
+      if ((found.nodes_used || 0) < nodes) { root.ruled = true; report(true); await refute(); return; }   // ruled out before spending its nodes
       nodes = Math.min(4 * nodes, 10000000);
     }
   })().catch(error => { if (!(error instanceof Cancelled)) throw error; });
@@ -241,7 +264,7 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
       result = await owner.search({network, batchSize, choice: 'policy',
         proofs: pool && {workers, slice: 8, table: 4, stamps, cancel: pool.cooperative ? worker => pool.cancel(worker) : null,
           query: (worker, request, stopped) => pool.query(worker, request, stopped)},
-        stop: () => cancelled.has(id) || root.mine !== null, onBatch: () => report()});
+        stop: () => cancelled.has(id) || root.mine !== null || root.lost !== null, onBatch: () => report()});
     } finally { owner.close(); }
   } finally {
     graph.close();
@@ -252,7 +275,7 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
   const exact = result.proven ? (result.proven > 0 ? player : 1 - player) : -1;
   const proof = !root.mine && exact >= 0 ? {winner: exact, turns: proofTurns(result.proof_plies, remaining, exact === player), plies: result.proof_plies} : null;
   const nativeNodes = result.proof_scheduler?.fresh_nodes || 0, certificates = result.proof_records?.length || 0;
-  return {mine: root.mine, proof, records: result.proof_records || [], used: root.nodes + nativeNodes, error: result.solver_error || root.error,
+  return {mine: root.mine, lost: root.lost, threat: root.threat, proof, records: result.proof_records || [], used: root.nodes + nativeNodes, error: result.solver_error || root.error,
     solver: {elapsed_ms: Math.round(performance.now() - start), root: root.ruled ? 'no forcing win' : 'asking', root_nodes: root.nodes,
       native_nodes: nativeNodes, certificates, workers}};
 }
@@ -342,6 +365,11 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         const record = winningLine(native, history, found.mine, facts.filter(f => f.history.length !== history.length || f.winner !== player));
         table.add(history, record);
         ({pv, proof} = record);
+      } else if (found.lost) {
+        threat = found.threat.moves.map(m => [...m]);
+        pv = principalVariation(native, history, found.lost.certificate, {attacker: 1 - player, known: facts}).pv;
+        proof = {winner: 1 - player, turns: found.lost.proof_turns, plies: state.remaining + 2 + 4 * (found.lost.proof_turns - 1),
+          ...proofEvidence(found.lost)};
       } else if (found.proof) proof = found.proof;
     } else if (solverNodes) {
       postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'}});
@@ -382,8 +410,16 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         if (verified(theirs)) threat = theirs.moves.map(m => [...m]);
         if ((replayed || verified(theirs) || premises.length) && (!timed || performance.now() < solverEnd)) {
           postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking defence'}});
-          const defended = replayed || note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
+          let defended = replayed || note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
           check();
+                    if (!timed && !replayed && verified(theirs) && searched(defended) && defended.status !== 'PROVEN_LOSS' && (defended.nodes_used || 0) >= solverNodes) {
+            // Without a clock: the opponent wins moving now and the query spent its whole budget: a cold quiet-defender proof can need several
+            // times a Standard budget, and what this query learned makes the retry cheaper.
+            const retried = note(await solve(id, history, {attacker: 'defender', nodes: Math.min(RETRY * solverNodes, 65536), ms: solverMs(), known: premises, stamps: proofStamps}));
+            check();
+            solverUsed += retried.nodes_used || 0; 
+            if (retried.status === 'PROVEN_LOSS' && retried.native_verified || searched(retried)) defended = retried;
+          }
           const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
           solved = solved && (lost || searched(defended));
           if (!replayed) solverUsed += defended.nodes_used || 0;
