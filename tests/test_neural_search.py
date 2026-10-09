@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 import numpy as np
 from hexo import Game
-from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, SearchCoordinator, native
+from neural_search import NeuralSearch, EvaluationCache, GameGraph, Recheck, SearchCoordinator, edge_bytes, native
 from tests import PATIENCE, slow
 from tests.reference import Reference
 
@@ -946,6 +946,23 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual(graph.archive()['limit'], 65536)
         graph.search(8, root_samples=4, batch_size=4)
         self.assertLessEqual(graph.archive()['bytes'], 65536)
+
+    def test_edge_memory_follows_the_stored_actions_and_returns_when_the_game_closes(self):
+        # A sprawling uniform game: legal lists grow with every stone while the
+        # graph keeps evicting nodes, so buffer sizes change throughout.
+        before = edge_bytes()
+        graph = GameGraph(Uniform(), 'edge-memory', [(0,0)], seed=5, limit=16, tactics=False)
+        try:
+            for _ in range(40):
+                result = graph.search(32, root_samples=8, batch_size=16)
+                memory = graph.memory()
+                # An Edge is 40 bytes; the rest pays for the visited edges' states.
+                self.assertLessEqual(memory['bytes'], 64*memory['edges'], memory)
+                self.assertEqual(edge_bytes()-before, memory['bytes'])
+                graph.advance(tuple(int(v) for v in result['action']))
+        finally:
+            graph.close()
+        self.assertEqual(edge_bytes(), before)
 
     def test_later_marks_tighten_a_proven_root_and_its_stored_parent(self):
         history = [(0,0),(0,3),(1,3),(1,0),(2,0),(2,3),(3,3),(3,0),(7,4),(4,3),(5,4)]

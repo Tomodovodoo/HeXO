@@ -1,5 +1,6 @@
 // Native placement-tree scheduling. Algorithm reference: DeepMind mctx.
 #include "hexo.cpp"
+#include <atomic>
 #include <memory>
 #include <memory_resource>
 #include <utility>
@@ -119,30 +120,36 @@ struct Edge {
  void eligibility(bool value){if(read().eligible!=value)write().eligible=value;}
  void release()noexcept {if(data && !data->empty){auto* resource=data->resource;std::destroy_at(data);resource->deallocate(data,sizeof(EdgeState),alignof(EdgeState));}}
 };
-// Legal lists are large and live together. Pool their buffers within one game,
-// recycling evicted nodes' blocks instead of making one heap allocation per node.
-// A node retains the resource because it can outlive the GameStore's indices.
+// Bytes held by every game's edge memory in this process.
+inline std::atomic<int64_t> edge_bytes{0};
+// One game's legal-action buffers and edge states, counted in `bytes` (peak `peak`).
+// Legal lists grow with the stones, so a node's buffer size keeps changing over a
+// game. Buffers come from the general heap, where an evicted node's buffer can serve
+// any later size; a size-class pool would keep every class the game used until it
+// ended, about three times the edges its graph stores. Edge states have one size and
+// stay pooled within the game. A node retains the resource because it can outlive
+// the GameStore's indices.
 // libc++ (the browser build) pools a block only up to a quarter of largest_required_pool_block and keeps larger ones
 // on a list it scans on every deallocation, which made freeing a browser graph quadratic in its edge states. Asking
 // for four times the largest block keeps every block pooled there; libstdc++ pools them either way.
 constexpr std::pmr::pool_options pooled(size_t blocks,size_t largest){return {blocks,4*largest};}
 struct EdgeMemory {
-#ifdef HEXO_RECLAIM_PROFILE
- struct Upstream : std::pmr::memory_resource {
-  uint64_t bytes=0,peak=0,allocations=0;
-  void* do_allocate(size_t n,size_t alignment)override {auto p=std::pmr::new_delete_resource()->allocate(n,alignment);bytes+=n;peak=std::max(peak,bytes);++allocations;return p;}
-  void do_deallocate(void* p,size_t n,size_t alignment)override {bytes-=n;std::pmr::new_delete_resource()->deallocate(p,n,alignment);}
+ struct Counted : std::pmr::memory_resource {
+  std::atomic<int64_t> bytes=0,peak=0;
+  void count(int64_t n){
+   auto now=bytes.fetch_add(n,std::memory_order_relaxed)+n;edge_bytes.fetch_add(n,std::memory_order_relaxed);
+   for(auto high=peak.load(std::memory_order_relaxed);now>high && !peak.compare_exchange_weak(high,now,std::memory_order_relaxed);){}
+  }
+  void* do_allocate(size_t n,size_t alignment)override {auto p=std::pmr::new_delete_resource()->allocate(n,alignment);count(int64_t(n));return p;}
+  void do_deallocate(void* p,size_t n,size_t alignment)override {std::pmr::new_delete_resource()->deallocate(p,n,alignment);count(-int64_t(n));}
   bool do_is_equal(const std::pmr::memory_resource& other)const noexcept override {return this==&other;}
- } upstream;
- std::pmr::unsynchronized_pool_resource pool{pooled(8,262144),&upstream};
- std::pmr::unsynchronized_pool_resource states{pooled(1024,sizeof(EdgeState)),&upstream};
- ~EdgeMemory(){auto start=std::chrono::steady_clock::now();states.release();pool.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
-  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"edge_memory\",\"peak_bytes\":%llu,\"allocations\":%llu,\"remaining_bytes\":%llu,\"release_ns\":%llu}\n",
-   (unsigned long long)upstream.peak,(unsigned long long)upstream.allocations,(unsigned long long)upstream.bytes,(unsigned long long)ns);
+ } buffers;
+ std::pmr::unsynchronized_pool_resource states{pooled(1024,sizeof(EdgeState)),&buffers};
+#ifdef HEXO_RECLAIM_PROFILE
+ ~EdgeMemory(){auto start=std::chrono::steady_clock::now();states.release();auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+  std::fprintf(stderr,"HEXO_RECLAIM {\"component\":\"edge_memory\",\"peak_bytes\":%lld,\"remaining_bytes\":%lld,\"release_ns\":%llu}\n",
+   (long long)buffers.peak.load(),(long long)buffers.bytes.load(),(unsigned long long)ns);
  }
-#else
- std::pmr::unsynchronized_pool_resource pool{pooled(8,262144)};
- std::pmr::unsynchronized_pool_resource states{pooled(1024,sizeof(EdgeState))};
 #endif
 };
 // Cold actions share the unknown completed Q. Each small block retains its
@@ -166,7 +173,7 @@ struct HistoryLink {std::shared_ptr<const HistoryLink> before;Cell cell;int ston
 struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false,raw_known=false;bool* archive_dirty=nullptr;double value=0,q=0,carried_sum=0,policy_mass=0,raw=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
  std::pmr::vector<int> active;std::pmr::vector<ColdBlock> cold;bool selective=false,cold_dirty=true;int cold_best=-1;double cold_mass=0;
  static constexpr int block_size=32;
- explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->pool),tracked(&memory->pool),active(&memory->pool),cold(&memory->pool){empty.owner=this;}
+ explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->buffers),tracked(&memory->buffers),active(&memory->buffers),cold(&memory->buffers){empty.owner=this;}
  void archive_changed(){if(archive_dirty)*archive_dirty=true;}
  void activate(Edge& edge){
   archive_changed();
@@ -1324,6 +1331,14 @@ HX_API int hxg_archive_forward(void* p,int enabled){try{
 HX_API int hxg_archive_stats(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);auto* a=t.state->archive.get();if(!a)return 0;
  t.trim_archive();std::array<int64_t,10> values{int64_t(a->occupied.count()),int64_t(a->total_bytes()),int64_t(a->limit),int64_t(a->retained),int64_t(a->reused),int64_t(a->discarded),int64_t(a->compatible.count()),int64_t(a->index_bytes()),int64_t(a->membership.size()),int64_t(a->focus_stones())};
  std::copy(values.begin(),values.end(),out);return 1;}
+// Between searches, on the owner thread: the stored nodes, their legal actions, and the bytes the game's edge memory
+// holds now and at most so far (legal-action buffers and edge-state chunks, nodes outside the store included).
+HX_API void hxg_memory(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);int64_t edges=0;
+ for(auto& [key,node]:t.store)edges+=int64_t(node->edges.size());
+ auto& held=t.state->memory->buffers;std::array<int64_t,4> values{int64_t(t.store.size()),edges,held.bytes.load(),held.peak.load()};
+ std::copy(values.begin(),values.end(),out);}
+// Bytes the edge memory of every game in this process holds.
+HX_API int64_t hxg_edge_bytes(){return gumbel::edge_bytes.load();}
 // Shared graph: moves the root to the position after `history` (n int64 q/r pairs), keeping every node's statistics
 // (Tree::root_at); 0 with the error set for an illegal history, an unshared tree or pending requests.
 HX_API int hxg_root_at(void* p,const int64_t* history,int n){try{std::vector<Cell> h;for(int i=0;i<n;++i)h.push_back({history[2*i],history[2*i+1]});static_cast<gumbel::Tree*>(p)->root_at(h);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
