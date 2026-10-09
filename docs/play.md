@@ -366,8 +366,9 @@ model, beside the one that plays engine moves, so they keep up during play. With
 position where a turn starts, plus any position you step to; while an engine seat plays it also deepens the current
 position through the presets up to the analysis preset, Lightning first, showing each as it lands and starting
 again when the position changes. At Lightning that is one search, so the analysis goes quiet once it lands; a
-custom budget or Deep Solve is not deepened and runs as asked. That deepening runs last in the queue, gives way to any other analysis and holds its network work while
-an engine seat searches. Auto asks for a position once per engine and budget, and again only while the position has
+custom budget or Deep Solve is not deepened and runs as asked. That deepening runs after the analysis asked for and
+review, ahead of background refreshes, gives way to any other analysis and holds its network work while an engine
+seat searches. Auto asks for a position once per engine and budget, and again only while the position has
 no evaluation or a stale one; the server decides whether a saved evaluation covers the budget. Cancelling an
 analysis leaves Auto on: Auto and deepening only stop asking for that position
 at those settings until something changes, a move, a step back or forward, another preset or engine, or Analyse
@@ -376,8 +377,9 @@ simulations it lacks, and keeps a solver proof it already has; these evaluations
 (their engine key ends in `:kept`), shown like them, and never used by review. All analysis of one game searches one
 game graph, kept until undo or a new or loaded game: a position reached from several analysed positions is one node,
 and the visits and values a search finds there count for every position before it. When an analysis lands, the saved analyses of the four
-placements before it that came from the same graph are searched again with a quarter of their budget, so stepping
-back shows what the later search found; any other position of the game the graph has changed since its analysis is
+placements before it that came from the same graph are searched again with a quarter of their budget, and never more
+than a quarter of the analysis budget, so stepping back shows what the later search found. These refreshes run after
+every other analysis job, deepening included, so the shown position never waits behind them; any other position of the game the graph has changed since its analysis is
 searched again the same way when you step to it. That search goes on from the visits the graph holds there. The share of the improved policy saturates at high budgets: its Q weight grows with the visits, so a
 deep search gives one stone nearly all of it. A position without a saved
 evaluation shows the search of the engine or analysis working on it as it goes. The search of a turn's second
@@ -535,7 +537,7 @@ order. Bubble had it the other way round.
 On the static page every Bubble search runs the hybrid scheduler on the game's graph, as the served page does: a
 preset's simulations are the owner's work per stone, and its solver nodes the root queries' budget, with the
 owner's proof frontier on the page's proof workers whenever that budget is above 0. A refresh searches with a quarter
-of the saved evaluation's simulations and no proof work. [web-engine.md](web-engine.md) has the settings.
+of the saved evaluation's simulations, of the analysis budget's at most, and no proof work. [web-engine.md](web-engine.md) has the settings.
 
 On an isolated page ONNX Runtime runs on the cores but one WebAssembly threads, at most 8. On hosts where the
 runtime's thread workers never come up (the Claude desktop browser pane is one), the engine notices the stalled

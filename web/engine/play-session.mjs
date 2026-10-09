@@ -12,7 +12,8 @@ export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000}
 
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
-const REFRESH_SHARE = .25;  // the share of a saved evaluation's simulations a refresh searches again (python/play.py)
+// The share of a saved evaluation's simulations a refresh searches again, of at most the analysis budget's (python/play.py).
+const REFRESH_SHARE = .25;
 /** True when the evaluation `found` differs from the saved evaluation `before` in its stones or by more than REFRESH_MOVE in value. */
 const moved = (found, before) => JSON.stringify((found.moves || []).map(p => p.join(',')).sort()) !== JSON.stringify((before.moves || []).map(p => p.join(',')).sort()) || Math.abs(found.value - before.value) > REFRESH_MOVE;
 
@@ -140,7 +141,7 @@ export class BrowserSession extends OfflineSession {
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
-    this.running = null; this.idle = Promise.resolve(); this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
+    this.lanes = {move: null, analysis: null}; this.settling = {move: Promise.resolve(), analysis: Promise.resolve()}; this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {generation: null, searches: 0};
     this.dismissed = null;   // the dismissal() of the analysis a person cancelled, or null
     this.proofs = new Proofs(); this.provenRecords = new Map();
@@ -282,16 +283,22 @@ export class BrowserSession extends OfflineSession {
     const preset = this.analysis.preset === 'solver' ? 'standard' : this.analysis.preset;
     return this.spec({...this.analysis, preset, custom: this.analysis.custom ?? this.analysis.budget});
   }
+  /** The running job: the move lane's, else the analysis lane's (see `pump`), or null. */
+  get running() { return this.lanes.move ?? this.lanes.analysis; }
+  /** Settles once neither lane runs the job it ran when asked. */
+  get idle() { return Promise.all([this.settling.move, this.settling.analysis]); }
   /** True while the current position deepens (see `deepen`): Auto is on at a preset (not custom, not the solver), an
    * engine seat plays and the game is neither paused, finished nor a match (python/play.py Session.deepening). */
   deepening() {
     return this.analysis?.auto && this.entries.get(this.analysis.engine)?.presets[this.analysis.preset] && !this.paused && this.native.game(this.history).winner < 0 && !this.match?.active && this.seats.some(s => this.adapters.has(s.engine));
   }
   /** While Auto is on and an engine seat plays, evaluates the current position at each preset in turn, fastest first,
-   * up to the analysis preset. */
+   * up to the analysis preset. A running tier of a position the game has moved on from finishes and is saved for its
+   * ply; the latest position is deepened after it, so positions that come faster than a search still get analysed. */
   deepen() {
     const active = this.deepening(), current = position(this.history);
-    this.cancelJobs(j => j.tier && (!active || position(j.history) !== current));
+    const behind = j => j.status === 'running' && position(this.history.slice(0, j.history.length)) === position(j.history);
+    this.cancelJobs(j => j.tier && (!active || position(j.history) !== current && !behind(j)));
     if (this.dismissed !== null && this.dismissed !== this.dismissal(this.history)) this.dismissed = null;
     if (!active || this.dismissed !== null || this.jobs.some(j => j.tier && j.status !== 'failed') || this.lookup(this.history)?.proof) return;
     const entry = this.entries.get(this.analysis.engine);
@@ -442,7 +449,7 @@ export class BrowserSession extends OfflineSession {
       const history = this.history.slice(0, ply), saved = this.analysis && this.lookup(history);
       this.dismissed = null;
       // A position viewed again whose graph another analysis has searched since: search the graph there again.
-      if (!body.force && this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine});
+      if (!body.force && this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history, {...this.analysis, budget: copy(saved.budget)}, {force: true, refresh: saved, line: this.analysisLine, cap: this.analysis.budget.simulations});
       else if (body.force || ply !== this.history.length || !this.deepening()) this.enqueue('analyse', history, this.analysis, {force: !!body.force, line: this.analysisLine});
     } else if (path === '/review') {
       if (!this.analysis || !this.adapters.has(this.analysis.engine)) throw Error('Choose an analysis engine');
@@ -541,11 +548,12 @@ export class BrowserSession extends OfflineSession {
   /** Queues a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation by `spec`'s
    * engine (the deepest, a tier included) is stale and holds no proof, nearest first, at that evaluation's budget: the search on the game graph `line` moved the values those positions reach
    * (python/play.py Session.refresh). A refresh searches that graph again with the REFRESH_SHARE of the simulations
-   * and no solver query, keeps the saved threat and replaces the saved evaluation. */
+   * (of `spec`'s at most) and no solver query, keeps the saved threat and replaces the saved evaluation. These refreshes
+   * are `background` work: they run after every other analysis, deepening included (see `pump`). */
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
       const saved = this.lookup(history.slice(0, ply), spec);
-      if (this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line});
+      if (this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line, cap: spec.budget.simulations, background: true});
     }
   }
   indexRecord(record) {
@@ -654,20 +662,30 @@ export class BrowserSession extends OfflineSession {
   }
   /** Runs the next job: an engine move first, then analysis, review and deepening. A queued move interrupts a running
    * job of another kind, which goes back to the queue (a review keeps its finished positions). */
-  async pump() {
+  /** Starts the next jobs on two lanes, as the served page has them: engine moves on one, analysis, review and
+   * deepening on the other, so analysis keeps up while engines play. A job of the engine a move runs on waits for that
+   * move (the engine has one worker), and a move queued for the engine of a running analysis interrupts it (the job
+   * goes back to the queue, a review keeping its finished positions). The analysis lane takes the analysis asked for,
+   * then review, deepening, and last the background refreshes of earlier positions, so the shown position never waits
+   * behind them. */
+  pump() {
     if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
-    if (this.running) {
-      if (this.running.kind !== 'move' && this.jobs.some(j => j.kind === 'move' && j.status === 'queued')) this.running.attempt.abort();
-      return;
-    }
-    const job = this.jobs.find(j => j.status === 'queued' && j.kind === 'move') || this.jobs.find(j => j.status === 'queued' && j.kind === 'analyse' && !j.tier)
-      || this.jobs.find(j => j.status === 'queued' && j.kind === 'review') || this.jobs.find(j => j.status === 'queued' && j.tier);
-    if (!job) return;
+    const queued = test => this.jobs.find(j => j.status === 'queued' && test(j));
+    const move = this.lanes.move ?? queued(j => j.kind === 'move'), busy = j => move && j.spec.engine === move.spec.engine;
+    if (this.lanes.analysis && busy(this.lanes.analysis)) this.lanes.analysis.attempt.abort();   // the move starts once it has stopped
+    else if (!this.lanes.move && move) this.run(move, 'move');
+    if (this.lanes.analysis) return;
+    const free = test => queued(j => j.kind !== 'move' && !busy(j) && test(j));
+    const job = free(j => j.kind === 'analyse' && !j.tier && !j.background) || free(j => j.kind === 'review') || free(j => j.tier) || free(j => j.background);
+    if (job) this.run(job, 'analysis');
+  }
+  /** Runs `job` on `lane` (see `pump`), then pumps again. */
+  async run(job, lane) {
     let settled;
-    this.idle = new Promise(resolve => { settled = resolve; });
-    this.running = job; job.status = 'running'; job.attempt = new AbortController(); this.changed();
+    this.settling[lane] = new Promise(resolve => { settled = resolve; });
+    this.lanes[lane] = job; job.status = 'running'; job.attempt = new AbortController(); this.changed();
     const signal = AbortSignal.any([job.controller.signal, job.attempt.signal]);
     let timer, interrupted = false;
     const match = job.kind === 'move' && this.match?.active ? this.match : null;
@@ -690,7 +708,7 @@ export class BrowserSession extends OfflineSession {
         timer = setTimeout(expire, Math.min(MAX_TIMER, Math.max(1, limit)));
       }
       let result = job.kind !== 'move' && !job.force ? this.lookup(history, job.spec, true) : null;
-      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * job.spec.budget.simulations)), solver_nodes: 0, solver_ms: 0,
+      const budget = job.refresh ? {...job.spec.budget, simulations: Math.max(1, Math.round(REFRESH_SHARE * Math.min(job.spec.budget.simulations, job.cap ?? Infinity))), solver_nodes: 0, solver_ms: 0,
         ...(job.spec.budget.ms ? {ms: Math.max(10, Math.round(REFRESH_SHARE * job.spec.budget.ms))} : {})}
         : job.spec.budget;
       try {
@@ -726,7 +744,7 @@ export class BrowserSession extends OfflineSession {
           // The refresh changed this position's result: new evidence for the positions before it, and another round here.
           this.graphSearched(graph, history.length); this.refresh(history, job.spec, job.line);
           const rounds = (job.rounds || 0) + 1;
-          if (rounds < REFRESH_ROUNDS) this.enqueue('analyse', history, job.spec, {force: true, refresh: this.lookup(history, job.spec), line: job.line, rounds});
+          if (rounds < REFRESH_ROUNDS) this.enqueue('analyse', history, job.spec, {force: true, refresh: this.lookup(history, job.spec), line: job.line, rounds, cap: job.cap, background: true});
         }
       }
       if (job.kind === 'move') {
@@ -752,7 +770,7 @@ export class BrowserSession extends OfflineSession {
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
       if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
-      clearTimeout(timer); this.running = null;
+      clearTimeout(timer); this.lanes[lane] = null;
       if (interrupted) job.status = 'queued';
       else if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
       else if (job.status !== 'failed') job.status = 'queued';

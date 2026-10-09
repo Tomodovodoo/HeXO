@@ -10,7 +10,7 @@ import {LIMITS, stageText} from './stages.mjs';
 
 /** Stages whose failure another device or thread count may avoid; a download fails the same way on any device. */
 const RETRIED = new Set(['probe', 'compile', 'session', 'timing', 'warmup']);
-const CANCEL_GRACE_MS = 2000;
+const CANCEL_GRACE_MS = 2000, CANCEL_LIMIT_MS = 10000;
 
 /** The engines' fallback notices for the page: 'notice' events whose `detail` is {engine (the EngineWorker), text (one
  * short line), cpu (true when the engine left WebGPU for WebAssembly)}. */
@@ -161,7 +161,11 @@ export class EngineWorker {
         }
         const wait = this.waits.get(data.id);
         if (!wait) return;
-        if (data.type === 'progress') { if (!wait.cancelled) { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage, data.placed); } return; }
+        if (data.type === 'progress') {
+          if (!wait.cancelled) { this.watch(data.id, data.stage ?? null, calling); wait.progress(data.fraction, data.live, data.stage, data.placed); }
+          else wait.grace?.();   // a worker still reporting is winding down, not stuck
+          return;
+        }
         this.watch(data.id, null);
         if (!wait.cancelled && data.type === 'error' && RETRIED.has(data.stage?.name)) { calling(this.failure('failed', data.stage, data.message)); return; }
         this.waits.delete(data.id);
@@ -220,13 +224,20 @@ export class EngineWorker {
         this.watch(id, null);
         if (!this.booting) {
           this.worker?.postMessage({type: 'cancel', id});
-          // A search stuck in WASM or inference cannot acknowledge cancellation. End its worker before
-          // releasing the session's job slot; the next job then loads a fresh engine on the same device.
-          timer = setTimeout(() => {
-            if (this.waits.get(id) !== wait) return;
-            this.fail(new DOMException('Cancelled', 'AbortError'));
-            this.notice(`${this.name}: cancelled search did not stop; restarting engine`, false);
-          }, CANCEL_GRACE_MS);
+          // A search stuck in WASM or inference cannot acknowledge cancellation, nor report anything. End its worker
+          // when it stays silent for CANCEL_GRACE_MS before releasing the session's job slot; the next job then loads
+          // a fresh engine on the same device. Each message of the call starts the grace again, for CANCEL_LIMIT_MS at most.
+          const asked = performance.now();
+          wait.grace = () => {
+            if (performance.now() - asked > CANCEL_LIMIT_MS) return;
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+              if (this.waits.get(id) !== wait) return;
+              this.fail(new DOMException('Cancelled', 'AbortError'));
+              this.notice(`${this.name}: cancelled search did not stop; restarting engine`, false);
+            }, CANCEL_GRACE_MS);
+          };
+          wait.grace();
         } else { this.waits.delete(id); wait.reject(new DOMException('Cancelled', 'AbortError')); }
       };
       this.waits.set(id, wait);
