@@ -465,6 +465,42 @@ console.log(JSON.stringify(out));"""
         self.assertGreaterEqual(answer['analysed'], 5)
         self.assertTrue(answer['latest'])
 
+    def test_analysis_of_a_seated_engine_finishes_while_that_engine_plays_twenty_moves(self):
+        spare = node(dict(kind='seated-analysis', spare=True))
+        self.assertGreaterEqual(spare['moves'], 20)
+        self.assertGreaterEqual(spare['analysed'], 3)
+        self.assertEqual((spare['onSpare'] == spare['analysed'], spare['spares'], spare['analysisOnMain']), (True, 1, 0))
+        shared = node(dict(kind='seated-analysis', spare=False))   # an engine with one worker still gets its analysis
+        self.assertGreaterEqual(shared['moves'], 20)
+        self.assertGreaterEqual(shared['analysed'], 3)
+
+    def test_failed_jobs_log_an_error_and_a_long_queued_job_warns_once_with_what_it_waits_for(self):
+        answer = node(dict(kind='console'))
+        self.assertEqual(len(answer['errors']), 1)
+        for part in ('analyse', 'bad', 'net-1', 'quick', 'ply 1', 'boom'):
+            self.assertIn(part, answer['errors'][0])
+        self.assertEqual(answer['stage'], "waiting for Slow's move")
+        self.assertEqual(len(answer['queued']), 1)
+        self.assertIn('waiting for move on slow', answer['queued'][0])
+        self.assertEqual(answer['later'], 1)
+
+    def test_the_solver_box_shows_only_the_running_search_of_the_shown_ply_and_only_on_the_solver_preset(self):
+        answer = node(dict(kind='solver-box'))
+        self.assertIn('8/8 workers busy', answer['own']['text'])
+        self.assertEqual(answer['otherPly'], dict(hidden=False, text='Not analysed yet'))
+        self.assertEqual(answer['ended'], dict(hidden=False, text='Starting the solver'))
+        for name in ('notSolver', 'deep'):
+            self.assertEqual(answer[name], dict(hidden=True, text=''))
+        self.assertTrue(answer['saved']['text'].startswith('No proof in 2.0 s'))
+
+    def test_a_viewed_past_ply_of_a_finished_game_is_analysed_once_not_every_few_seconds(self):
+        # The saved evaluation there is stale and Auto asks at Lightning; the refresh that answers searches nothing new
+        # on the graph and names none, which used to leave it unstamped and so stale for good.
+        answer = node(dict(kind='viewed-past-ply', plies=61, **{'from': 40}, view=49))
+        self.assertLessEqual(answer['asked'], 2)
+        self.assertLessEqual(answer['searches'], 2)
+        self.assertFalse(answer['stale'])
+
     def test_custom_budgets_apply_the_amount_last_edited_and_keep_the_other(self):
         answer = node(dict(kind='custom-forms'))
         self.assertEqual(answer['old'], dict(budget=dict(simulations=300, solver_nodes=4800),

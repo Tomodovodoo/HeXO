@@ -23,9 +23,10 @@ export async function mountPlay(engines, legacy) {
   session.initializing = true;
   const first = !await storage.get('sessions', id);
   if (first && study && params.has('batch')) await session.openGame(params.get('batch'), +params.get('game'));
-  for (const {entry, engine, record} of engines.values()) {
+  for (const {entry, engine, fresh, record} of engines.values()) {
     const tag = stage => { if (stage?.provider) entry.device = deviceLabel(stage); };   // once the probe has finished
-    session.registerEngine(entry, {
+    // The adapter of one engine instance (one worker); `fresh` makes another for the analysis of a seated engine.
+    const adapt = engine => ({
       ready: async (f, checkpoint) => {
         const report = (fraction, stage) => { tag(stage); f(fraction, stage); };
         entry.device = deviceLabel(await engine.load(report));
@@ -40,6 +41,7 @@ export async function mountPlay(engines, legacy) {
         return record ? {...record(result, history, preset), ...result} : result;
       }
     });
+    session.registerEngine(entry, adapt(engine), fresh && (() => adapt(fresh())));
   }
   if (first && !study) {
     const choices = legacy?.seats?.some(Boolean) ? legacy.seats : [null, {engine: entry.id, preset: entry.preset || 'standard'}];

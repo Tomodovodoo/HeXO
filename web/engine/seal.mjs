@@ -154,4 +154,4 @@ export function record(result, history, preset) {
 }
 
 export const seal = {entry: {id: ID, kind: 'seal', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
-  engine: new SealEngine(), record, build: 'python tools/build_web.py seal'};
+  engine: new SealEngine(), fresh: () => new SealEngine(), record, build: 'python tools/build_web.py seal'};

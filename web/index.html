@@ -173,7 +173,7 @@ svg.hazard{color:var(--x)}svg.hazard .glyph-o{stroke-width:1.8}
 .evalbar i::after{content:"";position:absolute;right:-1px;top:0;bottom:0;width:2px;background:#0b1222}
 .evalbar b{position:absolute;top:0;bottom:0;display:flex;align-items:center;padding:0 12px;font:700 13px var(--mono);color:#0b1222;z-index:1}
 .evalbar b:last-child{right:0}
-.solving{min-height:32px;display:flex;align-items:center;gap:8px;font:13px var(--mono);color:var(--muted)}.solving b{color:var(--c,inherit)}
+.solving[hidden]{display:none}.solving{min-height:32px;display:flex;align-items:center;gap:8px;font:13px var(--mono);color:var(--muted)}.solving b{color:var(--c,inherit)}
 .evalbar.idle i{transform:scaleX(.5)!important}.evalbar.idle{opacity:.3}.evalbar.stale{opacity:.55}
 .evalbar.pending::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.22),transparent);animation:sweep 1.2s linear infinite}
 @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
@@ -978,8 +978,12 @@ function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.liv
 /* the solver preset's panel in place of the evaluation bar: the running search's proof progress, then the proof or
    the work that found none (`solver` of a saved evaluation, python/play.py prove) */
 function renderSolving(ev,job){
-  const box=$('solving'),on=S.analysis?.preset==='solver'&&!finished();box.hidden=!on;$('evalbar').hidden=on;if(!on)return;
-  const live=job?.live?.solver,done=ev?.solver,n=v=>Number(v||0).toLocaleString(),s=ms=>(ms/1000).toFixed(1)+' s';
+  const box=$('solving'),on=S.analysis?.preset==='solver'&&!finished();box.hidden=!on;$('evalbar').hidden=on;
+  // Off the solver preset the box is empty as well as hidden, so no earlier search's numbers wait in it. Its numbers are
+  // those of a search that is running on the shown position and of that position's own saved evaluation.
+  if(!on){box.replaceChildren();return}
+  job=job?.ply===view?job:null;
+  const live=job?.status==='running'?job.live?.solver:null,done=ev?.solver,n=v=>Number(v||0).toLocaleString(),s=ms=>(ms/1000).toFixed(1)+' s';
   const proof=ev?.proof,mover=playerAt(view)?'O':'X',ruled=f=>f?.root==='no forcing win'?`${mover} has no forcing win here. `:'';
   box.replaceChildren(...(proof&&!live?[el('b',{style:`--c:${COLORS[proof.winner]}`},(proof.winner?'O':'X')+' wins'),
       el('span',{},`in ${proof.plies||'+'+proof.turns} placements`+(done?`, ${s(done.elapsed_ms)}, ${n(done.root_nodes+done.native_nodes)} nodes, ${n(done.certificates)} certificates`:''))]
@@ -1173,7 +1177,7 @@ function renderJobs(){
   const ajob=S.jobs.find(j=>j.kind==='analyse'&&j.ply===view),failed=!ajob&&S.failedJobs?.find(j=>j.kind==='analyse'&&j.ply===view),progress=$('analysis-progress');
   progress.style.visibility=ajob?'visible':'hidden';progress.style.setProperty('--c',COLORS[playerAt(view)]);
   progress.classList.toggle('running',ajob?.status==='running');progress.firstChild.style.transform=`scaleX(${ajob?Math.min(1,ajob.done/ajob.total):0})`;
-  const stage=$('analysis-stage');stage.textContent=failed?`Analysis failed: ${failed.error}`:ajob?.status==='queued'?'Waiting for engine':ajob?.stage||'';stage.title=stage.textContent;
+  const stage=$('analysis-stage');stage.textContent=failed?`Analysis failed: ${failed.error}`:ajob?.status==='queued'?ajob.stage||'Waiting for engine':ajob?.stage||'';stage.title=stage.textContent;
   const again=$('again');if(again){setIcon(again,!failed&&analysing.length?'close':'again');
     again.setAttribute('aria-label',failed?'Retry analysis':analysing.length?'Cancel analysis':'Analyse again');
     again.onclick=async()=>{if(failed||!analysing.length){dismissed=null;const ply=view,data=await post('/analyse',{ply,force:true});
