@@ -476,6 +476,11 @@ console.log(JSON.stringify(out));"""
         self.assertEqual(answer['reloaded'], ['strix-237000', 'strix-237000'])
         self.assertEqual(answer['bubble'], [200, 'b1', 200, 'b1', 200, 'b2', 200, None])
         self.assertFalse(answer['untouched'])
+        standard = dict(preset='standard', budget=dict(simulations=1), custom=None)
+        self.assertEqual(answer['switched'], [200, 200])
+        self.assertEqual(answer['strix'], [dict(standard, auto=False), dict(standard, auto=True)])
+        self.assertEqual(answer['partial'], [200, dict(simulations=1)])
+        self.assertEqual(answer['leftover'], dict(preset='standard', budget=dict(simulations=1)))
 
     def test_a_cancelled_analysis_keeps_auto_and_waits_for_a_change_of_position_or_request(self):
         answer = node(dict(kind='dismissal'))

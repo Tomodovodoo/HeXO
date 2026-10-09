@@ -59,8 +59,12 @@ export function customBudget(kind, form) {
   return {simulations: form.simulations, solver_nodes: form.simulations ? Math.min(4000000, Math.max(1024, 16 * form.simulations)) : 0};
 }
 /** The spec a /seat or /analysis `body` asks of the slot holding `current`: `current` with `body`'s fields, without its
- * checkpoint when `body` names another engine. */
-const choose = (current, body) => ({...current, ...body.engine !== undefined && body.engine !== current?.engine ? {checkpoint: null} : {}, ...body});
+ * engine's own checkpoint, preset and budgets when `body` names another engine. */
+function choose(current, body) {
+  if (body.engine === undefined || body.engine === current?.engine) return {...current, ...body};
+  const {checkpoint, preset, budget, custom, ...kept} = current ?? {};
+  return {...kept, ...body};
+}
 const starts = length => [0, ...Array.from({length: Math.ceil(Math.max(0, length - 1) / 2)}, (_, i) => 2 * i + 1)];
 
 /** `promise`, or an AbortError as soon as `signal` aborts, so a job never waits on a load it no longer needs. */
@@ -146,7 +150,8 @@ export class BrowserSession extends OfflineSession {
    * budget, options)` plays (`options.progress(fraction, live, stage)`). */
   registerEngine(entry, adapter) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
-    for (const seat of [...this.seats, this.analysis].filter(Boolean)) if (seat.engine === entry.id) Object.assign(seat, this.spec(seat));
+    const fit = spec => spec?.engine === entry.id ? this.saved(spec) : spec;
+    this.seats = this.seats.map(fit); this.analysis = fit(this.analysis);
     this.changed(); this.pump();
   }
   /** After engine `id` left WebGPU for WebAssembly: lightning becomes its starting preset, and the seats and the
@@ -161,15 +166,24 @@ export class BrowserSession extends OfflineSession {
     this.cancelJobs(job => job.spec.engine === id && job.spec.preset !== 'lightning' && !job.tier && job.kind !== 'review');
     this.changed(); this.pump();
   }
+  /** `input`, a seat, analysis or match player saved earlier, with its spec() fields renewed (its other fields, such as
+   * a player's name, kept): at the engine's starting preset when its saved preset or budget does not fit the engine. */
+  saved(input) {
+    const {custom, ...kept} = input;
+    try { return {...kept, ...this.spec(input)}; }
+    catch { return {...kept, ...this.spec({engine: input.engine, checkpoint: input.checkpoint, auto: input.auto})}; }
+  }
   /** The seat or analysis spec `input` asks for. A checkpoint the engine does not offer (a retired network, or another
-   * engine's) becomes its first; while its list is still empty the requested one is kept for relist() to check. */
+   * engine's) becomes its first; while its list is still empty the requested one is kept for relist() to check. A custom
+   * budget of an engine without a custom form takes the standard preset's fields, each from `input` when it has it. */
   spec(input) {
     if (input.engine === 'human') return human();
     const entry = this.entries.get(input.engine);
     if (!entry) throw Error('This engine is not installed in the browser');
     const preset = input.preset || entry.preset || 'standard', exclusive = preset === 'custom' && formKind(entry);
     const form = exclusive ? customForm(entry.kind, entry.presets.standard, input.custom ?? input.budget) : null;
-    const budget = form ? customBudget(entry.kind, form) : preset === 'custom' ? {...entry.presets.standard, ...input.custom, ...input.budget}
+    const asked = {...input.custom, ...input.budget}, standard = entry.presets.standard;
+    const budget = form ? customBudget(entry.kind, form) : preset === 'custom' ? Object.fromEntries(Object.keys(standard).map(name => [name, asked[name] ?? standard[name]]))
       : preset === 'solver' && entry.kind === 'bubble' ? SOLVER : entry.presets[preset];
     if (!budget) throw Error('Unknown strength preset');
     for (const [name, value] of Object.entries(budget)) {
@@ -185,7 +199,7 @@ export class BrowserSession extends OfflineSession {
   relist(id) {
     const entry = this.entries.get(id);
     if (!entry?.checkpoints?.length) return false;
-    const stale = spec => spec?.engine === id && !entry.checkpoints.includes(spec.checkpoint), fix = spec => stale(spec) ? {...spec, ...this.spec(spec)} : spec;
+    const stale = spec => spec?.engine === id && !entry.checkpoints.includes(spec.checkpoint), fix = spec => stale(spec) ? this.saved(spec) : spec;
     const players = this.match?.players ?? [];
     if (![...this.seats, this.analysis, ...players].some(stale)) return false;
     this.seats = this.seats.map(fix); this.analysis = fix(this.analysis);
@@ -856,7 +870,8 @@ export class BrowserSession extends OfflineSession {
           this.importing = true; this.paused = true; this.cancelJobs();
           try {
             await this.idle; await this.saving; await this.storage.restore(json, this.native); await this.restore({paused: true});
-            for (const spec of [...this.seats, this.analysis].filter(Boolean)) if (this.entries.has(spec.engine)) Object.assign(spec, this.spec(spec));
+            const fit = spec => this.entries.has(spec?.engine) ? this.saved(spec) : spec;
+            this.seats = this.seats.map(fit); this.analysis = fit(this.analysis);
           } finally { this.importing = false; }
           this.changed(); data = this.state();
         }
@@ -875,7 +890,7 @@ export class BrowserSession extends OfflineSession {
             if (!saved || saved.single || saved.completed >= saved.games) throw Error('No unfinished match');
             for (const p of saved.players) if (p.version && this.engineKey(p) !== p.version) throw Error('This match used a different engine version. Start a new match.');
             this.match = saved;
-            this.match.players = this.match.players.map(p => ({...p, ...this.spec(p)}));
+            this.match.players = this.match.players.map(p => this.saved(p));
             if (!saved.pending_game && saved.position?.game === saved.completed + 1) {
               this.load(saved.position.history, true, saved.position.opening);
               this.records = copy(saved.position.records); this.clock = copy(saved.position.clock);
