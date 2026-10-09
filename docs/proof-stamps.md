@@ -122,6 +122,23 @@ attack cells and every possible counterwin window. It does not trust the native
 compiler's masks or its danger calculation. This also works for a proposed quiet
 attacking turn supplied through `root_moves`.
 
+## Positions the mover loses
+
+A stamp is a local shape, not a remembered position. A position that the side to move loses is proved by the
+`defender` query (the section above): a fallback win for the opponent, then every reply that could disturb it. The
+query learns stamps as it goes, and the worker keeps them, so a query that runs out of nodes leaves the next one
+closer. After 25. [4,7] of `tests/fixtures/lost-quiet-defence.htttx` the first `defender` query needs about 10,500
+nodes on a cold worker (4,096 fails, 8,192 fails, 16,384 proves in 2.9 s); a worker that has already tried at 4,096
+proves it on the fourth try, and the same query on a worker that holds the proof takes 60 nodes. The positions
+after the opponent's replies are wins for the opponent that the stamps recognise at once (59 nodes, 0.3 s).
+
+Analysis asks for this proof in three places. A Standard analysis (`solve`, and its browser twin in `worker.mjs`)
+asks it after the opponent's threat is verified, and when a query without a clock spends all its nodes it asks
+once more with four times as many (at most 65,536). Deep Solve asks it as soon as the root has no forcing win,
+in rounds from 16,384 nodes. A timed turn keeps its single query inside its clock. Before this change Deep Solve
+asked only for a win of the side to move, so a lost position ran the frontier for the full two minutes (6.9 million
+frontier nodes, no proof) while the stamps that proved it in about five seconds were never used.
+
 ## Library and limits
 
 `tools/tactical/stamps.json` contains primitive strategies produced by HeXO.

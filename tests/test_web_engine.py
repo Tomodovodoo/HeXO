@@ -969,6 +969,27 @@ class Bundle(unittest.TestCase):
         self.assertGreater(ruled[-1]['checked'], ruled[1]['checked'])
         self.assertGreater(ruled[-1]['frontier_nodes'], ruled[1]['frontier_nodes'])
 
+    def lost_history(self):
+        """The 50 stones through 25. [4,7], where the side to move is lost to a quiet-defender proof."""
+        from notation import loads
+        text = (ROOT/'tests'/'fixtures'/'lost-quiet-defence.htttx').read_text(encoding='utf-8')
+        return [list(p) for p in loads(text).history]
+
+    def test_deep_solve_proves_the_side_to_move_lost_when_it_has_no_forcing_win(self):
+        history = self.lost_history()
+        self.assertEqual(len(history), 50)
+        answer = node(dict(kind='worker-turn', history=history, simulations=8, nodes=4096, proveMs=60000))
+        self.assertEqual(answer['solver']['root'], 'no forcing win')
+        self.assertEqual(answer['proof']['winner'], 0)
+        self.assertTrue(answer['threat'])
+        self.assertLess(answer['solver']['elapsed_ms'], 30000)
+
+    def test_a_standard_analysis_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
+        history = self.lost_history()
+        for ply in (len(history), len(history) - 1):
+            answer = node(dict(kind='worker-turn', history=history[:ply], simulations=8, nodes=4096))
+            self.assertEqual(answer['proof']['winner'], 0, ply)
+
     def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
         import re
         from hexo import Game
