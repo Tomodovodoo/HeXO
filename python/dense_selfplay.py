@@ -371,8 +371,7 @@ class Engine:
         """Start the slot's next search; True when it must wait for solver verdicts until the next visit."""
         key = position_key(np.asarray(slot.tree.history, np.int64).reshape(-1, 2))
         cached = slot.model.cache.get(key)
-        self.root_predictions[id(slot)] = (slot.model, key, float(cached[2][0]), cached[1]) if cached is not None \
-            else (slot.model, key, None, None)
+        self.root_predictions[id(slot)] = slot.model, key, float(cached[2][0]) if cached is not None else None
         if self.native_feed:
             from native_feed import NativeFeed
             if slot.model not in self.feeds:
@@ -501,7 +500,7 @@ class Engine:
                             result.update(proven=1, proof=proof, proof_turns=turns, proof_action=[list(s) for s in stones],
                                           proof_plies=bound, action=list(stones[0]))
                     if not checking:
-                        result['network_value'], result['prior_logits'] = self.root_predictions[id(slot)][2:]
+                        result['network_value'] = self.root_predictions[id(slot)][2]
                         if self.native_feed:
                             value = self.feeds[slot.model].root_value(slot.tree)
                             if value is not None:
@@ -586,7 +585,7 @@ class Engine:
                     checked(native.hxg_fulfill(ptr, request, *cached, len(cached[0])))
                     root = self.root_predictions[id(slot)]
                     if root[0] is model and root[1] == key:
-                        self.root_predictions[id(slot)] = model, key, float(cached[2][0]), cached[1]
+                        self.root_predictions[id(slot)] = model, key, float(cached[2][0])
                     self.hits += 1
                     progress = True
                 else:
@@ -646,7 +645,7 @@ class Engine:
                         checked(native.hxg_fulfill(ptr, request, *prediction, len(prediction[0])))
                         root = self.root_predictions.get(id(slot))
                         if root is not None and root[0] is model and root[1] == key:
-                            self.root_predictions[id(slot)] = model, key, float(prediction[2][0]), prediction[1]
+                            self.root_predictions[id(slot)] = model, key, float(prediction[2][0])
                 model.cache.put(key, prediction)
         if stopped:
             if not self.native_feed:

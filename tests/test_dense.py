@@ -5965,13 +5965,15 @@ class EngineTests(unittest.TestCase):
             checked(native.hxg_begin(tree.ptr, 2, 2))
             request = native.hxg_next(tree.ptr)
             actions = legal(tree.history)
-            prediction = actions, np.zeros(len(actions)), np.full(len(actions), .375)
+            prediction = actions, -.01*np.arange(len(actions)), np.full(len(actions), .375)
             checked(native.hxg_fulfill(tree.ptr, request, *prediction, len(actions)))
             model.cache.put(dense_selfplay.position_key(np.asarray(tree.history, np.int64)), prediction)
             engine.add(slot)
             while engine.slots or engine.closing:
                 engine.step()
             self.assertEqual(results[0]['network_value'], .375)
+            # The root's own logits come from the tree, whichever feed installed them.
+            np.testing.assert_allclose(results[0]['prior_logits'], prediction[1])
             self.assertFalse(engine.feeds)
         finally:
             engine.close()

@@ -1438,6 +1438,8 @@ HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double*
  }}t.trim_archive(false,false);return int(n.edges.size());
 }
 HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].read().eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;t.trim_archive(false,false);return int(q.size());}
+// The root edges' network logits, shifted so the largest is 0, in edge order: the prior the search started from.
+HX_API int hxg_logits(void* p,double* out){auto& n=*static_cast<gumbel::Tree*>(p)->root;if(!n.expanded)return 0;if(out)for(size_t i=0;i<n.edges.size();++i)out[i]=n.edges[i].logit;return int(n.edges.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
 // Completion includes an exact root, but never permits advancement while leaf reservations are outstanding.
 HX_API int hxg_done(void* p){return static_cast<gumbel::Tree*>(p)->done();}
