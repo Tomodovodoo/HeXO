@@ -412,17 +412,17 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
           postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking defence'}});
           let defended = replayed || note(await solve(id, history, {attacker: 'defender', nodes: solverNodes, ms: solverMs(), known: premises, stamps: proofStamps}));
           check();
-                    if (!timed && !replayed && verified(theirs) && searched(defended) && defended.status !== 'PROVEN_LOSS' && (defended.nodes_used || 0) >= solverNodes) {
+          if (!replayed) solverUsed += defended.nodes_used || 0;
+          if (!timed && !replayed && verified(theirs) && searched(defended) && defended.status !== 'PROVEN_LOSS' && (defended.nodes_used || 0) >= solverNodes) {
             // Without a clock: the opponent wins moving now and the query spent its whole budget: a cold quiet-defender proof can need several
             // times a Standard budget, and what this query learned makes the retry cheaper.
             const retried = note(await solve(id, history, {attacker: 'defender', nodes: Math.min(RETRY * solverNodes, 65536), ms: solverMs(), known: premises, stamps: proofStamps}));
             check();
-            solverUsed += retried.nodes_used || 0; 
+            solverUsed += retried.nodes_used || 0;
             if (retried.status === 'PROVEN_LOSS' && retried.native_verified || searched(retried)) defended = retried;
           }
           const lost = defended.status === 'PROVEN_LOSS' && defended.native_verified;
           solved = solved && (lost || searched(defended));
-          if (!replayed) solverUsed += defended.nodes_used || 0;
           if (lost) {
             pv = principalVariation(native, history, defended.certificate, {attacker: 1 - player, known: facts}).pv;
             proof = {winner: 1 - player, turns: defended.proof_turns, plies: state.remaining + 2 + 4 * (defended.proof_turns - 1),
