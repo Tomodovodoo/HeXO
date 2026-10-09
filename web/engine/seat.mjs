@@ -409,7 +409,7 @@ function recheck(entry, force = false) {
  * the WebAssembly ladder (bubble.mjs CPU_PRESETS), and the saved choices (or the static page's session) that use it
  * at another preset move to lightning, ending a job of it at another preset. */
 function lighten(engine) {
-  const found = [...ENGINES.values()].find(e => e.engine === engine);
+  const found = [...ENGINES.values()].find(e => e.engine === engine || e.spares?.has(engine));
   if (!found) return;
   const id = found.entry.id;
   found.entry.preset = 'lightning';
