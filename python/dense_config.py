@@ -221,6 +221,9 @@ class LearnerSettings:
     window_capacity: int = 2000000
     recency: float = 0.
     regret_fraction: float = 0.  # share of training batches drawn from the proof restart buffer
+    # KataGo's policy surprise weighting (dense_data.ReplayWindow.surprise_weights): this share of each game's
+    # full-search sampling weight follows the rows' stored KL from the network prior to the search policy; 0 = off.
+    surprise_weight: float = 0.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows
@@ -284,6 +287,8 @@ class LearnerSettings:
             raise ValueError('pair_policy_weight must be finite and nonnegative')
         if not 0 <= self.regret_fraction <= 1:
             raise ValueError('regret_fraction must lie in [0, 1]')
+        if not 0 <= self.surprise_weight <= 1 or self.surprise_weight and self.regret_fraction:
+            raise ValueError('surprise_weight must lie in [0, 1] and cannot combine with regret_fraction')
 
 
 @dataclass(frozen=True)

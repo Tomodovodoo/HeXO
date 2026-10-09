@@ -2473,6 +2473,50 @@ class DenseDataTests(unittest.TestCase):
             self.assertEqual(rows, {(1, 5): .5, (2, 0): .25})
             self.assertTrue(np.all(np.diff(window.regret_positions) > 0))
 
+    def test_surprise_weighting_draws_each_games_surprising_rows_more_often(self):
+        moves, _ = random_game(np.random.default_rng(4), 8)
+        episode, rows = episode_rows(moves, -1, [0.]*8, policy_every=2)
+        kl = {0: 0., 2: 0., 4: 0., 6: 3.}
+        for row in rows:
+            if row['ply'] in kl:
+                row['surprise'] = kl[row['ply']]
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            manifest = dense_data.write_shard(run/'shards'/'000001', dict(actor_sha256='a'*64), [episode], rows)
+            self.assertEqual(manifest['counts']['surprise_rows'], 4)
+            write_games(run/'shards'/'000002', [(moves, -1, [0.]*8)])  # no stored surprises: weight 1
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            self.assertEqual(window.surprise_rows, 4)
+            refs = [window.ref(*ref) for ref in window.index]
+            # KataGo's split at weight 0.5: half of the game's four full rows' weight evenly (0.5 each), half by KL.
+            expected = np.array([1. if ref.shard == '000002' or ref.row['ply'] % 2 else
+                                 .5+.5*4*kl[ref.row['ply']]/3 for ref in refs])
+            np.testing.assert_allclose(window.surprise_weights(.5), expected)
+            np.testing.assert_array_equal(window.surprise_weights(0.), np.ones(len(refs)))
+            drawn = Counter((r.shard, r.row['ply']) for r in window.sample(np.random.default_rng(0), 40000, surprise=.5))
+            frequency = np.array([drawn[ref.shard, ref.row['ply']] for ref in refs])/40000
+            np.testing.assert_allclose(frequency, expected/expected.sum(), atol=.006)
+        with self.assertRaisesRegex(ValueError, 'surprise_weight'):
+            dense_config.LearnerSettings(surprise_weight=.5, regret_fraction=.1)
+
+    def test_an_index_file_without_surprises_is_rebuilt_once_a_shard_stores_them(self):
+        moves, _ = random_game(np.random.default_rng(4), 6)
+        episode, rows = episode_rows(moves, -1, [0.]*6)
+        for row in rows:
+            row['surprise'] = .25
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            path = run/'shards'/'000001'
+            dense_data.write_shard(path, dict(actor_sha256='a'*64), [episode], rows)
+            index = dense_data.shard_index(path, dense_data.index_dir(run))
+            file = dense_data.index_dir(run)/'000001.npz'
+            with np.load(file) as data:
+                kept = {k: data[k] for k in data.files if k != 'surprise'}
+            np.savez(file, **kept)  # as written by a learner that predates the field
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            np.testing.assert_allclose(window.shards['000001'].surprise, index['surprise'])
+            self.assertEqual(window.surprise_rows, 6)
+
     def test_certified_value_errors_enter_bounded_priority_without_restarts(self):
         moves, _ = random_game(np.random.default_rng(4), 20)
         episode, rows = episode_rows(moves, -1, [-1.]*20)
@@ -3206,7 +3250,7 @@ class DenseBootstrapTests(unittest.TestCase):
             self.assertEqual((written['actor'], written['origin']), ('b'*64, 'converted'))
             self.assertEqual(dense_data.origin(dict(written, origin=None)), 'converted')    # inferred from the identity
             self.assertEqual(written['counts'], dict(games=2, rows=21, policy_rows=21, opponent_rows=0, terminal_games=1, capped_games=1,
-                                                 proven_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
+                                                 proven_rows=0, surprise_rows=0, proven_games=0, line_rows=0, adjudicated_plies=0,
                                                  restart_games=0, book_games=0, fork_games=0, forced_plies=0))
             self.assertEqual(dense_bootstrap.check(target), 21)
             _, stored = dense_data.read_shard(target)
@@ -4858,6 +4902,8 @@ class EngineTests(unittest.TestCase):
                     self.assertIsNone(row['policy'])
                 elif row['policy'] is not None:
                     self.assertAlmostEqual(float(row['policy'].sum()),1.,places=6)
+                self.assertEqual('surprise' in row,row['policy'] is not None)
+                self.assertGreaterEqual(row.get('surprise',0.),0.)
         with tempfile.TemporaryDirectory() as run:
             dense_data.write_shard(Path(run)/'shards'/'000001',dict(actor_sha256='stream-1'),episodes,rows)
             window = dense_data.ReplayWindow(run,capacity_rows=1000,validation_fraction=0.)
@@ -6226,6 +6272,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(episode['root_values'][:3], [None]*3)
         self.assertTrue(all(v is not None for v in episode['root_values'][3:]))
         self.assertEqual([r['ply'] for r in rows], [3, 4])
+        self.assertTrue(all(r['surprise'] >= 0 for r in rows))
         with tempfile.TemporaryDirectory() as run:
             manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'),
                                              [episode], [dict(r, game=0) for r in rows])
@@ -6233,6 +6280,15 @@ class EngineTests(unittest.TestCase):
                               manifest['counts']['forced_plies']), (1, 0, 3))
         with self.assertRaises(ValueError):
             dense_config.ActorSettings(book_fraction=.95, restart_fraction=.1)
+
+    def test_policy_surprise_is_the_kl_from_the_prior_to_the_search_policy(self):
+        logits = np.array([2., 0., -1., -30.])
+        prior = np.exp(logits)/np.exp(logits).sum()
+        self.assertAlmostEqual(dense_selfplay.policy_surprise(prior, logits+5.), 0., places=12)
+        policy = np.array([.1, .9, 0., 0.])
+        self.assertAlmostEqual(dense_selfplay.policy_surprise(policy, logits),
+                               float(np.sum(policy[:2]*np.log(policy[:2]/prior[:2]))), places=12)
+        self.assertGreater(dense_selfplay.policy_surprise(np.array([0., 0., 0., 1.]), logits), 25.)
 
     def test_fork_plays_the_value_heads_best_random_move_for_the_forking_side(self):
         moves = [[0, 0], [7, 0], [8, 0], [1, 0], [2, 0], [7, 1]]
