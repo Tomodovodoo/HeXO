@@ -268,7 +268,7 @@ class NeuralSearch:
         policy = np.empty(n)
         native.hxg_policy(self.ptr, policy.ctypes.data)
         logits = np.empty(n)
-        native.hxg_logits(self.ptr, logits.ctypes.data)
+        logits = logits if native.hxg_logits(self.ptr, logits.ctypes.data) else None
         completed_q = np.empty(n)
         native.hxg_q(self.ptr, completed_q.ctypes.data)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None

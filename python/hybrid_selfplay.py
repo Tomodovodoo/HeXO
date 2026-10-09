@@ -528,7 +528,8 @@ class HybridGames:
             player,winner = game.game.player,event['exact_winner']
             proven = 0 if winner<0 else 1 if winner==player else -1
             result = dict(event,actions=edges[:,:2].astype(np.int64),visits=edges[:,6].astype(np.int64),
-                          completed_q=edges[:,3],values=edges[:,4],policy=edges[:,5],prior_logits=edges[:,2],
+                          completed_q=edges[:,3],values=edges[:,4],policy=edges[:,5],
+                          prior_logits=edges[:,2] if event['network_value'] is not None else None,
                           completed=event['root_completed'],proven=proven,proof_turns=0,
                           solver_nodes=0,solver_budget=0,
                           proof_action=edges[edges[:,8].astype(bool),:2].astype(np.int64).tolist() if proven>0 else [])

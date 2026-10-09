@@ -6292,6 +6292,14 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(dense_selfplay.policy_surprise(policy, logits),
                                float(np.sum(policy[:2]*np.log(policy[:2]/prior[:2]))), places=12)
         self.assertGreater(dense_selfplay.policy_surprise(np.array([0., 0., 0., 1.]), logits), 25.)
+        # A root expanded by an immediate win, with no network evaluation, has no prior to be surprised by.
+        five = [(0, 0), (0, 1), (0, 2), (5, 5), (5, 6), (0, 3), (0, 4), (6, 5), (6, 6), (0, 5)]
+        tree = NeuralSearch(None, 'immediate', five, tactics=True)
+        try:
+            result = tree.search(8, root_samples=4, batch_size=4)
+        finally:
+            tree.close()
+        self.assertEqual((result['exact_winner'], result['prior_logits']), (1, None))
 
     def test_fork_plays_the_value_heads_best_random_move_for_the_forking_side(self):
         moves = [[0, 0], [7, 0], [8, 0], [1, 0], [2, 0], [7, 1]]
