@@ -5,7 +5,7 @@ millisecond time plus pid) holding
   episodes.json  [{moves, winner, reason, opening_plies, actor, root_values, full_search, actors?, opponent?,
                   trained_side?, origin?, restart?, book?}]
   rows.json      [{game, ply, player, remaining, target, weight, legal_sha256, proven?, proof_turns?, proof_plies?,
-                  solver_nodes?, solver_budget?, proof_action?}]
+                  solver_nodes?, solver_budget?, proof_action?, surprise?}]
   targets.npz    offsets [rows+1], probabilities: row i's improved policy over its native
                  `Game.legal_moves()` order is probabilities[offsets[i]:offsets[i+1]] (empty slice: no policy target)
   manifest.json  schema, created_at, origin, identity, actor, files (sha256), counts (opponent_rows,
@@ -32,6 +32,8 @@ rows a sidecar lists (proof_labels) once it appears. A game ended at a proof (ac
 'proven', its winner and `adjudicated` {ply, winner, line_plies: placements of the certificate's forced line from
 there}; rows of that line played without search carry `line` True and no policy. The manifest counts
 `proven_games`, `line_rows` and `adjudicated_plies`.
+Rows with a policy target carry `surprise`, KL(policy || network prior) in nats at that root (dense_selfplay
+policy_surprise), on shards whose manifest counts `surprise_rows`; older rows have none.
 Winning rows may carry `proof_action`: the certificate's remaining placements [[q,r], ...] at that row, or for a
 win proven by the search tree its shortest winning moves.
 Sidecars carry the same field as a mapping from ply strings to placements, applied by both readers. Missing
@@ -91,7 +93,8 @@ SURVEY_CHUNK = 64
 Ref = namedtuple('Ref', 'shard index row episode')
 Survey = namedtuple('Survey', 'manifest count actors')
 Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof_action search legal offsets following start moves roots searched has_roots '
-                             'has_search winner side held')
+                             'has_search winner side surprise held')
+SHARD_INDEX = tuple(f for f in Shard._fields if f not in ('surprise', 'held'))+('holdout', 'network', 'has_network')
 FUTURE = (6, 20)
 ORIGINS = ('converted', 'actor')
 SOURCES = ('converted', 'fresh', 'newest')
@@ -389,11 +392,11 @@ def write_shard(path, identity, episodes, rows, origin='actor'):
         if len(p) and (not np.isfinite(p).all() or np.any(p < 0) or not np.isclose(p.sum(), 1, atol=1e-4)):
             raise ValueError('Invalid policy target')
     keys = ('game', 'ply', 'player', 'remaining', 'target', 'weight', 'legal_sha256', 'proven', 'proof_turns', 'proof_plies',
-            'solver_nodes', 'solver_budget', 'line', 'proof_action', 'search')
+            'solver_nodes', 'solver_budget', 'line', 'proof_action', 'search', 'surprise')
     counts = dict(games=len(episodes), rows=len(rows), policy_rows=sum(len(p) > 0 for p in policies),
                   opponent_rows=sum(not trained(episodes[r['game']], r['ply']) for r in rows),
                   terminal_games=sum(e['winner'] >= 0 for e in episodes), capped_games=sum(e['winner'] < 0 for e in episodes),
-                  proven_rows=sum(bool(r.get('proven')) for r in rows),
+                  proven_rows=sum(bool(r.get('proven')) for r in rows), surprise_rows=sum('surprise' in r for r in rows),
                   proven_games=sum(e.get('reason') == 'proven' for e in episodes), line_rows=sum(bool(r.get('line')) for r in rows),
                   adjudicated_plies=sum(e['adjudicated']['line_plies'] for e in episodes if e.get('adjudicated')),
                   restart_games=sum(e.get('origin') == 'restart' for e in episodes),
@@ -541,7 +544,8 @@ def index_shard(path):
     has_network (the episode's saved network value at the row's ply, and whether it has one) and offsets [rows+1] (policy offsets). Per
     game: start [games+1] (ply offsets), winner, side (trained side, -1 for self-play), has_roots, has_search,
     holdout (holdout_key) and actor (index into `actors`). Per ply: moves [plies, 2], roots (NaN for null) and
-    searched. proof_action and search map row indices to those row fields; actors lists the episode actors."""
+    searched. Per row also surprise (float32, NaN without one). proof_action and search map row indices to those row
+    fields; actors lists the episode actors."""
     episodes, rows = read_shard(path, policies=False)
     game = np.array([r['game'] for r in rows], np.int32); ply = np.array([r['ply'] for r in rows], np.int32)
     where = {(g, t): i for i, (g, t) in enumerate(zip(game.tolist(), ply.tolist()))}
@@ -558,6 +562,7 @@ def index_shard(path):
         network=np.array([0. if v is None or v[r['ply']] is None else v[r['ply']] for v, r in zip(values, rows)], np.float64),
         has_network=np.array([v is not None and v[r['ply']] is not None for v, r in zip(values, rows)], bool),
         offsets=load_offsets(path, len(rows)),
+        surprise=np.array([r.get('surprise', np.nan) for r in rows], np.float32),
         start=np.cumsum([0]+[len(e['moves']) for e in episodes]).astype(np.int32),
         winner=np.array([e['winner'] for e in episodes], np.int8),
         side=np.array([-1 if e.get('trained_side') is None else e['trained_side'] for e in episodes], np.int8),
@@ -574,7 +579,8 @@ def index_shard(path):
 
 def shard_index(path, cache, fields=None):
     """index_shard(path) restricted to `fields` (default all). Read from `cache`/<shard name>.npz while the stamp saved
-    there equals shard_stamp(path) and the file hashes saved there equal those of the shard's manifest; otherwise built
+    there equals shard_stamp(path), the file hashes saved there equal those of the shard's manifest and it holds every
+    requested field (a file written before a field existed lacks it); otherwise built
     from the shard, which verifies its hashes, and saved there under a temporary name and linked into place. A stale
     file is removed first; when another process holds it open, or links its own file first, that file stands and the
     next read compares it again."""
@@ -583,7 +589,8 @@ def shard_index(path, cache, fields=None):
     files = json.dumps(manifest(path)['files'], sort_keys=True)
     try:
         with np.load(file) as data:
-            if np.array_equal(data['stamp'], stamp) and str(data['files']) == files:
+            if (np.array_equal(data['stamp'], stamp) and str(data['files']) == files
+                    and all(k in data.files for k in fields or ())):
                 return {k: _unpack(k, data[k]) for k in fields or [k for k in data.files if k not in ('stamp', 'files')]}
         with contextlib.suppress(FileNotFoundError, PermissionError):    # Windows: another process is reading it
             file.unlink()
@@ -859,7 +866,11 @@ class ReplayWindow:
 
     def load(self, name):
         path = self.run_dir/'shards'/name
-        x = shard_index(path, self.index_dir)
+        # A shard without stored surprises needs no index field for them, so older index files stay valid.
+        stored = self.manifests[name]['counts'].get('surprise_rows', 0) > 0
+        x = shard_index(path, self.index_dir, [*SHARD_INDEX, 'surprise'] if stored else SHARD_INDEX)
+        if not stored:
+            x['surprise'] = np.full(len(x['game']), np.nan, np.float32)
         labels, self.deblunders[name] = proof_annotations(path)
         if labels is None:
             self.unlabelled.add(name)
@@ -917,7 +928,7 @@ class ReplayWindow:
         listed = {}
         for (name, game, ply), weight in self.regret_entries.items():
             listed.setdefault(name, []).append((game, ply, weight))
-        priority_positions, priority_weights = [], []
+        priority_positions, priority_weights, surprises, games = [], [], [], []
         for k, (name, take) in enumerate(self.admitted):
             s = self.shards[name]; full = np.diff(s.offsets) > 0; positions = np.flatnonzero(full)
             start = self.starts[name] = 0 if take >= len(positions) else int(positions[-take]) if take else len(s.game)
@@ -934,6 +945,7 @@ class ReplayWindow:
             found[found] = train[position[found]] == priority[found]
             priority_positions.append(train_offset+position[found]); priority_weights.append(weight[found])
             train_offset += len(train)
+            surprises.append(s.surprise[train]); games.append(k*2**32+s.game[train].astype(np.int64))
             for (ids, rows), chosen in zip(parts, (train, i[held])):
                 ids.append(np.full(len(chosen), k, np.int32)); rows.append(chosen)
         names = [name for name, _ in self.admitted]
@@ -946,6 +958,10 @@ class ReplayWindow:
         self.regret_rows = len(self.regret_positions)
         self.regret_probability_cache = {}
         self.regret_distribution_cache = {}
+        self.surprise = np.concatenate([np.zeros(0, np.float32), *surprises]).astype(np.float64)
+        self.surprise_games = np.concatenate([np.zeros(0, np.int64), *games])
+        self.surprise_rows = int(np.count_nonzero(np.isfinite(self.surprise)))
+        self.surprise_cache = {}
         return self.rows
 
     @property
@@ -1027,6 +1043,19 @@ class ReplayWindow:
             self.regret_distribution_cache[recency] = base
         return self.regret_distribution_cache[recency]
 
+    def surprise_weights(self, weight):
+        """Sampling weight per training row for surprise_weight `weight`: 1, except rows with a stored surprise. Within
+        each game those keep their total weight, one per row, and split it (1 - weight) evenly and `weight` in
+        proportion to their KL, as KataGo writes surprising rows more often; a game whose surprises sum to 0 keeps 1."""
+        weights = np.ones(len(self.surprise))
+        stored = np.isfinite(self.surprise)
+        if weight and stored.any():
+            kl = np.maximum(self.surprise[stored], 0.)
+            _, game, rows = np.unique(self.surprise_games[stored], return_inverse=True, return_counts=True)
+            total = np.bincount(game, kl)[game]
+            weights[stored] = np.where(total > 0, 1-weight+weight*rows[game]*kl/np.where(total > 0, total, 1.), 1.)
+        return weights
+
     def regret_baseline(self, recency):
         return self.regret_distribution(recency)[self.regret_positions]
 
@@ -1098,15 +1127,22 @@ class ReplayWindow:
                 out.append((s.roots[a:b], s.searched[a:b] if s.has_search[g] else None, int(s.winner[g])))
         return out
 
-    def sample(self, rng, n, recency=0., validation=False, regret_fraction=0.):
+    def sample(self, rng, n, recency=0., validation=False, regret_fraction=0., surprise=0.):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
-        W rows has weight ((k+1)/W)^recency. Priority counts are stochastic, with the capped expected share,
-        so fewer than one expected priority draw per batch still samples regret rows."""
+        W rows has weight ((k+1)/W)^recency, times surprise_weights(surprise) for training draws. Priority counts are
+        stochastic, with the capped expected share, so fewer than one expected priority draw per batch still samples
+        regret rows."""
         index = self.validation if validation else self.index
         W = len(index)
         if not W:
             raise ValueError('Replay window is empty')
-        if recency:
+        if surprise and not validation:
+            if (surprise, recency) not in self.surprise_cache:
+                weights = self.surprise_weights(surprise)*((np.arange(1, W+1)/W)**recency if recency else 1.)
+                self.surprise_cache[surprise, recency] = np.cumsum(weights)
+            cumulative = self.surprise_cache[surprise, recency]
+            picks = np.minimum(np.searchsorted(cumulative, rng.random(n)*cumulative[-1], side='right'), W-1)
+        elif recency:
             w = (np.arange(1, W+1)/W)**recency
             p = self.regret_distribution(recency) if regret_fraction and self.regret_rows and not validation else w/w.sum()
             picks = rng.choice(W, n, p=p)
@@ -1574,7 +1610,7 @@ def batches(window, rng, batch_size, settings, validation=False, calibration=lam
     (recency and target_options)."""
     while True:
         s = settings()
-        refs = window.sample(rng, batch_size, s.recency, validation, s.regret_fraction)
+        refs = window.sample(rng, batch_size, s.recency, validation, s.regret_fraction, s.surprise_weight)
         yield collate_arrays(*examples(window, refs, rng, **target_options(s, calibration())))
 
 

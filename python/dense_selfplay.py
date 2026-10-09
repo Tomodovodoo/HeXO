@@ -290,6 +290,16 @@ def root_temperature(settings, ply):
     return late+(settings.root_temperature_early-late)*.5**(ply/settings.root_temperature_halflife)
 
 
+def policy_surprise(policy, logits):
+    """KL(policy || softmax(logits)) in nats: how far a search policy moved from the network prior over the same
+    legal moves."""
+    logits = np.asarray(logits, np.float64)
+    prior = logits-logits.max()
+    prior -= np.log(np.exp(prior).sum())
+    support = policy > 0
+    return float(np.sum(policy[support]*(np.log(policy[support])-prior[support])))
+
+
 def root_value(result, player):
     """Side-to-move value of a finished search: the solver's exact value when it proved one (result `proven`), else
     exact +-1 when the tree root is exact, else child values under the improved policy. Unvisited child values
@@ -815,6 +825,8 @@ class SelfPlayGame:
             if not np.isclose(policy.sum(), 1, atol=1e-6) or np.any(policy < 0):
                 raise ValueError('Search policy is not a distribution')
             row['policy'] = policy.astype(np.float32)
+            if result.get('prior_logits') is not None:
+                row['surprise'] = policy_surprise(row['policy'].astype(np.float64), result['prior_logits'])
         if dense_solver.active(self.solver, self.schedule) or result.get('proven'):
             row.update(proven=result['proven'], proof_turns=result['proof_turns'], solver_nodes=result['solver_nodes'],
                        solver_budget=result['solver_budget'])

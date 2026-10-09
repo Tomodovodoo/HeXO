@@ -27,6 +27,7 @@ bind('hxg_cancel', None, ptr)
 bind('hxg_advance', C.c_int, ptr, C.c_int64, C.c_int64)
 bind('hxg_stats', C.c_int, ptr, ptr, ptr, ptr, ptr)
 bind('hxg_policy', C.c_int, ptr, ptr)
+bind('hxg_logits', C.c_int, ptr, ptr)
 bind('hxg_completed', C.c_int, ptr)
 bind('hxg_done', C.c_int, ptr)
 bind('hxg_tactics', C.c_int, ptr, C.c_int)
@@ -266,6 +267,8 @@ class NeuralSearch:
         native.hxg_stats(self.ptr, actions.ctypes.data, visits.ctypes.data, values.ctypes.data, scores.ctypes.data)
         policy = np.empty(n)
         native.hxg_policy(self.ptr, policy.ctypes.data)
+        logits = np.empty(n)
+        logits = logits if native.hxg_logits(self.ptr, logits.ctypes.data) else None
         completed_q = np.empty(n)
         native.hxg_q(self.ptr, completed_q.ctypes.data)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
@@ -277,6 +280,7 @@ class NeuralSearch:
         shortest = [actions[i].tolist() for i in range(n) if np.isfinite(scores[i])] if proven > 0 else []
         return dict(action=actions[selected].tolist() if selected is not None else None,
                     actions=actions, visits=visits, values=values, policy=policy, scores=scores, completed_q=completed_q,
+                    prior_logits=logits,
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     node_value=native.hxg_value(self.ptr),
                     elapsed_ms=(finished-start)*1000,
