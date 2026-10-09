@@ -112,8 +112,8 @@ class NeuralSearch:
     within each halving round while permitting concurrent work across visit layers; default false."""
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
                  tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
-                 root_concentration=0., root_temperature=1., limit=None, archive_bytes=0, archive_forward=False,
-                 round_barrier=False):
+                 limit=None, archive_bytes=0, archive_forward=False, round_barrier=False, root_concentration=0.,
+                 root_temperature=1.):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -359,9 +359,8 @@ class GameGraph(NeuralSearch):
     `search(..., pv_check=f)` adds the principal-variation check (Recheck)."""
 
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
-                 proof_ms=100, q_range_floor=0., root_noise=0., root_concentration=0., root_temperature=1., limit=GRAPH_LIMIT,
-                 archive_bytes=0,
-                 archive_forward=False, round_barrier=False):
+                 proof_ms=100, q_range_floor=0., root_noise=0., limit=GRAPH_LIMIT, archive_bytes=0, archive_forward=False,
+                 round_barrier=False, root_concentration=0., root_temperature=1.):
         super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
                          q_range_floor=q_range_floor, root_noise=root_noise, root_concentration=root_concentration,
                          root_temperature=root_temperature,
