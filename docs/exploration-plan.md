@@ -83,7 +83,15 @@ This check draws the opening Gumbel-top-16 set 100 times for each of 1,500 full-
 | temperature 1.1 | 3.63 | 2.36 | 0.76 |
 | temperature 1.25 | 3.39 | 2.37 | 1.06 |
 
-The hopeless label comes from the prior, so it was checked against search. The live actors' uniform share samples about five such moves per search, and each gets a real Q. Over 1,500 full-search rows from the newest 400 live shards, with the same checkpoint's priors, the recorded targets put 0.46% of their mass on below-mean moves, and one of them is the target's top move in 0.33% of positions. Search rarely finds anything there, so a slot spent on them is mostly lost.
+The hopeless label comes from the prior, so it was checked against search. 320 positions from the newest 400 live shards were searched on the CPU at 64 simulations with 16 samples and the live uniform share of 0.1, using the same checkpoint. Each sampled move then carries its own searched Q.
+
+| sampled moves | count | best searched Q | within 0.05 of the best |
+|---|---:|---:|---:|
+| below the mean log prior | 1,266 | 0.2% | 1.8% |
+| 0.05% to 1%, above the mean | 454 | 4.4% | 24.7% |
+| the rest | 2,878 | 10.1% | 28.8% |
+
+The uniform share fills more than a quarter of the samples with below-mean moves, and search almost never finds one competitive. The band moves, which shaped noise keeps, come within 0.05 of the best about as often as the leading moves do.
 
 Gumbel-top-16 already explores. With no noise at all, about six of the sixteen samples come from the low-prior moves that blind spots live among. Every kind of noise trades some of them for hopeless moves. The live uniform 0.1 is the worst of the realistic settings: five of sixteen slots go to hopeless moves, and coverage of the 0.05% to 1% band drops by two thirds. Shaped noise at the same weight halves the hopeless slots and keeps more of both low-prior groups. It is better on every column, so it should replace the uniform share at the next actor restart. Whether any noise beats none needs a self-play test that was not run here. Temperature alone changes little and only adds hopeless samples, so it stays at 1.
 
