@@ -219,6 +219,7 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
     const left = () => Math.max(1, Math.floor(Math.min(end - performance.now(), 60000)));
     const theirs = await solve(id, history, {attacker: 'opponent', nodes: 32768, ms: left(), stamps, known: premises});
     root.nodes += theirs.nodes_used || 0;
+    if (theirs.reason?.startsWith(FAILED)) { root.error = theirs.reason; return; }
     if (!verified(theirs)) return;
     root.threat = theirs;
     for (let nodes = 16384; !root.done && !cancelled.has(id) && performance.now() < end;) {
