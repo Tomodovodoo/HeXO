@@ -10,6 +10,8 @@ import {stageText} from './stages.mjs';
 /** The analysis solver preset (python/play.py SOLVER): proof work alone for up to `solver_ms`, then the turn. */
 export const SOLVER = {simulations: 128, solver_nodes: 32768, solver_ms: 120000};
 
+/** A job that stays queued this long logs a console warning naming what it waits for. */
+const QUEUE_WARN_MS = 10000;
 const REFRESH_PLIES = 4;  // earlier placements a finished analysis refreshes (python/play.py REFRESH_PLIES)
 const REFRESH_ROUNDS = 3, REFRESH_MOVE = .05;  // further refreshes of one position while each still moves its result (python/play.py)
 // The share of a saved evaluation's simulations a refresh searches again, of at most the analysis budget's (python/play.py).
@@ -141,16 +143,19 @@ export class BrowserSession extends OfflineSession {
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
     this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
-    this.lanes = {move: null, analysis: null}; this.settling = {move: Promise.resolve(), analysis: Promise.resolve()}; this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
+    this.lanes = {move: null, analysis: null}; this.factories = new Map(); this.spares = new Map(); this.grant = null; this.heldSince = null; this.moveMs = null; this.queueWarnMs = QUEUE_WARN_MS; this.settling = {move: Promise.resolve(), analysis: Promise.resolve()}; this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {generation: null, searches: 0};
     this.dismissed = null;   // the dismissal() of the analysis a person cancelled, or null
     this.proofs = new Proofs(); this.provenRecords = new Map();
   }
   /** Adds a browser engine: `adapter.ready(progress, checkpoint)` loads it with that checkpoint's network (a timed
    * move's clock starts after it; `progress(fraction, stage)` with stages.mjs's stages) and `adapter.turn(history,
-   * budget, options)` plays (`options.progress(fraction, live, stage)`). */
-  registerEngine(entry, adapter) {
+   * budget, options)` plays (`options.progress(fraction, live, stage)`). `spare()`, when given, makes a second adapter of the
+   * same engine (its own worker, the same checkpoints): analysis then runs on it whenever the engine is also seated, so
+   * analysis never competes with the seat's moves for the one worker. */
+  registerEngine(entry, adapter, spare = null) {
     this.entries.set(entry.id, entry); this.adapters.set(entry.id, adapter);
+    this.spares.delete(entry.id); if (spare) this.factories.set(entry.id, spare); else this.factories.delete(entry.id);
     const fit = spec => spec?.engine === entry.id ? this.saved(spec) : spec;
     this.seats = this.seats.map(fit); this.analysis = fit(this.analysis);
     this.changed(); this.pump();
@@ -268,7 +273,10 @@ export class BrowserSession extends OfflineSession {
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
       evaluations, stale: Object.keys(evaluations).map(Number).filter(ply => this.stale(evaluations[ply], ply)), review: turns,
       review_preset: this.reviewSpec()?.preset ?? null,
-      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map(({id, kind, status, done, total, error, history, side, live, stage}) => ({id, kind, status, done, total, error, ply: history.length, side, live, stage}))};
+      jobs: this.jobs.filter(j => !j.controller.signal.aborted).map((job) => {
+        const {id, kind, status, done, total, error, history, side, live} = job;
+        return {id, kind, status, done, total, error, ply: history.length, side, live: status === 'running' ? live : undefined, stage: status === 'queued' ? this.waiting(job) ?? job.stage : job.stage};
+      })};
   }
   static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
@@ -498,7 +506,8 @@ export class BrowserSession extends OfflineSession {
     if (this.jobs.some(j => j.key === key)) return;
     if (kind === 'analyse' && !fields.force && this.lookup(history, spec, true)) return;
     if (kind === 'analyse' && !fields.refresh) this.cancelJobs(j => j.kind === 'analyse' && j.status !== 'failed' && (fields.tier ? j.tier : true));
-    this.jobs.push({id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, ...fields});
+    const job = {id: ++this.nextJob, kind, history: copy(history), spec: copy(spec), key, controller: new AbortController(), status: 'queued', done: 0, total: 1, queuedAt: Date.now(), ...fields};
+    this.jobs.push(job); this.watch(job);
   }
   /** Saves the evaluation `result` of `history` by `spec`. One whose solver could not run (`solver_error`) is kept for
    * this visit only and raises the session's `notice`, so a later visit evaluates the position again with proofs. A
@@ -660,38 +669,94 @@ export class BrowserSession extends OfflineSession {
     if (this.match?.active) await this.finishMatch(1 - side, 'timeout');
     this.changed();
   }
-  /** Runs the next job: an engine move first, then analysis, review and deepening. A queued move interrupts a running
-   * job of another kind, which goes back to the queue (a review keeps its finished positions). */
   /** Starts the next jobs on two lanes, as the served page has them: engine moves on one, analysis, review and
-   * deepening on the other, so analysis keeps up while engines play. A job of the engine a move runs on waits for that
-   * move (the engine has one worker), and a move queued for the engine of a running analysis interrupts it (the job
-   * goes back to the queue, a review keeping its finished positions). The analysis lane takes the analysis asked for,
-   * then review, deepening, and last the background refreshes of earlier positions, so the shown position never waits
-   * behind them. */
+   * deepening on the other, so analysis keeps up while engines play. An analysis of an engine that is also seated runs
+   * on that engine's spare worker when it has one (see `registerEngine`), so it never waits for the seat's moves.
+   * Without a spare, a job of the engine a move runs on waits for that move (the engine has one worker), and a move
+   * queued for the engine of a running analysis interrupts it (the job goes back to the queue, a review keeping its
+   * finished positions); to keep the analysis from starving, once a move has completed, an analysis held back
+   * has been held back longer than that move took runs before the next move and is not interrupted. The analysis lane takes the analysis
+   * asked for, then review, deepening, and last the background refreshes of earlier positions, so the shown position
+   * never waits behind them. */
   pump() {
     if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
     const queued = test => this.jobs.find(j => j.status === 'queued' && test(j));
-    const move = this.lanes.move ?? queued(j => j.kind === 'move'), busy = j => move && j.spec.engine === move.spec.engine;
-    if (this.lanes.analysis && busy(this.lanes.analysis)) this.lanes.analysis.attempt.abort();   // the move starts once it has stopped
-    else if (!this.lanes.move && move) this.run(move, 'move');
+    const move = this.lanes.move ?? queued(j => j.kind === 'move'), busy = j => move && this.shares(j, move);
+    const pick = pool => pool(j => j.kind === 'analyse' && !j.tier && !j.background) || pool(j => j.kind === 'review') || pool(j => j.tier) || pool(j => j.background);
+    // How long a seated engine's worker has gone without finishing an analysis that wants it, counted from the first pump that
+    // finds one (a deepening search of a position the game left is replaced by the next, so a job's own wait restarts).
+    const held = this.jobs.some(j => j.kind !== 'move' && j.status !== 'failed' && this.workerOf(j) === 'main' && this.seats.some(seat => seat.engine === j.spec.engine));
+    if (!held) this.heldSince = null; else this.heldSince ??= Date.now();
+    if (this.lanes.analysis && busy(this.lanes.analysis)) { if (this.lanes.analysis !== this.grant) this.lanes.analysis.attempt.abort(); }   // the move starts once it has stopped
+    else if (!this.lanes.move && move) {
+      const owed = !this.lanes.analysis && this.moveMs != null && held && Date.now() - this.heldSince > this.moveMs ? pick(test => queued(j => j.kind !== 'move' && this.shares(j, move) && test(j))) : null;
+      if (owed) { this.grant = owed; this.run(owed, 'analysis'); return; }
+      this.run(move, 'move');
+    }
     if (this.lanes.analysis) return;
-    const free = test => queued(j => j.kind !== 'move' && !busy(j) && test(j));
-    const job = free(j => j.kind === 'analyse' && !j.tier && !j.background) || free(j => j.kind === 'review') || free(j => j.tier) || free(j => j.background);
+    const job = pick(test => queued(j => j.kind !== 'move' && !busy(j) && test(j)));
     if (job) this.run(job, 'analysis');
+  }
+  /** The worker `job` runs on: 'spare' for an analysis of an engine that is seated and has a spare, else 'main'. */
+  workerOf(job) {
+    if (job.worker) return job.worker;
+    return job.kind !== 'move' && this.factories.has(job.spec.engine) && this.seats.some(seat => seat.engine === job.spec.engine) ? 'spare' : 'main';
+  }
+  /** True when `a` and `b` need the same engine worker. */
+  shares(a, b) { return a.spec.engine === b.spec.engine && this.workerOf(a) === 'main' && this.workerOf(b) === 'main'; }
+  /** The adapter `job` runs on. */
+  adapterOf(job) {
+    if (this.workerOf(job) !== 'spare') return this.adapters.get(job.spec.engine);
+    if (!this.spares.has(job.spec.engine)) this.spares.set(job.spec.engine, this.factories.get(job.spec.engine)());
+    return this.spares.get(job.spec.engine);
+  }
+  /** What `job` is, for the console: its kind, engine, checkpoint, preset and ply. */
+  describe(job) {
+    const ply = job.kind === 'review' ? job.plies[job.cursor] ?? job.history.length : job.history.length;
+    return `${job.kind} on ${job.spec.engine}, checkpoint ${job.spec.checkpoint ?? 'none'}, preset ${job.spec.preset}, ply ${ply}`;
+  }
+  /** The job a queued `job` waits for, or null when nothing holds it. */
+  holder(job) {
+    const move = this.lanes.move ?? this.jobs.find(j => j.status === 'queued' && j.kind === 'move');
+    if (job.kind !== 'move' && move && move !== job && this.shares(job, move)) return move;
+    const lane = job.kind === 'move' ? this.lanes.move : this.lanes.analysis;
+    if (lane && lane !== job) return lane;
+    if (job.kind === 'move' && this.lanes.analysis && this.shares(job, this.lanes.analysis)) return this.lanes.analysis;
+    return null;
+  }
+  /** What a queued `job` waits for in words, such as "waiting for Bubble's move", or null. */
+  waiting(job) {
+    const holder = this.holder(job);
+    if (!holder) return null;
+    const name = (this.entries.get(holder.spec.engine)?.name || holder.spec.engine).replace(/ \(browser\)$/, '');
+    return `waiting for ${name}'s ${holder.kind === 'move' ? 'move' : holder.kind === 'review' ? 'review' : 'analysis'}`;
+  }
+  /** Logs one console warning when `job` stays queued for QUEUE_WARN_MS, naming what holds the worker. */
+  watch(job) {
+    clearTimeout(job.warnTimer);
+    if (job.warned) return;
+    job.warnTimer = setTimeout(() => {
+      if (job.warned || job.status !== 'queued' || job.controller.signal.aborted || !this.jobs.includes(job)) return;
+      job.warned = true;
+      const holder = this.holder(job);
+      console.warn(`Queued for over ${this.queueWarnMs / 1000} s: ${this.describe(job)}; ${holder ? `waiting for ${this.describe(holder)} (${holder.status})` : 'no job holds the worker'}`);
+    }, this.queueWarnMs);
+    job.warnTimer.unref?.();
   }
   /** Runs `job` on `lane` (see `pump`), then pumps again. */
   async run(job, lane) {
     let settled;
     this.settling[lane] = new Promise(resolve => { settled = resolve; });
-    this.lanes[lane] = job; job.status = 'running'; job.attempt = new AbortController(); this.changed();
+    clearTimeout(job.warnTimer);
+    this.lanes[lane] = job; job.status = 'running'; job.attempt = new AbortController(); job.worker = this.workerOf(job); job.startedAt = Date.now(); this.changed();
     const signal = AbortSignal.any([job.controller.signal, job.attempt.signal]);
     let timer, interrupted = false;
     const match = job.kind === 'move' && this.match?.active ? this.match : null;
     const history = job.kind === 'review' ? job.history.slice(0, job.plies[job.cursor]) : job.history;
     try {
-      const adapter = this.adapters.get(job.spec.engine);
+      const adapter = this.adapterOf(job);
       await abortable(adapter.ready?.((f, stage) => { job.done = f * .1; job.stage = stageText(stage); this.onchange(this.state()); }, job.spec.checkpoint), signal);
       if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
       job.stage = stageText(null);
@@ -736,7 +801,15 @@ export class BrowserSession extends OfflineSession {
       if (job.refresh) result = {...result, threat: job.refresh.threat ?? [], ...(job.refresh.solver ? {solver: job.refresh.solver} : {})};
       const {graph_id: graph, ...answer} = result;
       result = answer;
-      if (job.kind === 'analyse' && job.line != null && graph) { result = {...result, graph: this.graphSearched(graph, history.length, !job.refresh)}; job.counted = true; }
+      if (job.kind === 'analyse' && job.line != null) {
+        // A search that left the graph's statistics alone (it names no graph) read the graph as it stands now, so its result
+        // is as current as that: it takes the current stamp. Unstamped, it would read as older than every search and the
+        // page would ask for it again at once, forever.
+        const stamp = graph ? this.graphSearched(graph, history.length, !job.refresh) : this.graph.generation != null ? [this.graph.generation, this.graph.plies.length] : undefined;
+        result = {...result, ...(stamp ? {graph: stamp} : {})}; job.counted = Boolean(graph);
+      }
+      // A refresh that finds the same stones and value adds no evidence to show: the saved candidates stay, with the new stamp.
+      if (job.refresh && !moved(result, job.refresh)) result = {...job.refresh, ...(result.graph ? {graph: result.graph} : {})};
       await this.record(history, job.spec, result, job.kind === 'move' && (ms != null || this.entries.get(job.spec.engine)?.kind === 'bubble'));
       if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
         if (!job.refresh) this.refresh(history, job.spec, job.line);
@@ -756,7 +829,7 @@ export class BrowserSession extends OfflineSession {
         if (shown.some((p, i) => position([p]) !== position([turn[i]]))) { this.changed(); return; }
         if (!this.match?.active) this.forkGame();
         this.history.push(...copy(turn.slice(shown.length)));
-        this.chargeTurn(job.side, at);
+        this.chargeTurn(job.side, at); this.moveMs = Date.now() - job.startedAt;
         if (this.match?.active) {
           this.match.timings.push({ply: history.length, side: job.side, engine: job.spec.engine, elapsed_ms: elapsed});
           const winner = this.native.game(this.history).winner;
@@ -768,12 +841,14 @@ export class BrowserSession extends OfflineSession {
       // A cancelled or failed primary analysis that touched its game graph (the worker names the graph) changed it.
       if (job.kind === 'analyse' && job.line != null && error.graph && !job.counted) this.graphSearched(error.graph, history.length, !job.refresh);
       interrupted = error.name === 'AbortError' && !job.controller.signal.aborted;
-      if (error.name !== 'AbortError') { job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
+      if (error.name !== 'AbortError') { console.error(`${this.describe(job)} failed: ${error.message}`, error); job.status = 'failed'; job.error = error.message; if (job.kind === 'move') { this.freezeClock(); this.paused = true; } if (this.match) this.match.error = error.message; }
     } finally {
-      clearTimeout(timer); this.lanes[lane] = null;
-      if (interrupted) job.status = 'queued';
+      clearTimeout(timer); this.lanes[lane] = null; job.worker = null;
+      if (this.grant === job) this.grant = null;
+      if (lane === 'analysis' && !interrupted && !job.controller.signal.aborted) this.heldSince = null;   // an analysis landed
+      if (interrupted) { job.status = 'queued'; this.watch(job); }   // it keeps its place in line: its wait counts from the first time it was queued
       else if (job.status !== 'failed' && (job.kind !== 'review' || job.cursor >= job.plies.length || job.controller.signal.aborted)) this.jobs = this.jobs.filter(j => j !== job);
-      else if (job.status !== 'failed') job.status = 'queued';
+      else if (job.status !== 'failed') { job.status = 'queued'; job.queuedAt = Date.now(); this.watch(job); }
       this.changed(); await this.saving;
       settled();
       queueMicrotask(() => this.pump());

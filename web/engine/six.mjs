@@ -64,6 +64,7 @@ const engine = new SixEngine();
 export const six = {
   entry: {id: ID, kind: 'six', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine,
+  fresh: () => new SixEngine(),
   listed: engine.manifest().then(() => {}, () => {}),
   record: (result, history, preset) => ({...result, engine: ID}),
   build: 'python tools/build_web.py ort six',

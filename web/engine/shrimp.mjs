@@ -51,4 +51,4 @@ export function record(result, history, preset) {
 }
 
 export const shrimp = {entry: {id: ID, kind: 'six', badge: 'shrimp', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
-  engine: new ShrimpEngine(), record, build: 'python tools/build_web.py ort shrimp'};
+  engine: new ShrimpEngine(), fresh: () => new ShrimpEngine(), record, build: 'python tools/build_web.py ort shrimp'};

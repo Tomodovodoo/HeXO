@@ -52,9 +52,12 @@ the mark sends no request to a server and answers its own requests in a browser 
 backup file, import and export, the opening book, tournaments and clocks. It differs from the server in these ways:
 
 - Jobs run on two lanes, as on the server: engine moves on one, analysis, review and deepening on the other, so Drip
-  against Drip still gets Bubble's analysis. Each browser engine has one worker, so a job of the engine a move runs on
-  waits for it, and a move queued for that engine sends the running analysis, review step or deepening back to the
-  queue. Deepening stops at the analysis preset. A deepening search of a position the game has moved on from
+  against Drip still gets Bubble's analysis. An analysis of an engine that is also seated runs on a second worker of
+  that engine (same checkpoint, one more WebGPU context), so it never waits for the seat's moves. An engine without a
+  second worker has one: a move queued for it sends the running analysis, review step or deepening back to the queue,
+  and after each move an analysis that has waited longer than that move runs before the next one. A job that fails
+  logs `console.error` with its engine, checkpoint, preset and ply, and one that stays queued for 10 s logs
+  `console.warn` once with the job it waits for; the analysis panel names it ("waiting for Bubble's move"). Deepening stops at the analysis preset. A deepening search of a position the game has moved on from
   finishes and is saved for its ply, and the latest position is deepened next, so positions that arrive faster than
   a search still get analysed.
 - A search reads a cancel between network batches, so Cancel, Pause and seat changes take effect within one batch.

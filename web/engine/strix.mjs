@@ -140,6 +140,7 @@ const engine = new StrixEngine([]);
 export const strix = {
   entry: {id: ID, kind: 'strix', name: LABEL, label: LABEL, checkpoints: engine.checkpoints, presets: PRESETS, preset: NEURAL_PRESET, analysis: true, clocks: false},
   engine,
+  fresh: () => new StrixEngine([...engine.networks.values()]),
   listed: engine.known().then(() => {}, () => {}),
   build: 'python tools/build_web.py strix-network',
   record: result => ({...result, proof: null, line: [], threat: [], engine: ID}),

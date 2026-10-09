@@ -34,6 +34,7 @@ import {savedIds} from './storage.mjs';
 const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, pace: turnTimes(PRESETS), preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
+  fresh: () => new BubbleEngine(),
   record: (result, history, preset) => ({...result, simulations: bubble.entry.presets[preset].simulations,
     solver_nodes: result.solved ? bubble.entry.presets[preset].solver_nodes : 0, engine: BUBBLE}),
   build: 'python tools/build_web.py ort model'};
@@ -252,6 +253,7 @@ async function run(key, task) {
     }
   } catch (error) {
     if (error.name !== 'AbortError') {
+      console.error(`${task.kind} failed: engine ${task.engine}, checkpoint ${task.checkpoint ?? 'none'}, preset ${task.preset}, ply ${task.history.length}: ${error.message}`, error);
       failed = key;
       if ((await check(task.engine)).state === 'unpublished') unpublished(task.engine);   // a worker's error is a plain message
       else original.toast(error.message);
@@ -407,7 +409,7 @@ function recheck(entry, force = false) {
  * the WebAssembly ladder (bubble.mjs CPU_PRESETS), and the saved choices (or the static page's session) that use it
  * at another preset move to lightning, ending a job of it at another preset. */
 function lighten(engine) {
-  const found = [...ENGINES.values()].find(e => e.engine === engine);
+  const found = [...ENGINES.values()].find(e => e.engine === engine || e.spares?.has(engine));
   if (!found) return;
   const id = found.entry.id;
   found.entry.preset = 'lightning';

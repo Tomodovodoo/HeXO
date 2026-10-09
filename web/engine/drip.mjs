@@ -103,4 +103,4 @@ export function record(result, history, preset) {
 }
 
 export const drip = {entry: {id: ID, kind: 'drip', name: LABEL, label: LABEL, checkpoints: [], presets: PRESETS, analysis: true, clocks: true},
-  engine: new DripEngine(), record, build: 'python tools/build_web.py wasm'};
+  engine: new DripEngine(), fresh: () => new DripEngine(), record, build: 'python tools/build_web.py wasm'};

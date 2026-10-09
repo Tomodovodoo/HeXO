@@ -896,6 +896,111 @@ if (job.kind === 'encode') {
   const analyses = calls.filter(c => c.kind === 'analysis');
   answer = {positions: ply, analysed: new Set(analyses.filter(c => c.outcome === 'done').map(c => c.ply)).size,
     cancelled: playing, latest: Boolean(s.lookup(s.history))};
+} else if (job.kind === 'seated-analysis') {
+  // Bubble plays one seat and Drip the other, each placement in 8 ms, while Auto analyses with Bubble at a preset that
+  // takes 60 ms. With a spare worker (`job.spare`) the analysis runs on it and finishes beside the moves; without one it
+  // still completes, after a move, rather than starving behind the next.
+  const s = new BrowserSession(native), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), calls = [];
+  const engine = (ms, name) => ({turn: (history, budget, options) => new Promise((resolve, reject) => {
+    const call = {name, kind: options.kind, ply: history.length, outcome: 'running'}; calls.push(call);
+    const timer = setTimeout(() => { call.outcome = 'done'; resolve({moves: native.legal(history).slice(0, native.game(history).remaining).map(m => [...m]), value: .5, top: []}); }, ms);
+    options.signal.addEventListener('abort', () => { clearTimeout(timer); call.outcome = 'cancelled'; reject(new DOMException('Cancelled', 'AbortError')); });
+  })});
+  let spares = 0;
+  const presets = {fast: {simulations: 1, solver_nodes: 0}, deep: {simulations: 64, solver_nodes: 0}};
+  const fast = {standard: {ms: 10}};
+  s.registerEngine({id: 'b', name: 'Bubble (browser)', kind: 'bubble', version: 'v1', checkpoints: [], presets}, {turn: (h, b, o) => engine(b.simulations > 1 ? 60 : 8, 'main').turn(h, b, o)},
+    job.spare ? () => { spares++; return {turn: (h, b, o) => engine(60, 'spare').turn(h, b, o)}; } : null);
+  s.registerEngine({id: 'd', name: 'Drip (browser)', kind: 'drip', version: 'v1', checkpoints: [], presets: fast}, engine(8, 'drip'));
+  await s.request('/analysis', {engine: 'b', preset: 'deep', auto: true}, 'POST');
+  s.seats = [s.spec({engine: 'b', preset: 'fast'}), s.spec({engine: 'd'})]; s.paused = false; s.changed(); s.pump();
+  for (let i = 0; i < 6000 && calls.filter(c => c.kind === 'move' && c.outcome === 'done').length < 20; i++) await wait(2);
+  const moves = calls.filter(c => c.kind === 'move' && c.outcome === 'done').length, doneDuring = calls.filter(c => c.kind === 'analyse' && c.outcome === 'done');
+  await s.request('/pause', {paused: true}, 'POST');
+  answer = {moves, analysed: doneDuring.length, onSpare: doneDuring.filter(c => c.name === 'spare').length, spares,
+    analysisOnMain: calls.filter(c => c.kind === 'analyse' && c.name === 'main').length};
+} else if (job.kind === 'console') {
+  // A failing analysis logs console.error with its engine, checkpoint, preset, ply and error; an analysis that waits
+  // behind a long move logs console.warn once, and its stage says what it waits for.
+  const s = new BrowserSession(native), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), errors = [], warns = [];
+  console.error = (...args) => errors.push(args.map(String).join(' ')); console.warn = (...args) => warns.push(args.map(String).join(' '));
+  s.queueWarnMs = 40;
+  const presets = {quick: {simulations: 1, solver_nodes: 0}};
+  s.registerEngine({id: 'bad', name: 'Bad', kind: 'bubble', version: 'v1', checkpoints: ['net-1'], presets}, {turn: async () => { throw new Error('boom'); }});
+  await s.request('/analysis', {engine: 'bad', preset: 'quick', checkpoint: 'net-1'}, 'POST');
+  await s.request('/play', {q: 0, r: 0}, 'POST'); await s.request('/analyse', {ply: 1}, 'POST');
+  for (let i = 0; i < 500 && !errors.length; i++) await wait(2);
+  const second = new BrowserSession(native);
+  second.queueWarnMs = 40;
+  let release;
+  second.registerEngine({id: 'slow', name: 'Slow (browser)', kind: 'bubble', version: 'v1', checkpoints: [], presets}, {turn: (history, budget, options) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve({moves: native.legal(history).slice(0, native.game(history).remaining).map(m => [...m]), value: .5, top: []}), 300);
+    options.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Cancelled', 'AbortError')); });
+  })});
+  await second.request('/analysis', {engine: 'slow', preset: 'quick'}, 'POST');
+  second.seats = [second.spec({engine: 'slow', preset: 'quick'}), {engine: 'human'}]; second.paused = false; second.changed(); second.pump();
+  await wait(5);
+  await second.request('/analyse', {ply: 0}, 'POST');
+  const stage = second.state().jobs.find(j => j.kind === 'analyse' && j.status === 'queued')?.stage;
+  await wait(150);
+  const queued = warns.filter(w => w.includes('analyse'));
+  await wait(400);
+  await second.request('/pause', {paused: true}, 'POST'); second.cancelJobs();
+  answer = {errors, stage, queued, later: warns.filter(w => w.includes('analyse')).length};
+} else if (job.kind === 'solver-box') {
+  // The page's solver panel (web/index.html renderSolving): what it shows for a search that runs on another ply, one
+  // that has ended, and when the analysis preset is not the solver, after it showed a running search.
+  const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
+  const box = {hidden: true, children: [], replaceChildren(...children) { this.children = children; }}, bar = {hidden: false};
+  const live = {solver: {elapsed_ms: 80500, root: 'no forcing win', root_nodes: 0, root_budget: 32768, frontier: 8, busy: 8, workers: 8, frontier_nodes: 769242, checked: 30857}};
+  const page = {S: {analysis: {preset: 'solver'}, winner: -1, history: Array(60).fill([0, 0])}, view: 50, COLORS: ['yellow', 'blue'],
+    $: id => id === 'solving' ? box : bar, entryOf: () => null,
+    el: (tag, attrs, ...kids) => ({text: kids.map(k => k.text ?? String(k)).join('')})};
+  runInNewContext(source.match(/^const playerAt=.*$/m)[0] + '\n' + source.slice(source.indexOf('function renderSolving('), source.indexOf('function shownEval(')) + source.slice(source.indexOf('function finished('), source.indexOf('function renderAnalysis(')), page);
+  const text = () => box.children.map(c => c.text).join('|');
+  const running = (ply, status = 'running') => ({kind: 'analyse', ply, status, live});
+  const case_ = (preset, view, jobs, ev = undefined) => { page.S.analysis.preset = preset; page.view = view; page.renderSolving(ev, jobs[0]); return {hidden: box.hidden, text: text()}; };
+  answer = {
+    own: case_('solver', 50, [running(50)]),
+    otherPly: case_('solver', 51, [running(50)]),
+    ended: case_('solver', 50, [running(50, 'queued')]),
+    notSolver: case_('standard', 50, [running(50)]),
+    deep: case_('deep', 51, [running(51)]),
+    saved: case_('solver', 50, [], {solver: {elapsed_ms: 2000, root_nodes: 5, native_nodes: 7, certificates: 1}}),
+  };
+} else if (job.kind === 'viewed-past-ply') {
+  // A finished game viewed at an earlier ply with Auto on at Lightning, while the saved evaluations there are Deep and
+  // stale (deeper positions were analysed after them): the page's autoAnalyse (web/index.html) asks again whenever the
+  // shown evaluation is missing or stale. Counts the /analyse requests until the session settles.
+  const s = new BrowserSession(native), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), searches = [];
+  const presets = {lightning: {simulations: 8, solver_nodes: 0}, deep: {simulations: 64, solver_nodes: 0}};
+  const entry = {id: 'b', name: 'B', kind: 'bubble', version: 'v1', checkpoints: [], presets};
+  let calls = 0;
+  s.registerEngine(entry, {turn: async (history, budget, options) => {
+    calls++; searches.push([history.length, budget.simulations, options.kind]);
+    const deep = budget.simulations > 32, value = deep ? .18 : .5 + .1 * (calls % 2);   // a small search moves the value each time
+    return {moves: native.legal(history).slice(0, native.game(history).remaining).map(m => [...m]), value,
+      top: Array.from({length: deep ? 5 : 2}, (_, i) => [i, 7, .2, .5, 0]), graph_id: budget.simulations > 16 ? 'g' : null};   // a search that adds nothing to the graph names none
+  }});
+  const history = [];
+  while (history.length < job.plies && native.game(history).winner < 0) history.push([...native.legal(history).find(m => !history.some(p => p[0] === m[0] && p[1] === m[1]))]);
+  s.load(history, true); s.outcome = {winner: 0, reason: 'six'};
+  const idle = async () => { for (let i = 0; i < 4000 && (s.running || s.jobs.some(j => j.status === 'queued')); i++) await wait(1); };
+  await s.request('/analysis', {engine: 'b', preset: 'deep', auto: false}, 'POST');
+  for (let ply = job.from; ply <= history.length; ply++) { await s.request('/analyse', {ply, force: true}, 'POST'); await idle(); }
+  const shownBefore = s.state().evaluations[job.view];
+  searches.length = 0;
+  await s.request('/analysis', {engine: 'b', preset: 'lightning', auto: true}, 'POST');
+  let asked = 0, last = null, now = 0;
+  for (let i = 0; i < 40; i++) {
+    const data = s.state(), ev = data.evaluations[job.view], jobs = data.jobs.some(j => j.kind === 'analyse' && j.ply === job.view);
+    now += 4000;
+    // web/index.html autoAnalyse
+    if (!jobs && data.analysis.auto && !(last != null && ev && !data.stale.includes(job.view))) { last = now; asked++; await s.request('/analyse', {ply: job.view}, 'POST'); }
+    await idle();
+  }
+  const shown = s.state().evaluations[job.view];
+  answer = {asked, searches: searches.length, before: [shownBefore.simulations, shownBefore.top.length], shown: [shown.simulations, shown.top.length], stale: s.state().stale.includes(job.view), plies: history.length};
 } else if (job.kind === 'restore-pause') {
   const make = async clock => {
     const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};
