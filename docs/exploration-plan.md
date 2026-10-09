@@ -87,13 +87,14 @@ The hopeless label comes from the prior, so it was checked against search. 320 p
 
 | sampled moves | count | best searched Q | within 0.05 of the best |
 |---|---:|---:|---:|
-| below the mean log prior | 1,266 | 0.2% | 1.8% |
-| 0.05% to 1%, above the mean | 454 | 4.4% | 24.7% |
-| the rest | 2,878 | 10.1% | 28.8% |
+| below the mean log prior | 1,246 | 0.3% | 2.3% |
+| below 0.05%, above the mean | 811 | 0.7% | 3.9% |
+| 0.05% to 1% | 416 | 1.4% | 19.2% |
+| 1% and up | 1,871 | 15.7% | 39.3% |
 
-The uniform share fills more than a quarter of the samples with below-mean moves, and search almost never finds one competitive. The band moves, which shaped noise keeps, come within 0.05 of the best about as often as the leading moves do.
+Moves below 0.05% are rarely competitive, whether they sit below the mean log prior or above it. Moves from 0.05% to 1% come within 0.05 of the best in one search of five. So the useful column is the 0.05% to 1% band. Counting the two groups below 0.05% as slots that search will mostly reject, the uniform 0.1 spends 6.1 of 16 samples there, shaped 0.1 spends 4.4 and no noise 2.9. Shaped 0.1 also samples 2.0 band moves against 1.4.
 
-Gumbel-top-16 already explores. With no noise at all, about six of the sixteen samples come from the low-prior moves that blind spots live among. Every kind of noise trades some of them for hopeless moves. The live uniform 0.1 is the worst of the realistic settings: five of sixteen slots go to hopeless moves, and coverage of the 0.05% to 1% band drops by two thirds. Shaped noise at the same weight halves the hopeless slots and keeps more of both low-prior groups. It is better on every column, so it should replace the uniform share at the next actor restart. Whether any noise beats none needs a self-play test that was not run here. Temperature alone changes little and only adds hopeless samples, so it stays at 1.
+Gumbel-top-16 already explores. With no noise at all, nearly four of the sixteen samples come from the 0.05% to 1% band. Every kind of noise trades some of those for moves below 0.05%. The live uniform 0.1 is the worst of the realistic settings: it cuts band coverage by two thirds and fills five slots with moves below the mean log prior. Shaped noise at the same weight keeps more of the band and spends fewer slots below 0.05%, so it should replace the uniform share at the next actor restart. No noise does better still on both counts. Whether that holds up in play needs a self-play test that was not run here, so the next experiment is `root_noise 0` against shaped 0.1. Temperature alone changes little and only adds hopeless samples, so it stays at 1.
 
 ## Surprise weighting, measured
 
