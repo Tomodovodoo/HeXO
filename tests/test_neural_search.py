@@ -140,6 +140,35 @@ class NeuralTree(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Invalid root noise concentration'):
                 NeuralSearch(Uniform(), 'shaped-noise', root_concentration=bad)
 
+    def test_root_temperature_flattens_only_the_sampling_prior(self):
+        history = recorded_position()
+        def sampled(seed, **options):
+            search = NeuralSearch(Tiered(), 'root-temperature', history, seed=seed, **options)
+            try:
+                result = search.search(16, root_samples=8, batch_size=8)
+            finally:
+                search.close()
+            return np.flatnonzero(result['visits']), result['policy']
+        hopeless = {}
+        for temperature in (1., 2., 3.):
+            hopeless[temperature] = 0
+            for seed in range(10):
+                moves, policy = sampled(seed, root_temperature=temperature)
+                if temperature == 1.:
+                    np.testing.assert_array_equal(moves, sampled(seed)[0])
+                hopeless[temperature] += np.count_nonzero(Tiered.tier(moves) == 2)
+                # The target keeps the raw prior: unsampled moves of one tier share one target probability.
+                unsampled = np.setdiff1d(np.flatnonzero(Tiered.tier(np.arange(len(policy))) == 2), moves)
+                np.testing.assert_allclose(policy[unsampled], policy[unsampled[0]], rtol=1e-12)
+            self.assertEqual(len(moves), 8)
+        # Dividing the logits by T moves sampling mass from the leaders and the 40 plausible moves to the 794 others.
+        self.assertEqual(hopeless[1.], 0)
+        self.assertLess(hopeless[2.], hopeless[3.])
+        self.assertGreater(hopeless[3.], 10)
+        for bad in (0., -1., float('inf'), float('nan')):
+            with self.assertRaisesRegex(ValueError, 'Invalid root temperature'):
+                NeuralSearch(Uniform(), 'root-temperature', root_temperature=bad)
+
     def test_q_range_floor_flattens_only_small_spreads(self):
         def entropy(p):
             return float(-(p[p > 0]*np.log(p[p > 0])).sum())

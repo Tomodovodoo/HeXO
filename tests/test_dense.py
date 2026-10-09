@@ -5343,7 +5343,8 @@ class EngineTests(unittest.TestCase):
         models = [dense_selfplay.Model(hexnet.HexNet(TINY), f'native-{k}', f'model-{k}', 'cpu', 32, 64) for k in range(2)]
         settings = dense_config.ActorSettings(full_fraction=.5, full_sims=32, cheap_sims=8, root_samples=8,
                                              cheap_root_samples=4, game_graph=192, max_plies=7, tactics=False,
-                                             opening_random_plies=0., root_noise=.2, root_noise_concentration=10.83)
+                                             opening_random_plies=0., root_noise=.2, root_noise_concentration=10.83,
+                                             root_temperature_early=1.25, root_temperature=1.1)
         games = [dense_selfplay.SelfPlayGame([models[0], models[0]], settings, 120+i, hybrid=True) for i in range(2)]
         games.append(dense_selfplay.SelfPlayGame(models, settings, 130, learner=1, opponent='model-0', hybrid=True))
         events = []
@@ -6383,6 +6384,28 @@ class EngineTests(unittest.TestCase):
             dense_selfplay.SelfPlayGame.plan(slot)
         shaped = ('root', 'concentration', 10.83)
         self.assertEqual(calls, [('root', .25), shaped, ('root', 0.), shaped, ('root', .25), shaped])
+
+    def test_root_temperature_decays_on_full_searches_only(self):
+        settings = dense_config.ActorSettings(full_fraction=.5, root_temperature_early=1.25, root_temperature=1.1)
+        self.assertAlmostEqual(dense_selfplay.root_temperature(settings, 0), 1.25)
+        self.assertAlmostEqual(dense_selfplay.root_temperature(settings, 38), 1.175)
+        self.assertAlmostEqual(dense_selfplay.root_temperature(settings, 400), 1.1, places=3)
+        draws, calls = iter([.1, .9, .1, .1]), []
+        fake = SimpleNamespace(hxg_root_temperature=lambda tree, t: calls.append(t) or 1)
+        slot = SimpleNamespace(settings=settings, moves=[[0, 0]]*38, forced_plies=0,
+                               rng=SimpleNamespace(random=lambda: next(draws)), tree=SimpleNamespace(ptr='root'))
+        with unittest.mock.patch.object(dense_selfplay, 'native', fake):
+            for _ in range(3):
+                dense_selfplay.SelfPlayGame.plan(slot)
+                calls.append(slot.temperature)
+        self.assertEqual(calls, [1.175, 1.175, 1., 1., 1.175, 1.175])
+        slot.settings = dense_config.ActorSettings(full_fraction=1.)
+        with unittest.mock.patch.object(dense_selfplay, 'native', SimpleNamespace()):
+            dense_selfplay.SelfPlayGame.plan(slot)
+        self.assertEqual(slot.temperature, 1.)
+        for bad in (dict(root_temperature=0.), dict(root_temperature_early=float('inf')), dict(root_temperature_halflife=-1.)):
+            with self.assertRaisesRegex(ValueError, 'root temperatures'):
+                dense_config.ActorSettings(**bad)
 
     def test_leaf_proof_skips_inference_and_records_exact_value(self):
         history = [[0,0],[0,3],[1,3],[1,0],[2,0],[2,3],[3,3],[3,0],[7,4],[4,3],[5,4]]

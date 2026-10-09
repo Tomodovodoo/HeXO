@@ -49,10 +49,10 @@ for name, result, args in (
     ('pause', C.c_int, [ptr, C.c_int]), ('paused', C.c_int, [ptr]),
     ('installed', C.c_uint64, [ptr]),
     ('retarget', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_int,
-                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_double]),
+                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_double, C.c_double]),
     ('release', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64]),
     ('replace', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_char_p, ptr, C.c_int,
-                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_double, C.c_uint64]),
+                         C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_double, C.c_double, C.c_uint64]),
 ):
     bind('hxb_'+name, result, *args)
 bind('hxp_new', ptr, ptr, ptr, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int)
@@ -638,19 +638,20 @@ class InferenceService:
         checked(native.hxb_start(self.ptr, ms))
 
     def retarget(self, producer, game, history, *, expected=0, work=0, ms=0, samples=16, views=8, noise=0.,
-                 concentration=0.):
-        """Copy a next-root command to its native graph owner, never mutate it here. `noise` and `concentration`
-        are the root's noise share and Dirichlet concentration (neural_search.NeuralSearch)."""
+                 concentration=0., temperature=1.):
+        """Copy a next-root command to its native graph owner, never mutate it here. `noise`, `concentration` and
+        `temperature` are the root's noise share, Dirichlet concentration and sampling temperature
+        (neural_search.NeuralSearch)."""
         cells = np.ascontiguousarray(history, np.int64).reshape(-1, 2)
         checked(native.hxb_retarget(self.ptr, producer, game, expected, cells.ctypes.data,
-                                    len(cells), work, ms, samples, views, noise, concentration))
+                                    len(cells), work, ms, samples, views, noise, concentration, temperature))
 
     def release(self, producer, game, *, expected):
         """Retire one game; its immutable completion includes all late proof effort."""
         checked(native.hxb_release(self.ptr, producer, game, expected))
 
     def replace(self, producer, game, source, *, expected, work=0, ms=0, samples=16, views=8, noise=0.,
-                concentration=0., seed=0):
+                concentration=0., temperature=1., seed=0):
         """Install a fresh game after release. Zero work/ms leaves it parked.
 
         Success transfers the source Tree and closes its caller wrapper. The
@@ -662,7 +663,7 @@ class InferenceService:
         cells = np.ascontiguousarray(source.history, np.int64).reshape(-1, 2)
         checked(native.hxb_replace(self.ptr, producer, game, expected, source.ptr,
                                     source.model_version.encode(), cells.ctypes.data, len(cells),
-                                    work, ms, samples, views, noise, concentration, seed))
+                                    work, ms, samples, views, noise, concentration, temperature, seed))
         source.ptr = None
 
     def launch(self):
