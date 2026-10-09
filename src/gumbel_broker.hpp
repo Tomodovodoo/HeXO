@@ -80,7 +80,7 @@ struct RootEvent {
   RootEvent()=default;RootEvent(std::string value):text(std::move(value)){}
   void timing(const char* name,double ms){text.pop_back();text+=",\""+std::string(name)+"\":"+std::to_string(ms)+'}';}
 };
-struct Command {int game,samples,views;uint64_t token,work;double ms,noise,concentration;std::vector<int64_t> cells;
+struct Command {int game,samples,views;uint64_t token,work;double ms,noise,concentration,temperature;std::vector<int64_t> cells;
  int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;Clock::time_point queued{};};
 struct Producer:std::enable_shared_from_this<Producer> {
  Broker& broker;owner::Pool& pool;int model,index,worker_request=0;
@@ -337,16 +337,16 @@ struct Broker {
    for(auto& p:producers)if(p)p->thread=std::thread([source=p]{source->run();});
   }catch(...){lock.unlock();cancel();for(auto& p:producers)if(p && p->thread.joinable())p->thread.join();throw;}
  }
- void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0){
+ void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0){
   auto queued=Clock::now();
   if(!continuous || !started || cancelled || producer<0 || producer>=int(producers.size()) || count<0 || (count && !cells) ||
-     (!work && !(ms>0) && !source) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1 || !std::isfinite(concentration) || concentration<0)
+     (!work && !(ms>0) && !source) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1 || !std::isfinite(concentration) || concentration<0 || !std::isfinite(temperature) || !(temperature>0))
    throw std::runtime_error("Invalid continuous search command");
   std::lock_guard lock(mutex);if(!producers[producer])throw std::runtime_error("Producer is retired");auto& p=*producers[producer];
   if(game<0 || game>=int(p.epochs.size()) || p.done || p.retiring || p.requested[game] || expected!=p.epochs[game] || !p.reported[game])
    throw std::runtime_error("Consume the matching game completion before retargeting");
   if(p.released[game]!=(source!=nullptr))throw std::runtime_error("Release the previous game before replacing its slot");
-  Command command{game,samples,views,expected+1,work,ms,noise,concentration,{}};command.queued=queued;if(count)command.cells.assign(cells,cells+2*count);
+  Command command{game,samples,views,expected+1,work,ms,noise,concentration,temperature,{}};command.queued=queued;if(count)command.cells.assign(cells,cells+2*count);
   if(source){
    auto& old=*p.pool.games[game];
    if(std::any_of(old.game->pins.begin(),old.game->pins.end(),[&](const auto& pin){
@@ -626,7 +626,7 @@ inline void Producer::run()noexcept{
      gumbel::Tree source(command.seed,command.replacement);source.shared=source.graph=true;
      source.tactics=command.tactics;source.range_floor=command.range;
      std::vector<Cell> history;for(size_t i=0;i<command.cells.size();i+=2)history.push_back({command.cells[i],command.cells[i+1]});source.root_at(history);
-     auto retired=pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.concentration,command.seed);
+     auto retired=pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.concentration,command.temperature,command.seed);
      broker.reclaim_owner(*this,std::move(retired));
      auto& o=*pool.games[command.game];
      if(command.ms){o.started=command.queued;if(o.expired()){o.deadline=true;o.stop();}}
@@ -637,7 +637,7 @@ inline void Producer::run()noexcept{
      continue;
     }
     auto& o=*pool.games[command.game];o.sample_limit=command.samples;o.max_views=command.views;
-    o.views[0].tree->root_noise=command.noise;o.views[0].tree->root_concentration=command.concentration;
+    o.views[0].tree->root_noise=command.noise;o.views[0].tree->root_concentration=command.concentration;o.views[0].tree->root_temperature=command.temperature;
     pool.retarget(command.game,command.cells.data(),int(command.cells.size()/2),command.work,command.ms);
     // Queueing and root preparation consume this command's clock. An expired
     // prepared root is stopped before either proof or neural frontier admission.
@@ -835,9 +835,9 @@ HX_API void hxb_owner_reclaim_stats(void* p,uint64_t* out){auto& b=*static_cast<
  std::array<uint64_t,6> values{uint64_t(std::count_if(b.garbage.begin(),b.garbage.end(),[](const auto& r){return bool(r.game);})),uint64_t(b.reclaiming_owner),b.reclaimed_owners,b.owner_reclaim_ns,uint64_t(b.retirement_reserved),b.retirement_deferred};std::copy(values.begin(),values.end(),out);}
 HX_API int hxb_start(void* p,double ms){try{static_cast<inference::Broker*>(p)->start(ms);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);if(b.started){gumbel::error="Configure continuous mode before starting";return 0;}b.continuous=true;return 1;}
-HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,temperature);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_release(void* p,int producer,int game,uint64_t expected){try{static_cast<inference::Broker*>(p)->release(producer,game,expected);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
-HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,temperature,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_wait_event(void* p,double ms){return static_cast<inference::Broker*>(p)->wait_event(ms);}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 // Borrowed immutable storage lasts until the next event or service destruction.

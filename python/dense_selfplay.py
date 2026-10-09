@@ -283,6 +283,13 @@ def policy_target(result, player):
     return result['exact_winner'] == player and not np.all(result['policy'] > 0)
 
 
+def root_temperature(settings, ply):
+    """Root sampling temperature of a full search before placement `ply`: settings.root_temperature plus
+    (root_temperature_early - root_temperature) * 0.5^(ply / root_temperature_halflife), KataGo's schedule."""
+    late = settings.root_temperature
+    return late+(settings.root_temperature_early-late)*.5**(ply/settings.root_temperature_halflife)
+
+
 def root_value(result, player):
     """Side-to-move value of a finished search: the solver's exact value when it proved one (result `proven`), else
     exact +-1 when the tree root is exact, else child values under the improved policy. Unvisited child values
@@ -744,7 +751,8 @@ class SelfPlayGame:
 
     def plan(self):
         """Draw the next search's kind (full with probability full_fraction), budget and root samples, and set the
-        side to move's root noise: root_noise at root_noise_concentration for a full search, 0 for a cheap one.
+        side to move's root noise and sampling temperature: root_noise at root_noise_concentration and
+        root_temperature(ply) for a full search, 0 and 1 for a cheap one.
         With full_turns, the second stone of a turn whose first stone this game searched keeps that stone's kind.
         With pv_check a full search's budget is its first pass (neural_search.Recheck, run by `recheck`)."""
         s = self.settings
@@ -760,6 +768,10 @@ class SelfPlayGame:
         if s.root_noise and not getattr(self, 'hybrid', False):
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
             checked(native.hxg_root_concentration(self.tree.ptr, s.root_noise_concentration))
+        tempered = s.root_temperature_early != 1 or s.root_temperature != 1
+        self.temperature = root_temperature(s, len(self.moves)) if tempered and self.is_full else 1.
+        if tempered and not getattr(self, 'hybrid', False):
+            checked(native.hxg_root_temperature(self.tree.ptr, self.temperature))
 
     @property
     def checking(self):
