@@ -67,7 +67,8 @@ TURN_MS = dict(GPU=dict(lightning=250, quick=650, standard=1400, strong=2000, de
 HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
 PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
 SEEDS = itertools.count(1740)  # owner seeds: repeated searches of a position draw new root samples
-REFRESH_SHARE = .25  # share of a saved analysis's simulations its refresh searches again (Session.refresh)
+REFRESH_SHARE = .25  # share of a saved analysis's simulations, the analysis budget's at most, a refresh searches again
+REFRESH_PRIORITY = 4  # background refreshes run after every other analysis job, deepening (3) included
 REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
 REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still moves its result
 REFRESH_MOVE = .05  # a refresh moved its result when its value changed by more than this, or its stones changed
@@ -1670,7 +1671,8 @@ class Engines:
         fresh graph. Searches with solver nodes run their proof frontier on this lane's `proof_workers`. With `keep`
         (a deepening tier) the search runs only the simulations the root lacks, and a proof the solver found for the
         position is reused. `refresh`, a saved evaluation of `history`, searches the game graph again with the
-        REFRESH_SHARE of that evaluation's simulations a stone and its solver findings; the graph is the one `budget` (the seat's) selects. A seat's
+        REFRESH_SHARE of that evaluation's simulations (of `budget`'s at most) a stone and its solver findings; the graph is the
+        one `budget` (the seat's) selects. A seat's
         evaluation or a tier's has a key ending in `:kept`, so continued evaluations are never mistaken for fresh
         ones. `used`, a list, receives the number `game_graph` gave each graph searched, before the search, so a
         caller sees it even when the search is cancelled."""
@@ -1681,7 +1683,7 @@ class Engines:
         floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
             build = self.solver_build() if budget['solver_nodes'] else 'none'
-            share = max(1, round(REFRESH_SHARE * refresh['simulations']))
+            share = max(1, round(REFRESH_SHARE * min(refresh['simulations'], budget['simulations'] or refresh['simulations'])))
             if spent.get('ms'):   # a refresh in time gets the same share of the clock
                 spent = spent | dict(ms=max(LIMITS['ms'], round(REFRESH_SHARE * spent['ms'])))
             trees = self.game_graph(bubble, game, build, floor, share, used=used)
@@ -3843,7 +3845,8 @@ class Session:
                 rounds = getattr(job, 'rounds', 0) + 1
                 if rounds < REFRESH_ROUNDS:
                     with self.lock:
-                        self.submit(Job('analyse', 2, history, seat=dict(seat), force=True, game=game, refresh=saved, rounds=rounds))
+                        self.submit(Job('analyse', REFRESH_PRIORITY, history, seat=dict(seat), force=True, game=game, refresh=saved,
+                                        rounds=rounds))
         return saved
 
     def searched(self, graph, ply, count=True):
@@ -3874,14 +3877,15 @@ class Session:
         """Queue a refresh of each position up to REFRESH_PLIES placements before `history` whose shown evaluation
         (`lookup`, a fresh analysis or a deepening tier) is stale (see `stale`) and holds no proof, nearest first, with
         `seat`'s network: the search on the game graph `game` moved the values those positions reach (see
-        `Engines.evaluate`)."""
+        `Engines.evaluate`). They run at REFRESH_PRIORITY, after the analysis of the shown position."""
         with self.lock:
             for ply in range(len(history) - 1, max(-1, len(history) - REFRESH_PLIES - 1), -1):
                 saved = self.lookup(history[:ply])
                 if self.stale(saved, ply) and not saved.get('proof') and not any(
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
-                    self.submit(Job('analyse', 2, history[:ply], seat=dict(seat), force=True, game=game, refresh=saved))
+                    self.submit(Job('analyse', REFRESH_PRIORITY, history[:ply], seat=dict(seat), force=True, game=game,
+                                    refresh=saved))
 
     def note_pace(self, seat, ms, stones):
         """Record that Bubble `seat` searched a turn of `stones` stones at its preset in `ms`: the page shows the entry's

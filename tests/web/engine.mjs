@@ -636,7 +636,7 @@ if (job.kind === 'encode') {
     return {value:.5,moves:[[0,1],[1,0]],top:[[0,1,1,.5]],solved:true};
   }});
   session.history = [[0,0]]; session.analysis = session.spec({engine:'test',preset:'standard',auto:true});
-  session.enqueue('analyse',session.history,session.analysis); await session.pump();
+  session.enqueue('analyse',session.history,session.analysis); session.pump(); await session.idle;
   const elements = new Map(), requests = [], notices = [];
   const element = () => ({classList:{toggle(){}},style:{setProperty(){}},firstChild:{style:{}},children:[],
     replaceChildren(){},append(){},setAttribute(k,v){this[k]=v;}});
@@ -832,6 +832,58 @@ if (job.kind === 'encode') {
   finish();
   for (let i = 0; i < 40 && s.jobs.some(j => j.kind === 'move'); i++) await wait();
   answer.after = s.history; answer.left = s.jobs.filter(j => j.kind === 'move').length;
+} else if (job.kind === 'half-turn') {
+  // Human against an engine with Auto at quick: an older page's deep evaluation of an early position makes its
+  // background refresh large. A person's first stone of a turn, played while that refresh is queued, is analysed at
+  // once, and the refresh searches at most a quarter of the analysis budget.
+  const s = new BrowserSession(native), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), searched = [];
+  const presets = {lightning: {simulations: 16, solver_nodes: 0}, quick: {simulations: 64, solver_nodes: 0}, dangerous: {simulations: 65536, solver_nodes: 0}};
+  s.registerEngine({id: 'b', name: 'B', kind: 'bubble', version: 'v1', checkpoints: [], presets}, {turn: (history, budget, options) => new Promise((resolve, reject) => {
+    searched.push([options.kind, history.length, budget.simulations]);
+    const timer = setTimeout(() => resolve({moves: native.legal(history).slice(0, native.game(history).remaining).map(m => [...m]), value: .5, top: [], graph_id: options.line ? 'g' : null}), 2 * budget.simulations);
+    options.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Cancelled', 'AbortError')); });
+  })});
+  s.seats = [{engine: 'human'}, s.spec({engine: 'b', preset: 'lightning'})]; s.paused = false;
+  await s.request('/analysis', {engine: 'b', preset: 'quick', auto: true}, 'POST');
+  const until = async test => { for (let i = 0; i < 4000 && !test(); i++) await wait(2); return test(); };
+  const free = () => native.legal(s.history).map(m => [...m]).find(([q, r]) => Math.abs(q) + Math.abs(r) > 2);
+  await s.request('/play', {q: 0, r: 0}, 'POST');
+  await until(() => s.history.length === 3 && !s.jobs.length);
+  const old = s.spec({...s.analysis, preset: 'dangerous'}), first = s.history.slice(0, 1);
+  s.indexRecord({...s.lookup(first), id: s.cacheKey(first, old), engine_key: s.engineKey(old), simulations: 65536, budget: old.budget, graph: undefined});
+  for (const _ of [0, 1]) { const [q, r] = free(); await s.request('/play', {q, r}, 'POST'); }
+  await until(() => s.history.length === 7 && !s.jobs.some(j => !j.background));
+  const [q, r] = free(), started = Date.now();
+  await s.request('/play', {q, r}, 'POST');
+  answer = {background: s.jobs.filter(j => j.background).length};
+  answer.analysed = await until(() => s.lookup(s.history) && !s.jobs.some(j => !j.background)); answer.ms = Date.now() - started;
+  await until(() => !s.jobs.length);
+  answer.refreshes = searched.filter(([kind, , n]) => kind === 'analyse').map(([, ply, n]) => n).filter(n => n < 16);
+  answer.largest = Math.max(...searched.map(([, , n]) => n));
+  s.cancelJobs();
+} else if (job.kind === 'lanes') {
+  // Two Drip-like engines play a placement every 60 ms while Auto analyses with a Bubble that needs 90 ms a search:
+  // the analysis runs beside the moves, each search finishes for its own position (none is cancelled for the next),
+  // and after a pause (which ends the search under way) the position on the board is analysed.
+  const s = new BrowserSession(native), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), calls = [];
+  const engine = (ms, kind) => ({turn: (history, budget, options) => new Promise((resolve, reject) => {
+    const call = {kind, ply: history.length, outcome: 'running'}; calls.push(call);
+    const timer = setTimeout(() => { call.outcome = 'done'; resolve({moves: native.legal(history).slice(0, native.game(history).remaining).map(m => [...m]), value: .5, top: []}); }, ms);
+    options.signal.addEventListener('abort', () => { clearTimeout(timer); call.outcome = 'cancelled'; reject(new DOMException('Cancelled', 'AbortError')); });
+  })});
+  s.registerEngine({id: 'd', name: 'D', kind: 'drip', version: 'v1', checkpoints: [], presets: {standard: {ms: 60}}}, engine(60, 'move'));
+  s.registerEngine({id: 'b', name: 'B', kind: 'bubble', version: 'v1', checkpoints: [], presets: {lightning: {simulations: 16, solver_nodes: 0}, quick: {simulations: 64, solver_nodes: 0}}}, engine(90, 'analysis'));
+  await s.request('/analysis', {engine: 'b', preset: 'lightning', auto: true}, 'POST');
+  s.seats = [s.spec({engine: 'd'}), s.spec({engine: 'd'})]; s.paused = false; s.changed(); s.pump();
+  for (let i = 0; i < 4000 && s.history.length < 20; i++) await wait(2);
+  const playing = calls.filter(c => c.kind === 'analysis' && c.outcome === 'cancelled').length;   // pausing ends the search under way
+  await s.request('/pause', {paused: true}, 'POST');
+  const ply = s.history.length;
+  await s.request('/analyse', {ply}, 'POST');
+  for (let i = 0; i < 4000 && (s.running || s.jobs.length); i++) await wait(2);
+  const analyses = calls.filter(c => c.kind === 'analysis');
+  answer = {positions: ply, analysed: new Set(analyses.filter(c => c.outcome === 'done').map(c => c.ply)).size,
+    cancelled: playing, latest: Boolean(s.lookup(s.history))};
 } else if (job.kind === 'restore-pause') {
   const make = async clock => {
     const s = new BrowserSession(native), entry = {id: 'test', name: 'Test', kind: 'bubble', version: 'v1', clocks: true, presets: {quick: {simulations: 1, solver_nodes: 0}, standard: {simulations: 1, solver_nodes: 0}}};

@@ -51,9 +51,15 @@ the mark sends no request to a server and answers its own requests in a browser 
 `offline.mjs`'s rules): seats, analysis with auto-deepening, review, saved games and evaluations in IndexedDB with a
 backup file, import and export, the opening book, tournaments and clocks. It differs from the server in these ways:
 
-- One job runs at a time. An engine move goes first and sends a running analysis, review step or deepening back to
-  the queue; deepening stops at strong unless the analysis engine runs on WebGPU.
+- Jobs run on two lanes, as on the server: engine moves on one, analysis, review and deepening on the other, so Drip
+  against Drip still gets Bubble's analysis. Each browser engine has one worker, so a job of the engine a move runs on
+  waits for it, and a move queued for that engine sends the running analysis, review step or deepening back to the
+  queue. Deepening stops at the analysis preset. A deepening search of a position the game has moved on from
+  finishes and is saved for its ply, and the latest position is deepened next, so positions that arrive faster than
+  a search still get analysed.
 - A search reads a cancel between network batches, so Cancel, Pause and seat changes take effect within one batch.
+  A worker that has not answered a cancel within 2 s, and has sent nothing for it in that time, is ended and the next
+  job starts a new one; one that keeps reporting is left to finish winding down, for 10 s at most.
 - When the solver's worker cannot start (some embedded browsers forbid a worker inside a worker), the page says so once
   and keeps those evaluations, which have no proofs, for the visit only.
 - Game links are read through hexo.mineking.dev's API mirror, the only one of the sites that lets another site read

@@ -450,6 +450,21 @@ console.log(JSON.stringify(out));"""
         self.assertEqual((answer['during'], answer['moves'], answer['player']), ([[0, 0], [1, 0]], [['running', 1]], 1))
         self.assertEqual((answer['after'], answer['left']), ([[0, 0], [1, 0], [2, 0]], 0))
 
+    def test_a_half_turn_asked_for_while_earlier_positions_refresh_is_analysed_within_its_budget(self):
+        answer = node(dict(kind='half-turn'))
+        self.assertGreater(answer['background'], 0)   # the deep refresh was queued when the stone came
+        self.assertTrue(answer['analysed'])
+        self.assertLess(answer['ms'], 1500)   # quick takes 128 ms here; the old refresh alone took 33 s
+        self.assertTrue(answer['refreshes'])
+        self.assertLessEqual(answer['largest'], 64)
+
+    def test_analysis_runs_beside_engine_moves_and_finishes_each_search(self):
+        answer = node(dict(kind='lanes'))
+        self.assertGreaterEqual(answer['positions'], 20)
+        self.assertEqual(answer['cancelled'], 0)
+        self.assertGreaterEqual(answer['analysed'], 5)
+        self.assertTrue(answer['latest'])
+
     def test_custom_budgets_apply_the_amount_last_edited_and_keep_the_other(self):
         answer = node(dict(kind='custom-forms'))
         self.assertEqual(answer['old'], dict(budget=dict(simulations=300, solver_nodes=4800),
@@ -815,6 +830,12 @@ class Loading(unittest.TestCase):
 
     def test_cancellation_keeps_a_worker_that_acknowledges_or_returns_a_late_result(self):
         self.assertEqual(self.out['cancel_ack'], [dict(name='AbortError', graph='kept', kept=True, waits=0)]*2)
+
+    def test_a_cancelled_search_that_keeps_reporting_keeps_its_worker(self):
+        # It acknowledges 3.5 s after the cancel, past the 2 s grace, but reports every 0.7 s until then.
+        found = self.out['cancel_winding']
+        self.assertEqual((found['result'], found['kept']), ('AbortError', True))
+        self.assertGreater(found['ms'], 3000)
 
 
 class Bundle(unittest.TestCase):

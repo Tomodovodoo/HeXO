@@ -265,5 +265,17 @@ for(const type of ['cancelled','result']) {
   engine.close();
 }
 
+// A cancelled search that is still winding down (it keeps reporting) past the grace keeps its worker.
+{
+  let entered;
+  const ready = new Promise(resolve=>{entered=resolve;}), control = new AbortController();
+  script={load(options,post){post({type:'ready',device:{provider:'webgpu'}});},call(){entered();},
+    cancel(message,post){for(let i=1;i<=5;i++)setTimeout(()=>post(i<5?{type:'progress',id:message.id,fraction:.5}:{type:'cancelled',id:message.id}),i*700);}};
+  const engine=new EngineWorker('worker.mjs','Bubble'), started=performance.now();
+  const result=engine.call({type:'turn'},{signal:control.signal}).then(()=>'resolved',error=>error.name);
+  await ready;const worker=engine.worker;control.abort();
+  out.cancel_winding={result:await result,ms:Math.round(performance.now()-started),kept:engine.worker===worker&&!worker.terminated};
+  engine.close();
+}
 process.stdout.write(JSON.stringify(out));
 process.exit(0);
