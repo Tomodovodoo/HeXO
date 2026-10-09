@@ -48,12 +48,51 @@ KataGo writes each full-search position to its training data more often when its
 
 The audit's finding 1 was that priority draws of exact rows over-trained the value head. Surprise weighting draws policy rows by policy evidence, but every drawn row also trains the value head, so it gets the same test as those draws.
 
-Change: actors store `surprise`, the KL from the root's raw network prior to the recorded policy target, on every row with a policy target. The actor stores the field always, since it changes no search. The KL compares the search with the network at that position. Pair mixing and certificate policies change the trained target later in the learner, and the scalar does not follow them on purpose. The sampler asks where search found something the network missed, and that stays true whatever target the learner builds from the row. Under the live `proof_policy_missing_only` the certificate policy goes only to rows without a search policy, which carry no surprise anyway. `surprise_weight` on the learner, 0 by default, is the share of each game's full-row sampling weight that follows that KL, with KataGo at 0.5. The sampler draws rows in proportion to the weight, and rows without a stored surprise keep weight 1. Before any live use, the audit's procedure measures it. That means 2,500 steps from a fixed EMA on the same shards, with the KL taken from each shard's own checkpoint, outcome BCE on the panels and 64 games against main/185000, compared with a baseline arm trained the same way.
+Change: actors store `surprise`, the KL from the root's raw network prior to the recorded policy target, on every row with a policy target. The actor stores the field always, since it changes no search. The KL compares the search with the network at that position. Pair mixing and certificate policies change the trained target later in the learner, and the scalar does not follow them on purpose. The sampler asks where search found something the network missed, and that stays true whatever target the learner builds from the row. Under the live `proof_policy_missing_only` the certificate policy goes only to rows without a search policy, which carry no surprise anyway. `surprise_weight` on the learner, 0 by default, is the share of each game's full-row sampling weight that follows that KL, with KataGo at 0.5. The sampler draws rows in proportion to the weight, and rows without a stored surprise keep weight 1. Before any live use, the audit's procedure measures it. That means 2,500 steps from a fixed EMA on the same shards, outcome BCE on the panels and 64 games against main/185000, compared with a baseline arm trained the same way.
 
 ## Not applicable
 
 Komi, handicap, rule randomization and seki forks have no counterpart, because HeXO has none of these rules. KataGo's value-surprise weighting is skipped for the reason in 7. Its visit reduction in won positions has a counterpart already, since proofs end decided games. Asymmetric playouts and side positions are outside this list and left out.
 
-## Order
+## What landed
 
-This note lands first. Shaped noise, root temperature, forking and surprise weighting follow as separate pull requests, each with a behaviour test. A switch happens only at an export boundary.
+Each change is off by default, and the live run is unchanged until a flag is set.
+
+| technique | PR | flags, default | recommended live value |
+|---|---|---|---|
+| shaped root noise | #485 | `root_noise_concentration` 0 | 10.83, keeping `root_noise` 0.1 |
+| root temperature | #487 | `root_temperature_early` 1, `root_temperature` 1, `root_temperature_halflife` 38 | leave at 1 |
+| game forks | #486 | `fork_early_fraction` 0, `fork_anywhere_fraction` 0, `fork_early_plies` 6, `fork_early_choices` 12, `fork_anywhere_choices` 36, `fork_min_choices` 3 | 0.04 and 0.01, the rest as default |
+| surprise weighting | #488 | `surprise_weight` 0 on the learner; actors always store `surprise` | leave at 0 |
+
+#485, #487 and #488 change native code. The main checkout's `build/libhexo_gumbel.dll` was rebuilt and swapped after each merge, so new processes load a library that matches the Python. Running processes keep their old library until they restart.
+
+## Root sampling on real priors
+
+This check draws the opening Gumbel-top-16 set 100 times for each of 1,500 full-search positions from new-schedule/197500's window. It uses that checkpoint's priors and the same arithmetic as `sampling()`, with no search. The columns count, per sampled set, moves with prior from 0.05% to 1%, moves below 0.05% that still lie above the mean log prior, and moves below the mean log prior, which are hopeless moves.
+
+| setting | 0.05% to 1% | below 0.05%, above mean | hopeless |
+|---|---:|---:|---:|
+| no noise | 3.77 | 2.37 | 0.58 |
+| uniform 0.1 (live) | 1.36 | 1.07 | 5.00 |
+| uniform 0.25 | 0.80 | 1.24 | 6.08 |
+| shaped 0.05 | 2.41 | 1.73 | 2.23 |
+| shaped 0.1 | 2.03 | 1.88 | 2.56 |
+| shaped 0.25 (KataGo) | 1.59 | 2.18 | 3.06 |
+| shaped 0.1, temperature 1.25 | 2.40 | 2.04 | 2.32 |
+| temperature 1.1 | 3.63 | 2.36 | 0.76 |
+| temperature 1.25 | 3.39 | 2.37 | 1.06 |
+
+Gumbel-top-16 already explores. With no noise at all, about six of the sixteen samples come from the low-prior moves that blind spots live among. Every kind of noise trades some of them for hopeless moves. The live uniform 0.1 is the worst of the realistic settings: five of sixteen slots go to hopeless moves, and coverage of the 0.05% to 1% band drops by two thirds. Shaped noise at the same weight halves the hopeless slots and keeps more of both low-prior groups. It is better on every column, so it should replace the uniform share at the next actor restart. Whether any noise beats none needs a self-play test that was not run here. Temperature alone changes little and only adds hopeless samples, so it stays at 1.
+
+## Surprise weighting, measured
+
+new-schedule/197500's training data from before the October 8 restart is overwritten, so the audit's seed is gone. Both arms start from the current new-schedule/197500 EMA, which was trained with the live settings. They train 2,500 steps on copies of that checkpoint's window, 1,119 shards and 870,063 policy rows, with the live learner flags (`--value-target outcome --regret-fraction 0 --cheap-value-weight 1`, pair weight 0.5, certificate policy 0.25 on missing rows only). The surprise arm adds `--surprise-weight 0.5`. The KL comes from the seed EMA's prior for every row, not from each shard's own checkpoint as KataGo does it, because most of those checkpoints were overwritten too. Mean KL is 0.57 nats, and the top 10% of rows carry 37% of it. The panels are the audit's: held-out rows, outcome BCE on unproven rows of finished games, and policy KL against the stored target for first and second stones.
+
+| arm | vs main/185000, W-L-capped | outcome BCE A170 / B190 / H | first-stone KL A170 / B190 / H | second-stone KL A170 / B190 / H |
+|---|---:|---:|---:|---:|
+| seed, no training | | 0.647 / 0.650 / 0.638 | 0.775 / 0.713 / 0.757 | 0.512 / 0.483 / 0.367 |
+| baseline | 41-21-2 | 0.638 / 0.642 / 0.636 | 0.778 / 0.709 / 0.754 | 0.511 / 0.481 / 0.365 |
+| surprise 0.5 | 40-24-0 | 0.638 / 0.642 / 0.636 | 0.811 / 0.745 / 0.736 | 0.522 / 0.497 / 0.379 |
+
+Unlike the regret draws, surprise weighting leaves outcome BCE where it is, within 0.001 on every panel, so it does not over-train the value head. It also buys nothing. The match is a tie within its noise. Policy KL against the average target rises by 0.03 nats on two of three first-stone panels and falls by 0.02 on the third. On every second-stone panel it rises by 0.01 to 0.02. That is what drawing surprising rows more often should do to a fit of the average. The audit found policy KL does not predict Elo, so that cost may not matter either, but there is no gain to pay it for. `surprise_weight` stays at 0. Actors keep storing `surprise`, so a later arm on data with generator-side KL costs one learner flag.
