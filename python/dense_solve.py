@@ -89,14 +89,17 @@ import sys
 import time
 import traceback
 
+import numpy as np
+
 import dense_config
 import dense_data
 from dense_data import player_at
-from dense_solver import VERDICTS
+from dense_solver import VERDICTS, Proof, proof_line, proof_plies
 from forcing_material import worth_solving
+import hexcrop
 from hexo import Game
 from proof import VerificationTimeout
-from tactical_proof import PROVEN_WIN, IsolatedTactics, independent_verify
+from tactical_proof import PROVEN_WIN, IsolatedTactics, independent_verify, build_hash
 from legacy.train import write_json
 
 SAFETY_MS = 60000
@@ -128,6 +131,14 @@ class PassSettings:
     poll_seconds: float = 30.
     solve_workers_min: int = 1     # shard workers while the actors play
     solve_workers_max: int = 0     # shard workers during a phased learner's training phase; 0: physical cores - 2
+    continuation_fraction: float = 0.  # maximum added rows / source shard rows; 0 disables continuations
+    continuation_max_plies: int = 32    # at most one bounded continuation per source game
+    continuation_verify_seconds: float = .1
+
+    def __post_init__(self):
+        if not 0 <= self.continuation_fraction <= .1 or not 1 <= self.continuation_max_plies <= 384 \
+                or not 0 < self.continuation_verify_seconds <= 120:
+            raise ValueError('Invalid proof continuation fraction, length or verification budget')
 
 
 def below_normal():
@@ -183,7 +194,47 @@ def exports(run, variant):
 
 def new_stats():
     return dict(positions=0, gated=0, hits=0, windows=0, persistent=0, transient=0, verified=0, verify_timeouts=0, failures=0,
+                continuation_games=0, continuation_rows=0, continuation_verified=0, continuation_timeouts=0,
                 last_failure=None, window_plies=Counter(), queries={k: dict(queries=0, proofs=0, ms=0.) for k in KINDS})
+
+
+def continuation(shard, g, episode, ply, certificate, rng, limit):
+    """Exact rows along one checked strategy; keep the source's holdout key and train no prefix rows."""
+    history = [list(m) for m in episode['moves'][:ply]]
+    proof = Proof(list(map(tuple, history)), certificate)
+    line = proof_line(proof, history, rng, max_plies=limit)
+    game, rows, values = Game(history), [], [None]*ply
+    winner = game.player
+    try:
+        for stone, turns, action in line:
+            moves = np.asarray(history, np.int64).reshape(-1, 2)
+            try:
+                hexcrop.encode_game(game, moves)
+            except hexcrop.SpanError:
+                break
+            legal = hexcrop.legal_array(game, moves)
+            exact = 1 if game.player == winner else -1
+            row = dict(ply=len(history), player=game.player, remaining=game.remaining, policy=None,
+                       legal_sha256=dense_data.legal_digest(legal), proven=exact, proof_turns=turns,
+                       proof_plies=proof_plies(game.remaining, turns, exact > 0), line=True,
+                       solver_nodes=0, solver_budget=0)
+            if exact > 0:
+                if not action or not all(tuple(a) in set(map(tuple, legal)) for a in action):
+                    raise ValueError('Proof continuation lacks legal winning stones')
+                row['proof_action'] = action
+            game.play(*stone)
+            history.append(list(stone)); rows.append(row); values.append(float(exact))
+        if game.winner >= 0 and game.winner != winner:
+            raise ValueError('Proof continuation contradicts its certified winner')
+    finally:
+        game.close()
+    source = dict(shard=shard, game=g, ply=ply, holdout_key=dense_data.holdout_key(episode),
+                  certificate_hash=hashlib.sha256(json.dumps(certificate, separators=(',', ':')).encode()).hexdigest())
+    result = dict(moves=history, winner=winner, reason='proven', opening_plies=ply,
+                  actor=episode['actor'], actors=episode.get('actors'), trained_side=episode.get('trained_side'),
+                  root_values=values, network_values=[None]*len(history), full_search=[False]*len(history),
+                  origin='proof', proof=source, adjudicated=dict(ply=ply, winner=winner, line_plies=len(rows)))
+    return result, rows
 
 
 def merge(total, part):
@@ -273,9 +324,10 @@ class Solver:
     def __init__(self, run, out, settings, tactics, clock=time.time):
         self.run, self.out, self.s, self.tactics, self.clock = Path(run), Path(out), settings, tactics, clock
         self.stats = new_stats()
+        self.continuation_budget = 0
 
     def query(self, where, history, attacker, nodes, kind):
-        """(moves, proof_turns, certificate hash) of a native-verified proof, None for a search verdict UNKNOWN, else
+        """(moves, proof_turns, certificate hash, certificate JSON) of a native-verified proof, None for a search verdict UNKNOWN, else
         FAILED (module contract)."""
         result = self.tactics.history([list(p) for p in history], nodes=nodes, ms=SAFETY_MS, attacker=attacker)
         stats = self.stats['queries'][kind]
@@ -300,7 +352,7 @@ class Solver:
                 dense_config.log_event(self.out, 'solve', 'error', f'independent check rejected a proof at {where} '
                                        f'({attacker}, {nodes} nodes): {error}', where=list(where), attacker=attacker)
                 raise Rejected(f'Independent check rejected a native proof at {where}') from error
-        return [tuple(m) for m in result['moves']], result['proof_turns'], hashlib.sha256(text.encode()).hexdigest()
+        return [tuple(m) for m in result['moves']], result['proof_turns'], hashlib.sha256(text.encode()).hexdigest(), text
 
     def game(self, shard, g, e):
         """(window records, buffer entries) of episode `g` of `shard`."""
@@ -308,11 +360,15 @@ class Solver:
         start = dense_data.forced_plies(e)
         roots = e.get('root_values') or [None]*T
         network = e.get('network_values') or [None]*T
-        memo = {}
+        memo, candidate = {}, None
 
         def attack(t, nodes):
+            nonlocal candidate
             if (t, nodes) not in memo:
-                memo[t, nodes] = self.query((shard, g, t), moves[:t], 'mover', nodes, 'solve' if nodes == s.solve_nodes else 'scan')
+                result = self.query((shard, g, t), moves[:t], 'mover', nodes, 'solve' if nodes == s.solve_nodes else 'scan')
+                if result and self.continuation_budget and candidate is None and nodes == s.solve_nodes:
+                    candidate = t, result[3]
+                memo[t, nodes] = result[:3] if result else result
             return memo[t, nodes]
 
         hits, game = [], Game()
@@ -361,6 +417,26 @@ class Solver:
                 if kind == 'attack' and network[ply] is not None:
                     entry['value_source'] = 'network'
                 entries.append(entry if kind == 'attack' else dict(entry, saving_turns=saving))
+        if candidate is not None:
+            ply, text = candidate
+            certificate = json.loads(text)
+            try:
+                independent_verify(certificate, moves[:ply], deadline_seconds=s.continuation_verify_seconds)
+                self.stats['continuation_verified'] += 1
+            except VerificationTimeout:
+                self.stats['continuation_timeouts'] += 1
+            except ValueError as error:
+                raise Rejected(f'Independent check rejected continuation {shard}:{g}:{ply}') from error
+            else:
+                e, rows = continuation(shard, g, e, ply, certificate, self.continuation_rng,
+                                       min(s.continuation_max_plies, self.continuation_budget))
+                if rows:
+                    index = len(self.continuation_episodes)
+                    self.continuation_episodes.append(e)
+                    self.continuation_rows.extend(dict(row, game=index) for row in rows)
+                    self.continuation_budget -= len(rows)
+                    self.stats['continuation_games'] += 1
+                    self.stats['continuation_rows'] += len(rows)
         return windows, entries
 
     def lookback(self, shard, g, moves, first, winner, opening, start):
@@ -389,8 +465,14 @@ class Solver:
         manifest = dense_data.verify(path)
         episodes = json.loads((path/'episodes.json').read_text(encoding='utf-8'))
         identity = manifest['identity']
+        self.continuation_budget = int(self.s.continuation_fraction*manifest['counts']['rows'])
+        self.continuation_rng = np.random.default_rng([dense_config.load(self.run).seed,
+            int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], 'little')])
+        self.continuation_episodes, self.continuation_rows = [], []
         windows, entries, observations = [], [], []
-        for g, e in enumerate(episodes):
+        order = self.continuation_rng.permutation(len(episodes)) if self.continuation_budget else range(len(episodes))
+        for g in order:
+            g = int(g); e = episodes[g]
             found, new = self.game(name, g, e)
             windows += found
             entries += [dict(entry, checkpoint=identity.get('checkpoint')) for entry in new]
@@ -405,7 +487,8 @@ class Solver:
                     observations.append((key, identity.get('checkpoint'), e['root_values'][source['ply']]))
         deblunders = [dict(kind='deblunder', game=w['game'], first_ply=w['first_ply'], owner=w['mover'])
                       for w in windows if not w['persistent'] and episodes[w['game']]['winner'] == 1-w['mover']]
-        return dict(windows=windows, deblunders=deblunders, entries=entries, observations=observations, stats=self.stats)
+        return dict(windows=windows, deblunders=deblunders, entries=entries, observations=observations, stats=self.stats,
+                    continuations=dict(episodes=self.continuation_episodes, rows=self.continuation_rows))
 
 
 class Pass:
@@ -423,6 +506,19 @@ class Pass:
 
     def record(self, name, result):
         """Add a shard's result to the buffer and the counters, then save the buffer and write the sidecar."""
+        generated = result.get('continuations')
+        if generated and generated['rows']:
+            source = dense_data.verify(self.run/'shards'/name)
+            identity = dict(source['identity'], proof_source=name, proof_source_files=source['files'],
+                            proof_settings=asdict(self.s), proof_seed=dense_config.load(self.run).seed,
+                            proof_build=build_hash())
+            path = self.out/'shards'/(name+'0')
+            if path.exists():
+                if dense_data.verify(path)['identity'] != identity:
+                    raise ValueError(f'Proof continuation shard collision: {path}')
+            else:
+                dense_data.write_shard(path, identity, generated['episodes'], generated['rows'], origin='proof')
+            write_sidecar(path, [])  # generated games never enter the proof pass or restart buffer
         for entry in result['entries']:
             self.buffer.add(entry)
         for key, checkpoint, value, *source in result['observations']:
@@ -444,6 +540,7 @@ class Pass:
         worker failed after the others and without those that failed ATTEMPTS times."""
         names = [p.name for p in dense_data.shard_dirs(self.run)][::-1][:limit]
         names = [n for n in names if self.failed[n] < ATTEMPTS and not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
+        names = [n for n in names if dense_data.origin(dense_data.manifest(self.run/'shards'/n)) != 'proof']
         return sorted(names, key=lambda n: self.failed[n])
 
     def workers(self):

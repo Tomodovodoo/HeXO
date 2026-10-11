@@ -16,7 +16,8 @@ millisecond time plus pid) holding
                  with --deblunder-weight > 0; they never add exact labels.
 Readers (ReplayWindow, ValidationSets, survey) read a shard's rows through its index, <run>/cache/shards/<name>.npz
 (shard_index), built once and rebuilt when the shard's files change; proof sidecars are read directly.
-`origin` is 'converted' (dense_bootstrap) or 'actor' (dense_selfplay); `origin()` infers it for older manifests.
+`origin` is 'converted' (dense_bootstrap), 'actor' (dense_selfplay), or 'proof' (dense_solve continuations).
+Proof episodes carry their source validation key; their prefix has no rows. `origin()` infers older origins.
 `row.game` indexes the shard's episode list. `episode.winner` is 0/1 for finished games ('six-in-a-row') and -1
 for capped games ('cap' at the ply limit, 'span' when a searched position does not fit the largest crop);
 `episode.root_values` is null or one entry per ply (searched root value in [-1, 1] for the side to
@@ -96,7 +97,7 @@ Shard = namedtuple('Shard', 'game ply player remaining proven known_result proof
                              'has_search winner side surprise held')
 SHARD_INDEX = tuple(f for f in Shard._fields if f not in ('surprise', 'held'))+('holdout', 'network', 'has_network')
 FUTURE = (6, 20)
-ORIGINS = ('converted', 'actor')
+ORIGINS = ('converted', 'actor', 'proof')
 SOURCES = ('converted', 'fresh', 'newest')
 # Calibration map basis (calibration_features): hat functions of log2(plies remaining) centred on H_KNOTS, and the
 # root value's logit with |v| clipped to V_CLIP.
@@ -114,6 +115,8 @@ def forced_plies(episode):
     """Placements an actor episode replays without search or rows: a restart's or book's ply, a fork's ply plus its
     forked move, else 0."""
     origin = episode.get('origin')
+    if origin == 'proof':
+        return episode['proof']['ply']
     if origin == 'fork':
         return episode['fork']['ply']+1
     return episode[origin]['ply'] if origin in ('restart', 'book') else 0
@@ -131,6 +134,11 @@ def player_at(ply):
 
 def holdout_key(episode):
     """The game's 64-bit validation key: the first eight bytes of the sha256 of its moves, little-endian."""
+    if episode.get('origin') == 'proof':
+        key = episode['proof']['holdout_key']
+        if type(key) is not int or not 0 <= key < 2**64:
+            raise ValueError('Proof continuation needs its source game validation key')
+        return key
     return int.from_bytes(hashlib.sha256(json.dumps(episode['moves']).encode()).digest()[:8], 'little')
 
 

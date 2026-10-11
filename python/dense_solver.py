@@ -69,7 +69,8 @@ import numpy as np
 from dense_config import EvaluationSettings
 from neural_search import checked, native
 from hexo import Game
-from tactical_proof import MAX_NODES, MAX_TABLE_MB, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
+from proof import VerificationTimeout
+from tactical_proof import independent_verify, MAX_NODES, MAX_TABLE_MB, PROVEN_WIN, IsolatedTactics, NativeTactics, build_hash
 
 SAFETY_MS, DEEP_SAFETY_MS = 5000, 60000
 POINTS = ('root', 'threat', 'finalist', 'deep', 'defence')
@@ -713,6 +714,51 @@ class Proof:
             if set(played) != set(action) or node['kind'] == 'immediate_win' or (first and self.first_turn_only):
                 return labels, None, None, ()
             index, i, first = node['child'], i+len(action), False
+
+
+def proof_line(proof, history, rng, *, alternatives=True, max_plies=float('inf')):
+    """Sample a legal continuation of a checked certificate without search or network evaluations.
+
+    Defender replies and stone order vary with rng. Retained attacker alternatives need an independent
+    check at their actual prefix; rejection or timeout keeps the primary strategy. Stop at max_plies.
+    """
+    history, line = [tuple(m) for m in history], []
+    game = Game(history)
+    try:
+        while game.winner < 0 and len(line) < max_plies:
+            _, move, node, played = proof.walk(history)
+            if move is None:
+                break
+            if (alternatives and node['kind'] == 'attacker_move' and not played
+                    and node.get('alternatives')):
+                choice = rng.integers(1+len(node['alternatives']))
+                if choice:
+                    alternative = node['alternatives'][choice-1]
+                    index, nodes = proof.nodes.index(node), list(proof.nodes)
+                    nodes[index] = dict(node, action=alternative['action'], child=alternative['child'])
+                    certificate = dict(version=1, width='wide', root=index, nodes=nodes)
+                    try:
+                        verified = independent_verify(certificate, history, deadline_seconds=.1) == 'PROVEN_WIN'
+                    except (ValueError, VerificationTimeout):
+                        verified = False
+                    if verified:
+                        previous_turns = move[1]
+                        proof = Proof(history, certificate)
+                        _, move, node, played = proof.walk(history)
+                        extra = max(0, move[1]-previous_turns)
+                        if extra:
+                            line = [(stone, turns+extra, action) for stone, turns, action in line]
+            stones = move[0] or proof.reply(history, rng)
+            if stones is None:
+                threats = {tuple(c) for t in node.get('threats', ()) for c in t}
+                stones = [next(tuple(m) for m in game.legal_moves() if tuple(m) not in threats)]
+            stone = stones[rng.integers(len(stones))]
+            line.append((stone, move[1], proof.action(history)))
+            game.play(*stone)
+            history.append(stone)
+    finally:
+        game.close()
+    return line
 
 
 class Plan:

@@ -646,7 +646,7 @@ class Adjudication(unittest.TestCase):
                               proof_plies=dense_solver.proof_plies(2, result['proof_turns']),
                               proof_action=[list(a) for a in first], proof=proof, solver_nodes=0, solver_budget=0)
                 with mock.patch.object(model.evaluator, 'evaluate', side_effect=AssertionError('No neural search needed')):
-                    with mock.patch.object(dense_selfplay, 'independent_verify', wraps=dense_selfplay.independent_verify) as verifier:
+                    with mock.patch.object(dense_solver, 'independent_verify', wraps=dense_solver.independent_verify) as verifier:
                         self.assertFalse(game.searched(search))
                     checked += verifier.call_count
                 self.assertEqual(game.game.winner, winner)
@@ -692,10 +692,10 @@ class Adjudication(unittest.TestCase):
             game.game.close()
             for tree in game.trees.values():
                 tree.close()
-        for error in (ValueError('unverified alternative'), dense_selfplay.VerificationTimeout('expired')):
+        for error in (ValueError('unverified alternative'), dense_solver.VerificationTimeout('expired')):
             game = from_position(dense_selfplay.SelfPlayGame([model, model], s, 3), base)
             try:
-                with mock.patch.object(dense_selfplay, 'independent_verify', side_effect=error) as verifier:
+                with mock.patch.object(dense_solver, 'independent_verify', side_effect=error) as verifier:
                     game.adjudicate(winner, proof)
                 self.assertGreater(verifier.call_count, 0)
                 self.assertEqual(game.game.winner, winner)

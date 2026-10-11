@@ -182,6 +182,75 @@ class PassTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         self.assertFalse((self.run/'shards'/'1000000000001'/'proofs.jsonl').exists())
 
+    def test_continuations_are_bounded_exact_rows_with_the_source_split_and_no_new_search(self):
+        settings = replace(SMALL, continuation_fraction=.1, continuation_max_plies=16,
+                           continuation_verify_seconds=10.)
+        source = self.run/'shards'/'1000000000001'
+        before = dense_data.verify(source)
+        baseline = dense_solve.Solver(self.run, self.run.parent/'baseline', SMALL, Recorder(self.engine))
+        baseline.solve(source.name)
+        tactics = Recorder(self.engine)
+        result = dense_solve.Solver(self.run, self.run, settings, tactics).solve(source.name)
+        for kind in dense_solve.KINDS:
+            for count in ('queries', 'proofs'):
+                self.assertEqual(result['stats']['queries'][kind][count], baseline.stats['queries'][kind][count])
+        generated = result['continuations']
+        self.assertTrue(generated['rows'])
+        self.assertLessEqual(len(generated['rows']), int(before['counts']['rows']*.1))
+        parent = json.loads((source/'episodes.json').read_text())[0]
+        for e in generated['episodes']:
+            self.assertEqual(dense_data.holdout_key(e), dense_data.holdout_key(parent))
+            self.assertEqual(dense_data.forced_plies(e), e['proof']['ply'])
+        coordinator = dense_solve.Pass(self.run, self.run, settings)
+        coordinator.record(source.name, json.loads(json.dumps(result)))
+        path = self.run/'shards'/(source.name+'0')
+        manifest = dense_data.verify(path)
+        self.assertEqual(manifest['origin'], 'proof')
+        self.assertEqual(manifest['counts']['policy_rows'], 0)
+        self.assertEqual(manifest['counts']['line_rows'], len(generated['rows']))
+        self.assertEqual(coordinator.pending(), [])
+        (path/'proofs.jsonl').unlink()
+        self.assertEqual(coordinator.pending(), [])
+        self.assertEqual(dense_data.verify(source)['files'], before['files'])
+        coordinator.record(source.name, json.loads(json.dumps(result)))
+        self.assertEqual(dense_data.verify(path)['files'], manifest['files'])
+        write_games(self.run/'shards'/'000001', [(winning_game(), 0, [0.]*12)])
+        window = dense_data.ReplayWindow(self.run, 1000, cheap_row_fraction=0.)
+        refs = [window.ref(path.name, i) for i in range(manifest['counts']['rows'])]
+        samples, targets = dense_data.examples(window, refs, np.random.default_rng(3),
+            proof_policy_weight=1., proof_policy_missing_only=True, proven_weight=1.)
+        for ref, sample, target in zip(refs, samples, targets):
+            self.assertGreaterEqual(ref.row['ply'], generated['episodes'][ref.row['game']]['proof']['ply'])
+            self.assertEqual(target['value'], float(ref.row['proven'] > 0))
+            self.assertEqual(target['value_weight'], 1.)
+            if ref.row['proven'] > 0:
+                self.assertEqual(target['policy_weight'], 1.)
+                self.assertAlmostEqual(target['policy'].sum(), 1., places=6)
+                support = set(map(tuple, sample.actions[target['policy'] > 0]))
+                self.assertEqual(support, set(map(tuple, ref.row['proof_action'])))
+            else:
+                self.assertEqual(target['policy_weight'], 0.)
+        fraction = min(1., dense_data.holdout_key(parent)/2**64+.01)
+        held = dense_data.ReplayWindow(self.run, 1000, validation_fraction=fraction)
+        self.assertTrue(all(held.shards[n].held.all() for n in (source.name, path.name)))
+        self.assertFalse(any(n in (source.name, path.name) for n, _ in held.index))
+        self.assertEqual(sum(n in (source.name, path.name) for n, _ in held.validation),
+                         before['counts']['rows']+len(refs))
+
+    def test_continuation_verification_timeout_adds_no_rows(self):
+        settings = replace(SMALL, verify_fraction=0., continuation_fraction=.1)
+        with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=VerificationTimeout('late')):
+            result = dense_solve.Solver(self.run, self.run, settings, self.engine).solve('1000000000001')
+        self.assertEqual(result['continuations'], dict(episodes=[], rows=[]))
+        self.assertEqual(result['stats']['continuation_timeouts'], 1)
+
+    def test_rejected_continuation_is_never_published(self):
+        settings = replace(SMALL, verify_fraction=0., continuation_fraction=.1)
+        with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=ValueError('bad')):
+            with self.assertRaises(dense_solve.Rejected):
+                dense_solve.Solver(self.run, self.run, settings, self.engine).solve('1000000000001')
+        self.assertFalse((self.run/'shards'/'10000000000010').exists())
+
     @slow
     def test_worker_processes_match_the_in_process_solver_and_resume(self):
         out = self.run.parent/'out'
