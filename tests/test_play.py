@@ -542,6 +542,7 @@ class Jobs(unittest.TestCase):
         # The analysis at 5 refreshes 2; each refresh moves the value there, so it runs REFRESH_ROUNDS times and stops.
         self.assertEqual(self.engines.refreshes, [2, 2, 2])
         self.assertEqual(self.session.state()['stale'], [])
+        self.assertEqual(self.session.graph_plies[self.session.analysis_graph], [2, 5])
 
     def test_a_cancelled_analysis_still_counts_its_graph_search(self):
         self.session.configure_seat(1, 'human')

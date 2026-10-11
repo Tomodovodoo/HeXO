@@ -562,7 +562,11 @@ export class BrowserSession extends OfflineSession {
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
       const saved = this.lookup(history.slice(0, ply), spec);
-      if (this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line, cap: spec.budget.simulations, background: true});
+      const earlier = history.slice(0, ply);
+      // Keep a pending refresh's place and round count when another result reaches the same position.
+      if (this.stale(saved, ply) && !saved.proof && !this.jobs.some(j => j.kind === 'analyse' && j.refresh && j.status !== 'failed' && position(j.history) === position(earlier))) {
+        this.enqueue('analyse', earlier, {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line, cap: spec.budget.simulations, background: true});
+      }
     }
   }
   indexRecord(record) {
@@ -814,8 +818,9 @@ export class BrowserSession extends OfflineSession {
       if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
         if (!job.refresh) this.refresh(history, job.spec, job.line);
         else if (graph && moved(result, job.refresh)) {
-          // The refresh changed this position's result: new evidence for the positions before it, and another round here.
-          this.graphSearched(graph, history.length); this.refresh(history, job.spec, job.line);
+          // Propagate to earlier stale positions without counting a refresh as a new primary search.
+          // Counting it would stale already refreshed positions and restart their rounds.
+          this.refresh(history, job.spec, job.line);
           const rounds = (job.rounds || 0) + 1;
           if (rounds < REFRESH_ROUNDS) this.enqueue('analyse', history, job.spec, {force: true, refresh: this.lookup(history, job.spec), line: job.line, rounds, cap: job.cap, background: true});
         }

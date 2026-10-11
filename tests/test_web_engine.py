@@ -1619,6 +1619,13 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['asked'], [[2, 4], [4, 4], [2, 1], [2, 1], [2, 1]])
         self.assertEqual(result['stale'], [])
 
+    def test_changed_refreshes_settle_without_restarting_earlier_rounds(self):
+        result = node(dict(kind='refresh-cascade'))
+        self.assertEqual(result['pending'], 0)
+        self.assertEqual(result['stale'], [])
+        self.assertLessEqual(max(result['counts'].values()), 3)
+        self.assertLessEqual(result['calls'], 25 * 3 + 1)
+
     def test_restored_budget_game_is_not_paused(self):
         result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
         self.assertFalse(result['budget']['before'])

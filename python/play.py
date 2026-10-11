@@ -3882,9 +3882,7 @@ class Session:
             if refresh is None:
                 self.refresh(history, seat, game)
             elif used and moved(found, refresh):
-                # The refresh changed this position's result: that is new evidence for the positions before it, and
-                # worth another round here while the result keeps moving.
-                self.searched(used[-1], len(history))
+                # Propagate to earlier stale positions without making completed refreshes stale again.
                 self.refresh(history, seat, game)
                 rounds = getattr(job, 'rounds', 0) + 1
                 if rounds < REFRESH_ROUNDS:

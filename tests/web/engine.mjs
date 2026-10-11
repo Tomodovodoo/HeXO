@@ -1014,6 +1014,21 @@ if (job.kind === 'encode') {
     return {before, after: back.paused, clock: Boolean(back.clock)};
   };
   answer = {budget: await make(null), clocked: await make(job.clock)};
+} else if (job.kind === 'refresh-cascade') {
+  const s = new BrowserSession(native), asked = [];
+  const entry = {id: 'b', name: 'Bubble', kind: 'bubble', version: 'v1', presets: {standard: {simulations: 4, solver_nodes: 0}}};
+  s.registerEngine(entry, {turn: async history => {
+    asked.push(history.length);
+    return {moves: [[9, asked.length % 2]], value: .5, top: [], graph_id: 'g'};
+  }});
+  const history = [];
+  while (history.length < 25 && native.game(history).winner < 0) history.push([...native.legal(history)[0]]);
+  s.load(history, true); s.analysis = s.spec({engine: 'b', preset: 'standard'});
+  for (let ply = 0; ply < history.length; ply++) await s.record(history.slice(0, ply), s.analysis, {moves: [[9, 9]], value: .5, top: [], graph: ['g', 0]});
+  await s.request('/analyse', {ply: history.length, force: true}, 'POST');
+  for (let i = 0; i < 1000 && (s.running || s.jobs.some(j => j.status === 'queued')); i++) await new Promise(r => setTimeout(r, 1));
+  answer = {calls: asked.length, counts: Object.fromEntries([...new Set(asked)].map(ply => [ply, asked.filter(p => p === ply).length])), pending: s.jobs.length, stale: s.state().stale};
+  s.cancelJobs();
 } else if (job.kind === 'stale-loop') {
   const s = new BrowserSession(native), asked = [];
   const entry = {id: 'browser:test', name: 'Test', kind: 'bubble', version: 'v1', checkpoints: [], presets: {standard: {simulations: 4, solver_nodes: 0}, quick: {simulations: 4, solver_nodes: 0}}};
