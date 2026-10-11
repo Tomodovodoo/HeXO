@@ -5,6 +5,7 @@ Use --baseline once before a rollout and --note to record configuration changes.
 """
 import argparse
 from collections import Counter
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -69,7 +70,11 @@ def progress(rows, field):
 
 def metrics(run, variant, now, hours):
     result = {}
-    for name in (f'learner-{variant}', 'actor-0', 'gpu'):
+    actors = sorted((p.stem for p in (run/'metrics').glob('actor-*.jsonl')
+                     if p.stem.removeprefix('actor-').isdigit()),
+                    key=lambda name: int(name.removeprefix('actor-')))
+    actor_times = []
+    for name in (f'learner-{variant}', *actors, 'gpu'):
         stored, malformed = tail(run/'metrics'/f'{name}.jsonl')
         rows = [r for r in stored if r['time'] >= now-hours*3600]
         result[name] = dict(records=len(rows), malformed_records_in_log_tail=malformed, last=rows[-1] if rows else None)
@@ -84,9 +89,23 @@ def metrics(run, variant, now, hours):
         elif name.startswith('actor-'):
             result[name].update(games=progress(rows, 'games_completed'), placements=progress(rows, 'positions'),
                                 active_placements_per_second=mean([r for r in rows if r.get('placements_per_second', 0) > 0], 'placements_per_second'))
+            if rows:
+                actor_times.extend((rows[0]['time'], rows[-1]['time']))
         else:
+            temperatures = [r['temperature'] for r in rows if isinstance(r.get('temperature'), (int, float)) and math.isfinite(r['temperature'])]
             result[name].update(utilization=mean(rows, 'utilization'), watts=mean(rows, 'watts'),
-                                max_temperature=max((r['temperature'] for r in rows), default=None))
+                                max_temperature=max(temperatures, default=None))
+    seconds = max(actor_times)-min(actor_times) if actor_times else 0
+    summary = dict(workers=actors, observed_seconds=seconds)
+    for field in ('games', 'placements'):
+        summary[field] = {key: sum(result[name][field][key] for name in actors)
+                          for key in ('increment', 'resets', 'unobserved_boundaries')}
+        summary[f'wall_{field}_per_second'] = summary[field]['increment']/seconds if seconds else None
+    rates = [result[name]['active_placements_per_second'] for name in actors
+             if result[name]['active_placements_per_second'] is not None]
+    summary['active_placements_per_second'] = sum(rates) if rates else None
+    summary['note'] = 'Observed work summed across workers; restart boundaries excluded. Active throughput sums each worker\'s active mean, not a simultaneous measurement.'
+    result['actors'] = summary
     return result
 
 
@@ -135,18 +154,50 @@ def league_summary(league, variant):
                 note='Internal Elo is relative to this league. Match counts and opponent identities matter; protocols and openings can differ.')
 
 
+def external_estimates(run):
+    """Newest saved estimate per report, provided every referenced report is intact."""
+    estimates, timestamps, digests = {}, {}, {}
+    for metadata in sorted((run/'matches').glob('*/*-elo-estimate.json')):
+        saved = read(metadata)
+        if saved.get('schema') not in ('hexo-external-elo-estimate-v1', 'hexo-external-elo-estimate-v2'):
+            continue
+        sources = saved.get('sources', [])
+        if saved['schema'] == 'hexo-external-elo-estimate-v2' and not sources:
+            continue
+        intact = True
+        for source in (saved['match'], *sources):
+            evidence = (metadata.parent/source['report']).resolve()
+            if not evidence.is_relative_to(run.resolve()) or not evidence.is_file():
+                intact = False
+                break
+            if evidence not in digests:
+                digests[evidence] = hashlib.sha256(evidence.read_bytes()).hexdigest()
+            if digests[evidence] != source['report_sha256']:
+                intact = False
+                break
+        if not intact:
+            continue
+        calculated = saved['calculated_at']
+        if isinstance(calculated, str):
+            try:
+                date = datetime.fromisoformat(calculated)
+                calculated = (date if date.tzinfo else date.replace(tzinfo=timezone.utc)).timestamp()
+            except (ValueError, OverflowError, OSError):
+                continue
+        if not isinstance(calculated, (int, float)) or not math.isfinite(calculated):
+            continue
+        report = (metadata.parent/saved['match']['report']).resolve()
+        if report not in timestamps or calculated > timestamps[report]:
+            estimates[report], timestamps[report] = saved, calculated
+    return estimates
+
+
 def external_reports(run):
     reports = {'six': [], 'pulsatrix': []}
+    estimates = external_estimates(run)
     for path in sorted((run/'matches').glob('*/report.json'), key=lambda p: p.stat().st_mtime):
         data = read(path)
-        estimate = None
-        for metadata in sorted(path.parent.glob('*elo-estimate.json')):
-            saved = read(metadata)
-            match = saved.get('match', {})
-            if (match.get('report') == path.name and
-                    match.get('report_sha256') == hashlib.sha256(path.read_bytes()).hexdigest()):
-                estimate = saved
-                break
+        estimate = estimates.get(path.resolve())
         identity = json.dumps((estimate or data).get('opponent', {})).lower()
         if not any(word in identity for word in ('six', 'tyto', 'pulsatrix')):
             identity = path.parent.name.lower()
@@ -191,6 +242,7 @@ def collect(run, variant, out, hours, shards, baseline=False, note=None, command
                   hours=hours, checkpoints=[checkpoint(p) for p in paths[-3:]],
                   learner_status=read(run/f'learner-status-{variant}.json') if variant != 'main' else read(run/'learner-status.json'),
                   actor_status=read(run/'actor-status.json'), evaluator_status=read(run/'evaluator-status.json'),
+                  actor_statuses={p.stem: read(p) for p in sorted(run.glob('actor-status*.json'))},
                   metrics=metrics(run, variant, now, hours), recent_actor_sample=recent_shards(run, shards),
                   league=league_summary(read(run/'league.json'), variant), external_reports=external_reports(run))
     if commands:
