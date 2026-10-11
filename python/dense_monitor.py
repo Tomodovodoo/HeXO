@@ -138,14 +138,27 @@ def league_summary(league, variant):
 def external_reports(run):
     reports = {'six': [], 'pulsatrix': []}
     for path in sorted((run/'matches').glob('*/report.json'), key=lambda p: p.stat().st_mtime):
-        if not any(word in path.parent.name.lower() for word in ('six', 'tyto', 'pulsatrix')):
-            continue
         data = read(path)
-        family = 'six' if 'six' in path.parent.name.lower() else 'pulsatrix'
+        estimate = None
+        for metadata in sorted(path.parent.glob('*elo-estimate.json')):
+            saved = read(metadata)
+            match = saved.get('match', {})
+            if (match.get('report') == path.name and
+                    match.get('report_sha256') == hashlib.sha256(path.read_bytes()).hexdigest()):
+                estimate = saved
+                break
+        identity = json.dumps((estimate or data).get('opponent', {})).lower()
+        if not any(word in identity for word in ('six', 'tyto', 'pulsatrix')):
+            identity = path.parent.name.lower()
+        if not any(word in identity for word in ('six', 'tyto', 'pulsatrix')):
+            continue
+        family = 'six' if 'six' in identity else 'pulsatrix'
         reports[family].append(dict(path=path.relative_to(run).as_posix(),
                                    kind='calibration' if 'calibration' in path.parent.name.lower() else 'external_match',
+                                   estimate_metadata=estimate,
                                    summary={k: data[k] for k in ('status', 'manifest', 'score', 'summary', 'statistics', 'local', 'opponent', 'settings', 'wins', 'losses', 'capped') if k in data},
-                                   games=len(data.get('games', []))))
+                                   games=estimate['match']['games'] if estimate else
+                                   len(data['games']) if isinstance(data.get('games'), list) else None))
     return {k: v[-6:] for k, v in reports.items()}
 
 
