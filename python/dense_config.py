@@ -12,6 +12,7 @@ import time
 from legacy.train import write_json
 
 SCHEMA = 'hexo-dense-run-v1'
+METRICS_SESSION = str(time.time_ns())
 
 
 @dataclass(frozen=True)
@@ -423,10 +424,10 @@ def log_event(run, source, kind, message, **fields):
 
 
 def append_metrics(run, name, **fields):
-    """Append {time, **fields} to <run>/metrics/<name>.jsonl."""
+    """Append a timestamped record with its process session to the named metrics log."""
     path = Path(run)/'metrics'/f'{name}.jsonl'
     path.parent.mkdir(exist_ok=True)
-    append_line(path, dict(time=time.time(), **fields))
+    append_line(path, dict(time=time.time(), session=METRICS_SESSION, **fields))
 
 
 def from_dict(data):

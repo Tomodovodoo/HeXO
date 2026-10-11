@@ -112,6 +112,8 @@ def policy_summary(weight, placements, entropy, kl, top1, top2, argmax_mass, pai
     for suffix, selected in (('', known), ('_first', known & (placements == 2)), ('_second', known & (placements == 1))):
         prefix = 'policy'+suffix
         result[prefix+'_rows'] = int(selected.sum())
+        result[prefix+'_target_entropy'] = mean(entropy, selected)
+        result[prefix+'_kl'] = mean(kl, selected)
         result |= {f'{prefix}_{name}': mean(x, selected) for name, x in (('top1', top1), ('top2', top2),
                                                                          ('argmax_mass', argmax_mass))}
     paired = known & np.isfinite(pair_top1)
@@ -411,8 +413,8 @@ class PhaseHeartbeat:
 
 def pad(bucket, quantum):
     """Append inert rows up to a multiple of `quantum` rows so cuDNN sees few distinct batch shapes.
-    Padding rows have one empty crop cell (keeps pooled means finite and adds one cell to the norm
-    statistics), no legal or opponent cells and zero weight on every head."""
+    Padding rows have no crop cells, legal cells or target weight. Empty pooling denominators are
+    handled by HexNet, so these rows do not affect the real rows' normalization statistics."""
     extra = -len(bucket['counts']) % quantum
     if not extra:
         return bucket
@@ -424,8 +426,6 @@ def pad(bucket, quantum):
             out[k] = torch.cat((v, v[-1:].expand(extra)))
         else:
             fill = torch.full((extra, *v.shape[1:]), -1 if k in ('cells', 'next_cells') else 0, dtype=v.dtype)
-            if k == 'planes':
-                fill[:, 3, v.shape[2]//2, v.shape[3]//2] = 1
             out[k] = torch.cat((v, fill))
     return out
 
@@ -764,7 +764,8 @@ class Learner:
             group['lr'] = lr
         self.optimizer.zero_grad(set_to_none=True)
         losses = batch_losses(self.model, batch, self.coefficients(), self.device, self.memory_format, True)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.settings.grad_clip, error_if_nonfinite=True)
+        self.grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.settings.grad_clip,
+                                                       error_if_nonfinite=True).detach()
         # AdamW decay or saved moments can move the inactive channels sharing the opponent head.
         legacy = [p[1:] for p in (self.model.aux_spatial.weight, self.model.aux_spatial.bias)] \
                  if self.model.future_target == 'masked' and self.model.config.aux_heads else []
@@ -960,6 +961,15 @@ class Learner:
                 'policy_target_entropy', 'policy_kl', 'policy_top1', 'policy_top2', 'policy_argmax_mass',
                 'policy_pair_top1'))).items()})
             out.update({f'{source}_{k}': v for k, v in outcome_split(r['outcome_bce'], r['finished'] > 0, r['proven'] != 0).items()})
+            for phase, selected in (('early', r['ply'] < EARLY_PLY),
+                                    ('middle', (r['ply'] >= EARLY_PLY) & (r['ply'] < LATE_PLY)),
+                                    ('late', r['ply'] >= LATE_PLY)):
+                mask = selected & p
+                out[f'{source}_policy_kl_{phase}'] = float(np.average(r['policy_kl'][mask], weights=r['policy_weight'][mask])) if mask.any() else None
+                out[f'{source}_policy_kl_{phase}_rows'] = int(mask.sum())
+                mask = selected & (r['finished'] > 0) & (r['proven'] == 0)
+                out[f'{source}_outcome_bce_unproven_{phase}'] = float(r['outcome_bce'][mask].mean()) if mask.any() else None
+                out[f'{source}_outcome_bce_unproven_{phase}_rows'] = int(mask.sum())
             if self.settings.deblunder_weight:
                 out.update({f'{source}_{k}': v for k, v in deblunder_split(r['value_bce'], r['deblundered']).items()})
             if source not in CURVE_SOURCES:
@@ -1148,8 +1158,12 @@ def main():
             finished = time.perf_counter()
             rate = (rate+[(finished, s.batch, ready-started, finished-ready)])[-50:]
             if logged:
+                grad_norm = float(learner.grad_norm)
                 dense_config.append_metrics(args.run, f'learner-{s.variant}', step=learner.step, samples_seen=learner.samples_seen,
                                             lr=learner.lr(), **{LOGGED.get(h, h): v for h, v in learner.metrics.items()},
+                                            grad_norm=grad_norm, grad_clip=s.grad_clip,
+                                            grad_clip_scale=min(1., s.grad_clip/max(grad_norm, 1e-12)),
+                                            weight_decay=s.weight_decay,
                                             samples_per_second=speed(), window_rows=window.rows, vram=learner.vram())
             if learner.step % 10 == 0:
                 wait, gpu = np.mean([r[2] for r in rate]), np.mean([r[3] for r in rate])

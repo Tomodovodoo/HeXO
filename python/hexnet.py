@@ -373,7 +373,8 @@ class HexNet(nn.Module):
 
     def forward(self, planes, mask, aux=True):
         count = mask.sum((2, 3), dtype=torch.float32)    # a bf16 sum rounds counts above 256
-        cells = count.sum()
+        cells = count.sum().clamp_min(1)
+        count = count.clamp_min(1)  # empty batch-padding rows contribute no cells to normalization
         x = self.stem(torch.cat((planes, self.lines(planes[:, :1], planes[:, 1:2], mask)), 1)*mask)
         if self.net_kernels == 'fused':
             mask = mask.to(x.dtype)

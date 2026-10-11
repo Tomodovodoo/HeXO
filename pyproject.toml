@@ -25,6 +25,7 @@ py-modules = [
   "dense_data",
   "dense_eval",
   "dense_learn",
+  "dense_monitor",
   "dense_openings",
   "dense_posterior",
   "dense_player",

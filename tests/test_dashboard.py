@@ -150,6 +150,7 @@ class ResumedReports(unittest.TestCase):
 
 class ExternalRatings(unittest.TestCase):
     def test_legacy_match_tracks_current_reference_rating(self):
+        import dense_monitor
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             folder = run/'matches/opponent'
@@ -166,6 +167,7 @@ class ExternalRatings(unittest.TestCase):
             reference = dict(id='main/132500', elo=1600, elo_interval=[1404, 1796], ema_sha256='a'*64)
             league = dict(checkpoints=[dict(id='main/000500', elo=0), reference])
             rating = dashboard.external_ratings(run, league)['pulsatrix:standard']
+            self.assertEqual(dense_monitor.external_reports(run)['pulsatrix'][0]['games'], 64)
             self.assertEqual(rating['elo'], 1800)
             self.assertAlmostEqual(rating['elo_interval'][1]-1800, 1.96*math.sqrt(20000))
             reference['elo'] = 1700
@@ -178,6 +180,7 @@ class ExternalRatings(unittest.TestCase):
             # The numeric v2 file sorts before the ISO-string legacy file.
             (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
             self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 2000)
+            self.assertEqual(dense_monitor.external_reports(run)['pulsatrix'][0]['estimate_metadata'], newer)
             newer['calculated_at'] = '2026-09-29'
             saved['calculated_at'] = 1790812800
             (folder/'a-newer-elo-estimate.json').write_text(json.dumps(newer), encoding='utf-8')
@@ -185,6 +188,7 @@ class ExternalRatings(unittest.TestCase):
             self.assertEqual(dashboard.external_ratings(run, league)['pulsatrix:standard']['elo'], 1900)
 
     def test_calibrated_match_requires_both_unchanged_reports(self):
+        import dense_monitor
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             folder = run/'matches/calibration'
@@ -206,6 +210,9 @@ class ExternalRatings(unittest.TestCase):
             league = dict(checkpoints=[dict(id='main/000500', elo=0),
                 dict(id='main/132500', elo=1600, elo_interval=[1404, 1796], ema_sha256='a'*64)])
             rating = dashboard.external_ratings(run, league)['six:default']
+            monitored = dense_monitor.external_reports(run)['six'][0]
+            self.assertEqual((monitored['path'], monitored['games'], monitored['estimate_metadata']),
+                             ('matches/six/report.json', 12, saved))
             self.assertEqual((rating['label'], rating['elo'], rating['calibration_games']), ('Six@default', 2200, 32))
             self.assertAlmostEqual(rating['elo_interval'][0], 2200-1.96*math.sqrt(20000))
             sources = saved.pop('sources')
@@ -213,15 +220,18 @@ class ExternalRatings(unittest.TestCase):
                 if evidence is not None: saved['sources'] = evidence
                 path.write_text(json.dumps(saved), encoding='utf-8')
                 self.assertEqual(dashboard.external_ratings(run, league), {})
+                self.assertIsNone(dense_monitor.external_reports(run)['six'][0]['estimate_metadata'])
             saved['sources'] = sources
             path.write_text(json.dumps(saved), encoding='utf-8')
             for report in (match, calibration):
                 original = report.read_bytes()
                 report.write_text('{"games": [1]}', encoding='utf-8')
                 self.assertEqual(dashboard.external_ratings(run, league), {})
+                self.assertIsNone(dense_monitor.external_reports(run)['six'][0]['estimate_metadata'])
                 report.write_bytes(original)
             calibration.unlink()
             self.assertEqual(dashboard.external_ratings(run, league), {})
+            self.assertIsNone(dense_monitor.external_reports(run)['six'][0]['estimate_metadata'])
 
 
 class EvaluationBinding(unittest.TestCase):

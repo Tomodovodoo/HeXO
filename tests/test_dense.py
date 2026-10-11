@@ -2300,9 +2300,8 @@ class DenseDataTests(unittest.TestCase):
         self.assertAlmostEqual(loss_on-loss_off, .5*off[-1].item(), places=5)
         self.assertFalse(all(torch.allclose(a, b) for a, b in zip(grad_off, grad_on)))
 
-    def test_padding_rows_carry_no_loss_and_shift_gradients_through_norm_statistics_only(self):
-        """Padding rows have zero loss weight; their one crop cell enters the norm statistics, so gradients move by
-        a small amount that grows with the number of padding rows."""
+    def test_padding_rows_do_not_change_real_losses_or_gradients(self):
+        """Dummy rows have no cells or loss weight; changing their count preserves real-row learning."""
         torch.manual_seed(0)
         model = hexnet.HexNet(TINY, 'masked')
         moves = winning_game()
@@ -2322,10 +2321,9 @@ class DenseDataTests(unittest.TestCase):
             gradients.append(torch.cat([p.grad.flatten() for p in m.parameters() if p.grad is not None]))
         self.assertTrue(torch.isfinite(losses[0]).all())
         for logged in losses[1:]:
-            torch.testing.assert_close(logged, losses[0], rtol=1e-3, atol=1e-5)
-        shift = [float((g-gradients[0]).norm()/gradients[0].norm()) for g in gradients[1:]]
-        self.assertLess(shift[0], .03)
-        self.assertLess(shift[0], shift[1])
+            torch.testing.assert_close(logged, losses[0], rtol=1e-5, atol=1e-6)
+        for gradient in gradients[1:]:
+            torch.testing.assert_close(gradient, gradients[0], rtol=1e-4, atol=1e-6)
 
     def test_shard_round_trip_and_tamper(self):
         rng = np.random.default_rng(2)
@@ -3748,6 +3746,10 @@ class ValidationSourceTests(unittest.TestCase):
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
                 self.assertAlmostEqual(v[f'{source}_policy_ce'],
                                        v[f'{source}_policy_target_entropy']+v[f'{source}_policy_kl'], delta=1e-5)
+                self.assertAlmostEqual(v[f'{source}_policy_kl_early'], v[f'{source}_policy_kl'])
+                self.assertEqual(v[f'{source}_policy_kl_early_rows'], v[f'{source}_policy_rows'])
+                self.assertIsNone(v[f'{source}_policy_kl_middle'])
+                self.assertIsNone(v[f'{source}_policy_kl_late'])
                 for name in ('policy_ce', 'value_bce'):
                     self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
             self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))
@@ -3836,6 +3838,8 @@ class ValidationSourceTests(unittest.TestCase):
         summary = dense_learn.policy_summary([2, 1, 1, 0], [2, 1, 2, 2], [1., 2., 3., 9.], [.1, .2, .3, 9.],
                                              [1, 0, 0, 1], [1, 1, 0, 1], [.5, .4, .2, .9], [1, math.nan, 0, 1])
         expected = dict(policy_target_entropy=7/4, policy_kl=.7/4, policy_rows=3, policy_top1=.5, policy_top2=.75,
+                        policy_first_target_entropy=5/3, policy_first_kl=.5/3,
+                        policy_second_target_entropy=2., policy_second_kl=.2,
                         policy_argmax_mass=1.6/4, policy_first_rows=2, policy_first_top1=2/3, policy_first_top2=2/3,
                         policy_first_argmax_mass=.4, policy_second_rows=1, policy_second_top1=0.,
                         policy_second_top2=1., policy_second_argmax_mass=.4, policy_pair_top1=2/3, policy_pair_rows=2)
@@ -10716,7 +10720,7 @@ class DenseTimedWorker(unittest.TestCase):
         history = [[0, 0]]
         first = dict(producer=0, game=0, model=0, token=1, history=history,
                      context='first', action=[1, 0], exact_winner=-1,
-                     root_completed=2, completed=2,
+                     root_completed=2, completed=2, network_value=.2,
                      edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
         for winner, visits in ((-1, 200), (-1, 0), (1, 0)):
             with self.subTest(exact_winner=winner, position_edge_visits=visits), \
@@ -10733,6 +10737,7 @@ class DenseTimedWorker(unittest.TestCase):
                 frames = [first, dict(producer=0, game=0, model=0,
                     token=2, history=history+[[1, 0]], context='second', action=[2, 0],
                     exact_winner=winner, root_completed=0, completed=200, issued=80,
+                    network_value=.8 if winner < 0 else None,
                     elapsed_ms=476., result_build_ms=2., result_ready_elapsed_ms=478.,
                     publish_delay_ms=1., event_queue_ms=784.,
                     winning_turn=[[2, 0]] if winner == 1 else [],
@@ -10768,6 +10773,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['stones'][1]['source'], 'position_search' if visits else 'uncredited_estimate')
                 self.assertEqual(result['stones'][1]['position_edge_visits'], visits)
                 self.assertEqual(result['stones'][1]['root_completed'], 0)
+                self.assertEqual(result['stones'][1]['policy_prior_rank'], 1)
                 self.assertEqual(result['root_searches'][1]['error'], 'no_completed_comparison')
                 self.assertEqual(result['proof_status'], 'UNKNOWN')
             else:
@@ -10775,6 +10781,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(len(result['stones']), 2)
                 self.assertEqual(result['proof_status'], 'PROVEN_WIN')
                 self.assertEqual(result['stones'][1]['source'], 'verified_proof')
+                self.assertIsNone(result['stones'][1]['policy_prior_rank'])
                 self.assertNotIn('error', result['root_searches'][1])
 
     def test_raw_policy_turn_plays_both_stones_or_a_verified_proof(self):
