@@ -204,10 +204,16 @@ class PassTests(unittest.TestCase):
             self.assertEqual(e['winner'], -1)
             self.assertEqual(e['reason'], 'cap')
         coordinator = dense_solve.Pass(self.run, self.run, settings)
+        # Actor attribution must not turn proof episodes into supervised actor progress.
+        result_identity = json.loads((source/'manifest.json').read_text())
+        result_identity['identity']['process'] = 17
+        (source/'manifest.json').write_text(json.dumps(result_identity))
         coordinator.record(source.name, json.loads(json.dumps(result)))
         path = self.run/'shards'/(source.name+'0')
         manifest = dense_data.verify(path)
         self.assertEqual(manifest['origin'], 'proof')
+        self.assertNotIn('process', manifest['identity'])
+        self.assertEqual(dense_selfplay.published(self.run, 17)['games_completed'], before['counts']['games'])
         self.assertEqual(manifest['counts']['policy_rows'], 0)
         self.assertEqual(manifest['counts']['line_rows'], len(generated['rows']))
         self.assertEqual(coordinator.pending(), [])
@@ -215,6 +221,8 @@ class PassTests(unittest.TestCase):
         self.assertEqual(coordinator.pending(), [])
         (source/'proofs.jsonl').unlink()
         self.assertEqual(coordinator.pending(limit=1), [source.name])
+        with unittest.mock.patch.object(dense_data, 'manifest', side_effect=AssertionError('reloaded cached origin')):
+            self.assertEqual(coordinator.pending(limit=1), [source.name])
         self.assertEqual(dense_data.verify(source)['files'], before['files'])
         coordinator.record(source.name, json.loads(json.dumps(result)))
         self.assertEqual(dense_data.verify(path)['files'], manifest['files'])
@@ -256,6 +264,13 @@ class PassTests(unittest.TestCase):
     def test_rejected_continuation_is_never_published(self):
         settings = replace(SMALL, verify_fraction=0., continuation_fraction=.1)
         with unittest.mock.patch.object(dense_solve, 'independent_verify', side_effect=ValueError('bad')):
+            with self.assertRaises(dense_solve.Rejected):
+                dense_solve.Solver(self.run, self.run, settings, self.engine).solve('1000000000001')
+        self.assertFalse((self.run/'shards'/'10000000000010').exists())
+
+    def test_nonwinning_continuation_verdict_is_rejected(self):
+        settings = replace(SMALL, verify_fraction=0., continuation_fraction=.1)
+        with unittest.mock.patch.object(dense_solve, 'independent_verify', return_value='PROVEN_LOSS'):
             with self.assertRaises(dense_solve.Rejected):
                 dense_solve.Solver(self.run, self.run, settings, self.engine).solve('1000000000001')
         self.assertFalse((self.run/'shards'/'10000000000010').exists())

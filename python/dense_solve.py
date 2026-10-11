@@ -422,7 +422,9 @@ class Solver:
             ply, text = candidate
             certificate = json.loads(text)
             try:
-                independent_verify(certificate, moves[:ply], deadline_seconds=s.continuation_verify_seconds)
+                verdict = independent_verify(certificate, moves[:ply], deadline_seconds=s.continuation_verify_seconds)
+                if verdict != 'PROVEN_WIN':
+                    raise ValueError(f'Continuation verifier returned {verdict}')
                 self.stats['continuation_verified'] += 1
             except VerificationTimeout:
                 self.stats['continuation_timeouts'] += 1
@@ -504,6 +506,7 @@ class Pass:
         self.started = self.refreshed = self.reported = clock()
         self.busy, self.running, self.target, self.switches, self.failed = 0., {}, None, [], Counter()
         self.stats = dict(new_stats(), shards_done=0)
+        self.origins = {}
 
     def record(self, name, result):
         """Add a shard's result to the buffer and the counters, then save the buffer and write the sidecar."""
@@ -513,6 +516,7 @@ class Pass:
             identity = dict(source['identity'], proof_source=name, proof_source_files=source['files'],
                             proof_settings=asdict(self.s), proof_seed=dense_config.load(self.run).seed,
                             proof_build=build_hash())
+            identity.pop('process', None)
             path = self.out/'shards'/(name+'0')
             if path.exists():
                 if dense_data.verify(path)['identity'] != identity:
@@ -539,8 +543,15 @@ class Pass:
     def pending(self, limit=None):
         """Shard names without a sidecar under `out` among the newest `limit` shards, newest first, shards whose
         worker failed after the others and without those that failed ATTEMPTS times."""
-        names = [p.name for p in dense_data.shard_dirs(self.run)[::-1]
-                 if dense_data.origin(dense_data.manifest(p)) != 'proof'][:limit]
+        names = []
+        for p in dense_data.shard_dirs(self.run)[::-1] if limit != 0 else ():
+            if p.name not in self.origins:
+                self.origins[p.name] = dense_data.origin(dense_data.manifest(p))
+            if self.origins[p.name] == 'proof':
+                continue
+            names.append(p.name)
+            if limit is not None and len(names) >= limit:
+                break
         names = [n for n in names if self.failed[n] < ATTEMPTS and not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
         return sorted(names, key=lambda n: self.failed[n])
 
