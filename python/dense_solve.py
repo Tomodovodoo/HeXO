@@ -226,11 +226,12 @@ def continuation(shard, g, episode, ply, certificate, rng, limit):
             history.append(list(stone)); rows.append(row); values.append(float(exact))
         if game.winner >= 0 and game.winner != winner:
             raise ValueError('Proof continuation contradicts its certified winner')
+        finished = game.winner == winner
     finally:
         game.close()
     source = dict(shard=shard, game=g, ply=ply, holdout_key=dense_data.holdout_key(episode),
                   certificate_hash=hashlib.sha256(json.dumps(certificate, separators=(',', ':')).encode()).hexdigest())
-    result = dict(moves=history, winner=winner, reason='proven', opening_plies=ply,
+    result = dict(moves=history, winner=winner if finished else -1, reason='proven' if finished else 'cap', opening_plies=ply,
                   actor=episode['actor'], actors=episode.get('actors'), trained_side=episode.get('trained_side'),
                   root_values=values, network_values=[None]*len(history), full_search=[False]*len(history),
                   origin='proof', proof=source, adjudicated=dict(ply=ply, winner=winner, line_plies=len(rows)))
@@ -538,9 +539,9 @@ class Pass:
     def pending(self, limit=None):
         """Shard names without a sidecar under `out` among the newest `limit` shards, newest first, shards whose
         worker failed after the others and without those that failed ATTEMPTS times."""
-        names = [p.name for p in dense_data.shard_dirs(self.run)][::-1][:limit]
+        names = [p.name for p in dense_data.shard_dirs(self.run)[::-1]
+                 if dense_data.origin(dense_data.manifest(p)) != 'proof'][:limit]
         names = [n for n in names if self.failed[n] < ATTEMPTS and not (self.out/'shards'/n/dense_data.SIDECAR).exists()]
-        names = [n for n in names if dense_data.origin(dense_data.manifest(self.run/'shards'/n)) != 'proof']
         return sorted(names, key=lambda n: self.failed[n])
 
     def workers(self):

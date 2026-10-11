@@ -183,7 +183,7 @@ class PassTests(unittest.TestCase):
         self.assertFalse((self.run/'shards'/'1000000000001'/'proofs.jsonl').exists())
 
     def test_continuations_are_bounded_exact_rows_with_the_source_split_and_no_new_search(self):
-        settings = replace(SMALL, continuation_fraction=.1, continuation_max_plies=16,
+        settings = replace(SMALL, continuation_fraction=.1, continuation_max_plies=1,
                            continuation_verify_seconds=10.)
         source = self.run/'shards'/'1000000000001'
         before = dense_data.verify(source)
@@ -201,6 +201,8 @@ class PassTests(unittest.TestCase):
         for e in generated['episodes']:
             self.assertEqual(dense_data.holdout_key(e), dense_data.holdout_key(parent))
             self.assertEqual(dense_data.forced_plies(e), e['proof']['ply'])
+            self.assertEqual(e['winner'], -1)
+            self.assertEqual(e['reason'], 'cap')
         coordinator = dense_solve.Pass(self.run, self.run, settings)
         coordinator.record(source.name, json.loads(json.dumps(result)))
         path = self.run/'shards'/(source.name+'0')
@@ -211,6 +213,8 @@ class PassTests(unittest.TestCase):
         self.assertEqual(coordinator.pending(), [])
         (path/'proofs.jsonl').unlink()
         self.assertEqual(coordinator.pending(), [])
+        (source/'proofs.jsonl').unlink()
+        self.assertEqual(coordinator.pending(limit=1), [source.name])
         self.assertEqual(dense_data.verify(source)['files'], before['files'])
         coordinator.record(source.name, json.loads(json.dumps(result)))
         self.assertEqual(dense_data.verify(path)['files'], manifest['files'])
@@ -218,11 +222,16 @@ class PassTests(unittest.TestCase):
         window = dense_data.ReplayWindow(self.run, 1000, cheap_row_fraction=0.)
         refs = [window.ref(path.name, i) for i in range(manifest['counts']['rows'])]
         samples, targets = dense_data.examples(window, refs, np.random.default_rng(3),
-            proof_policy_weight=1., proof_policy_missing_only=True, proven_weight=1.)
+            proof_policy_weight=1., proof_policy_missing_only=True, proven_weight=1.,
+            future_target='masked', short_value_target='future')
         for ref, sample, target in zip(refs, samples, targets):
             self.assertGreaterEqual(ref.row['ply'], generated['episodes'][ref.row['game']]['proof']['ply'])
             self.assertEqual(target['value'], float(ref.row['proven'] > 0))
             self.assertEqual(target['value_weight'], 1.)
+            self.assertEqual(target['outcome_weight'], 0.)
+            if ref.row['ply']+20 > len(ref.episode['moves']):
+                self.assertFalse(np.any(target['future_weight']))
+                self.assertEqual(target['short_weight'], 0.)
             if ref.row['proven'] > 0:
                 self.assertEqual(target['policy_weight'], 1.)
                 self.assertAlmostEqual(target['policy'].sum(), 1., places=6)
