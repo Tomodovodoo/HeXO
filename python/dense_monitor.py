@@ -204,7 +204,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--variant', default='new-schedule')
+    parser.add_argument('--variant', help='Learner variant; defaults to the run configuration')
     parser.add_argument('--hours', type=float, default=24)
     parser.add_argument('--shards', type=int, default=8)
     parser.add_argument('--commands', type=Path)
@@ -213,6 +213,8 @@ def main():
     args = parser.parse_args()
     if args.hours <= 0 or args.shards < 1:
         parser.error('hours and shards must be positive')
+    if args.variant is None:
+        args.variant = read(args.run/'config.json')['learner']['variant']
     result, path = collect(**vars(args))
     print(json.dumps(dict(snapshot=str(path), checkpoint=result['checkpoints'][-1]['id'],
                           learner_stage=(result['learner_status'] or {}).get('stage'),

@@ -93,8 +93,10 @@ records a baseline once. Run the same command without `--baseline` for later sna
 records the actual service launch arguments; `--note "reason for the change"` adds a checkpoint-bound entry to
 `changes.jsonl`. Snapshots include retained checkpoint settings, recent validation, bounded log summaries,
 actor shard counts and root comparison credits, league opponents, and existing Six/Pulsatrix reports.
-The collector performs no model inference or extra evaluation games. Counter resets are reported and counted
-as new process work. Malformed log records are counted rather than silently treated as progress.
+The collector defaults to the learner variant in `config.json`; specify `--variant` when the live learner
+overrides it. It performs no model inference or extra evaluation games. Counter resets and session changes
+are reported, and their first observations are excluded from work totals. Legacy logs cannot identify every
+restart. Malformed log records are counted rather than silently treated as progress.
 
 Validation records entropy-adjusted policy error separately for first and second stones and for positions
 before ply 20, plies 20 through 59, and ply 60 onward. Unproven outcome error has the same phase split and
