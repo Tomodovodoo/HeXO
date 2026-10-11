@@ -10716,7 +10716,7 @@ class DenseTimedWorker(unittest.TestCase):
         history = [[0, 0]]
         first = dict(producer=0, game=0, model=0, token=1, history=history,
                      context='first', action=[1, 0], exact_winner=-1,
-                     root_completed=2, completed=2,
+                     root_completed=2, completed=2, network_value=.2,
                      edges=np.array([[1, 0, 0, 0, .2, 1, 2, 2, 1]], float))
         for winner, visits in ((-1, 200), (-1, 0), (1, 0)):
             with self.subTest(exact_winner=winner, position_edge_visits=visits), \
@@ -10733,6 +10733,7 @@ class DenseTimedWorker(unittest.TestCase):
                 frames = [first, dict(producer=0, game=0, model=0,
                     token=2, history=history+[[1, 0]], context='second', action=[2, 0],
                     exact_winner=winner, root_completed=0, completed=200, issued=80,
+                    network_value=.8 if winner < 0 else None,
                     elapsed_ms=476., result_build_ms=2., result_ready_elapsed_ms=478.,
                     publish_delay_ms=1., event_queue_ms=784.,
                     winning_turn=[[2, 0]] if winner == 1 else [],
@@ -10768,6 +10769,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(result['stones'][1]['source'], 'position_search' if visits else 'uncredited_estimate')
                 self.assertEqual(result['stones'][1]['position_edge_visits'], visits)
                 self.assertEqual(result['stones'][1]['root_completed'], 0)
+                self.assertEqual(result['stones'][1]['policy_prior_rank'], 1)
                 self.assertEqual(result['root_searches'][1]['error'], 'no_completed_comparison')
                 self.assertEqual(result['proof_status'], 'UNKNOWN')
             else:
@@ -10775,6 +10777,7 @@ class DenseTimedWorker(unittest.TestCase):
                 self.assertEqual(len(result['stones']), 2)
                 self.assertEqual(result['proof_status'], 'PROVEN_WIN')
                 self.assertEqual(result['stones'][1]['source'], 'verified_proof')
+                self.assertIsNone(result['stones'][1]['policy_prior_rank'])
                 self.assertNotIn('error', result['root_searches'][1])
 
     def test_raw_policy_turn_plays_both_stones_or_a_verified_proof(self):

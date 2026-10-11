@@ -52,14 +52,18 @@ def mean(rows, field):
 
 
 def progress(rows, field):
-    """Counter increments over the observed interval, including process restarts."""
+    """Observed increments within sessions; omit unknown work across restarts."""
     records = [r for r in rows if field in r]
-    total, resets = 0, 0
+    total, resets, boundaries = 0, 0, 0
     for a, b in zip(records, records[1:]):
         delta = b[field]-a[field]
         resets += delta < 0
-        total += delta if delta >= 0 else b[field]
-    return dict(increment=total, resets=resets,
+        boundary = a.get('session') != b.get('session') or delta < 0
+        boundaries += boundary
+        if not boundary:
+            total += delta
+    return dict(increment=total, resets=resets, unobserved_boundaries=boundaries,
+                note='Observed work only. First observations and restart boundaries are excluded; legacy logs cannot identify every restart.',
                 observed_seconds=records[-1]['time']-records[0]['time'] if len(records) > 1 else 0)
 
 

@@ -290,7 +290,8 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                    move_comparison_credits=int(edges[chosen[0], 7]),
                    root_comparison_credits=int(edges[:, 7].sum()),
                    policy_choice_unvisited=bool(winner < 0 and not edges[chosen[0], 6]),
-                   policy_prior_rank=int((edges[:, 2] > edges[chosen[0], 2]).sum()+1))
+                   policy_prior_rank=int((edges[:, 2] > edges[chosen[0], 2]).sum()+1)
+                   if found.get('network_value') is not None else None)
         row['source'] = ('verified_proof' if winner >= 0 else 'completed_comparisons'
                          if found['root_completed'] else 'position_search'
                          if row['position_edge_visits'] else 'uncredited_estimate')
