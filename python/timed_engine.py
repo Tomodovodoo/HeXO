@@ -128,7 +128,7 @@ def legal_turn(history, moves=None):
             raise ValueError('Game has finished')
         if moves is None:
             while game.player == side and game.winner < 0:
-                action = game.legal_moves()[0]
+                action = game.turns(width=4)[0]['moves'][0]
                 game.play(*action)
                 chosen.append(list(action))
         else:
@@ -156,7 +156,7 @@ def complete_candidate(history, prefix):
             game.play(*action)
             moves.append(list(action))
         while game.winner < 0 and game.player == side:
-            action = game.legal_moves()[0]
+            action = game.turns(width=4)[0]['moves'][0]
             game.play(*action)
             moves.append(list(action))
         return moves
@@ -283,6 +283,14 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                    scheduler_completed=found['completed'],
                    root_completed=found['root_completed'], context=found['context'])
         row['position_edge_visits'] = int(edges[:, 6].sum())
+        chosen = np.flatnonzero((edges[:, :2] == action).all(1))
+        if len(chosen) != 1:
+            raise ValueError('Hybrid choice is not a unique legal root action')
+        row.update(move_edge_visits=int(edges[chosen[0], 6]),
+                   move_comparison_credits=int(edges[chosen[0], 7]),
+                   root_comparison_credits=int(edges[:, 7].sum()),
+                   policy_choice_unvisited=bool(winner < 0 and not edges[chosen[0], 6]),
+                   policy_prior_rank=int((edges[:, 2] > edges[chosen[0], 2]).sum()+1))
         row['source'] = ('verified_proof' if winner >= 0 else 'completed_comparisons'
                          if found['root_completed'] else 'position_search'
                          if row['position_edge_visits'] else 'uncredited_estimate')

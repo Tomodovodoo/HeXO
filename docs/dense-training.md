@@ -86,6 +86,23 @@ The replay window follows KataGo: at least `window_min_rows` full-search rows, t
 
 Policy surprise weighting follows KataGo too. Actors store `surprise` on every row with a policy target whose root a network evaluation expanded: the KL from the root's raw network prior to the recorded search policy, in nats. Roots expanded by an immediate win or a proof have no prior and store none. With `--surprise-weight w` the learner samples those rows unevenly within each game. The game's rows that store a surprise keep their total sampling weight, one per row, and split it, `1 - w` evenly and `w` in proportion to their KL. KataGo uses 0.5. Cheap rows and rows without a stored surprise keep weight 1, so a window of older shards samples as before, and the pacing count does not change. The weight only changes how often a row is drawn, never its loss weight. It cannot be combined with `regret_fraction`. The learner status reports `surprise_rows`, the training rows that store one. Index files written before the field existed are rebuilt only for shards whose manifest counts `surprise_rows`.
 
+## Progress monitoring
+
+`python python/dense_monitor.py --run runs/dense-v1 --out artifacts/live/training-monitor --baseline`
+records a baseline once. Run the same command without `--baseline` for later snapshots. `--commands path`
+records the actual service launch arguments; `--note "reason for the change"` adds a checkpoint-bound entry to
+`changes.jsonl`. Snapshots include retained checkpoint settings, recent validation, bounded log summaries,
+actor shard counts and root comparison credits, league opponents, and existing Six/Pulsatrix reports.
+The collector performs no model inference or extra evaluation games. Counter resets are reported and counted
+as new process work. Malformed log records are counted rather than silently treated as progress.
+
+Validation records entropy-adjusted policy error separately for first and second stones and for positions
+before ply 20, plies 20 through 59, and ply 60 onward. Unproven outcome error has the same phase split and
+sample counts. Learner logs include the gradient norm before clipping, its clip scale, and weight decay.
+These use existing training and validation passes. A changing replay or newest-source panel is not a fixed
+comparison; snapshots identify its checkpoint. Lower policy error alone does not demonstrate stronger play.
+The run's internal Elo does not establish its strength against an external engine.
+
 ## Book, restart and fork starts
 
 `--book-fraction` starts that share of new games from the opening book's off-policy pool, with a random hex symmetry, and `--restart-fraction` from the proof pass's restart buffer. Preset stones produce no rows; search and training start after them. A tactical opening from `openings/tactical/` fixes the value target of the first position after its prefix, so a later blunder cannot contradict the opening's known result.
