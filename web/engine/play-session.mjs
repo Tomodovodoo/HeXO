@@ -562,7 +562,13 @@ export class BrowserSession extends OfflineSession {
   refresh(history, spec, line) {
     for (let ply = history.length - 1; ply >= Math.max(0, history.length - REFRESH_PLIES); ply--) {
       const saved = this.lookup(history.slice(0, ply), spec);
-      if (this.stale(saved, ply) && !saved.proof) this.enqueue('analyse', history.slice(0, ply), {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line, cap: spec.budget.simulations, background: true});
+      const earlier = history.slice(0, ply);
+      // Keep a pending refresh's place and round count when another result reaches the same position.
+      if (!this.stale(saved, ply) || saved.proof) continue;
+      const pending = this.jobs.find(j => j.kind === 'analyse' && j.refresh && j.status !== 'failed' && position(j.history) === position(earlier));
+      if (pending) {
+        if (pending.status === 'queued') pending.cap = Math.max(pending.cap ?? Infinity, spec.budget.simulations ?? Infinity);
+      } else this.enqueue('analyse', earlier, {...spec, budget: copy(saved.budget)}, {force: true, refresh: saved, line, cap: spec.budget.simulations, background: true});
     }
   }
   indexRecord(record) {
@@ -682,7 +688,9 @@ export class BrowserSession extends OfflineSession {
     if (this.importing || this.conflicted) return;
     const state = this.native.game(this.history), seat = this.seats[state.player];
     if (!this.paused && state.winner < 0 && this.adapters.has(seat.engine) && !this.jobs.some(j => j.kind === 'move')) this.enqueue('move', this.history, seat, {side: state.player, line: this.lines[state.player]});
-    const queued = test => this.jobs.find(j => j.status === 'queued' && test(j));
+    // Finish deeper refreshes, including their repeat rounds, before ancestors read their graph evidence.
+    const queued = test => this.jobs.filter(j => j.status === 'queued' && test(j))
+      .sort((a, b) => a.background && b.background ? b.history.length - a.history.length : 0)[0];
     const move = this.lanes.move ?? queued(j => j.kind === 'move'), busy = j => move && this.shares(j, move);
     const pick = pool => pool(j => j.kind === 'analyse' && !j.tier && !j.background) || pool(j => j.kind === 'review') || pool(j => j.tier) || pool(j => j.background);
     // How long a seated engine's worker has gone without finishing an analysis that wants it, counted from the first pump that
@@ -814,8 +822,9 @@ export class BrowserSession extends OfflineSession {
       if (job.kind === 'analyse' && job.line != null && this.entries.get(job.spec.engine)?.kind === 'bubble') {
         if (!job.refresh) this.refresh(history, job.spec, job.line);
         else if (graph && moved(result, job.refresh)) {
-          // The refresh changed this position's result: new evidence for the positions before it, and another round here.
-          this.graphSearched(graph, history.length); this.refresh(history, job.spec, job.line);
+          // Propagate to earlier stale positions without counting a refresh as a new primary search.
+          // Counting it would stale already refreshed positions and restart their rounds.
+          this.refresh(history, job.spec, job.line);
           const rounds = (job.rounds || 0) + 1;
           if (rounds < REFRESH_ROUNDS) this.enqueue('analyse', history, job.spec, {force: true, refresh: this.lookup(history, job.spec), line: job.line, rounds, cap: job.cap, background: true});
         }
