@@ -3887,7 +3887,7 @@ class Session:
                 rounds = getattr(job, 'rounds', 0) + 1
                 if rounds < REFRESH_ROUNDS:
                     with self.lock:
-                        self.submit(Job('analyse', REFRESH_PRIORITY, history, seat=dict(seat), force=True, game=game, refresh=saved,
+                        self.submit(Job('analyse', REFRESH_PRIORITY + 1 / (len(history) + 1), history, seat=dict(seat), force=True, game=game, refresh=saved,
                                         rounds=rounds))
         return saved
 
@@ -3926,7 +3926,8 @@ class Session:
                 if self.stale(saved, ply) and not saved.get('proof') and not any(
                         getattr(j, 'refresh', None) is not None and j.history == tuple(history[:ply])
                         and j.status == 'queued' for j in self.jobs.values()):
-                    self.submit(Job('analyse', REFRESH_PRIORITY, history[:ply], seat=dict(seat), force=True, game=game,
+                    # Complete deeper positions' repeat rounds before their ancestors read the graph.
+                    self.submit(Job('analyse', REFRESH_PRIORITY + 1 / (ply + 1), history[:ply], seat=dict(seat), force=True, game=game,
                                     refresh=saved))
 
     def note_pace(self, seat, ms, stones):

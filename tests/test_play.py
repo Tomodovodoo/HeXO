@@ -544,6 +544,20 @@ class Jobs(unittest.TestCase):
         self.assertEqual(self.session.state()['stale'], [])
         self.assertEqual(self.session.graph_plies[self.session.analysis_graph], [2, 5])
 
+    def test_refresh_rounds_finish_before_ancestors_read_the_graph(self):
+        self.session.configure_seat(1, 'human')
+        for move in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]:
+            self.session.play(*move)
+        self.engines.drift = .1
+        for ply in (1, 2):
+            self.session.analyse(ply, force=True)
+            wait(lambda: not self.session.state()['jobs'])
+        self.engines.refreshes.clear()
+        self.session.analyse(5, force=True)
+        wait(lambda: not self.session.state()['jobs'])
+        self.assertEqual(self.engines.refreshes, [2, 2, 2, 1, 1, 1])
+        self.assertEqual(self.session.state()['stale'], [])
+
     def test_a_cancelled_analysis_still_counts_its_graph_search(self):
         self.session.configure_seat(1, 'human')
         for move in [(0, 0), (1, 0), (2, 0)]:

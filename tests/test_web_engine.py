@@ -1625,6 +1625,9 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['stale'], [])
         self.assertLessEqual(max(result['counts'].values()), 3)
         self.assertLessEqual(result['calls'], 25 * 3 + 1)
+        self.assertEqual(result['order'], sorted(result['order'], reverse=True))
+        self.assertEqual((result['initialCap'], result['upgradedCap']), (1, 16))
+        self.assertEqual(result['work'][1], 4)
 
     def test_restored_budget_game_is_not_paused(self):
         result = node(dict(kind='restore-pause', clock=dict(mode='game', tc='60+1')))
