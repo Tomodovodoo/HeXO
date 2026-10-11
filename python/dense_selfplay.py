@@ -34,8 +34,6 @@ from hexo import Game
 from legacy.klent import digest
 from neural_search import HOLD, EvaluationCache, GameGraph, NeuralSearch, Recheck, checked, native
 from legacy.train import write_json
-from proof import VerificationTimeout
-from tactical_proof import independent_verify
 
 # Crop cells per forward: 48 positions at 48x48, proportionally fewer for larger crops (a b6c96 forward peaks
 # near 0.14 GB; about 0.33 GB per process with the CUDA context). A crop-size group is padded into the next larger size present when that adds fewer than
@@ -913,43 +911,7 @@ class SelfPlayGame:
         winning action comes from the strategy followed at that prefix. Analysis without line rows uses the primary
         attacker choices. After an unstoppable node, defender stones avoid its threats; stop if no move is supplied.
         """
-        history, line = [tuple(m) for m in self.moves], []
-        game = Game(history)
-        try:
-            while game.winner < 0:
-                _, move, node, played = proof.walk(history)
-                if move is None:
-                    break
-                if (self.settings.proven_line_rows and node['kind'] == 'attacker_move' and not played
-                        and node.get('alternatives')):
-                    choice = self.rng.integers(1+len(node['alternatives']))
-                    if choice:
-                        alternative = node['alternatives'][choice-1]
-                        index, nodes = proof.nodes.index(node), list(proof.nodes)
-                        nodes[index] = dict(node, action=alternative['action'], child=alternative['child'])
-                        certificate = dict(version=1, width='wide', root=index, nodes=nodes)
-                        try:
-                            verified = independent_verify(certificate, history, deadline_seconds=.1) == 'PROVEN_WIN'
-                        except (ValueError, VerificationTimeout):
-                            verified = False
-                        if verified:
-                            previous_turns = move[1]
-                            proof = dense_solver.Proof(history, certificate)
-                            _, move, node, played = proof.walk(history)
-                            extra = max(0, move[1]-previous_turns)
-                            if extra:
-                                line = [(stone, turns+extra, action) for stone, turns, action in line]
-                stones = move[0] or proof.reply(history, self.rng)
-                if stones is None:
-                    threats = {tuple(c) for t in node.get('threats', ()) for c in t}
-                    stones = [next(tuple(m) for m in game.legal_moves() if tuple(m) not in threats)]
-                stone = stones[self.rng.integers(len(stones))]
-                line.append((stone, move[1], proof.action(history)))
-                game.play(*stone)
-                history.append(stone)
-        finally:
-            game.close()
-        return line
+        return dense_solver.proof_line(proof, self.moves, self.rng, alternatives=self.settings.proven_line_rows)
 
     def label(self, ply, proven, turns, proof_action=None):
         """Record a proof's verdict (+1 / -1: the side to move wins / loses) on the row of `ply` unless it has one;

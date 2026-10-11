@@ -51,6 +51,35 @@ At export, held replay validation reports `certified_policy_mass`, the probabili
 
 Replay validation's policy CE, target entropy, KL and top-1 use the same policy row weights, so CE equals target entropy plus KL even when certificate rows have a smaller loss weight. `policy_top2` is the share of rows where the network's argmax is among the target's two highest-mass moves (ties at the second mass count), so a pair-mixed first stone scores when the network picks either stone of the pair. `policy_argmax_mass` is the mean target probability on the network's argmax. `policy_pair_top1` is the share of first-stone rows trained on a pair target where the network's argmax is one of the two stones the turn played, with its count in `policy_pair_rows`. `policy_first_*` and `policy_second_*` split top-1, top-2 and argmax mass by placements remaining in the turn, with row counts, as the certified metrics do. Certified-move recognition remains an unweighted mean over positions with a winning witness.
 
+## Proof continuations
+
+The CPU proof pass can turn certificates it already finds into additional training rows:
+
+```sh
+python python/dense_solve.py --run runs/dense-v1 --continuation-fraction 0.03 --continuation-max-plies 32
+```
+
+This is off by default. Each source shard contributes at most `continuation_fraction` times its row count,
+with at most one continuation per source game and `continuation_max_plies` placements per line. Games are
+visited in a reproducible shuffled order. No extra solver search or network evaluation is requested.
+The root certificate must pass the independent checker within `continuation_verify_seconds` (0.1 seconds);
+a timeout adds no rows and a rejection stops the proof pass. Covered defender replies, either stone order,
+and independently checked attacker alternatives provide varied continuations.
+
+Added rows have exact values, no search policy, and winning stones from the checked strategy. They use the
+ordinary learner weights: `proof_policy_weight` is their winning-row policy loss weight, so 1 gives it the
+same weight as an ordinary search-policy row. `proven_value_weight` still controls their value loss.
+They enter ordinary replay and pacing without priority sampling. Increasing `proof_policy_weight` from
+0.25 to 1 also strengthens existing proof-only rows; it needs no additional games or training steps.
+With `proof_policy_missing_only` enabled, existing search-policy targets keep their current targets.
+
+Continuations are immutable shards with origin `proof`, named by appending `0` to the source shard name.
+Their episode records identify the source shard, game, root ply, certificate hash and source validation key.
+That key keeps a source and all its continuations on the same training or validation side. Preset prefix
+stones produce no rows. Proof shards do not enter the actor validation panels, actor selection, the restart
+buffer or further proof searches. Publication is safe to retry after interruption. Solver status reports
+`continuation_games`, `continuation_rows`, `continuation_verified` and `continuation_timeouts`.
+
 ## Window and pacing
 
 The replay window follows KataGo: at least `window_min_rows` full-search rows, then it grows by `window_expand_per_row` times the extra rows, tapered by the exponent `window_taper`. Pacing keeps `samples_per_row` presentations per kept row; changing it, or the cheap-row fraction, resets the pacing base at the current row count. Phases are off in a new run. With `--phase-rows N` on the learner and `--phase-follow` on the actors, the two alternate: actors play until N new rows exist, then pause while the learner trains through them, and the evaluator yields while either is busy. That is how the live run shared one GPU; without it, all three compete for the card at once. `learner-status.json` reports the window size, retained rows, pacing backlog and phase state. A shard directory moved out of `shards/` while the learner runs (a quarantine) leaves the window and the validation subsets at their next refresh, and a `shard_vanished` event records it.
