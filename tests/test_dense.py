@@ -3746,6 +3746,10 @@ class ValidationSourceTests(unittest.TestCase):
                 self.assertEqual(v[f'{source}_rows'], len(sets.subsets[source, 'held']))
                 self.assertAlmostEqual(v[f'{source}_policy_ce'],
                                        v[f'{source}_policy_target_entropy']+v[f'{source}_policy_kl'], delta=1e-5)
+                self.assertAlmostEqual(v[f'{source}_policy_kl_early'], v[f'{source}_policy_kl'])
+                self.assertEqual(v[f'{source}_policy_kl_early_rows'], v[f'{source}_policy_rows'])
+                self.assertIsNone(v[f'{source}_policy_kl_middle'])
+                self.assertIsNone(v[f'{source}_policy_kl_late'])
                 for name in ('policy_ce', 'value_bce'):
                     self.assertAlmostEqual(v[f'{source}_gap_{name}'], v[f'{source}_{name}']-v[f'{source}_train_{name}'])
             self.assertEqual((aggregate, v), (learner.validate(window), learner.validate_sources(sets)))

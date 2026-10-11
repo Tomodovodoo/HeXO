@@ -965,7 +965,7 @@ class Learner:
                                     ('middle', (r['ply'] >= EARLY_PLY) & (r['ply'] < LATE_PLY)),
                                     ('late', r['ply'] >= LATE_PLY)):
                 mask = selected & p
-                out[f'{source}_policy_kl_{phase}'] = float(r['policy_kl'][mask].mean()) if mask.any() else None
+                out[f'{source}_policy_kl_{phase}'] = float(np.average(r['policy_kl'][mask], weights=r['policy_weight'][mask])) if mask.any() else None
                 out[f'{source}_policy_kl_{phase}_rows'] = int(mask.sum())
                 mask = selected & (r['finished'] > 0) & (r['proven'] == 0)
                 out[f'{source}_outcome_bce_unproven_{phase}'] = float(r['outcome_bce'][mask].mean()) if mask.any() else None
