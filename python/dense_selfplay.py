@@ -1380,7 +1380,7 @@ def worker(args):
         try:
             write_json(status_path, fields)
         except PermissionError as error:
-            if getattr(error, 'winerror', None) not in (5, 32):
+            if stage in ('finished', 'failed') or getattr(error, 'winerror', None) not in (5, 32):
                 raise
             # A locked heartbeat must not discard games in progress. Leave the
             # previous atomic file intact and retry on the next status update.

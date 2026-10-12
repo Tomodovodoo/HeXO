@@ -7209,6 +7209,24 @@ class YieldTests(unittest.TestCase):
         self.assertTrue(due('paused', 'paused', dense_selfplay.METRICS_SECONDS))
         self.assertFalse(due('playing', 'playing', 1.))
 
+    def test_terminal_heartbeat_sharing_error_does_not_exit_successfully(self):
+        settings = dense_config.ActorSettings(hybrid_scheduler=False, book_fraction=0., restart_fraction=0.)
+        config = replace(dense_config.RunConfig(), device='cpu', actor=settings)
+        model = SimpleNamespace(checkpoint='main/test', sha='a'*64, config=TINY)
+        engine = unittest.mock.Mock(slots=[], closing=[], searches=0, evals=0, calls=0, full_calls=0, solver=None)
+        error = PermissionError('terminal heartbeat locked after atomic-write retries')
+        error.winerror = 32
+        with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
+             unittest.mock.patch.object(dense_selfplay, 'load', return_value=model), \
+             unittest.mock.patch.object(dense_selfplay, 'Engine', return_value=engine), \
+             unittest.mock.patch.object(dense_selfplay, 'write_json', side_effect=[error, None]) as writes, \
+             unittest.mock.patch.object(dense_selfplay, 'log_event'):
+            with self.assertRaises(PermissionError) as raised:
+                dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=0, initial_model=None))
+        self.assertIs(raised.exception, error)
+        self.assertEqual([call.args[1]['stage'] for call in writes.call_args_list], ['finished', 'failed'])
+        engine.close.assert_called_once()
+
     def test_historical_games_can_restart_when_book_fraction_is_zero(self):
         settings = dense_config.ActorSettings(hybrid_scheduler=False, games_in_flight=2, shard_games=2,
                                                historical_fraction=1., restart_fraction=1.)
