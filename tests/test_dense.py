@@ -3609,7 +3609,7 @@ class ValidationSourceTests(unittest.TestCase):
             for r, t in zip(refs, targets):
                 self.assertEqual(t['policy_weight'], 1.)
                 following = sets.following(r)
-                self.assertEqual(t['next_weight'] > 0, following is not None)
+                self.assertEqual(t['next_weight'] > 0, following is not None and bool(len(sets.policy(following))))
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
@@ -3750,7 +3750,7 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual({k: len(p) for k, p in sets.picks.items() if k[0] != 'converted'},
                              {(s, split): 6 for s in ('fresh', 'newest') for split in ('held', 'train')})
             self.assertLessEqual(max(len(w) for w in sets.walked.values()), 6)
-            self.assertLessEqual(len(sets.entries), 2*6*len(sets.picks))
+            self.assertLessEqual(len(sets.entries), 3*6*len(sets.picks))
             self.assertEqual(sorted(sets.actors), [f'{1000000000001+k}' for k in range(12)])
             self.assertTrue(all(list(c) == ['x'] for c in sets.actors.values()))
 
@@ -3763,7 +3763,7 @@ class ValidationSourceTests(unittest.TestCase):
             source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000010', policy_every=1)
             sets = dense_data.ValidationSets(run, .3, 5, limit=40, quota=12)
             sets.refresh()
-            successors = set(sets.entries)-set(sets.following_index)
+            successors = set(sets.entries)-{key for picks in sets.picks.values() for key in picks}
             source_shard(run/'shards'/'1000000000003', 3, 'y', checkpoint='main/000020', policy_every=1)
             sets.refresh()
             self.assertEqual(sets.newest, 'y')
@@ -3775,6 +3775,47 @@ class ValidationSourceTests(unittest.TestCase):
                     if following is not None:
                         self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
                         self.assertTrue(len(sets.policy(following)))
+                        second = sets.following(following)
+                        if second is not None:
+                            self.assertEqual((second.row['game'], second.row['ply']),
+                                             (r.row['game'], r.row['ply']+2))
+
+    def test_validation_retains_nested_successors_and_cheap_refutation_labels(self):
+        moves = winning_game()
+        for selected in (4, 5):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                episode, rows = episode_rows(moves, 0)
+                actions = legal(moves[:5])
+                played = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), .25/(len(actions)-1), np.float32)
+                policy[played] = .75
+                rows[5]['policy'] = policy
+                rows[6].update(policy=None, proven=-1)
+                dense_data.write_shard(run/'shards'/'1000000000001',
+                                       dict(actor_sha256='x', checkpoint='main/000010'), [episode], rows, 'actor')
+                sets = dense_data.ValidationSets(run, 0., 5, limit=1, quota=1)
+                scan = sets.scan
+                with unittest.mock.patch.object(sets, 'scan', side_effect=lambda *args:
+                                                sorted(scan(*args), key=lambda r: r[0] != selected)):
+                    sets.refresh()
+                ref = sets.subsets['fresh', 'train'][0]
+                self.assertEqual(ref.row['ply'], selected)
+                _, targets = dense_data.examples(sets, [ref], np.random.default_rng(0))
+                if selected == 4:
+                    following = sets.following(ref)
+                    self.assertEqual(sets.following(following).row['proven'], -1)
+                    self.assertAlmostEqual(targets[0]['next_weight'], .25, places=6)
+                    self.assertEqual(float(targets[0]['next_policy'][played].sum()), 0.)
+                else:
+                    self.assertEqual(len(sets.policy(sets.following(ref))), 0)
+                    self.assertAlmostEqual(targets[0]['policy_weight'], .25, places=6)
+                    self.assertEqual(float(targets[0]['policy'][played].sum()), 0.)
+                with unittest.mock.patch.object(dense_data, 'read_shard', side_effect=AssertionError('cached')):
+                    sets.refresh()
+                _, cached = dense_data.examples(sets, sets.subsets['fresh', 'train'], np.random.default_rng(0))
+                for key in targets[0]:
+                    np.testing.assert_array_equal(targets[0][key], cached[0][key])
 
     @few_rows
     def test_export_logs_per_source_validation(self):
