@@ -334,6 +334,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         # the turn thread so a ready root choice can be published immediately.
         service.launch()
         selected, token = [], 0
+        first_choices = []
         first_end = started + limits['normal_ms']*.6/1000
         while game.player == side and game.winner < 0 and not stopped():
             first = remaining == 2 and not selected
@@ -429,6 +430,8 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
             result['completed'] += found['root_completed']
             result['scheduler_completed'] += found['completed']
             if not selected:
+                first_choices = [edges[i, :2].astype(np.int64).tolist()
+                                 for i in np.argsort(-edges[:, 5]) if edges[i, 5] > 0]
                 result['win_probability'] = probability
                 result['proof_status'] = ('PROVEN_WIN' if winner == side else 'PROVEN_LOSS') if winner >= 0 else 'UNKNOWN'
                 result['suggestions'] = [dict(move=edges[i, :2].astype(np.int64).tolist(), probability=float(edges[i, 5]))
@@ -446,12 +449,21 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                 # without restarting the complete-turn clock or work counters.
                 rejected = result['stones']+[row]
                 result.setdefault('rejected_turns', []).append(dict(moves=selected+[action], stones=rejected))
-                result['moves'] = legal_turn(history, selected+[action])
-                emit(result['moves'], dict(result, stones=rejected))
                 result['stones'] = []
                 selected = []
                 game.close()
                 game = Game(history)
+                rejected_first = {tuple(turn['moves'][0]) for turn in result['rejected_turns']}
+                alternative = next((move for move in first_choices+[list(move) for move in game.legal_moves()]
+                                    if tuple(move) not in rejected_first), None)
+                if alternative is None:
+                    result['stones'] = rejected
+                    emit(result['rejected_turns'][-1]['moves'], complete=True)
+                    break
+                result['moves'] = complete_candidate(history, [alternative])
+                result['win_probability'] = None
+                result['repair_fallback'] = list(result['moves'])
+                emit(result['moves'])
                 first_end = time.monotonic() + max(0, normal-time.monotonic())*.6
                 continue
             result['stones'].append(row)

@@ -10752,7 +10752,7 @@ class DenseTimedWorker(unittest.TestCase):
         frames = [
             dict(producer=0, game=0, model=0, token=1, history=history, context='first',
                  action=[1, 0], exact_winner=-1, root_completed=2, completed=3,
-                 edges=np.array([[1,0,0,0,.2,1,2,2,1]], float)),
+                 edges=np.array([[1,0,0,0,.2,.8,2,2,1], [0,1,0,0,.4,.2,1,1,1]], float)),
             dict(producer=0, game=0, model=0, token=2, history=history+[[1,0]], context='losing',
                  action=[2, 0], exact_winner=0, root_completed=1, completed=4,
                  edges=np.array([[2,0,0,0,-1,1,1,1,1]], float)),
@@ -10788,6 +10788,37 @@ class DenseTimedWorker(unittest.TestCase):
         self.assertAlmostEqual(service.retarget.call_args_list[2].kwargs['ms'], 168.)
         self.assertLessEqual(result['elapsed_ms'], 1000.)
         self.assertFalse(next(p for p in published if p.get('rejected_turns'))['turn_complete'])
+        for boundary in ('deadline', 'cancel'):
+            with self.subTest(boundary=boundary), \
+                    unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
+                    unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                clock[0] = 0.
+                cancelled, published = threading.Event(), []
+                service = service_type.return_value
+                service.stats.return_value = dict(launched_rows=80)
+                service.progress.return_value = None
+                def completion():
+                    index = service.event.call_count-1
+                    clock[0] = (.6, .7, .99)[index]
+                    return frames[index] if index < 2 else dict(producer=0, game=0, model=0,
+                        token=3, history=history, error='deadline')
+                def publish(event):
+                    published.append(event)
+                    if boundary == 'cancel' and event.get('repair_fallback'):
+                        cancelled.set()
+                service.event.side_effect = completion
+                result = hybrid_turn(player, history, limits, cancelled, publish)
+                self.assertEqual(service.retarget.call_count, 2 if boundary == 'cancel' else 3)
+            self.assertEqual(result['moves'][0], [0,1])
+            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+            self.assertEqual(result['repair_fallback'], result['moves'])
+            self.assertEqual(published[-1]['moves'], result['moves'])
+            self.assertEqual(result['stones'], [])
+            self.assertIsNone(result['win_probability'])
+            self.assertEqual(result['proof_status'], 'UNKNOWN')
+            self.assertEqual(result['stop_reason'], 'stop' if boundary == 'cancel' else 'deadline')
+            self.assertEqual((result['completed'], result['scheduler_completed']), (3,7))
+            self.assertLessEqual(result['elapsed_ms'], 1000.)
 
     def test_unsearched_completion_preserves_candidate_and_exact_evidence(self):
         from types import SimpleNamespace
