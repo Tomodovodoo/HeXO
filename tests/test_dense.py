@@ -2814,6 +2814,31 @@ class DenseDataTests(unittest.TestCase):
                         part = batch['policy'][batch['offsets'][i]:batch['offsets'][i+1]]
                         self.assertAlmostEqual(float(part.sum()), float(weight > 0), places=5)
 
+    def test_refuted_continuation_cannot_supply_paired_first_stone_targets(self):
+        moves = winning_game()
+        for mass in (.75, 1.):
+            with self.subTest(mass=mass), tempfile.TemporaryDirectory() as run:
+                episode, rows = episode_rows(moves, 0)
+                actions = legal(moves[:5])
+                selected = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), (1-mass)/(len(actions)-1), np.float32)
+                policy[selected] = mass
+                rows[5]['policy'] = policy
+                rows[6]['proven'] = -1  # A searched child, with its own policy.
+                dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+                window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+                ref = window.ref('000001', 5)
+                _, corrected = dense_data.examples(window, [ref], np.random.default_rng(0))
+                _, paired = dense_data.examples(window, [ref], np.random.default_rng(0), pair_policy_weight=1.)
+                for key in corrected[0]:
+                    np.testing.assert_array_equal(paired[0][key], corrected[0][key])
+                self.assertFalse(paired[0]['paired'])
+                self.assertAlmostEqual(paired[0]['policy_weight'], 1-mass, places=6)
+                _, original = dense_data.examples(window, [ref], np.random.default_rng(0),
+                                                 pair_policy_weight=1., policy_refutations=False)
+                self.assertTrue(original[0]['paired'])
+                self.assertEqual(original[0]['policy_weight'], 1.)
+
     def test_opponent_loss_does_not_refute_a_second_stone(self):
         moves = winning_game()
         with tempfile.TemporaryDirectory() as run:

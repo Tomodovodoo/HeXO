@@ -1526,7 +1526,8 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                     next_policy, next_actions, nref, window.following(nref), next_fixed)
         policy_weight = float(len(policy) > 0)
         paired = False
-        if pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy):
+        if (pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy)
+                and (not policy_refutations or fixed < 0 or nref.row.get('proven', 0) >= 0)):
             mixed = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
             paired, policy = mixed is not policy, mixed
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
