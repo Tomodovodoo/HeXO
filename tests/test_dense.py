@@ -10740,6 +10740,51 @@ class SlowDenseTests(unittest.TestCase):
 
 
 class DenseTimedWorker(unittest.TestCase):
+    def test_clocked_turn_keeps_gumbel_finalist_separate_from_policy_target(self):
+        from timed_engine import hybrid_turn, legal_turn, check_settings
+        from time_control import allowance
+        import threading
+        history = [[0,0]]
+        for choice in (None, 'gumbel', 'policy'):
+            with self.subTest(choice=choice), \
+                    unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
+                    unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                clock = [0.]
+                first = [1,0] if choice == 'policy' else [0,1]
+                pool = unittest.mock.Mock(proofs=None)
+                player = SimpleNamespace(options=dict(solver=False), model_sha256='fixed', checkpoint='fixed',
+                    prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+                frames = [dict(producer=0, game=0, model=0, token=1, history=history, context='first',
+                    action=[0,1], exact_winner=-1, root_completed=20, completed=20,
+                    edges=np.array([[1,0,0,0,.2,.99,1,1,1], [0,1,0,0,.4,.01,40,15,1]], float)),
+                    dict(producer=0, game=0, model=0, token=2, history=history+[first], context='second',
+                        action=[0,2], exact_winner=-1, root_completed=2, completed=2,
+                        edges=np.array([[0,2,0,0,.4,1,2,2,1]], float))]
+                service = service_type.return_value
+                service.stats.return_value = dict(launched_rows=64)
+                service.progress.return_value = None
+                def completion():
+                    index = service.event.call_count-1
+                    clock[0] = (.6,.95)[index]
+                    return frames[index]
+                service.event.side_effect = completion
+                limits = allowance(movetime=1000, reserve_ms=20)
+                if choice is not None:limits['choice'] = choice
+                result = hybrid_turn(player, history, limits, threading.Event())
+            self.assertEqual(result['moves'], [first,[0,2]])
+            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+            self.assertEqual(result['suggestions'][0]['move'], [1,0])
+            self.assertEqual(result['suggestions'][0]['probability'], .99)
+            self.assertEqual(result['stones'][0]['selection'], choice or 'gumbel')
+            self.assertEqual(result['settings']['search_choice'], choice or 'gumbel')
+            self.assertEqual(result['stones'][0]['move_comparison_credits'], 1 if choice == 'policy' else 15)
+            self.assertEqual(service.retarget.call_args_list[1].args[2], history+[first])
+            self.assertEqual(result['proof_status'], 'UNKNOWN')
+        check_settings({'choice':'gumbel'}, {'enabled':False})
+        check_settings({'choice':'policy'}, {'enabled':False})
+        with self.assertRaisesRegex(ValueError, 'search.choice'):
+            check_settings({'choice':'visits'}, {'enabled':False})
+
     def test_clocked_turn_revisits_first_stone_when_its_continuation_loses(self):
         from timed_engine import hybrid_turn, legal_turn
         from time_control import allowance
