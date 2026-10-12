@@ -2766,6 +2766,92 @@ class DenseDataTests(unittest.TestCase):
                 _, unmixed = dense_data.examples(window, refs, np.random.default_rng(0), pair_policy_weight=1.)
             self.assertFalse(any(target['paired'] for target in unmixed))
 
+    def test_refuted_first_stone_targets_preserve_only_unrefuted_mass(self):
+        moves = winning_game()
+        for mass, proven in [(.75, 0), (1., 0), (.75, -1), (.75, 1)]:
+            with self.subTest(mass=mass, proven=proven), tempfile.TemporaryDirectory() as run:
+                episode, rows = episode_rows(moves, 0, [.2]*len(moves))
+                actions = legal(moves[:5])
+                selected = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), (1-mass)/(len(actions)-1), np.float32)
+                policy[selected] = mass
+                rows[5].update(policy=policy, proven=proven)
+                rows[6].update(policy=None, proven=-1)
+                if proven > 0:
+                    rows[5]['proof_action'] = [actions[~selected][0].tolist()]
+                dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+                window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+                refs = [window.ref('000001', i) for i in [4, 5, 6]]
+                original = window.policy(refs[1]).copy()
+                options = dict(proof_policy_weight=1., short_value_target='average')
+                samples, before = dense_data.examples(window, refs, np.random.default_rng(0),
+                                                      policy_refutations=False, **options)
+                _, after = dense_data.examples(window, refs, np.random.default_rng(0), **options)
+                np.testing.assert_array_equal(window.policy(refs[1]), original)
+                for old, new in zip(before, after):
+                    for key in ('value', 'value_weight', 'outcome', 'outcome_weight', 'exact',
+                                'short_value', 'short_weight', 'future', 'future_weight'):
+                        np.testing.assert_array_equal(old[key], new[key])
+                if proven < 0:
+                    np.testing.assert_array_equal(after[1]['policy'], before[1]['policy'])
+                    self.assertEqual(after[1]['policy_weight'], 1.)
+                    self.assertEqual(after[0]['next_weight'], 1.)
+                elif mass == 1.:
+                    self.assertEqual(len(after[1]['policy']), 0)
+                    self.assertEqual(after[1]['policy_weight'], 0.)
+                    self.assertEqual(after[0]['next_weight'], 0.)
+                else:
+                    self.assertEqual(float(after[1]['policy'][selected].sum()), 0.)
+                    self.assertAlmostEqual(float(after[1]['policy'].sum()), 1., places=6)
+                    self.assertAlmostEqual(after[1]['policy_weight'], 1. if proven else 1-mass, places=6)
+                    # The auxiliary next-policy head must not teach the stale first stone either.
+                    cells = dense_data.crop_index(samples[0], actions)
+                    self.assertEqual(float(after[0]['next_policy'][cells == cells[selected][0]].sum()), 0.)
+                    self.assertAlmostEqual(after[0]['next_weight'], 1. if proven else 1-mass, places=6)
+                for batch in dense_data.collate(samples, after).values():
+                    self.assertTrue(torch.isfinite(batch['policy']).all())
+                    for i, weight in enumerate(batch['policy_weight']):
+                        part = batch['policy'][batch['offsets'][i]:batch['offsets'][i+1]]
+                        self.assertAlmostEqual(float(part.sum()), float(weight > 0), places=5)
+
+    def test_refuted_continuation_cannot_supply_paired_first_stone_targets(self):
+        moves = winning_game()
+        for mass in (.75, 1.):
+            with self.subTest(mass=mass), tempfile.TemporaryDirectory() as run:
+                episode, rows = episode_rows(moves, 0)
+                actions = legal(moves[:5])
+                selected = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), (1-mass)/(len(actions)-1), np.float32)
+                policy[selected] = mass
+                rows[5]['policy'] = policy
+                rows[6]['proven'] = -1  # A searched child, with its own policy.
+                dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+                window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+                ref = window.ref('000001', 5)
+                _, corrected = dense_data.examples(window, [ref], np.random.default_rng(0))
+                _, paired = dense_data.examples(window, [ref], np.random.default_rng(0), pair_policy_weight=1.)
+                for key in corrected[0]:
+                    np.testing.assert_array_equal(paired[0][key], corrected[0][key])
+                self.assertFalse(paired[0]['paired'])
+                self.assertAlmostEqual(paired[0]['policy_weight'], 1-mass, places=6)
+                _, original = dense_data.examples(window, [ref], np.random.default_rng(0),
+                                                 pair_policy_weight=1., policy_refutations=False)
+                self.assertTrue(original[0]['paired'])
+                self.assertEqual(original[0]['policy_weight'], 1.)
+
+    def test_opponent_loss_does_not_refute_a_second_stone(self):
+        moves = winning_game()
+        with tempfile.TemporaryDirectory() as run:
+            episode, rows = episode_rows(moves, 0)
+            rows[3]['proven'] = -1
+            dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            ref = window.ref('000001', 2)
+            _, targets = dense_data.examples(window, [ref], np.random.default_rng(0))
+            self.assertEqual(ref.row['remaining'], 1)
+            np.testing.assert_array_equal(targets[0]['policy'], window.policy(ref))
+            self.assertEqual(targets[0]['policy_weight'], 1.)
+
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
         compact, _ = random_game(rng, 14)
@@ -3548,7 +3634,7 @@ class ValidationSourceTests(unittest.TestCase):
             for r, t in zip(refs, targets):
                 self.assertEqual(t['policy_weight'], 1.)
                 following = sets.following(r)
-                self.assertEqual(t['next_weight'] > 0, following is not None)
+                self.assertEqual(t['next_weight'] > 0, following is not None and bool(len(sets.policy(following))))
                 if following is not None:
                     self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
             dense_data.collate(samples, targets)
@@ -3689,7 +3775,7 @@ class ValidationSourceTests(unittest.TestCase):
             self.assertEqual({k: len(p) for k, p in sets.picks.items() if k[0] != 'converted'},
                              {(s, split): 6 for s in ('fresh', 'newest') for split in ('held', 'train')})
             self.assertLessEqual(max(len(w) for w in sets.walked.values()), 6)
-            self.assertLessEqual(len(sets.entries), 2*6*len(sets.picks))
+            self.assertLessEqual(len(sets.entries), 3*6*len(sets.picks))
             self.assertEqual(sorted(sets.actors), [f'{1000000000001+k}' for k in range(12)])
             self.assertTrue(all(list(c) == ['x'] for c in sets.actors.values()))
 
@@ -3702,7 +3788,7 @@ class ValidationSourceTests(unittest.TestCase):
             source_shard(run/'shards'/'1000000000002', 2, 'x', checkpoint='main/000010', policy_every=1)
             sets = dense_data.ValidationSets(run, .3, 5, limit=40, quota=12)
             sets.refresh()
-            successors = set(sets.entries)-set(sets.following_index)
+            successors = set(sets.entries)-{key for picks in sets.picks.values() for key in picks}
             source_shard(run/'shards'/'1000000000003', 3, 'y', checkpoint='main/000020', policy_every=1)
             sets.refresh()
             self.assertEqual(sets.newest, 'y')
@@ -3714,6 +3800,47 @@ class ValidationSourceTests(unittest.TestCase):
                     if following is not None:
                         self.assertEqual((following.row['game'], following.row['ply']), (r.row['game'], r.row['ply']+1))
                         self.assertTrue(len(sets.policy(following)))
+                        second = sets.following(following)
+                        if second is not None:
+                            self.assertEqual((second.row['game'], second.row['ply']),
+                                             (r.row['game'], r.row['ply']+2))
+
+    def test_validation_retains_nested_successors_and_cheap_refutation_labels(self):
+        moves = winning_game()
+        for selected in (4, 5):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                episode, rows = episode_rows(moves, 0)
+                actions = legal(moves[:5])
+                played = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), .25/(len(actions)-1), np.float32)
+                policy[played] = .75
+                rows[5]['policy'] = policy
+                rows[6].update(policy=None, proven=-1)
+                dense_data.write_shard(run/'shards'/'1000000000001',
+                                       dict(actor_sha256='x', checkpoint='main/000010'), [episode], rows, 'actor')
+                sets = dense_data.ValidationSets(run, 0., 5, limit=1, quota=1)
+                scan = sets.scan
+                with unittest.mock.patch.object(sets, 'scan', side_effect=lambda *args:
+                                                sorted(scan(*args), key=lambda r: r[0] != selected)):
+                    sets.refresh()
+                ref = sets.subsets['fresh', 'train'][0]
+                self.assertEqual(ref.row['ply'], selected)
+                _, targets = dense_data.examples(sets, [ref], np.random.default_rng(0))
+                if selected == 4:
+                    following = sets.following(ref)
+                    self.assertEqual(sets.following(following).row['proven'], -1)
+                    self.assertAlmostEqual(targets[0]['next_weight'], .25, places=6)
+                    self.assertEqual(float(targets[0]['next_policy'][played].sum()), 0.)
+                else:
+                    self.assertEqual(len(sets.policy(sets.following(ref))), 0)
+                    self.assertAlmostEqual(targets[0]['policy_weight'], .25, places=6)
+                    self.assertEqual(float(targets[0]['policy'][played].sum()), 0.)
+                with unittest.mock.patch.object(dense_data, 'read_shard', side_effect=AssertionError('cached')):
+                    sets.refresh()
+                _, cached = dense_data.examples(sets, sets.subsets['fresh', 'train'], np.random.default_rng(0))
+                for key in targets[0]:
+                    np.testing.assert_array_equal(targets[0][key], cached[0][key])
 
     @few_rows
     def test_export_logs_per_source_validation(self):
@@ -10740,6 +10867,51 @@ class SlowDenseTests(unittest.TestCase):
 
 
 class DenseTimedWorker(unittest.TestCase):
+    def test_clocked_turn_keeps_gumbel_finalist_separate_from_policy_target(self):
+        from timed_engine import hybrid_turn, legal_turn, check_settings
+        from time_control import allowance
+        import threading
+        history = [[0,0]]
+        for choice in (None, 'gumbel', 'policy'):
+            with self.subTest(choice=choice), \
+                    unittest.mock.patch('hybrid_scheduler.InferenceService') as service_type, \
+                    unittest.mock.patch('timed_engine.time.monotonic', side_effect=lambda: clock[0]):
+                clock = [0.]
+                first = [1,0] if choice == 'policy' else [0,1]
+                pool = unittest.mock.Mock(proofs=None)
+                player = SimpleNamespace(options=dict(solver=False), model_sha256='fixed', checkpoint='fixed',
+                    prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+                frames = [dict(producer=0, game=0, model=0, token=1, history=history, context='first',
+                    action=[0,1], exact_winner=-1, root_completed=20, completed=20,
+                    edges=np.array([[1,0,0,0,.2,.99,1,1,1], [0,1,0,0,.4,.01,40,15,1]], float)),
+                    dict(producer=0, game=0, model=0, token=2, history=history+[first], context='second',
+                        action=[0,2], exact_winner=-1, root_completed=2, completed=2,
+                        edges=np.array([[0,2,0,0,.4,1,2,2,1]], float))]
+                service = service_type.return_value
+                service.stats.return_value = dict(launched_rows=64)
+                service.progress.return_value = None
+                def completion():
+                    index = service.event.call_count-1
+                    clock[0] = (.6,.95)[index]
+                    return frames[index]
+                service.event.side_effect = completion
+                limits = allowance(movetime=1000, reserve_ms=20)
+                if choice is not None:limits['choice'] = choice
+                result = hybrid_turn(player, history, limits, threading.Event())
+            self.assertEqual(result['moves'], [first,[0,2]])
+            self.assertEqual(legal_turn(history, result['moves']), result['moves'])
+            self.assertEqual(result['suggestions'][0]['move'], [1,0])
+            self.assertEqual(result['suggestions'][0]['probability'], .99)
+            self.assertEqual(result['stones'][0]['selection'], choice or 'gumbel')
+            self.assertEqual(result['settings']['search_choice'], choice or 'gumbel')
+            self.assertEqual(result['stones'][0]['move_comparison_credits'], 1 if choice == 'policy' else 15)
+            self.assertEqual(service.retarget.call_args_list[1].args[2], history+[first])
+            self.assertEqual(result['proof_status'], 'UNKNOWN')
+        check_settings({'choice':'gumbel'}, {'enabled':False})
+        check_settings({'choice':'policy'}, {'enabled':False})
+        with self.assertRaisesRegex(ValueError, 'search.choice'):
+            check_settings({'choice':'visits'}, {'enabled':False})
+
     def test_clocked_turn_revisits_first_stone_when_its_continuation_loses(self):
         from timed_engine import hybrid_turn, legal_turn
         from time_control import allowance

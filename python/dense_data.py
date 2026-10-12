@@ -1250,7 +1250,7 @@ class ValidationSets:
     it exactly; a shard that disappears from the run takes its rows with it; the 'newest' subsets start over
     when the newest actor changes. refresh() updates them.
     `subsets[source, split]` lists Refs; policy, value_targets and following serve examples() like
-    ReplayWindow. Retained between refreshes: the chosen rows with their next-ply rows and episodes, the names
+    ReplayWindow. Retained between refreshes: the chosen rows with their next two ply rows and episodes, the names
     of the shards each subset has consumed, and per scanned shard its full-search row count per episode actor
     (`actors`); a shard's row candidates live for one refresh, so a new newest actor rescans the shards it
     played. Each refresh sets proven = +1 on chosen rows (and successors) that their shard's proof sidecar lists
@@ -1330,21 +1330,31 @@ class ValidationSets:
                 walked.add(name)
         entries, following, missing = {}, {}, {}
         for name, i in {key for chosen in self.picks.values() for key in chosen}:
-            if (name, i) in self.following_index:    # cached as a chosen row, not only as a successor
-                following[name, i] = j = self.following_index[name, i]
-                entries.update({(name, k): self.entries[name, k] for k in (i, j) if k is not None})
-            else:
-                missing.setdefault(name, []).append(i)
+            if (name, i) in self.following_index:
+                j = self.following_index[name, i]
+                if j is None or (name, j) in self.following_index:
+                    following[name, i] = j
+                    k = None if j is None else self.following_index[name, j]
+                    if j is not None:
+                        following[name, j] = k
+                    entries.update({(name, r): self.entries[name, r] for r in (i, j, k) if r is not None})
+                    continue
+            missing.setdefault(name, []).append(i)
         for name, indices in missing.items():
             episodes, rows = read_shard(self.run_dir/'shards'/name)
             where = {(r['game'], r['ply']): k for k, r in enumerate(rows)}
             for i in indices:
-                j = where.get((rows[i]['game'], rows[i]['ply']+1))
-                following[name, i] = j if j is not None and len(rows[j]['policy']) else None
-                for k in (i, following[name, i]):
-                    if k is not None:    # copies, so the shard's policy array can be freed
-                        row = {key: v for key, v in rows[k].items() if key != 'policy'}
-                        entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
+                chain = [i]
+                for _ in range(2):
+                    row = rows[chain[-1]]
+                    j = where.get((row['game'], row['ply']+1))
+                    following[name, chain[-1]] = j
+                    if j is None:
+                        break
+                    chain.append(j)
+                for k in chain:    # copies, so the shard's policy array can be freed
+                    row = {key: v for key, v in rows[k].items() if key != 'policy'}
+                    entries[name, k] = (row, episodes[row['game']], rows[k]['policy'].copy())
         self.entries, self.following_index = entries, following
         names = {n for n, _ in entries}
         for name in names:
@@ -1372,7 +1382,7 @@ class ValidationSets:
         return self.entries[ref.shard, ref.index][2]
 
     def following(self, ref):
-        """Ref of the same game's next-ply row when it has a policy, else None."""
+        """Ref of the same game's next-ply row, including cheap rows needed for proof labels, or None."""
         j = self.following_index[ref.shard, ref.index]
         return None if j is None else self.ref(ref.shard, j)
 
@@ -1405,6 +1415,29 @@ def pair_policy(policy, actions, second_actions, second_policy, weight):
     return ((policy + weight*second/second.sum())/(1+weight)).astype(np.float32)
 
 
+def exclude_refuted_first(policy, actions, ref, following, fixed):
+    """Remove a first stone whose same-player continuation was later proved losing.
+
+    Unknown alternatives keep their previous total weight, not the refuted mass.
+    An already lost root has no unrefuted alternative to prefer.
+    """
+    row = ref.row
+    if (not len(policy) or row['remaining'] != 2 or fixed < 0 or following is None
+            or following.row['remaining'] != 1 or following.row['player'] != row['player']
+            or following.row.get('proven', 0) >= 0):
+        return policy, 1.
+    played = ref.episode['moves'][row['ply']]
+    selected = (actions == played).all(1)
+    if selected.sum() != 1:
+        raise ValueError(f'Refuted first stone is not uniquely legal: {ref.shard}/{ref.index}')
+    policy = policy.copy()
+    policy[selected] = 0
+    surviving = float(policy.sum())
+    if surviving <= 0:
+        return np.zeros(0, np.float32), 0.
+    return policy/surviving, 1. if fixed > 0 else surviving
+
+
 def target_options(settings, calibration=None):
     """examples() keyword arguments from a LearnerSettings and the current Calibration: finished games get
     outcome_lambda only with value_target 'td' and `calibration` only with 'calibrated' (hard outcomes while
@@ -1422,7 +1455,7 @@ def target_options(settings, calibration=None):
 
 def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_value_weight=.25, full_only=False,
              outcome_lam=1., calibration=None, proven_weight=2., deblunder_weight=0., proof_policy_weight=0., future_target='legacy',
-             short_value_target='future', proof_policy_missing_only=False, pair_policy_weight=0.):
+             short_value_target='future', proof_policy_missing_only=False, pair_policy_weight=0., policy_refutations=True):
     """Render refs under random symmetries and derive every learner target from the episodes.
 
     Positions are encoded from the move prefix without replaying it (hexcrop.Position); the side to move and the
@@ -1434,7 +1467,10 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         proof_policy_weight. With proof_policy_missing_only, certificate targets apply only when the search
         policy is empty. Losing rows and rows without a witness keep their original policy. With
         pair_policy_weight > 0, a first stone whose search policy and second stone's search policy both exist
-        first takes pair_policy(policy, ..., pair_policy_weight);
+        first takes pair_policy(policy, ..., pair_policy_weight). With policy_refutations, a later proven-losing
+        same-player second-stone row removes the played first stone's mass. Unproven alternatives keep only
+        their previous total loss weight; no surviving mass means no policy supervision. The same correction
+        applies to next-policy targets. Set policy_refutations=False for original-target diagnostics;
       paired: whether that step mixed second-stone mass into the policy (not collated);
       value, value_weight: value_targets(..., lam, full_search if full_only, outcome_lam, calibration) at the ply;
         weight 1 for finished games, `bootstrap_weight` for capped games with root values, 0 otherwise, times
@@ -1478,13 +1514,20 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         fixed = proven or manual
         nref = window.following(ref)
         next_policy = window.policy(nref) if nref is not None else np.zeros(0, np.float32)
+        next_policy_weight = 1.
         if len(next_policy):
             next_actions = hexcrop.legal_array(hexcrop.Position(moves[:t+1]), moves[:t+1])
             if len(next_actions) != len(next_policy) or legal_digest(next_actions) != nref.row['legal_sha256']:
                 raise ValueError(f'Next-ply legal list disagrees with row: {nref.shard}/{nref.index}')
+            if policy_refutations:
+                next_fixed = (nref.row.get('proven', 0) or nref.row.get('known_result', 0)
+                              or known_result(e, t+1))
+                next_policy, next_policy_weight = exclude_refuted_first(
+                    next_policy, next_actions, nref, window.following(nref), next_fixed)
         policy_weight = float(len(policy) > 0)
         paired = False
-        if pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy):
+        if (pair_policy_weight > 0 and s.remaining == 2 and len(policy) and len(next_policy)
+                and (not policy_refutations or fixed < 0 or nref.row.get('proven', 0) >= 0)):
             mixed = pair_policy(policy, s.actions, next_actions, next_policy, pair_policy_weight)
             paired, policy = mixed is not policy, mixed
         if (proof_policy_weight > 0 and proven > 0 and ref.row.get('proof_action')
@@ -1499,6 +1542,9 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
                 policy = (policy + proof_policy_weight*proof_policy)/(1+proof_policy_weight)
             else:
                 policy, policy_weight = proof_policy, proof_policy_weight
+        if policy_refutations:
+            policy, confidence = exclude_refuted_first(policy, s.actions, ref, nref, fixed)
+            policy_weight *= confidence
         u = t+horizon; roots = e['root_values']
         if short_value_target == 'average':
             key = (ref.shard, ref.row['game'])
@@ -1531,7 +1577,7 @@ def examples(window, refs, rng, lam=.9, bootstrap_weight=1., horizon=16, cheap_v
         if len(next_policy):
             cells = crop_index(s, next_actions); p = np.where(cells >= 0, next_policy, 0).astype(np.float32)
             if p.sum() > 0:
-                following = (cells, p/p.sum(), 1.)
+                following = (cells, p/p.sum(), next_policy_weight)
         samples.append(s)
         out.append(dict(policy=policy, policy_weight=policy_weight, paired=paired,
                         value=float(fixed > 0) if fixed else .5 if values[t] is None else values[t],

@@ -38,7 +38,7 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
-SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor'},
+SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'choice'},
                 solver={'enabled', 'stamps', 'workers', 'budget'})
 
 
@@ -51,6 +51,8 @@ def check_settings(search, solver):
     cap = search.get('max_simulations', search.get('simulations'))
     if cap is not None and (type(cap) is not int or cap <= 0):
         raise ValueError('simulation cap must be a positive integer')
+    if search.get('choice', 'gumbel') not in ('gumbel', 'policy'):
+        raise ValueError('search.choice must be gumbel or policy')
     if search.get('enabled', True) and solver.get('enabled', True):
         proof_settings(solver)
     elif {'workers', 'budget'} & solver.keys():
@@ -245,6 +247,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                   suggestions=[], winning_line=[], threat=None,
                   proof_status='UNKNOWN', solver_status='concurrent' if player.options['solver'] else 'off',
                   settings=dict(player.options) | dict(simulations=limits.get('simulations'), solver_slice_ms=8,
+                      search_choice=limits.get('choice', 'gumbel'),
                       proof_workers=workers, proof_budget=budget),
                   completed=0, scheduler_completed=0, evaluated=0, solver_nodes=0, stones=[], root_searches=[])
     service = None
@@ -269,7 +272,10 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         value = (1. if winner == side else -1.) if winner >= 0 else float(edges[:, 5] @ edges[:, 4])
         probability = (value+1)/2
         action = found['action']
-        if winner < 0 and edges[:, 5].sum() > 0:
+        # The policy target includes every eligible action, with imputed Q for
+        # unsearched moves. The native action honors the completed Gumbel round's
+        # finalists; do not replace that winner with the target's global argmax.
+        if winner < 0 and limits.get('choice', 'gumbel') == 'policy' and edges[:, 5].sum() > 0:
             action = edges[np.argmax(edges[:, 5]), :2].astype(np.int64).tolist()
         witness = found.get('winning_turn', [])
         if witness:
@@ -279,6 +285,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         elif winner == side and game.remaining == 2:
             raise ValueError('Winning root has no complete turn witness')
         row = dict(history=current, move=action, win_probability=probability,
+                   selection='verified_proof' if winner >= 0 else limits.get('choice', 'gumbel'),
                    exact_winner=winner, completed=found['root_completed'],
                    scheduler_completed=found['completed'],
                    root_completed=found['root_completed'], context=found['context'])
@@ -543,6 +550,7 @@ def _worker(connection, cancellation, config):
                     budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
+                                 choice=search.get('choice', 'gumbel'),
                                  q_range_floor=search.get('q_range_floor', 0.))
             search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
             if player.options['search'] and player.evaluator.cuda:
