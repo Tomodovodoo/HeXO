@@ -2766,6 +2766,67 @@ class DenseDataTests(unittest.TestCase):
                 _, unmixed = dense_data.examples(window, refs, np.random.default_rng(0), pair_policy_weight=1.)
             self.assertFalse(any(target['paired'] for target in unmixed))
 
+    def test_refuted_first_stone_targets_preserve_only_unrefuted_mass(self):
+        moves = winning_game()
+        for mass, proven in [(.75, 0), (1., 0), (.75, -1), (.75, 1)]:
+            with self.subTest(mass=mass, proven=proven), tempfile.TemporaryDirectory() as run:
+                episode, rows = episode_rows(moves, 0, [.2]*len(moves))
+                actions = legal(moves[:5])
+                selected = (actions == moves[5]).all(1)
+                policy = np.full(len(actions), (1-mass)/(len(actions)-1), np.float32)
+                policy[selected] = mass
+                rows[5].update(policy=policy, proven=proven)
+                rows[6].update(policy=None, proven=-1)
+                if proven > 0:
+                    rows[5]['proof_action'] = [actions[~selected][0].tolist()]
+                dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+                window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+                refs = [window.ref('000001', i) for i in [4, 5, 6]]
+                original = window.policy(refs[1]).copy()
+                options = dict(proof_policy_weight=1., short_value_target='average')
+                samples, before = dense_data.examples(window, refs, np.random.default_rng(0),
+                                                      policy_refutations=False, **options)
+                _, after = dense_data.examples(window, refs, np.random.default_rng(0), **options)
+                np.testing.assert_array_equal(window.policy(refs[1]), original)
+                for old, new in zip(before, after):
+                    for key in ('value', 'value_weight', 'outcome', 'outcome_weight', 'exact',
+                                'short_value', 'short_weight', 'future', 'future_weight'):
+                        np.testing.assert_array_equal(old[key], new[key])
+                if proven < 0:
+                    np.testing.assert_array_equal(after[1]['policy'], before[1]['policy'])
+                    self.assertEqual(after[1]['policy_weight'], 1.)
+                    self.assertEqual(after[0]['next_weight'], 1.)
+                elif mass == 1.:
+                    self.assertEqual(len(after[1]['policy']), 0)
+                    self.assertEqual(after[1]['policy_weight'], 0.)
+                    self.assertEqual(after[0]['next_weight'], 0.)
+                else:
+                    self.assertEqual(float(after[1]['policy'][selected].sum()), 0.)
+                    self.assertAlmostEqual(float(after[1]['policy'].sum()), 1., places=6)
+                    self.assertAlmostEqual(after[1]['policy_weight'], 1. if proven else 1-mass, places=6)
+                    # The auxiliary next-policy head must not teach the stale first stone either.
+                    cells = dense_data.crop_index(samples[0], actions)
+                    self.assertEqual(float(after[0]['next_policy'][cells == cells[selected][0]].sum()), 0.)
+                    self.assertAlmostEqual(after[0]['next_weight'], 1. if proven else 1-mass, places=6)
+                for batch in dense_data.collate(samples, after).values():
+                    self.assertTrue(torch.isfinite(batch['policy']).all())
+                    for i, weight in enumerate(batch['policy_weight']):
+                        part = batch['policy'][batch['offsets'][i]:batch['offsets'][i+1]]
+                        self.assertAlmostEqual(float(part.sum()), float(weight > 0), places=5)
+
+    def test_opponent_loss_does_not_refute_a_second_stone(self):
+        moves = winning_game()
+        with tempfile.TemporaryDirectory() as run:
+            episode, rows = episode_rows(moves, 0)
+            rows[3]['proven'] = -1
+            dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'), [episode], rows)
+            window = dense_data.ReplayWindow(run, capacity_rows=1000, validation_fraction=0.)
+            ref = window.ref('000001', 2)
+            _, targets = dense_data.examples(window, [ref], np.random.default_rng(0))
+            self.assertEqual(ref.row['remaining'], 1)
+            np.testing.assert_array_equal(targets[0]['policy'], window.policy(ref))
+            self.assertEqual(targets[0]['policy_weight'], 1.)
+
     def test_examples_and_collate(self):
         rng = np.random.default_rng(6)
         compact, _ = random_game(rng, 14)
