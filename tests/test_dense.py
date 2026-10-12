@@ -7163,11 +7163,17 @@ class YieldTests(unittest.TestCase):
                 self.fail('worker stayed paused after phase-idle')
 
         write = dense_selfplay.write_json
+        status_failures = [0]
 
         def status(path, fields):
             if Path(path).name == 'actor-status.json':
                 acks.append((fields['stage'], dict(fields['phase_ack']), len(order)))
                 order.append('ack '+str(fields['phase_ack']))
+                if status_failures[0] < 2:
+                    status_failures[0] += 1
+                    error = PermissionError('heartbeat temporarily locked')
+                    error.winerror = 32
+                    raise error
             write(path, fields)
 
         with unittest.mock.patch.object(dense_selfplay.dense_config, 'load', return_value=config), \
@@ -7176,10 +7182,14 @@ class YieldTests(unittest.TestCase):
              unittest.mock.patch.object(dense_selfplay, 'SelfPlayGame', side_effect=game), \
              unittest.mock.patch.object(dense_selfplay, 'write_json', side_effect=status), \
              unittest.mock.patch.object(dense_selfplay.dense_data, 'write_shard'), \
-             unittest.mock.patch.object(dense_selfplay, 'log_event'), \
+             unittest.mock.patch.object(dense_selfplay, 'log_event') as events, \
              unittest.mock.patch.object(dense_selfplay.time, 'sleep', side_effect=sleep):
             dense_selfplay.worker(SimpleNamespace(run=str(self.run), worker=0, games=3, initial_model=None))
 
+        self.assertEqual(status_failures[0], 2)
+        self.assertEqual(sum(call.args[2] == 'warning' for call in events.call_args_list), 1)
+        self.assertEqual(sum('heartbeat publication recovered' in call.args[3] for call in events.call_args_list), 1)
+        self.assertEqual(json.loads((self.run/'actor-status.json').read_text())['stage'], 'finished')
         self.assertEqual([ack for stage, ack, _ in acks if stage == 'paused'],
                          [dict(main='A'), dict(main='B')])
         self.assertEqual(order.count('sync'), 2)

@@ -1344,6 +1344,7 @@ def worker(args):
     since = dict(time=time.perf_counter(), positions=state['positions'], evals=0)
 
     logged, stage_logged = time.perf_counter(), 'playing'
+    status_failed = False
     gate = Yield(run, config.learner.samples_per_row, settings.yield_below, settings.yield_resume, settings.yield_check_seconds,
                  settings.phase_follow)
     paused_since, paused_total = None, 0.
@@ -1352,7 +1353,7 @@ def worker(args):
     def status(stage):
         """Rewrite the heartbeat; append a metrics line whenever the stage changes and otherwise every
         METRICS_SECONDS."""
-        nonlocal logged, stage_logged, solver_failures
+        nonlocal logged, stage_logged, solver_failures, status_failed
         now = time.perf_counter()
         window.append((now, state['positions'], engine.evals))
         while len(window) > 2 and now-window[1][0] > 60:
@@ -1376,7 +1377,22 @@ def worker(args):
                       off_policy_openings=len(book_starts.nodes) if book_starts else 0)
         if settings.hybrid_scheduler:
             fields['hybrid_scheduler'] = engine.summary()
-        write_json(status_path, fields)
+        try:
+            write_json(status_path, fields)
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) not in (5, 32):
+                raise
+            # A locked heartbeat must not discard games in progress. Leave the
+            # previous atomic file intact and retry on the next status update.
+            if not status_failed:
+                log_event(run, 'actor', 'warning', f'worker {args.worker}: heartbeat publication failed: {error}',
+                          process=args.worker)
+            status_failed = True
+        else:
+            if status_failed:
+                log_event(run, 'actor', 'info', f'worker {args.worker}: heartbeat publication recovered',
+                          process=args.worker)
+            status_failed = False
         if fields['solver'] and fields['solver']['failures'] > solver_failures:
             solver_failures = fields['solver']['failures']
             log_event(run, 'actor', 'error', f'worker {args.worker}: {solver_failures} solver queries failed, last: '
