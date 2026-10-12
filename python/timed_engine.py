@@ -334,9 +334,10 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         # the turn thread so a ready root choice can be published immediately.
         service.launch()
         selected, token = [], 0
+        first_end = started + limits['normal_ms']*.6/1000
         while game.player == side and game.winner < 0 and not stopped():
             first = remaining == 2 and not selected
-            end = min(normal, started + limits['normal_ms']*.6/1000) if first else normal
+            end = min(normal, first_end) if first else normal
             ms = max(0., (min(hard, end)-time.monotonic())*1000)
             cap = limits.get('simulations')
             work = 0 if cap is None else max(0, cap-result['scheduler_completed'])
@@ -436,6 +437,23 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                 # One winning same-player continuation proves the original root;
                 # a losing chosen continuation does not cover its alternatives.
                 result.update(win_probability=1., proof_status='PROVEN_WIN')
+            if (remaining == 2 and len(selected) == 1 and winner >= 0 and winner != side
+                    and result['stones'][0]['exact_winner'] < 0 and cap is None
+                    and not cancel.is_set() and normal-time.monotonic() > 2*limits['reserve_ms']/1000):
+                # The first stone is still provisional. Its now-losing child
+                # refutes that move, not every alternative at the original root.
+                # Revisit the retained graph, whose edge now carries the loss,
+                # without restarting the complete-turn clock or work counters.
+                rejected = result['stones']+[row]
+                result.setdefault('rejected_turns', []).append(dict(moves=selected+[action], stones=rejected))
+                result['moves'] = legal_turn(history, selected+[action])
+                emit(result['moves'], dict(result, stones=rejected))
+                result['stones'] = []
+                selected = []
+                game.close()
+                game = Game(history)
+                first_end = time.monotonic() + max(0, normal-time.monotonic())*.6
+                continue
             result['stones'].append(row)
             game.play(*action)
             selected.append(action)
