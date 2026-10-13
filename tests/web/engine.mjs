@@ -588,7 +588,7 @@ if (job.kind === 'encode') {
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null, proveMs: job.proveMs ?? 0,
-      known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
+      kind: job.turnKind ?? null, known: job.known || null, replay: job.replay || [], proofStamps: job.proofStamps}});
   }
   const error = messages.find(m => m.type === 'error');
   if (error) throw new Error(error.message);
@@ -673,18 +673,18 @@ if (job.kind === 'encode') {
   answer = {failure,retry,recovered,queued,afterRetry:elements.get('analysis-stage').textContent};
 } else if (job.kind === 'analysis-bar') {
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
-  answer = job.cases.map(({history, value, live, top = [], node_value}) => {
+  answer = job.cases.map(({history, value, live, top = [], node_value, jobPly = history.length, livePly}) => {
     const elements = new Map(), element = () => ({classList: {toggle() {}}, style: {}, firstChild: {style: {}}, replaceChildren() {}});
-    const evaluation = {value, node_value, top, threat: []};
+    const evaluation = {value, node_value, top, threat: [], ...(livePly == null ? {} : {ply: livePly})};
     const page = {view: history.length, COLORS: ['yellow', 'blue'],
       $: id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
       S: {history, winner: -1, evaluations: live ? {} : {[history.length]: evaluation},
-        jobs: live ? [{kind: 'analyse', ply: history.length, status: 'running', live: evaluation}] : []}};
+        jobs: live ? [{kind: livePly == null ? 'analyse' : 'move', ply: jobPly, status: 'running', live: evaluation}] : []}};
     runInNewContext(source.match(/^const playerAt=.*$/m)[0] + '\n' + source.match(/^const pct=.*$/m)[0] + '\n'
       + source.slice(source.indexOf('function liveAt('), source.indexOf('function renderStudy('))
-      + '\nconst e=shownEval(view); renderAnalysis.sig = JSON.stringify([view, false, e.top, e.threat, false]); renderAnalysis();', page);
+      + '\nconst e=shownEval(view); globalThis.shown=e; renderAnalysis.sig = JSON.stringify([view, false, e?.top??[], e?.threat, false]); renderAnalysis();', page);
     return {x: elements.get('xv').textContent, o: elements.get('ov').textContent,
-      transform: elements.get('evalbar').firstChild.style.transform};
+      transform: elements.get('evalbar').firstChild.style.transform, hasEval: !!page.shown, top: page.shown?.top??[]};
   });
 } else if (job.kind === 'pv') {
   answer = principalVariation(native, job.history, job.certificate, job.options || {});

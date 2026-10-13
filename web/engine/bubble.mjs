@@ -94,7 +94,8 @@ export class BubbleEngine extends EngineWorker {
       solverSlice: budget.solver_slice_ms ?? 8, solverTable: budget.solver_table_mb ?? 4, proveMs: budget.solver_ms ?? 0,
       proofStamps: options.proofStamps ?? true,
       batchSize: budget.batch_size, choice: options.choice ?? 'policy', qRangeFloor: budget.q_range_floor ?? 0,
-      ms: options.ms ?? budget.ms ?? null, line: options.line ?? null, known: options.known ?? null, replay: options.replay ?? []}, options);
+      ms: options.ms ?? budget.ms ?? null, line: options.line ?? null, kind: options.kind ?? null,
+      known: options.known ?? null, replay: options.replay ?? []}, options);
   }
 
   /** Loads network `checkpoint` (a NETWORKS name, the default when null) and starts the PROOF_WORKERS proof workers, so

@@ -1372,6 +1372,23 @@ class Bundle(unittest.TestCase):
                         self.assertEqual(glimpse['root'], root)
                         self.assertTrue(0 <= glimpse['value'] <= 1)
                         self.assertTrue(glimpse['top'])
+        # A seated engine physically publishes its first stone before searching
+        # the second; live candidates then belong to that new board.
+        root = history[:1]
+        for turn in node(dict(kind='glimpse', turnKind='move', history=root, simulations=32, nodes=0)):
+            self.assertEqual({g['ply'] for g in turn['live']}, {1, 2})
+            for glimpse in turn['live']:
+                prefix = root + turn['result']['moves'][:glimpse['ply']-len(root)]
+                self.assertEqual(glimpse['root'], prefix)
+                self.assertTrue(glimpse['top'])
+                self.assertTrue(all(t[:2] not in prefix for t in glimpse['top']))
+        second = root + [[1, 0]]
+        matching, stale = node(dict(kind='analysis-bar', cases=[
+            dict(history=second, value=.32, live=True, jobPly=1, livePly=2, top=[[2, 0, 1, .32, 0]]),
+            dict(history=second, value=.32, live=True, jobPly=1, livePly=1, top=[[1, 0, 1, .32, 0]])]))
+        self.assertTrue(matching['hasEval'])
+        self.assertEqual(matching['top'][0][:2], [2, 0])
+        self.assertFalse(stale['hasEval'])
 
     def test_root_candidates_are_published_before_the_solver_runs(self):
         root = [[0, 0], [1, 0]]
