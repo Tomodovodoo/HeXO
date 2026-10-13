@@ -1284,8 +1284,8 @@ class SharedGraph(unittest.TestCase):
         unbounded.search(8, root_samples=4, batch_size=4)
         self.assertEqual(unbounded.store()['evicted'], 0)
 
-    def test_root_sampling_considers_a_stored_high_value_child(self):
-        # A neural estimate learned below x competes on its stored Q when sampling the earlier root.
+    def test_root_sampling_uses_the_prior_before_reused_values(self):
+        # Reused values survive, but do not decide which candidates receive a fresh comparison.
         a = recorded_position(11)
         probe = self.graph(Uniform(), a)
         actions = [tuple(map(int, action)) for action in probe.search(2, root_samples=2, batch_size=2)['actions']]
@@ -1301,9 +1301,17 @@ class SharedGraph(unittest.TestCase):
         graph = self.graph(Likes(), [*a, x])
         graph.search(32, root_samples=4, batch_size=4)
         graph.at(a)
-        chosen = graph.search(4, root_samples=2, batch_size=2)
-        self.assertEqual(tuple(map(int, chosen['action'])), x)
-        self.assertGreater(chosen['visits'][self.edge(chosen, x)], 0)
+        view = graph.view(a, seed=9)
+        self.addCleanup(view.close)
+        chosen = view.search(2, root_samples=2, batch_size=2)
+        fresh = self.graph(Uniform(), a).view(a, seed=9)
+        self.addCleanup(fresh.close)
+        comparison = fresh.search(2, root_samples=2, batch_size=2)
+        self.assertEqual(chosen['actions'][view.credits() > 0].tolist(),
+                         comparison['actions'][fresh.credits() > 0].tolist())
+        graph.at([*a, x])
+        self.assertGreater(native.hxg_value(graph.ptr), .5)
+        self.assertGreater(int(graph.result(0, 0, 0, 0)['visits'].sum()), 0)
 
     def test_opening_candidates_use_stored_scores_independent_of_batch_size(self):
         class Changing(Spread):

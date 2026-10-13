@@ -352,7 +352,7 @@ struct GameStore {
   return false;
  }
 };
-struct RootEdge { double gumbel=0,opening_q=0,noise=0;int epoch=0;uint64_t credits=0; };
+struct RootEdge { double gumbel=0,noise=0;int epoch=0;uint64_t credits=0; };
 struct RootRound {
  std::vector<int> widths,ends,members,counts,limits;std::vector<double> opening;int active=-1;
 };
@@ -420,7 +420,7 @@ struct Tree {
   if(root_noise>0 && root_concentration>0)draw_noise();
   root_prepared=true;
   schedule(int(std::count_if(root->edges.begin(),root->edges.end(),[](const auto& e){return e.read().eligible;})));
-  freeze_root_q();
+  refresh_root();
  }
  // KataGo's shaped Dirichlet noise over the eligible root edges, one draw per search, kept in root_edges[i].noise:
  // half of the concentration is spread evenly, half in proportion to how far each edge's log min(p, 0.01) lies above
@@ -444,13 +444,8 @@ struct Tree {
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)sum+=root_edges[i].noise=std::exp(shape[i]-top);
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)root_edges[i].noise/=sum;
  }
- // Root sampling uses the evidence available at this search's start. Keep it with the view's root session so
- // predictions from early candidates or other views cannot change the remaining Gumbel-top-k draws.
- void freeze_root_q(){
-  if(!shared)return;
-  current(*root);auto& q=transformed(*root);
-  for(size_t i=0;i<q.size();++i)root_edges[i].opening_q=q[i];
- }
+ // Keep shared evidence available for halving and reporting without feeding it into nomination.
+ void refresh_root(){if(shared)current(*root);}
  bool done()const {return requests.empty() && (board.winner>=0 || (root->expanded && root->exact_winner>=0) || completed>=budget);}
  // Edge value for the node's mover: exact, else in a graph the child's MCGS value (which may come from other
  // parents), else the tree's running mean, else the node's own network value.
@@ -914,8 +909,9 @@ struct Tree {
   int select_round(Node& node,const SelectionQ& q,const std::vector<int>& blocked){
    const int phase=int(std::upper_bound(round.ends.begin(),round.ends.end(),started)-round.ends.begin()),width=round.widths[phase];
    if(phase==0 && round.opening.empty())round.opening=sampling(node);
+   // Nominate from the sampling prior; inherited Q ranks admitted candidates during halving.
    auto score=[&](int i){auto& e=node.edges[i];bool first=phase==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();
-    return root_edges[i].gumbel+(phase?e.logit:round.opening[i])+(phase?q[i]:root_edges[i].opening_q)+(first?1e6:0)+bonus(e);};
+    return root_edges[i].gumbel+(phase?e.logit:round.opening[i])+(phase?q[i]:0)+(first?1e6:0)+bonus(e);};
    auto better=[&](int a,int b){bool da=phase==0 && defence.contains(node.edges[a].action),db=phase==0 && defence.contains(node.edges[b].action);
     if(da!=db)return da;double x=score(a),y=score(b);return x!=y?x>y:a<b;};
    if(round.active!=phase){
@@ -1103,7 +1099,7 @@ struct Tree {
     if(started && considered!=sequence[started-1] && !requests.empty())return 0;
     auto first=[&](const Edge& e){return considered==0 && std::find(priority.begin(),priority.end(),e.action)!=priority.end();};
     bool forced=false;auto logits=considered?std::vector<double>():sampling(*node);
-    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.read().eligible || root_edges[i].epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=root_edges[i].gumbel+(considered?e.logit:logits[i])+(considered?q[i]:root_edges[i].opening_q)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
+    for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.read().eligible || root_edges[i].epoch!=considered)continue;bool admit=considered==0 && defence.contains(e.action);double score=root_edges[i].gumbel+(considered?e.logit:logits[i])+(considered?q[i]:0)+(first(e)?1e6:0)+bonus(e);if((admit && !forced) || (admit==forced && score>best)){forced=admit;best=score;chosen=i;}}
     // Marked-lost candidates can leave a round short of candidates; the best of the latest-eliminated ones step in.
     int reached=-1;
     if(chosen<0)for(int i=0;i<int(node->edges.size());++i){auto& e=node->edges[i];if(!e.read().eligible || root_edges[i].epoch>considered)continue;double score=root_edges[i].gumbel+e.logit+q[i]+bonus(e);if(root_edges[i].epoch>reached || (root_edges[i].epoch==reached && score>best)){reached=root_edges[i].epoch;best=score;chosen=i;}}
@@ -1209,7 +1205,7 @@ struct Tree {
   }
   // A certificate adds its witness as a winning edge; settle keeps any shorter tactical win found by classify.
   if(exact>=0){for(auto& edge:node.edges)if(edge.action==witness && (edge.read().exact_winner!=exact || edge.read().distance>distance)){edge.write().exact_winner=exact;edge.write().distance=distance;edge.write().bound=true;}settle(node);}
-  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.read().eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);if(at_root)freeze_root_q();if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);
+  node.pending=false;if(at_root)schedule(int(std::count_if(node.edges.begin(),node.edges.end(),[](auto& e){return e.read().eligible;})));backup(path,node.exact_winner<0?node.value:node.exact_winner==node.player?1:-1);if(at_root)refresh_root();if(state->evidence)state->evidence(state->evidence_owner,*this,path);requests.erase(found);
  }
  // Installs a caller-verified certificate at pending leaf `id`: its first turn `moves` and `turns`, the most attacker
  // turns on any certificate path, which bound the win within move_count + 4 * (turns - 1) placements.
