@@ -544,8 +544,18 @@ if (job.kind === 'encode') {
       return reply.result;
     };
     // Without a preset the job's simulations and root nodes are the standard level, so a test can set both.
-    session.registerEngine({id: 'test', kind: 'bubble', name: 'Bubble',
-      presets: job.preset ? PRESETS : {...PRESETS, standard: {simulations: job.simulations, solver_nodes: job.nodes}}}, adapter);
+    const entry = {id: 'test', kind: 'bubble', name: 'Bubble',
+      presets: job.preset ? PRESETS : {...PRESETS, standard: {simulations: job.simulations, solver_nodes: job.nodes}}};
+    // Use the page's adapter and Bubble result recorder, so a worker result must also survive publication.
+    const seat = readFileSync(new URL('../../web/engine/seat.mjs', import.meta.url), 'utf8');
+    const bubbleContext = {BubbleEngine: class {}, NETWORKS: [], PRESETS: entry.presets, turnTimes: () => ({}), NEURAL_PRESET: 'standard'};
+    runInNewContext(seat.slice(seat.indexOf('const BUBBLE ='), seat.indexOf('const ENGINES =')) + '\nglobalThis.item = bubble;', bubbleContext);
+    const page = {entry, engine: adapter, record: bubbleContext.item.record};
+    adapter.load = async () => ({provider: 'wasm'}); adapter.prepare = async () => {};
+    const mount = readFileSync(new URL('../../web/engine/browser-play.mjs', import.meta.url), 'utf8');
+    runInNewContext(mount.slice(mount.indexOf('const adapt ='), mount.indexOf('    session.registerEngine')) + '\nglobalThis.adapter = adapt(engine);',
+      Object.assign(page, {tag: () => {}, notePace: () => {}, deviceLabel: () => 'CPU', performance}));
+    session.registerEngine(entry, page.adapter);
     const imported = await session.request('/import', {text: JSON.stringify({history: job.history, records: job.restore ? [] : job.records || []})}, 'POST');
     if (imported[0] !== 200) throw Error(JSON.stringify(imported));
     if (job.restore) {
@@ -553,7 +563,7 @@ if (job.kind === 'encode') {
       for (const record of job.records) await session.storage.put('evaluations', record);
       await session.persist(); await session.saving; await session.restore({paused: true});
     }
-    const configured = await session.request('/analysis', {engine: 'test', preset: job.preset ?? 'standard', auto: false}, 'POST');
+    const configured = await session.request('/analysis', {engine: 'test', preset: job.preset ?? 'standard', ...(job.custom ? {custom: job.custom} : {}), auto: false}, 'POST');
     if (configured[0] !== 200) throw Error(JSON.stringify(configured));
     const requested = await session.request('/analyse', {ply: job.history.length}, 'POST');
     if (requested[0] !== 200) throw Error(JSON.stringify(requested));

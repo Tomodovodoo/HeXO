@@ -39,7 +39,7 @@ export async function mountPlay(engines, legacy) {
         const preset = options.preset === 'custom' ? 'standard' : options.preset;
         // A move's own search: a clock's turn, a custom budget and a turn the proofs or the solver answered say nothing of the preset.
         if (options.kind === 'move' && options.ms == null && options.preset !== 'custom' && result.actual_completed !== 0) notePace(entry, options.preset, performance.now() - started, result.moves?.length);
-        return record ? {...record(result, history, preset), ...result} : result;
+        return record ? {...record(result, history, preset, budget), ...result} : result;
       }
     });
     session.registerEngine(entry, adapt(engine), fresh && (() => {
