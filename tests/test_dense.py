@@ -1509,6 +1509,19 @@ class DenseConfigTests(unittest.TestCase):
         saved['actor'] = {older.get(key, key): value for key, value in saved['actor'].items()}
         self.assertEqual(dense_config.from_dict(saved), config)
 
+    def test_actor_exploration_bands_and_solver_free_share_reach_workers(self):
+        parser = argparse.ArgumentParser()
+        dense_config.add_arguments(parser, dense_config.ActorSettings)
+        args = parser.parse_args(['--search-budget-jitter', '.5', '--solver-free-fraction', '.05'])
+        settings = dense_config.override(dense_config.ActorSettings(), args)
+        self.assertEqual((settings.search_budget_jitter,settings.solver_free_fraction),(.5,.05))
+        flags = dense_selfplay.actor_flags(args)
+        self.assertIn('--search-budget-jitter',flags)
+        self.assertIn('--solver-free-fraction',flags)
+        for values in (dict(search_budget_jitter=1.),dict(search_budget_jitter=-.1),
+                       dict(solver_free_fraction=1.1),dict(solver_free_fraction=.05,hybrid_scheduler=False)):
+            with self.assertRaises(ValueError):dense_config.ActorSettings(**values)
+
     def test_hybrid_actors_drop_proof_workers_without_the_solver_build(self):
         hybrid, legacy = dense_config.ActorSettings(), dense_config.ActorSettings(hybrid_scheduler=False)
         with unittest.mock.patch('tactical_proof.NativeTactics', side_effect=OSError('not built')):
@@ -5181,15 +5194,17 @@ class EngineTests(unittest.TestCase):
                  book=(dict(suite='test',key=str(i),ply=len(history)),history)) for i in range(2)]
         counts = [1,1]
         def refill(slot, finished):
-            if counts[slot]==2:
+            if counts[slot]==3:
                 return None
             counts[slot] += 1
-            return dense_selfplay.SelfPlayGame([model,model],settings,240+slot,hybrid=True,
+            next_settings = replace(settings,solver_free_fraction=1.,full_sims=256,max_plies=len(history)+2) if counts[slot]==2 else settings
+            return dense_selfplay.SelfPlayGame([model,model],next_settings,240+slot+counts[slot],hybrid=True,
                     book=(dict(suite='test',key=f'new-{slot}',ply=len(history)),history))
         episodes,rows,receipt = play_stream(games,refill,producers=1,proof_workers=1,slice_ms=25,views=4)
-        self.assertEqual(len(episodes),4)
-        self.assertTrue(all(e['winner']==0 and e['reason']=='proven' for e in episodes))
-        self.assertTrue(all(r['proven']==1 and r['proof_plies']>0 for r in rows))
+        self.assertEqual(len(episodes),6)
+        self.assertEqual(sum(e['solver_free'] for e in episodes),2)
+        self.assertTrue(all(e['reason']=='cap' if e['solver_free'] else e['winner']==0 and e['reason']=='proven' for e in episodes))
+        self.assertTrue(all(r.get('proven',0)==0 and r['search']['queries']==0 if r['search']['solver_free'] else r['proven']==1 and r['proof_plies']>0 for r in rows))
         self.assertTrue(all(r['search']['missing_fresh']==0 for r in rows))
         self.assertEqual(sum(r['solver_nodes'] for r in rows),sum(s['fresh_nodes'] for s in receipt['proof_stats']))
         self.assertGreater(sum(r['solver_nodes'] for r in rows),0)
@@ -6714,6 +6729,44 @@ class EngineTests(unittest.TestCase):
         slot.moves, slot.forced_plies = [[0, 0]]*2, 0
         dense_selfplay.SelfPlayGame.plan(slot)
         self.assertTrue(slot.is_full)
+
+        slot.settings = replace(slot.settings,full_turns=True,full_sims=64,cheap_sims=32,search_budget_jitter=.5)
+        slot.budget_rng = np.random.default_rng(240)
+        slot.rng = SimpleNamespace(random=lambda: .1)
+        budgets = []
+        for ply in range(1,129):
+            slot.moves = [[0,0]]*ply
+            dense_selfplay.SelfPlayGame.plan(slot)
+            budgets.append(slot.budget)
+        self.assertTrue(all(32<=b<=96 for b in budgets))
+        self.assertTrue(all(a==b for a,b in zip(budgets[::2],budgets[1::2])))
+        self.assertGreater(len(set(budgets)),8)
+
+    def test_solver_free_hybrid_games_do_not_query_or_adjudicate_frontier_proofs(self):
+        from hybrid_selfplay import play_cohort
+        from tests.test_neural_search import NativeProofs
+        from tactical_proof import library
+        if not library().is_file():self.skipTest('Build the tactical library first')
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY),'proof-cohort','fixed','cpu',32,128)
+        settings = dense_config.ActorSettings(full_fraction=1.,full_sims=256,game_graph=192,tactics=False,
+            opening_random_plies=0.,max_plies=len(NativeProofs.opening)+2,adjudicate_proven=True)
+        games = [dense_selfplay.SelfPlayGame([model,model],replace(settings,solver_free_fraction=share),250+i,
+            hybrid=True,book=(dict(suite='test',key=str(i),ply=len(NativeProofs.opening)),NativeProofs.opening))
+            for i,share in enumerate((0.,1.))]
+        events=[]
+        episodes,rows,receipt = play_cohort(games,producers=1,quantum=32,views=4,proof_workers=1,
+            proof_stamps=True,progress=lambda index,event:events.append((index,event)))
+        self.assertEqual([e['solver_free'] for e in episodes],[False,True])
+        self.assertNotIn('adjudicated',episodes[1])
+        self.assertEqual(len(episodes[1]['moves']),settings.max_plies)
+        unassisted=[r for r in rows if r['game']==1]
+        self.assertTrue(unassisted)
+        self.assertTrue(all(r['search']['solver_free'] and r['search']['queries']==0 and
+                            r['search']['fresh_nodes']==0 and not r.get('proven',0) for r in unassisted))
+        self.assertTrue(all(e['proof_enabled']==(index==0) for index,e in events if 'error' not in e))
+        self.assertGreater(sum(r['search']['queries'] for r in rows if r['game']==0),0)
+        self.assertEqual(receipt['inference']['pending_rows'],0)
 
     def test_root_noise_reaches_only_full_searches(self):
         draws, calls = iter([.1, .9, .1, .1]), []

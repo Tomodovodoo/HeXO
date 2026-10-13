@@ -1153,6 +1153,10 @@ class Bundle(unittest.TestCase):
         result = node(dict(kind='worker-turn', history=[[0,0]], simulations=2, nodes=0))
         self.assertEqual(len(result['moves']), 2)
         self.assertTrue(all(stats['completed'] >= 2 for stats in result['scheduler']))
+        for budget in (16,64):
+            result = node(dict(kind='worker-turn',history=[[0,0]],simulations=budget,nodes=0))
+            self.assertTrue(all(stats['completed']==budget for stats in result['scheduler']))
+            self.assertTrue(all(stats['views']>1 for stats in result['scheduler']))
 
     def test_native_browser_owner_stops_split_forwards_at_cancellation_or_proof(self):
         for control in (dict(cancel=True, cancelAfter=3), dict(stopAfter=3), dict(prove=True, proveAfter=3)):
@@ -1199,6 +1203,12 @@ class Bundle(unittest.TestCase):
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']
         self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])
+        answer = node(dict(kind='native-owner',history=NINE_STONES,work=256,choice='policy',biasedValues=True))
+        result = answer['result']
+        self.assertEqual(sum(result['root_credits']),answer['stats']['root_completed'])
+        self.assertGreater(max(result['visits']),max(result['root_credits']))
+        np.testing.assert_allclose(result['policy'],answer['focusPolicy'],atol=1e-12)
+        self.assertGreater(float(np.max(np.abs(np.asarray(result['policy'])-answer['sharedPolicy']))),.001)
 
     def test_every_preset_sends_its_work_and_proof_workers(self):
         for request in node(dict(kind='owner-adapter')):

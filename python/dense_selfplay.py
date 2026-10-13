@@ -730,6 +730,10 @@ class SelfPlayGame:
             raise ValueError('Hybrid self-play uses frontier slice settings, not legacy solver query budgets')
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
+        budget_seed, cohort_seed = np.random.SeedSequence(seed).spawn(2)
+        self.budget_rng = np.random.default_rng(budget_seed)
+        self.solver_free = bool(settings.solver_free_fraction and
+                                np.random.default_rng(cohort_seed).random()<settings.solver_free_fraction)
         if sum(start is not None for start in (restart, book, fork)) > 1:
             raise ValueError('A game starts from at most one of a restart, an opening book and a fork')
         self.restart, forced = (None, []) if restart is None else (restart[0], [[int(q), int(r)] for q, r in restart[1]])
@@ -767,18 +771,24 @@ class SelfPlayGame:
         """Draw the next search's kind (full with probability full_fraction), budget and root samples, and set the
         side to move's root noise and sampling temperature: root_noise at root_noise_concentration and
         root_temperature(ply) for a full search, 0 and 1 for a cheap one.
-        With full_turns, the second stone of a turn whose first stone this game searched keeps that stone's kind.
+        With full_turns, the second stone of a turn whose first stone this game searched keeps its kind and drawn budget.
         With pv_check a full search's budget is its first pass (neural_search.Recheck, run by `recheck`)."""
         s = self.settings
         ply = len(self.moves) if s.full_turns else 0
-        if not (ply and ply % 2 == 0 and ply > self.forced_plies):
+        repeated = ply and ply % 2 == 0 and ply > self.forced_plies
+        if not repeated:
             self.is_full = bool(self.rng.random() < s.full_fraction)
-        self.budget = s.full_sims if self.is_full else s.cheap_sims
+            center = s.full_sims if self.is_full else s.cheap_sims
+            spread = int(center*s.search_budget_jitter)
+            self.turn_budget = int(self.budget_rng.integers(center-spread,center+spread+1)) if spread else center
+        self.budget = self.turn_budget
         self.check = Recheck(self.tree, self.budget, s.pv_check) if s.pv_check and self.is_full else None
         self.passes = []
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
+        if s.search_budget_jitter:
+            self.samples = min(self.samples,self.budget)
         if s.root_noise and not getattr(self, 'hybrid', False):
             checked(native.hxg_root_noise(self.tree.ptr, s.root_noise if self.is_full else 0.))
             checked(native.hxg_root_concentration(self.tree.ptr, s.root_noise_concentration))
@@ -881,7 +891,7 @@ class SelfPlayGame:
             self.label(ply, result['proven'], result['proof_turns'], action)
         if game.winner >= 0:
             return False
-        if self.settings.adjudicate_proven and result.get('proven'):
+        if self.settings.adjudicate_proven and not self.solver_free and result.get('proven'):
             self.adjudicate(player if result['proven'] > 0 else 1-player, result.get('proof'))
             return False
         if len(self.moves) >= self.settings.max_plies:
@@ -988,6 +998,7 @@ class SelfPlayGame:
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
                        root_values=self.values, network_values=self.network_values, full_search=self.full,
+                       solver_free=self.solver_free,
                        origin='book' if self.book is not None else 'fork' if self.fork is not None
                        else 'restart' if self.restart else 'selfplay')
         if self.book is not None:

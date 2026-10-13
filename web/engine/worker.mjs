@@ -175,11 +175,11 @@ const searched = r => verified(r) || VERDICTS.has(r.reason);
 /** The root of the first stone's running search as the analysis panel shows it: {value (the mover's win chance), top}. */
 function rootRows(tree, choice) {
   if (!tree) return null;
-  const {action, actions, policy, values, completed_q} = tree.result(choice);
+  const {action, actions, policy, values, completed_q, exact_winner, node_value} = tree.result(choice);
   if (!action) return null;
   const top = topRows(actions, policy, completed_q, action);
-  const refuted = top.length && top.every(row => row[4] < 0) && tree.m._hxg_exact(tree.ptr) < 0;
-  const value = refuted ? tree.m._hxg_value(tree.ptr) : policy.reduce((sum, p, i) => sum + p * values[i], 0);
+  const refuted = top.length && top.every(row => row[4] < 0) && exact_winner < 0;
+  const value = refuted ? node_value : policy.reduce((sum, p, i) => sum + p * values[i], 0);
   return {value: Math.round((value + 1) / 2 * 1e4) / 1e4, top, refuted: refuted ? top.length : 0};
 }
 
@@ -440,6 +440,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
       pv = outcome.pv;
     }
     const given = moves.length > 0, current = history.map(p => [...p]), searchStart = performance.now();
+    let firstRootCredits = null;
     for (let local = native.game(current); !given && local.player === player && local.winner < 0; local = native.game(current)) {
       let action, policy, actions, stoneValue, values = null;
       const stone = moves.length, stoneEnd = !timed || local.remaining === 1 || stone ? end : searchStart + .6 * (end - searchStart);
@@ -465,7 +466,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         if (line != null && edges.size) touched = tree.id;
         check();
         let searchedResult;
-        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(64, simulations)), work: simulations, views: 8,
+        const owner = new NativeOwner(tree, {quantum: Math.max(4, Math.min(32, Math.floor(simulations / 2))), work: simulations, views: 8,
           ms: timed ? Math.max(1, stoneEnd - performance.now()) : 0});
         try {
           searchedResult = await owner.search({network, batchSize, choice,
@@ -476,7 +477,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
               if (line != null) touched = tree.id;
               postMessage({type: 'progress', id, fraction: timed ? Math.min(1, (performance.now() - start) / ms)
                 : Math.min(1, (stone + stats.completed / simulations) / state.remaining),
-                ...(stone && kind !== 'move' ? {} : {live: liveRows(rootRows(owner.root, choice), current.length)})});
+                ...(stone && kind !== 'move' ? {} : {live: liveRows(rootRows(owner, choice), current.length)})});
             }});
           scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference,
             ...(proofPool ? {proof: searchedResult.proof_scheduler} : {})});
@@ -487,6 +488,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
           }
         } finally { owner.close(); }
         const result = settled(searchedResult, unmarked, local.player);
+        if (!moves.length) firstRootCredits = searchedResult.root_credits;
         if (line != null && searchedResult.all_view_completed) touched = tree.id;
         check();
         completed += searchedResult.all_view_completed;
@@ -515,7 +517,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
     if (line != null && tree && moves.length > 1 && !given) {
       // The later stones' searches changed the graph under the first root: read that root again.
       tree.at(history.map(p => [...p]));
-      const root = tree.result(choice);
+      const root = tree.result(choice, firstRootCredits);
       top = topRows(root.actions, root.policy, root.completed_q, moves[0]);
       value = (root.policy.reduce((sum, p, i) => sum + p * root.values[i], 0) + 1) / 2;
       nodeValue = (root.node_value + 1) / 2;

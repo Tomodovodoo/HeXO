@@ -28,7 +28,7 @@ struct Owner {
  std::vector<uint64_t> direct_root_credits;std::vector<int> last_members;
  std::vector<Cell> focus;std::mt19937_64 rng;uint64_t next_id=1,ticks=0,allocations=0,reclaimed=0,completed=0,issued=0,cancelled=0,created=0,retired=0,step_ns=0,discover_ns=0;
  int quantum,max_views,max_depth,sample_limit=16;size_t view_cursor=0;uint64_t work_limit;double time_limit_ms;std::chrono::steady_clock::time_point started;
- bool stopped=false,deadline=false,root_raw_known=false;double exploration=.2,root_raw=0;
+ bool stopped=false,deadline=false,root_raw_known=false,proof_enabled=true;double exploration=.2,root_raw=0;
  Owner(Tree& source,int capacity,int q,int count,int depth,uint64_t work,double ms,uint64_t seed,void* common=nullptr,int samples=16):owned_feed(common?nullptr:hxgf_new(capacity)),feed(common?common:owned_feed.get()),game(source.state),rng(seed),quantum(q),max_views(count),max_depth(depth),sample_limit(samples),work_limit(work),time_limit_ms(ms),started(std::chrono::steady_clock::now()){
   if(!source.shared || !feed || q<4 || count<1 || count>64 || depth<1 || depth>32 || !std::isfinite(ms) || ms<0 || (!work && !ms))throw std::runtime_error("Invalid native owner limits");
   if(game->scheduler_owner)throw std::runtime_error("Game already has a native owner");
@@ -226,7 +226,7 @@ struct Owner {
   if(stopped_count<0)throw std::runtime_error(gumbel::error);if(stopped_count){stop();throw std::runtime_error("Inference failed for native owner view");}return 1;
  }
  int choice(int64_t* action){
-  auto& t=*views[0].tree;t.proof_root();auto& n=*t.root;if(!n.expanded)return 0;t.current(n);auto q=t.transformed(n);t.trim_archive(false,false);
+  auto& t=*views[0].tree;t.proof_root();auto& n=*t.root;if(!n.expanded)return 0;t.current(n);auto q=t.transformed(n,double(direct_max()));t.trim_archive(false,false);
   // Deeper same-position values may refresh the choice, but an incomplete new
   // comparison does not replace the last completed root sampling credits.
   const auto& epochs=last_root.empty()?t.root_edges:last_root;int maximum=0,seen=0;
@@ -241,6 +241,9 @@ struct Owner {
    if(score>best){best=score;selected=int(i);}
   }if(selected<0)return 0;action[0]=n.edges[selected].action.q;action[1]=n.edges[selected].action.r;return 1;
  }
+ uint64_t direct_credit(size_t i)const{return (i<direct_root_credits.size()?direct_root_credits[i]:0)+(views[0].active && i<views[0].tree->root_edges.size()?views[0].tree->root_edges[i].credits:0);}
+ uint64_t direct_max()const{uint64_t maximum=0;const auto& edges=views[0].tree->root->edges;for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)maximum=std::max(maximum,direct_credit(i));return maximum;}
+ std::vector<double> policy(){auto& t=*views[0].tree;t.proof_root();if(!t.root->expanded)return {};t.current(*t.root);return t.policy(*t.root,double(direct_max()));}
 };
 }
 extern "C" HX_API void* hxgo_new(void* tree,int capacity,int quantum,int views,int depth,uint64_t work,double ms,uint64_t seed){try{if(!tree)throw std::runtime_error("Missing source tree");return new owner::Owner(*static_cast<gumbel::Tree*>(tree),capacity,quantum,views,depth,work,ms,seed);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
@@ -365,12 +368,13 @@ struct Pool {
   o.work_limit=work;o.time_limit_ms=ms;o.started=std::chrono::steady_clock::now();o.stopped=o.deadline=false;
   failed[index]=false;stopped=false;++retargets;o.start(root);
  }
- std::unique_ptr<Owner> replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,double concentration,double temperature,uint64_t seed){
+ std::unique_ptr<Owner> replace(int index,Tree& source,int samples,int views,uint64_t work,double ms,double noise,double concentration,double temperature,uint64_t seed,bool proof_enabled=true){
   auto& old=*games[index];int quantum=old.quantum,depth=old.max_depth;
   // Retirement already drained this slot's proof jobs and detached neural
   // subscribers. Device snapshots own copied encodings, not the old store.
   source.root_noise=noise;source.root_concentration=concentration;source.root_temperature=temperature;
   auto replacement=std::make_unique<Owner>(source,0,quantum,views,depth,(work || ms)?work:uint64_t(quantum),ms,seed,feed,samples);
+  replacement->proof_enabled=proof_enabled;
   auto retired=std::move(games[index]);games[index]=std::move(replacement);
   if(!work && !ms)games[index]->stop();
   if(proof_bind)proof_bind(proof_owner,index);
@@ -405,6 +409,10 @@ extern "C" HX_API int hxgm_admit(void* p){try{return owner::caller(p).admit();}c
 extern "C" HX_API int hxgm_done(void* p){return static_cast<owner::Pool*>(p)->stopped;}
 extern "C" HX_API void* hxgm_feed(void* p){return static_cast<owner::Pool*>(p)->feed;}
 extern "C" HX_API void* hxgm_owner(void* p,int i){auto& pool=*static_cast<owner::Pool*>(p);return i<0 || i>=int(pool.games.size())?nullptr:pool.games[i].get();}
+extern "C" HX_API int hxgm_proof_mode(void* p,int i,int enabled){try{auto& pool=owner::caller(p);if(pool.steps || pool.proof_owner || i<0 || i>=int(pool.games.size()) || (enabled!=0 && enabled!=1))throw std::runtime_error("Set proof mode before pool work and proof binding");pool.games[i]->proof_enabled=enabled!=0;return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+extern "C" HX_API int hxgo_proof_enabled(void* p){return static_cast<owner::Owner*>(p)->proof_enabled;}
+extern "C" HX_API int hxgo_policy(void* p,double* out){auto weights=static_cast<owner::Owner*>(p)->policy();if(out)std::copy(weights.begin(),weights.end(),out);return int(weights.size());}
+extern "C" HX_API int hxgo_root_credits(void* p,uint64_t* out){auto& o=*static_cast<owner::Owner*>(p);o.views[0].tree->proof_root();size_t count=o.views[0].tree->root->edges.size();if(out)for(size_t i=0;i<count;++i)out[i]=o.direct_credit(i);return int(count);}
 extern "C" HX_API const char* hxgm_model(void* p){return static_cast<owner::Pool*>(p)->model.c_str();}
 extern "C" HX_API int hxgm_install(void* p,const uint64_t* ids,int count,const int64_t* offsets,const int64_t* actions,const double* logits,const double* values){try{return owner::caller(p).install(ids,count,offsets,actions,logits,values);}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxgm_stats(void* p,uint64_t* out){auto& pool=*static_cast<owner::Pool*>(p);uint64_t active=0,failed=0;for(size_t i=0;i<pool.games.size();++i){active+=!pool.games[i]->stopped;failed+=pool.failed[i];}std::array<uint64_t,5> stats{pool.steps,uint64_t(pool.games.size()),active,failed,pool.retargets};std::copy(stats.begin(),stats.end(),out);}

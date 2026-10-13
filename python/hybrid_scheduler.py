@@ -76,6 +76,15 @@ for name, result, args in (
 ):
     bind('hxp_'+name, result, *args)
 
+if hasattr(native, 'hxb_replace_proofs'):
+    bind('hxb_replace_proofs', C.c_int, ptr, C.c_int, C.c_int, C.c_uint64, ptr, C.c_char_p,
+         ptr, C.c_int, C.c_uint64, C.c_double, C.c_int, C.c_int, C.c_double, C.c_double,
+         C.c_double, C.c_uint64, C.c_int)
+    bind('hxgm_proof_mode', C.c_int, ptr, C.c_int, C.c_int)
+    bind('hxgo_proof_enabled', C.c_int, ptr)
+    bind('hxgo_policy', C.c_int, ptr, ptr)
+    bind('hxgo_root_credits', C.c_int, ptr, ptr)
+
 
 def _solver(package, direct):
     """The tactical library and its native worker callbacks."""
@@ -401,6 +410,14 @@ class SearchPool:
         self.proofs = ProofLoop(self, package, **options)
         return self.proofs
 
+    def proof_mode(self, game, enabled):
+        """Set a fresh pool slot's proof participation before binding a proof loop."""
+        if not hasattr(native, 'hxgm_proof_mode'):
+            if not enabled:
+                raise ValueError('Solver-free games require the proof-mode native API')
+            return
+        checked(native.hxgm_proof_mode(self.ptr, game, bool(enabled)))
+
     @property
     def ptr(self):
         if not self._ptr:
@@ -651,7 +668,7 @@ class InferenceService:
         checked(native.hxb_release(self.ptr, producer, game, expected))
 
     def replace(self, producer, game, source, *, expected, work=0, ms=0, samples=16, views=8, noise=0.,
-                concentration=0., temperature=1., seed=0):
+                concentration=0., temperature=1., seed=0, proofs=True):
         """Install a fresh game after release. Zero work/ms leaves it parked.
 
         Success transfers the source Tree and closes its caller wrapper. The
@@ -661,9 +678,16 @@ class InferenceService:
         Predictions are reusable only within the slot's frozen model identity.
         """
         cells = np.ascontiguousarray(source.history, np.int64).reshape(-1, 2)
-        checked(native.hxb_replace(self.ptr, producer, game, expected, source.ptr,
-                                    source.model_version.encode(), cells.ctypes.data, len(cells),
-                                    work, ms, samples, views, noise, concentration, temperature, seed))
+        if hasattr(native, 'hxb_replace_proofs'):
+            checked(native.hxb_replace_proofs(self.ptr, producer, game, expected, source.ptr,
+                source.model_version.encode(), cells.ctypes.data, len(cells), work, ms, samples, views,
+                noise, concentration, temperature, seed, bool(proofs)))
+        elif proofs:
+            checked(native.hxb_replace(self.ptr, producer, game, expected, source.ptr,
+                source.model_version.encode(), cells.ctypes.data, len(cells), work, ms, samples, views,
+                noise, concentration, temperature, seed))
+        else:
+            raise ValueError('Solver-free games require the proof-mode native API')
         source.ptr = None
 
     def launch(self):

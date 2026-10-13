@@ -213,7 +213,7 @@ struct Loop {
   pool.proof_listen=[](void* p,std::shared_ptr<owner::Signal> signal){auto& loop=*static_cast<Loop*>(p);std::lock_guard lock(loop.mutex);loop.listener=std::move(signal);};
  }
  ~Loop(){shutdown();for(auto& game:pool.games){game->game->evidence=nullptr;game->game->evidence_owner=nullptr;}pool.proof_owner=nullptr;pool.proof_step=nullptr;pool.proof_collect=nullptr;pool.proof_retarget=nullptr;pool.proof_bind=nullptr;pool.proof_ready=nullptr;pool.proof_listen=nullptr;}
- void bind(int game){auto& store=*pool.games[game]->game;store.evidence_owner=this;store.evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
+ void bind(int game){auto& store=*pool.games[game]->game;if(!pool.games[game]->proof_enabled){store.evidence=nullptr;store.evidence_owner=nullptr;return;}store.evidence_owner=this;store.evidence=[](void* p,Tree& t,const gumbel::Path& path){static_cast<Loop*>(p)->observe(t,path);};}
  void completed(const std::shared_ptr<Job>& job){
   // Quiet UNKNOWN results still drain on the bounded owner tick. Waking for
   // every tiny query interrupts neural feeding without adding graph evidence.
@@ -237,7 +237,7 @@ struct Loop {
   service.account(Clock::now());service.loops.erase(std::find(service.loops.begin(),service.loops.end(),this));attached=false;
  }
  void observe(Tree& t,const gumbel::Path& path){
-  size_t i=0;while(i<pool.games.size() && pool.games[i]->game.get()!=t.state.get())++i;if(i==pool.games.size() || pool.games[i]->stopped)return;
+  size_t i=0;while(i<pool.games.size() && pool.games[i]->game.get()!=t.state.get())++i;if(i==pool.games.size() || pool.games[i]->stopped || !pool.games[i]->proof_enabled)return;
   auto& f=frontiers[i];double relevance=1;for(auto& v:pool.games[i]->views)if(v.tree.get()==&t){relevance=v.relevance;break;}
   double share=1;for(auto [parent,index]:path.edges){const auto& edge=parent->edges[index];share*=std::max(.001,parent->prior(edge));}
   double forcing=1+std::min(size_t(8),path.own.size()+path.threats.size());
@@ -281,7 +281,7 @@ struct Loop {
  std::vector<Ready> prepare(size_t available,Census& c){
   ++c[Scans];
   std::vector<Ready> ready(frontiers.size());auto now=Clock::now();bool explore=submitted%5==4;
-  for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped)continue;
+  for(size_t n=0;n<frontiers.size();++n){size_t i=(cursor+n)%frontiers.size();auto& o=*pool.games[i];auto& f=frontiers[i];if(o.stopped || !o.proof_enabled)continue;
    auto& candidates=ready[i];candidates.single=available==1;if(!candidates.single)candidates.choices.reserve(f.tasks.size());
    for(auto it=f.tasks.begin();it!=f.tasks.end();){auto task=it->second;auto node=task->node.lock();
     if(!task->flight && (!node || node->exact_winner>=0)){it=f.tasks.erase(it);continue;}++it;
@@ -446,7 +446,7 @@ struct Loop {
   auto& queue=endpoints[game];Endpoint path=std::move(queue.front());queue.pop_front();
   --endpoint_pending;endpoint_pending_bytes-=path.bytes;if(!queue.empty())endpoint_games.push_back(game);
   auto& o=*pool.games[game];
-  if(path.generation!=frontiers[game].generation || o.stopped || o.expired()){
+  if(path.generation!=frontiers[game].generation || o.stopped || !o.proof_enabled || o.expired()){
    ++endpoint_obsolete;endpoint_record(path.id,game,path.generation,0,path.context,path.result,"obsolete");
   }else{
    auto added=neural(path);++endpoint_admitted;endpoint_record(path.id,game,path.generation,added,path.context,path.result,"admitted");
@@ -458,7 +458,7 @@ struct Loop {
   auto& effort=f.effort[job.generation];++effort.queries;
   if(job.info[4]){fresh+=job.info[3];effort.fresh+=job.info[3];}else{++missing_fresh;++effort.missing;}
   o.game->pins.erase(job.task.get());task.flight=false;
-  if(job.cancelled || job.generation!=f.generation){task.ready=Clock::now()+std::chrono::milliseconds(slice);return;}
+  if(job.cancelled || job.generation!=f.generation || !o.proof_enabled){task.ready=Clock::now()+std::chrono::milliseconds(slice);return;}
   if(!job.error.empty())throw std::runtime_error(job.error);
   int player=int((job.history.size()+1)/2%2),remaining=job.history.empty() || job.history.size()%2==0?1:2;
   if(job.info[12] && (job.info[9]!=uint64_t(player) || job.info[10]!=uint64_t(remaining) || job.info[11]!=uint64_t(job.side)))throw std::runtime_error("Native proof scope mismatch");
@@ -493,7 +493,7 @@ struct Loop {
   if(disabled)discard_endpoints();else prune_endpoints();
  }
  void prune(){
-  {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}sweep();}
+  {std::lock_guard lock(mutex);for(auto& [id,job]:live){auto& o=*pool.games[job->game];if(o.stopped || !o.proof_enabled || job->generation!=frontiers[job->game].generation || job->pin->exact_winner>=0)mark(*job,true);}sweep();}
  }
  // load: the owner's recent share of wall time in proof steps and feedback,
  // decaying over 100 ms. Above `budget`, steps install but admit nothing, so
@@ -508,7 +508,7 @@ struct Loop {
   void step(){
    auto start=Clock::now();++ticks;settle();
   admit_endpoints();
-  for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped)continue;
+  for(size_t i=0;i<pool.games.size();++i){auto& o=*pool.games[i];if(o.stopped || !o.proof_enabled)continue;
    for(auto& v:o.views)if(v.active && v.tree->root->expanded)frontiers[i].offer(v.tree->root,v.history,v.relevance,std::abs(v.tree->root->q-v.tree->root->value));
   }
   if(load*std::exp(-std::chrono::duration<double>(start-marked).count()/.1)<=budget)admit();
@@ -674,6 +674,7 @@ extern "C" HX_API int hxp_free(void* p){auto& loop=*static_cast<proving::Loop*>(
 extern "C" HX_API int hxp_offer(void* p,int game,const int64_t* cells,int count,double relevance){try{
  auto& loop=*static_cast<proving::Loop*>(p);if(game<0 || game>=int(loop.pool.games.size()) || count<0 || (count && !cells) || !std::isfinite(relevance) || relevance<0)throw std::runtime_error("Invalid proof frontier position");
  std::vector<Cell> history;for(int i=0;i<count;++i)history.push_back({cells[2*i],cells[2*i+1]});auto& owner=*loop.pool.games[game];
+ if(!owner.proof_enabled)throw std::runtime_error("Proofs are disabled for this game");
  gumbel::Tree view(0,owner.game);view.shared=view.graph=view.scheduler_owned=true;view.root_at(history);loop.frontiers[game].offer(view.root,history,relevance,0);return 1;
 }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 extern "C" HX_API void hxp_stats(void* p,uint64_t* out,double* times){auto& loop=*static_cast<proving::Loop*>(p);std::lock_guard lock(loop.mutex);loop.service.account(proving::Clock::now());uint64_t active=0,tasks=0,facts=0;double service=loop.service_ms,idle=0;for(auto& w:loop.workers)active+=w->active && w->active->loop==&loop;for(double ms:loop.idle_ms)idle+=ms;for(auto& f:loop.frontiers){tasks+=f.tasks.size();facts+=f.facts.size();}

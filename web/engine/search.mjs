@@ -198,13 +198,19 @@ export class NeuralSearch {
   }
   proveLoss(winner, plies) { this.n.checked(this.m._hxg_prove_loss(this.ptr, winner, plies)); }
 
-  result(choice = 'gumbel') {
+  result(choice = 'gumbel', credits = null) {
     const m = this.m, n = m._hxg_stats(this.ptr, 0, 0, 0, 0);
     const a = this.n.alloc(16 * n), v = this.n.alloc(4 * n), q = this.n.alloc(8 * n), s = this.n.alloc(8 * n), p = this.n.alloc(8 * n);
     const c = this.n.alloc(8 * n);
+    const creditBuffer = credits === null ? 0 : this.n.alloc(8 * n);
     try {
       m._hxg_stats(this.ptr, a, v, q, s);
-      m._hxg_policy(this.ptr, p);
+      if (credits === null) m._hxg_policy(this.ptr, p);
+      else {
+        if (credits.length !== n) throw Error('Policy credits do not match root actions');
+        this.n.view(BigUint64Array, creditBuffer, n).set(credits.map(BigInt));
+        if (m._hxg_policy_credits(this.ptr, creditBuffer, n, p) < 0) this.n.checked(0);
+      }
       m._hxg_q(this.ptr, c);
       const actions = this.n.pairs(a, n), visits = Array.from(this.n.view(Int32Array, v, n));
       const values = Array.from(this.n.view(Float64Array, q, n)), scores = Array.from(this.n.view(Float64Array, s, n));
@@ -222,7 +228,7 @@ export class NeuralSearch {
         proof_plies: proven ? m._hxg_distance(this.ptr) : 0,
         proof_action: proven > 0 ? actions.filter((_, i) => Number.isFinite(scores[i])) : []};
     } finally {
-      for (const pointer of [a, v, q, s, p, c]) m._free(pointer);
+      for (const pointer of [a, v, q, s, p, c, creditBuffer]) m._free(pointer);
     }
   }
 }
@@ -430,14 +436,21 @@ export class NativeOwner {
   result(choice = 'gumbel') {
     if (!this.ptr) throw new Error('Native owner is closed');
     if (choice !== 'policy' && choice !== 'gumbel') throw new Error('choice must be policy or gumbel');
-    const result = this.root.result(choice), action = this.n.alloc(16);
+    const credits = this.credits(), result = this.root.result(choice, credits), action = this.n.alloc(16);
     try {
       const found = this.m._hxgo_choice(this.ptr, action);
       if (found < 0) this.n.checked(0);
       const stats = this.stats();
       return {...result, action: choice === 'policy' ? result.action : found ? this.n.pairs(action, 1)[0] : null, completed: stats.root_completed,
-        all_view_completed: stats.completed};
+        all_view_completed: stats.completed, root_credits: credits};
     } finally { this.m._free(action); }
+  }
+  credits() {
+    const count = this.m._hxgo_root_credits(this.ptr, 0), buffer = this.n.alloc(8 * count);
+    try {
+      this.m._hxgo_root_credits(this.ptr, buffer);
+      return Array.from(this.n.view(BigUint64Array, buffer, count), Number);
+    } finally { this.m._free(buffer); }
   }
   close() {
     if (!this.ptr) return;

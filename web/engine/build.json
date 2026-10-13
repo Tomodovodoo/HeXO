@@ -1,12 +1,12 @@
 {
  "sources": {
-  "src/gumbel.cpp": "2073c7d898d84445fd7759bd56387da0e87f658e9e354e843f5f6321dd0d7de3",
-  "src/gumbel_owner.cpp": "90571c2d50adfffce9a98a51795931b37cf9d22847eae2522eee5b06497fc7e5",
-  "src/gumbel_proof.cpp": "f6dfc96902c899ddd8a550b562707f3740d1cec62f9097866f51ae4ebe49e66b",
+  "src/gumbel.cpp": "7735d92adf8d54d661cfc76e45def79d0c1d14243638bad53db2a45f30a67330",
+  "src/gumbel_owner.cpp": "1ab671d3b8d57744b4bde8ed4d99fab7887472d38b020f2b0be9842099e1a7f1",
+  "src/gumbel_proof.cpp": "e2466f487f2439b89cb5506eaaa456a3cd4bd313e3c336140592a679ace29c9f",
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
   "src/gumbel_batch.cpp": "a5defcd282fd94191c9db41ba069ecff5b11ee058f5b91dcb6523ef551bebf28",
   "src/gumbel_parallel.hpp": "123bee0c1cecbd53fc4bed49e3f9d574f40530dcd34579afc34578378e975e4a",
-  "src/gumbel_broker.hpp": "b46c7e1821e13f8e60e5e9bbabebef5c96ab9381415defbd0c18d334900acaf7",
+  "src/gumbel_broker.hpp": "e81df9be055f491f74b897c72dde36ba10de1423240cd4b76522d5b5fad01032",
   "src/hexo.cpp": "9c55ee1a4575df4caa738d0bfff566a0a5c7ad43ff1e3ad7898ead6eb0876853",
   "src/hexo.hpp": "aa4459c649f17ecc209a892f1522952e4a259385a82d15a48c689f5a975cb520",
   "src/nnue.hpp": "38e657c7fe31028565ff971e34742be42e4c82031ac51f70d558828cfc6e4a54",
@@ -90,8 +90,8 @@
   "tools/strix_web/src/lib.rs": "40e36d710556f8e17362e15404a3caa7981936cc91c26383d1bde61ca8c0ecf4"
  },
  "artefacts": {
-  "gumbel.mjs": "4e87ba697cd5346eb8766bb1a4591c03ac1c853226b677c74628644e9444f716",
-  "gumbel.wasm": "2374a6afad150e6872c4eeda5fc9acd9cf8c5438ca291d64af6c3051d17f41c5",
+  "gumbel.mjs": "50f39eb2073af7b6c9b0159a4690ee29f2512ff494a5caf48ea7b277422eff43",
+  "gumbel.wasm": "9250cb4ae14209f7871e78086eac70eb4b31adf244ae4c1f2fe21a2cbd06b519",
   "tactical.wasm": "8701ab6f52ce7b9ca8c07e29ea030facbf532849b163a0e747a09aa4aff336b2",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "371a7e1214b7ad14eaa4f3127e910555799b67d67b68f6fecf2c1d8cc57b2ea4",

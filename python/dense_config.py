@@ -54,6 +54,8 @@ class ActorSettings:
     cheap_sims: int = 12         # value-only positions; no policy row
     full_fraction: float = .25   # KataGo playout-cap randomization share
     full_turns: bool = False     # a turn's second stone repeats its first stone's full or cheap draw
+    search_budget_jitter: float = 0. # uniform fractional band around each full/cheap budget; keeps its mean
+    solver_free_fraction: float = 0. # per-game hybrid cohort without frontier proofs or certificate reuse
     root_samples: int = 16       # Gumbel m
     cheap_root_samples: int = 4  # leave cheap searches enough visits to descend beyond the root
     max_plies: int = 256
@@ -181,6 +183,10 @@ class ActorSettings:
             raise ValueError('search_choice must be gumbel or policy')
         if not 0 <= self.early_prior_fraction <= 1 or self.early_prior_plies < 0:
             raise ValueError('early_prior_fraction must lie in [0, 1] and early_prior_plies be nonnegative')
+        if not 0 <= self.search_budget_jitter < 1:
+            raise ValueError('search_budget_jitter must lie in [0, 1)')
+        if not 0 <= self.solver_free_fraction <= 1 or self.solver_free_fraction and not self.hybrid_scheduler:
+            raise ValueError('solver_free_fraction must lie in [0, 1] and requires hybrid_scheduler')
         if not 0 <= self.q_range_floor <= 2:
             raise ValueError('q_range_floor must lie in [0, 2]')
         if not 0 <= self.root_noise < 1:
