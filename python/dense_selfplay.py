@@ -1173,6 +1173,7 @@ class BookStarts:
         if node['status'] == 'tactical':
             metadata['tactical'] = {k: node['tactical'][k] for k in ('winner', 'source')}
         if 'training_start' in node:
+            metadata['suite'] = 'training-starts'
             metadata['training_start'] = node['training_start']
         return metadata, moves.tolist()
 

@@ -6527,7 +6527,7 @@ class EngineTests(unittest.TestCase):
         settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
                                              opening_random_plies=5., tactics=False, max_plies=5)
         history = [[0, 0], [7, 0], [8, 0]]
-        source = dict(suite='book', key='test', digest='x', ply=3, off_policy=True,
+        source = dict(suite='training-starts', key='test', digest='x', ply=3, off_policy=True,
                       training_start=dict(source=dict(report_sha256='frozen', game=1), pool_sha256='pool'))
         slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, book=(source, history))
         engine = dense_selfplay.Engine(8)
@@ -6580,7 +6580,7 @@ class EngineTests(unittest.TestCase):
         settings = dense_config.ActorSettings(full_fraction=1., full_sims=4, root_samples=2,
             tactics=False, max_plies=5, hybrid_proof_workers=0, hybrid_quantum=4)
         history = [[0, 0], [7, 0], [8, 0]]
-        source = dict(suite='book', key='test', digest='x', ply=3, off_policy=True,
+        source = dict(suite='training-starts', key='test', digest='x', ply=3, off_policy=True,
                       training_start=dict(source=dict(game=1, prefix_ply=3), pool_sha256='pool'))
         slot = dense_selfplay.SelfPlayGame([model]*2, settings, 1, book=(source, history), hybrid=True)
         engine = ActorEngine(settings)

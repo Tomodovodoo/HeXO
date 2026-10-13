@@ -265,9 +265,11 @@ class RefreshTests(unittest.TestCase):
                 self.assertEqual(dense_openings.canonical(moves)[0], metadata['key'])
                 self.assertNotIn('tactical', metadata)
                 if metadata['key'] == key:
+                    self.assertEqual(metadata['suite'], 'training-starts')
                     self.assertEqual(metadata['training_start'], dict(source=start['source'],
                                       pool_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
                 else:
+                    self.assertEqual(metadata['suite'], 'book')
                     self.assertNotIn('training_start', metadata)
             self.assertGreater(min(draws.values()), 70)
             self.assertEqual(book.path.read_bytes(), original)
