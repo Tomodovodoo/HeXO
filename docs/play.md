@@ -235,6 +235,9 @@ engine moves at that level, then those; each move moves the estimate halfway to 
 | Deep | 1,024 | 64 | 16,384 / 8,192 | 10,000 | 1,920 | 512 |
 | Dangerous | 65,536 | 1,024 | 4,000,000 / 131,072 | 60,000 | 2,000,000 | 4,096 |
 
+The following timing tables are historical measurements. They predate the served search's adaptive half-budget
+slices and 32-simulation maximum quantum; they do not measure the current allocation.
+
 Seconds per two-stone engine move with network 205000, measured on 2026-10-08 on an RTX 3070 Ti that the training
 run shared, the browser's WebAssembly on 8 threads. The browser columns are fresh searches of three positions of 3 to
 13 stones, two runs each; the served column is the moves of one game. The range is the fastest to the slowest.
@@ -296,7 +299,9 @@ Every Bubble search on the served page runs on the hybrid scheduler ([search-sch
 analysis, Auto, deepening, refresh, review, engine turns and matches. Each stone of a turn is one search of
 the game graph at that position. A native graph owner spends the preset's simulations there as completed
 simulations over up to eight views: the position itself and positions below it that its own evidence ranks, at most
-eight placements down. Each view searches in quanta of up to 64 simulations (fewer when the budget is smaller), with
+eight placements down. Each view searches in quanta of up to 32 simulations, capped at half the requested work
+with a minimum slice of four, so a small budget leaves work for a subsequent view. A pooled search uses its
+smallest requested budget to size the shared slice. The search keeps
 16 sampled root candidates and the round barrier, and the network batches of every view share one queue of up to
 128 rows. A position's simulations therefore mean neural work spent around it, not visits at its root alone.
 
@@ -310,12 +315,12 @@ whole time. Solver nodes 0 turns both off, and so does a missing tactical build.
 
 | Preset | Work per stone (GPU) | Owner quantum | Root query nodes | Proof frontier |
 |---|---|---|---|---|
-| Lightning | 16 | 16 | 1,024 | on |
-| Quick | 64 | 64 | 2,048 | on |
-| Standard | 256 | 64 | 4,096 | on |
-| Strong | 512 | 64 | 8,192 | on |
-| Deep | 1,024 | 64 | 16,384 | on |
-| Dangerous | 65,536 | 64 | 4,000,000 | on |
+| Lightning | 16 | 8 | 1,024 | on |
+| Quick | 64 | 32 | 2,048 | on |
+| Standard | 256 | 32 | 4,096 | on |
+| Strong | 512 | 32 | 8,192 | on |
+| Deep | 1,024 | 32 | 16,384 | on |
+| Dangerous | 65,536 | 32 | 4,000,000 | on |
 
 ### By hand
 

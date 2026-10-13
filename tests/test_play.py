@@ -2669,11 +2669,22 @@ class TurnTrees(unittest.TestCase):
         graph = engines.graphs[1][1]
         visits = int(graph.result(0, 0, 0, 0)['visits'].sum())
         self.assertGreaterEqual(visits, 128)
-        # Both roots of the turn already hold 128 visits, so one more tier runs one simulation at each; the second
-        # stone's also counts at the first stone's edge.
-        evaluate(bubble, None, history, 128, 0, trees=engines.game_graph(bubble, 1, keep=True))
-        graph.at(history)
-        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'].sum()), visits + 2)
+        # Descendant views need not leave 128 visits at the chosen second-stone
+        # root. Each searched position gets exactly its own missing work.
+        trees, requested = engines.game_graph(bubble, 1, keep=True), {}
+
+        def observed(cells, count, network):
+            tree, missing = trees(cells, count, network)
+            before = int(tree.result(0, 0, 0, 0)['visits'].sum())
+            requested[tuple(map(tuple, cells))] = (count, before, missing)
+            return tree, missing
+
+        found = evaluate(bubble, None, history, 128, 0, trees=observed)
+        self.assertEqual(len(requested), 2)
+        for count, before, missing in requested.values():
+            self.assertEqual(missing, max(1, count - before))
+        self.assertEqual(requested[tuple(history)][2], 1)
+        self.assertEqual(found['actual_completed'], sum(r[2] for r in requested.values()))
         trees = engines.game_graph(bubble, 1, 'abc', keep=True)
         tree, missing = trees([(0, 0)], 32, bubble.evaluator)
         self.assertIsNot(tree, graph)
