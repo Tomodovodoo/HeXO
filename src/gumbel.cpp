@@ -702,10 +702,11 @@ struct Tree {
   restore_root();pin();adopt(root,history);
   evict();
  }
- // MCGS value of a graph node for its mover from its network value and its edges' visits and current values.
+ // Back up the moves the mover can still select. A refuted move keeps its
+ // visit credits for accounting, but must not make ancestors expect that blunder.
  void refresh(Node& node) {
   double total=node.value+node.carried_sum;int count=1+node.carried;
-  for(int i:node.tracked_edges()){auto& e=node.edges[i];if(e.read().visits){total+=e.read().visits*value(node,e);count+=e.read().visits;}}
+  for(int i:node.tracked_edges()){auto& e=node.edges[i];if(e.read().eligible && e.read().visits){total+=e.read().visits*value(node,e);count+=e.read().visits;}}
   node.q=node.exact_winner>=0?(node.exact_winner==node.player?1:-1):total/count;
  }
  // After a backup changed `from`, bring its parents other than `skip` (its parent on the backup path) and their
@@ -979,6 +980,9 @@ struct Tree {
   for(auto& edge:node.edges)attained|=edge.read().exact_winner==node.player && !edge.read().bound && edge.read().distance==fastest;
   for(auto& edge:node.edges)edge.eligibility(winning?edge.read().exact_winner==node.player && edge.read().distance==fastest
    :!safe?edge.read().distance>=longest:edge.read().exact_winner<0);
+  // Evicted summaries have no per-action attribution. Once a move is refuted,
+  // their old average cannot be restricted to the surviving replies.
+  if(!winning && safe && slowest>0){node.carried=0;node.carried_sum=0;}
   if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=!attained || quickest<fastest;}
   else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;node.bound=slowest>longest;}
  }
