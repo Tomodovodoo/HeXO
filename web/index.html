@@ -973,7 +973,7 @@ function renderEngineHead(){
 function selectedTurn(){if(!S||!view)return null;return S.review.find(t=>t.ply<=view-1&&view-1<t.ply+t.stones.length)||null}
 /* the evaluation shown for ply p: the saved one, else the search of a running move or analysis of that position;
    its top rows without the stones the search never tried (no policy share, not proven), which older saves kept */
-function liveAt(p){const j=S.jobs.find(j=>j.ply===p&&j.status==='running'&&j.live&&!j.live.solver);
+function liveAt(p){const j=S.jobs.find(j=>(j.live?.ply??j.ply)===p&&j.status==='running'&&j.live&&!j.live.solver);
   return j?{value:j.live.value,top:j.live.top,refuted:j.live.refuted,threat:[],pv:[],proof:null,live:true}:null}
 /* the solver preset's panel in place of the evaluation bar: the running search's proof progress, then the proof or
    the work that found none (`solver` of a saved evaluation, python/play.py prove) */

@@ -309,11 +309,13 @@ async function turn(request) {
  * or search, gives a position it proves lost for the mover its proof and line, and marks the proven stones of each
  * search root exact before it searches (NeuralSearch.settle); a stone the graph does not take is applied to the
  * search's result (proof.mjs settled). */
-async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, line = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
+async function playTurn({id, history, model, simulations, solverNodes, batchSize = BATCH[device.provider], choice = 'policy', qRangeFloor = 0, ms = null, line = null, kind = null, known = null, replay = [], proofStamps = true, solverWorkers = 1, solverSlice = 8, solverTable = 4, proveMs = 0}) {
   await use(model, new Stages(postMessage, id));
   const start = performance.now(), check = () => { if (cancelled.has(id)) throw new Cancelled(); };
   check();
   const state = native.game(history), player = state.player;
+  // Played turns stream each placement root; analysis keeps evaluating its requested board.
+  const liveRows = (rows, ply) => rows && (kind === 'move' ? {...rows, ply} : rows);
   if (state.winner >= 0) throw new Error('The game has finished');
   const table = new Proofs(known || []), given = answered(native, history, table), frontier = new Map();
   if (given) return {...given, ms: Math.round(performance.now() - start)};
@@ -380,7 +382,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         const total = weights.reduce((a, b) => a + b, 0), policy = weights.map(w => w / total);
         const action = actions[policy.indexOf(Math.max(...policy))];
         postMessage({type: 'progress', id, fraction: 0, stage: {name: 'checking proof'},
-          live: rootRows(tree, choice) || {value: (prediction.q[0] + 1) / 2, top: topRows(actions, policy, null, action)}});
+          live: liveRows(rootRows(tree, choice) || {value: (prediction.q[0] + 1) / 2, top: topRows(actions, policy, null, action)}, history.length)});
       }
       let replayed = null;
       if (proofStamps && !timed) for (const winner of [player, 1 - player]) {
@@ -474,7 +476,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
               if (line != null) touched = tree.id;
               postMessage({type: 'progress', id, fraction: timed ? Math.min(1, (performance.now() - start) / ms)
                 : Math.min(1, (stone + stats.completed / simulations) / state.remaining),
-                ...(stone ? {} : {live: rootRows(owner.root, choice)})});
+                ...(stone && kind !== 'move' ? {} : {live: liveRows(rootRows(owner.root, choice), current.length)})});
             }});
           scheduler.push({...searchedResult.scheduler, inference: searchedResult.inference,
             ...(proofPool ? {proof: searchedResult.proof_scheduler} : {})});
