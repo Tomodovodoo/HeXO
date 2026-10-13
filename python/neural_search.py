@@ -57,6 +57,8 @@ bind('hxg_store', C.c_int, ptr, ptr)
 bind('hxg_root_version', C.c_int64, ptr)
 bind('hxg_q', C.c_int, ptr, ptr)
 bind('hxg_facts', C.c_int, ptr, ptr, C.c_int)
+if hasattr(native, 'hxg_eligible'):
+    bind('hxg_eligible', C.c_int, ptr, ptr)
 bind('hxg_prove_loss', C.c_int, ptr, C.c_int, C.c_int)
 bind('hxg_value', C.c_double, ptr)
 if hasattr(native, 'hxg_view'):
@@ -278,6 +280,12 @@ class NeuralSearch:
         logits = logits if native.hxg_logits(self.ptr, logits.ctypes.data) else None
         completed_q = np.empty(n)
         native.hxg_q(self.ptr, completed_q.ctypes.data)
+        eligible = None
+        if hasattr(native, 'hxg_eligible'):
+            eligible = np.empty(n, np.int32)
+            if native.hxg_eligible(self.ptr, eligible.ctypes.data) != n:
+                raise ValueError('Root eligibility does not match its actions')
+            eligible = eligible.astype(bool)
         selected = int(np.argmax(scores)) if n and np.isfinite(scores).any() else None
         winner = native.hxg_exact(self.ptr)
         proven = 0 if winner < 0 else 1 if winner == ((len(self.history)+1)//2)%2 else -1
@@ -291,7 +299,7 @@ class NeuralSearch:
                     completed=native.hxg_completed(self.ptr), evaluated=evaluated, cache_hits=hits,
                     node_value=native.hxg_value(self.ptr),
                     elapsed_ms=(finished-start)*1000,
-                    exact_winner=winner,
+                    exact_winner=winner, eligible=eligible,
                     proven=proven, proof_turns=0, solver_nodes=0, solver_budget=0,
                     proof_plies=native.hxg_distance(self.ptr) if proven else 0, proof_action=shortest,
                     proof_status=('UNKNOWN' if winner < 0 else

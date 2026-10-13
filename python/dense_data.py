@@ -45,6 +45,8 @@ starts from a buffer position: its first `restart.ply` moves are the source game
 has rows only from that ply on (null root values and full_search False before it); `restart` names the source
 {shard, game, ply, kind, regret, plies_to_proof}. The manifest counts them as `restart_games` and their
 replayed plies without rows as `forced_plies`.
+Optional `prior_moves` records early raw-prior draws as {ply, search_action, action, probability}. These are searched
+placements with unchanged search-policy supervision, not forced prefixes. Outcomes follow the moves actually played.
 A fork game (dense_selfplay.Forks) has origin 'fork' and `fork` {kind: 'early' or 'anywhere', ply, choices}: its
 first `fork.ply` moves are a finished game's, and the move at `fork.ply` is the best of `choices` random legal moves
 by the value head. Those `fork.ply`+1 placements have no rows and null root values; the game is otherwise ordinary.
