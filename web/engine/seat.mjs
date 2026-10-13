@@ -13,7 +13,7 @@
  * stage) while it loads, stages.mjs's stages), `engine.files()` lists the files it downloads (assets.mjs records, for the picker's download
  * button) and `engine.turn(history, budget, {signal, progress})` (progress(fraction, live, stage)) resolves to its turn {moves, ...} at a
  * preset's budget, plus `checkpoint` (one of `entry.checkpoints`, chosen in a select when there are several) when the
- * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset)` is the
+ * entry lists any, rejecting with an AbortError when `signal` aborts; `record(result, history, preset, budget)` is the
  * evaluation record the analysis panel shows for that turn. A seat or the analysis shows the stage of its job next to
  * its bar, and an engine's fallback notice (engine-worker.mjs `notices`) is a toast; a fallback to the CPU moves the
  * engine's choices to lightning. */
@@ -35,8 +35,8 @@ const BUBBLE = 'browser:bubble', bubbleLabel = 'Bubble (browser)';
 const bubble = {entry: {id: BUBBLE, kind: 'bubble', name: bubbleLabel, label: bubbleLabel, checkpoints: NETWORKS.map(n => n.name), presets: PRESETS, pace: turnTimes(PRESETS), preset: NEURAL_PRESET, analysis: true, clocks: true},
   engine: new BubbleEngine(),
   fresh: () => new BubbleEngine(),
-  record: (result, history, preset) => ({...result, simulations: bubble.entry.presets[preset].simulations,
-    solver_nodes: result.solved ? bubble.entry.presets[preset].solver_nodes : 0, engine: BUBBLE}),
+  record: (result, history, preset, budget) => ({...result, simulations: budget.simulations,
+    solver_nodes: result.solved ? budget.solver_nodes : 0, engine: BUBBLE}),
   build: 'python tools/build_web.py ort model'};
 const ENGINES = new Map([bubble, drip, shrimp, seal, six, strix].map(e => [e.entry.id, e]));
 const STORE = 'browser-engines';
@@ -242,7 +242,7 @@ async function run(key, task) {
       }
     } else {
       if (result.solver_error && notice !== result.solver_error) original.toast(`The solver could not run in this browser (${notice = result.solver_error}), so evaluations have no proofs`);
-      const evaluation = record(result, task.history, task.preset);
+      const evaluation = record(result, task.history, task.preset, budget);
       analyses.set(analysisKey(task, task.history), evaluation);
       const s = state();
       if (s && hk(s.history.slice(0, task.history.length)) === hk(task.history)) {

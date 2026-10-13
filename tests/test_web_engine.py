@@ -1002,9 +1002,16 @@ class Bundle(unittest.TestCase):
         answer = node(dict(kind='worker-turn', adapter=True, history=history, preset='solver'))
         self.assertEqual(answer['analysis']['preset'], 'solver')
         self.assertEqual(answer['analysis']['budget']['solver_ms'], 120000)
+        self.assertEqual(answer['simulations'], 128)
+        self.assertEqual(answer['solver_nodes'], 32768)
         self.assertEqual(answer['proof']['winner'], mover)
         self.assertLess(answer['solver']['elapsed_ms'], 120000)
         self.assertGreater(answer['solver']['root_nodes'] + answer['solver']['native_nodes'], 0)
+        custom = node(dict(kind='worker-turn', adapter=True, history=history, preset='custom', custom=dict(simulations=7)))
+        self.assertEqual(custom['analysis']['preset'], 'custom')
+        self.assertEqual(custom['simulations'], 7)
+        self.assertEqual(custom['solver_nodes'], 1024)
+        self.assertEqual(custom['proof']['winner'], mover)
 
     def test_native_proof_frontier_settles_during_inference_and_drains_both_producers(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
