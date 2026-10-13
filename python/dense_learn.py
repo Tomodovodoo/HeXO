@@ -32,6 +32,7 @@ VALIDATION_ROWS = 2048
 RECALIBRATION_ROWS = 4096
 QUANTUM = 4  # bucket rows are padded to a multiple of this; a padding row costs as much compute as a real one
 STATUS_SECONDS = 2.
+HEARTBEAT_RETRY_SECONDS = 30.  # Stay below the actors' 120-second stale-heartbeat cutoff.
 REFRESH_SECONDS = 30.
 ACTOR_WAIT_SECONDS = 120.
 SURVEY_PROCESSES = 8  # startup shard survey workers (dense_data.survey); they only parse shard files
@@ -389,11 +390,29 @@ class PhaseHeartbeat:
         self.path, self.status = path, {}
         self.lock, self.stopped = threading.Lock(), threading.Event()
         self.thread = None
+        self.error = None
+
+    def publish(self):
+        deadline = time.monotonic()+HEARTBEAT_RETRY_SECONDS
+        while True:
+            try:
+                write_json(self.path, self.status)
+                return
+            except PermissionError as error:
+                if os.name != 'nt' or getattr(error, 'winerror', None) not in (5, 32) \
+                        or self.status.get('stage') in ('idle', 'failed') or time.monotonic() >= deadline:
+                    raise
+                # Keep the previous atomic heartbeat while a Windows reader holds it.
+                # Persistent failures still stop the learner; the published timestamp
+                # remains the time of this status update, not a fabricated fresh phase.
+                time.sleep(.1)
 
     def write(self, **fields):
         with self.lock:
+            if self.error is not None and fields.get('stage') not in ('idle', 'failed'):
+                raise self.error
             self.status.update(fields, updated_at=time.time())
-            write_json(self.path, self.status)
+            self.publish()
             if self.thread is None and self.status.get('phase_request'):
                 self.thread = threading.Thread(target=self.renew, daemon=True)
                 self.thread.start()
@@ -403,7 +422,11 @@ class PhaseHeartbeat:
             with self.lock:
                 if self.status.get('phase_request') and self.status.get('stage') in ('waiting-for-actors', 'training', 'exporting'):
                     self.status['updated_at'] = time.time()
-                    write_json(self.path, self.status)
+                    try:
+                        self.publish()
+                    except BaseException as error:
+                        self.error = error
+                        return  # The next foreground status write must report renewal failure.
 
     def close(self):
         self.stopped.set()
