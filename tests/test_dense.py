@@ -8763,6 +8763,26 @@ class OpponentSchedulerTests(unittest.TestCase):
             historical = dense_selfplay.Historical(tmp, config, np.random.default_rng(0))
             historical.redraw('main/000003', 'c'*64)
             self.assertEqual(list(historical.models), ['main/000002'])
+            original = historical.models['main/000002']
+            historical.next()
+            plan, state = list(historical.plan), json.dumps(historical.rng.bit_generator.state)
+            historical.redraw('main/000003', 'c'*64)
+            self.assertIs(historical.models['main/000002'], original)
+            self.assertEqual(list(historical.plan), plan)
+            self.assertEqual(json.dumps(historical.rng.bit_generator.state), state)
+            league = json.loads((Path(tmp)/'league.json').read_text())
+            league['checkpoints'][1]['elo'] = 200.
+            (Path(tmp)/'league.json').write_text(json.dumps(league))
+            historical.redraw('main/000003', 'c'*64)
+            self.assertFalse(historical.plan)  # Changed PFSP weights redraw the pool.
+            self.assertIs(historical.models['main/000002'], original)
+            historical.redraw('main/000004', 'e'*64)
+            self.assertEqual(set(historical.models), {'main/000001','main/000002'})
+            league['checkpoints'][1]['ema_sha256'] = 'f'*64
+            (Path(tmp)/'league.json').write_text(json.dumps(league))
+            hexnet.save_model(Path(tmp)/'checkpoints/main/000002/ema.pt', hexnet.HexNet(TINY))
+            historical.redraw('main/000004', 'e'*64)
+            self.assertIsNot(historical.models['main/000002'], original)
 
     def test_mixed_games_mask_the_opponent_plies(self):
         torch.manual_seed(8)

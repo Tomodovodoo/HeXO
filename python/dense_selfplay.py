@@ -1204,7 +1204,8 @@ class Restarts:
 
 class Historical:
     """Frozen historical opponents of one actor worker. `redraw(champion, sha)` re-reads league.json, draws
-    `historical_pool` opponents (draw_pool over opponent_weights; rated checkpoints with an ema.pt whose league
+    `historical_pool` opponents when its current checkpoint, eligible digests or weights change (draw_pool over
+    opponent_weights; rated checkpoints with an ema.pt whose league
     ema_sha256 differs from the champion's `sha`) and loads their
     ema.pt, keeping models drawn again; `next()` returns (opponent Model, champion colour) for the next historical
     game: opponents come in blocks of about target/BLOCKS consecutive games, so few opponent models share the
@@ -1218,6 +1219,7 @@ class Historical:
         self.target = round(s.historical_fraction*min(s.games_in_flight, s.games_in_flight if games is None else games))
         self.block = max(1, math.ceil(self.target/BLOCKS))
         self.models, self.weights, self.plan, self.started = {}, {}, deque(), 0
+        self.pool_key, self.model_sha = None, {}
 
     def redraw(self, champion, sha):
         path = self.run/'league.json'
@@ -1225,10 +1227,18 @@ class Historical:
         same = {c['id'] for c in league.get('checkpoints', []) if c.get('ema_sha256') == sha}
         weights = {k: w for k, w in opponent_weights(league, champion, self.config.actor.historical_weighting).items()
                    if k not in same and (self.run/'checkpoints'/k/'ema.pt').exists()}
+        digests = {c['id']: c.get('ema_sha256') for c in league.get('checkpoints', [])}
+        key = champion, sha, self.config.actor.historical_pool, tuple(sorted((k,w,digests.get(k)) for k,w in weights.items()))
+        # Shard publication refreshes sources frequently. Keep its pool and colour/block plan while the inputs
+        # are unchanged, rather than loading new models and stranding old game producers at every shard.
+        if key == self.pool_key:
+            return
         pool = draw_pool(weights, self.config.actor.historical_pool, self.rng)
-        self.models = {k: self.models.get(k) or load(self.run, self.config, source=(k, self.run/'checkpoints'/k/'ema.pt'))
-                       for k in pool}
+        self.models = {k: (self.models.get(k) if self.model_sha.get(k)==digests.get(k) else None)
+                       or load(self.run, self.config, source=(k, self.run/'checkpoints'/k/'ema.pt')) for k in pool}
         self.weights = {k: weights[k] for k in pool}
+        self.model_sha = {k: digests.get(k) for k in pool}
+        self.pool_key = key
         self.plan.clear()
 
     def next(self):
