@@ -172,6 +172,10 @@ struct HistoryLink {std::shared_ptr<const HistoryLink> before;Cell cell;int ston
 };
 struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exact_winner=-1,distance=-1,n=0,stones=0,carried=0;bool expanded=false,pending=false,bound=false,dirty=false,indexed=false,dormant=false,raw_known=false;bool* archive_dirty=nullptr;double value=0,q=0,carried_sum=0,policy_mass=0,raw=0;uint64_t used=0,losses_seen=0;Cell first;Key position,context;std::shared_ptr<EdgeMemory> memory;std::shared_ptr<const HistoryLink> history;EdgeState empty;std::pmr::vector<Edge> edges;std::pmr::vector<int> tracked;std::vector<std::weak_ptr<Node>> parents;
  std::pmr::vector<int> active;std::pmr::vector<ColdBlock> cold;bool selective=false,cold_dirty=true;int cold_best=-1;double cold_mass=0;
+ // Canonical legal-action order is stable for this context. One bit per move
+ // records exclusions already applied to the carried average before eviction.
+ std::vector<uint64_t> carried_excluded;
+ bool carried_excludes(size_t i)const{return i/64<carried_excluded.size() && (carried_excluded[i/64]&(uint64_t(1)<<(i%64)));}
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->buffers),tracked(&memory->buffers),active(&memory->buffers),cold(&memory->buffers){empty.owner=this;}
  void archive_changed(){if(archive_dirty)*archive_dirty=true;}
@@ -232,7 +236,7 @@ void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
-struct Summary { int n=0,count=1;double q=0,value=0;Key position; };
+struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
 // Dormant nodes hold evidence, not scheduling rights. Each entry owns itself,
@@ -254,6 +258,7 @@ struct Archive {
   // Charge every history link conservatively even when prefixes are shared.
   return sizeof(Node)+2*sizeof(void*)+n.edges.capacity()*sizeof(Edge)+states*sizeof(EdgeState)
    +(n.active.capacity()+n.tracked.capacity())*sizeof(int)+n.cold.capacity()*sizeof(ColdBlock)
+   +n.carried_excluded.capacity()*sizeof(uint64_t)
    +n.parents.capacity()*sizeof(std::weak_ptr<Node>)+size_t(n.stones)*(sizeof(HistoryLink)+2*sizeof(void*));
  }
  size_t index_bytes()const{
@@ -488,7 +493,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;n->carried_excluded=std::move(o.excluded);evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -614,8 +619,18 @@ struct Tree {
    // Visit accounting also includes refuted moves. Preserve the denominator
    // of the filtered mean rather than reconstructing it from those credits.
    int count=1+node->carried;
-   for(int i:node->tracked_edges()){auto& e=node->edges[i];if(e.read().eligible)count+=e.read().visits;}
-   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position};
+   auto excluded=node->carried_excluded;
+   for(int i:node->tracked_edges()){auto& e=node->edges[i];if(e.read().eligible){
+    count+=e.read().visits;
+    // A forgotten proof may have allowed fresh visits on an old exclusion.
+    // Those samples enter this mean, so it no longer excludes that action.
+    if(e.read().visits && size_t(i/64)<excluded.size())excluded[i/64]&=~(uint64_t(1)<<(i%64));
+   }}
+   for(size_t i=0;i<node->edges.size();++i)if(!node->edges[i].read().eligible){
+    if(excluded.empty())excluded.resize((node->edges.size()+63)/64);
+    excluded[i/64]|=uint64_t(1)<<(i%64);
+   }
+   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position,std::move(excluded)};
   }
   node->dormant=false;++state->released;
  }
@@ -976,19 +991,20 @@ struct Tree {
   // Only expansion installs the complete legal action list. A pending/unexpanded leaf is never a universal proof.
   if(!node.expanded || node.edges.empty())return;
   const int none=std::numeric_limits<int>::max();
-  bool winning=false,safe=false,attained=false;int fastest=none,slowest=0,longest=0,quickest=none;
+  bool winning=false,safe=false,attained=false,new_refutation=false;int fastest=none,slowest=0,longest=0,quickest=none;
   auto lower=[&](const Edge& e,int turn){return e.read().bound?(tactics?node.remaining+turn:1):e.read().distance;};
   for(auto& edge:node.edges){
    if(edge.read().exact_winner==node.player){winning=true;fastest=std::min(fastest,edge.read().distance);quickest=std::min(quickest,lower(edge,3));}
    else if(edge.read().exact_winner<0)safe=true;
-   else {slowest=std::max(slowest,edge.read().distance);longest=std::max(longest,lower(edge,5));}
+   else {slowest=std::max(slowest,edge.read().distance);longest=std::max(longest,lower(edge,5));
+    new_refutation|=!node.carried_excludes(size_t(&edge-node.edges.data()));}
   }
   for(auto& edge:node.edges)attained|=edge.read().exact_winner==node.player && !edge.read().bound && edge.read().distance==fastest;
   for(auto& edge:node.edges)edge.eligibility(winning?edge.read().exact_winner==node.player && edge.read().distance==fastest
    :!safe?edge.read().distance>=longest:edge.read().exact_winner<0);
-  // Evicted summaries have no per-action attribution. Once a move is refuted,
-  // their old average cannot be restricted to the surviving replies.
-  if(!winning && safe && slowest>0){node.carried=0;node.carried_sum=0;}
+  // Rediscovering an old exclusion leaves the filtered summary valid. A newly
+  // refuted move cannot be separated from its unattributed carried average.
+  if(!winning && safe && new_refutation){node.carried=0;node.carried_sum=0;node.carried_excluded.clear();}
   if(winning){node.exact_winner=node.player;node.distance=fastest;node.bound=!attained || quickest<fastest;}
   else if(!safe){node.exact_winner=1-node.player;node.distance=slowest;node.bound=slowest>longest;}
  }
@@ -1364,7 +1380,7 @@ HX_API int hxg_store(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p
 HX_API int hxg_storage(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);if(!t.shared)return 0;
  std::array<int64_t,8> counts{};
  for(auto& [key,n]:t.store){counts[0]+=int64_t(n->edges.size());counts[2]+=int64_t(n->edges.capacity()*sizeof(gumbel::Edge));
-  counts[5]+=int64_t((n->tracked.capacity()+n->active.capacity())*sizeof(int)+n->cold.capacity()*sizeof(gumbel::ColdBlock));for(auto& edge:n->edges)counts[1]+=!edge.read().empty;}
+  counts[5]+=int64_t((n->tracked.capacity()+n->active.capacity())*sizeof(int)+n->cold.capacity()*sizeof(gumbel::ColdBlock)+n->carried_excluded.capacity()*sizeof(uint64_t));for(auto& edge:n->edges)counts[1]+=!edge.read().empty;}
  counts[3]=counts[1]*sizeof(gumbel::EdgeState);counts[4]=int64_t(t.store.size());counts[6]=sizeof(gumbel::Edge);counts[7]=sizeof(gumbel::EdgeState);
  std::copy(counts.begin(),counts.end(),out);return 1;
 }
