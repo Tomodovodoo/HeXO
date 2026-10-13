@@ -7865,17 +7865,26 @@ class PhaseTests(unittest.TestCase):
             heartbeat.close()
 
     def test_learner_heartbeat_renewal_failure_reaches_foreground(self):
-        heartbeat = dense_learn.PhaseHeartbeat(Path('unused-status.json'))
-        heartbeat.status = dict(stage='exporting', phase_request='token')
-        heartbeat.stopped = unittest.mock.Mock()
-        heartbeat.stopped.wait.return_value = False
-        error = OSError('renewal failed')
-        with unittest.mock.patch.object(dense_learn, 'write_json', side_effect=error):
-            heartbeat.renew()
-        self.assertIs(heartbeat.error, error)
-        with self.assertRaises(OSError) as raised:
-            heartbeat.write(stage='phase-idle')
-        self.assertIs(raised.exception, error)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'status.json'
+            heartbeat = dense_learn.PhaseHeartbeat(path)
+            heartbeat.status = dict(stage='exporting', phase_request='token')
+            error = OSError('renewal failed')
+            with unittest.mock.patch.object(heartbeat.stopped, 'wait', return_value=False), \
+                 unittest.mock.patch.object(dense_learn, 'write_json', side_effect=error):
+                heartbeat.renew()
+            self.assertIs(heartbeat.error, error)
+            with self.assertRaises(OSError) as raised:
+                heartbeat.write(stage='phase-idle')
+            self.assertIs(raised.exception, error)
+            # The foreground exception handler can publish a terminal failure
+            # after the lock clears, releasing actors without a stale timeout.
+            heartbeat.write(stage='failed', phase_request=None, error=repr(error))
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['stage'], 'failed')
+            self.assertIsNone(saved['phase_request'])
+            self.assertEqual(saved['error'], repr(error))
+            heartbeat.close()
 
     def test_training_waits_for_all_acks_and_keeps_export_heartbeat_fresh(self):
         torch.set_num_threads(2)
