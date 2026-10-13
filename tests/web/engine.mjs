@@ -584,7 +584,7 @@ if (job.kind === 'encode') {
     await context.onmessage({data: {type: 'turn', id: 1, history: job.history, line: 'game', simulations: job.simulations, solverNodes: 0}});
     const mine = messages.filter(m => m.id === 1), times = [started, ...mine.map(m => m.at)];
     answer = {replies: mine.filter(m => m.type !== 'progress').map(m => m.type), ms: mine.at(-1).at - started,
-      gap: Math.max(...times.slice(1).map((t, i) => t - times[i])), live: mine.filter(m => m.live).map(m => m.live)};
+      gap: Math.max(...times.slice(1).map((t, i) => t - times[i])), live: mine.filter(m => m.live).map(m => ({...m.live, fraction: m.fraction}))};
   } else for (let id = 1; id <= (glimpsing ? 2 : 1); id++) {
     await context.onmessage({data: {type: 'turn', id, history: job.history, line: glimpsing ? 'live' : null,
       simulations: job.simulations, solverNodes: job.nodes, solverSlice: job.solverSlice ?? 8, ms: job.ms ?? null, proveMs: job.proveMs ?? 0,

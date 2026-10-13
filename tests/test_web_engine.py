@@ -1130,9 +1130,11 @@ class Bundle(unittest.TestCase):
         self.assertEqual(answer['replies'], ['cancelled'])
         self.assertLess(answer['ms'], 3000 + 1000)
         self.assertLess(answer['gap'], 1500)
-        values = [live['value'] for live in answer['live']]
-        self.assertGreater(len(values), 10)
-        self.assertGreater(len(set(values)), len(values) // 4)
+        # A zero value head can stay neutral after proven blunders are pruned.
+        # Completed search work, rather than changing confidence, must advance.
+        fractions = [live['fraction'] for live in answer['live']]
+        self.assertGreater(len(fractions), 10)
+        self.assertGreater(len(set(fractions)), len(fractions) // 4)
 
     def test_a_timed_search_on_a_peaked_network_answers_within_its_clock(self):
         result = node(dict(kind='worker-turn', history=NINE_STONES, simulations=65536, nodes=0, peaked=True, ms=1000))

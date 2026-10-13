@@ -232,7 +232,7 @@ void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
-struct Summary { int n=0;double q=0,value=0;Key position; };
+struct Summary { int n=0,count=1;double q=0,value=0;Key position; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
 // Dormant nodes hold evidence, not scheduling rights. Each entry owns itself,
@@ -488,7 +488,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.n-1;n->carried_sum=o.q*o.n-o.value;evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -610,7 +610,13 @@ struct Tree {
    e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->q:-node->q)*e.read().visits;
    e.write().child.reset();
   }}
-  if(node->n)evicted_stats[node->context]={node->n,node->q,node->value,node->position};
+  if(node->n){
+   // Visit accounting also includes refuted moves. Preserve the denominator
+   // of the filtered mean rather than reconstructing it from those credits.
+   int count=1+node->carried;
+   for(int i:node->tracked_edges()){auto& e=node->edges[i];if(e.read().eligible)count+=e.read().visits;}
+   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position};
+  }
   node->dormant=false;++state->released;
  }
  void trim_archive(bool need_slot=false,bool refresh=true){
