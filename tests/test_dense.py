@@ -6527,7 +6527,8 @@ class EngineTests(unittest.TestCase):
         settings = dense_config.ActorSettings(full_fraction=1., full_sims=2, root_samples=2,
                                              opening_random_plies=5., tactics=False, max_plies=5)
         history = [[0, 0], [7, 0], [8, 0]]
-        source = dict(suite='book', key='test', digest='x', ply=3, off_policy=True)
+        source = dict(suite='training-starts', key='test', digest='x', ply=3, off_policy=True,
+                      training_start=dict(source=dict(report_sha256='frozen', game=1), pool_sha256='pool'))
         slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, book=(source, history))
         engine = dense_selfplay.Engine(8)
         try:
@@ -6543,6 +6544,8 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(v is not None for v in episode['root_values'][3:]))
         self.assertEqual([r['ply'] for r in rows], [3, 4])
         self.assertTrue(all(r['surprise'] >= 0 for r in rows))
+        self.assertNotIn('tactical', episode['book'])
+        self.assertTrue(all('tactical' not in r for r in rows))
         with tempfile.TemporaryDirectory() as run:
             manifest = dense_data.write_shard(Path(run)/'shards'/'000001', dict(actor_sha256='test'),
                                              [episode], [dict(r, game=0) for r in rows])
@@ -6550,6 +6553,8 @@ class EngineTests(unittest.TestCase):
                               manifest['counts']['forced_plies']), (1, 0, 3))
         with self.assertRaises(ValueError):
             dense_config.ActorSettings(book_fraction=.95, restart_fraction=.1)
+        with self.assertRaises(ValueError):
+            dense_config.ActorSettings(training_start_pool='starts.json')
 
     def test_policy_surprise_is_the_kl_from_the_prior_to_the_search_policy(self):
         logits = np.array([2., 0., -1., -30.])
@@ -6567,6 +6572,32 @@ class EngineTests(unittest.TestCase):
         finally:
             tree.close()
         self.assertEqual((result['exact_winner'], result['prior_logits']), (1, None))
+
+    def test_hybrid_book_start_keeps_independent_prefix_out_of_training_rows(self):
+        from hybrid_selfplay import ActorEngine
+        torch.set_num_threads(2)
+        model = dense_selfplay.Model(hexnet.HexNet(TINY), 'tiny', 'test', 'cpu', 8, 64)
+        settings = dense_config.ActorSettings(full_fraction=1., full_sims=4, root_samples=2,
+            tactics=False, max_plies=5, hybrid_proof_workers=0, hybrid_quantum=4)
+        history = [[0, 0], [7, 0], [8, 0]]
+        source = dict(suite='training-starts', key='test', digest='x', ply=3, off_policy=True,
+                      training_start=dict(source=dict(game=1, prefix_ply=3), pool_sha256='pool'))
+        slot = dense_selfplay.SelfPlayGame([model]*2, settings, 1, book=(source, history), hybrid=True)
+        engine = ActorEngine(settings)
+        try:
+            engine.add(slot)
+            end = time.monotonic()+PATIENCE
+            while engine.slots and time.monotonic() < end:
+                engine.step()
+            self.assertFalse(engine.slots)
+            episode, rows = slot.episode()
+        finally:
+            engine.close()
+        self.assertEqual((episode['origin'], episode['book'], episode['moves'][:3]), ('book', source, history))
+        self.assertEqual(episode['root_values'][:3], [None]*3)
+        self.assertEqual([r['ply'] for r in rows], [3, 4])
+        self.assertNotIn('tactical', episode['book'])
+        self.assertTrue(all(not r.get('proven') for r in rows))
 
     def test_fork_plays_the_value_heads_best_random_move_for_the_forking_side(self):
         moves = [[0, 0], [7, 0], [8, 0], [1, 0], [2, 0], [7, 1]]
@@ -7537,12 +7568,16 @@ class YieldTests(unittest.TestCase):
     def test_actor_flags_round_trip_through_the_worker_parser(self):
         parser = argparse.ArgumentParser()
         dense_config.add_arguments(parser, dense_config.ActorSettings)
-        args = parser.parse_args(['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
+        args = parser.parse_args(['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8',
+                                 '--book-fraction', '0.25', '--training-start-pool', 'starts with spaces.json'])
         flags = dense_selfplay.actor_flags(args)
-        self.assertEqual(flags, ['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics', '--yield-below', '0.8'])
+        self.assertEqual(flags, ['--games-in-flight', '256', '--leaf-batch', '512', '--no-tactics',
+                                '--yield-below', '0.8', '--book-fraction', '0.25',
+                                '--training-start-pool', 'starts with spaces.json'])
         settings = dense_config.override(dense_config.ActorSettings(), parser.parse_args(flags))
         self.assertEqual((settings.games_in_flight, settings.tactics, settings.yield_below, settings.leaf_batch),
                          (256, False, .8, 512))
+        self.assertEqual((settings.book_fraction, settings.training_start_pool), (.25, 'starts with spaces.json'))
 
     def test_actor_cli_accepts_games_and_batch_flags(self):
         argv = ['dense_selfplay.py', '--run', 'unused', '--games', '100', '--games-in-flight', '256', '--leaf-batch', '512']

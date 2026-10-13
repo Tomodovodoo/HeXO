@@ -413,8 +413,11 @@ class OpeningBookPages(unittest.TestCase):
         episodes = [episode(image, plies, winner) for plies, winner in [(11, 0), (21, 1), (31, 1), (41, -1)]]
         episodes += [episode(empty['moves'], 9, 0), episode(image, 100, 0, 'selfplay'),
                      episode(image, 200, 0, 'restart'), dict(episode(image, 150, 0), opponent='older-model')]
+        independent = episode(image, 250, 0)
+        independent['book'].update(suite='training-starts', training_start=dict(source={}, pool_sha256='pool'))
+        episodes.append(independent)  # shares book ancestors but was never drawn from that book
         folder = self.run/'shards/001'
-        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=6)))
+        self.write(folder/'manifest.json', dict(origin='actor', counts=dict(book_games=7)))
         self.write(folder/'episodes.json', episodes)
         converted = self.run/'shards/002'
         self.write(converted/'manifest.json', dict(identity=dict(source='converted corpus')))
@@ -436,7 +439,7 @@ class OpeningBookPages(unittest.TestCase):
             self.assertNotEqual(path.name, 'episodes.json')
             return read(path, *args, **kwargs)
         with patch.object(Path, 'read_text', cached_read):
-            self.assertEqual(dashboard.game_lengths(self.run, 0)['games'], 8)
+            self.assertEqual(dashboard.game_lengths(self.run, 0)['games'], 9)
             self.assertEqual(self.get(key=empty['key'])['rows'][0]['games'], 1)
         self.write(folder.with_name('003')/'manifest.json', dict(origin='actor', counts=dict(book_games=1)))
         self.write(folder.with_name('003')/'episodes.json', [episode(empty['moves'], 13, 1)])

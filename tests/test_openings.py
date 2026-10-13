@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter
 import contextlib
+import hashlib
 from dataclasses import asdict, replace
 import io
 import itertools
@@ -236,6 +237,81 @@ class FilterTests(unittest.TestCase):
 class RefreshTests(unittest.TestCase):
     def book(self, run, **values):
         return dense_openings.Book(run, settings(**values))
+
+    def test_actor_only_starts_preserve_evaluation_book_and_default_draws(self):
+        with tempfile.TemporaryDirectory() as run:
+            book = self.book(run)
+            normal = opening(book, [(0, 0), (7, 0), (8, 0)])
+            normal['off_policy'] = True
+            book.save()
+            original = book.path.read_bytes()
+            default = dense_selfplay.BookStarts(run, 10)
+            expected_digest = hashlib.sha256(json.dumps([(normal['key'], None)], sort_keys=True).encode()).hexdigest()
+            self.assertEqual(default.digest, expected_digest)
+            source_moves = [[0, 0], [1, 0], [0, 1], [2, 0], [2, 1]]
+            key = dense_openings.canonical(source_moves)[0]
+            start = dict(key=key, moves=source_moves, source=dict(report_sha256='frozen', game=1, ply=5))
+            path = Path(run)/'training-starts.json'
+            path.write_text(json.dumps(dict(schema='hexo-training-starts-v1', starts=[start, start,
+                                             dict(key=normal['key'], moves=normal['moves'], source={})])))
+            starts = dense_selfplay.BookStarts(run, 10, path)
+            self.assertEqual({n['key'] for n in starts.nodes}, {normal['key'], key})
+            self.assertEqual(len(starts.nodes), 2)  # duplicates cannot increase the draw weight
+            rng = np.random.default_rng(2)
+            draws = Counter()
+            for _ in range(200):
+                metadata, moves = starts.draw(rng)
+                draws[metadata['key']] += 1
+                self.assertEqual(dense_openings.canonical(moves)[0], metadata['key'])
+                self.assertNotIn('tactical', metadata)
+                if metadata['key'] == key:
+                    self.assertEqual(metadata['suite'], 'training-starts')
+                    self.assertEqual(metadata['training_start'], dict(source=start['source'],
+                                      pool_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+                else:
+                    self.assertEqual(metadata['suite'], 'book')
+                    self.assertNotIn('training_start', metadata)
+            self.assertGreater(min(draws.values()), 70)
+            self.assertEqual(book.path.read_bytes(), original)
+            self.assertEqual([n['key'] for n in self.book(run).openings()], [normal['key']])
+            a, b = np.random.default_rng(9), np.random.default_rng(9)
+            unchanged = dense_selfplay.BookStarts(run, 10)
+            self.assertEqual([default.draw(a) for _ in range(12)], [unchanged.draw(b) for _ in range(12)])
+            capped = dense_selfplay.BookStarts(run, 5, path)
+            self.assertEqual([n['key'] for n in capped.nodes], [normal['key']])
+
+    def test_actor_only_starts_validate_once_and_reload_changed_provenance(self):
+        with tempfile.TemporaryDirectory() as run:
+            path = Path(run)/'training-starts.json'
+            moves = [[0, 0], [7, 0], [8, 0]]
+            start = dict(key=dense_openings.canonical(moves)[0], moves=moves, source=dict(game=1))
+            data = dict(schema='hexo-training-starts-v1', starts=[start])
+            path.write_text(json.dumps(data))
+            starts = dense_selfplay.BookStarts(run, 10, path)
+            digest = starts.digest
+            with unittest.mock.patch.object(dense_selfplay, 'Game', wraps=dense_selfplay.Game) as replay:
+                starts.load()
+                self.assertEqual(replay.call_count, 0)
+                start['source']['game'] = 2
+                path.write_text(json.dumps(data))
+                starts.load()
+                self.assertEqual(replay.call_count, 1)
+            self.assertNotEqual(starts.digest, digest)
+            self.assertEqual(starts.draw(np.random.default_rng(0))[0]['training_start']['source'], dict(game=2))
+
+    def test_actor_only_starts_reject_illegal_terminal_and_labelled_prefixes(self):
+        winning = [[0, 0], [0, 1], [0, 2], [5, 5], [5, 6], [0, 3], [0, 4], [6, 5], [6, 6], [0, 5], [0, 6]]
+        base = dict(key=dense_openings.canonical([[0, 0]])[0], moves=[[0, 0]], source={})
+        invalid = [dict(base, moves=[]), dict(base, moves=[[0, 0], [0, 0]]),
+                   dict(base, moves=[[0.0, 0]]), dict(base, key='wrong'), dict(base, winner=0),
+                   dict(base, moves=winning, key=dense_openings.canonical(winning)[0])]
+        with tempfile.TemporaryDirectory() as run:
+            path = Path(run)/'training-starts.json'
+            for start in invalid:
+                with self.subTest(start=start):
+                    path.write_text(json.dumps(dict(schema='hexo-training-starts-v1', starts=[start])))
+                    with self.assertRaises(ValueError):
+                        dense_selfplay.BookStarts(run, 384, path)
 
     def test_tactical_import_keeps_training_starts_out_of_evaluation_and_retirement(self):
         source = json.loads((dense_openings.FROZEN/'tactical'/'known-loss-v1.json').read_text())

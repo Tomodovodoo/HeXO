@@ -1110,22 +1110,59 @@ class Forks:
 
 
 class BookStarts:
-    """Read-only snapshot of off-policy and tactical starts, reloaded at shard/phase boundaries.
+    """Read-only snapshot of off-policy, tactical and optional actor-only starts, reloaded at shard/phase boundaries.
 
     Draw classes uniformly, then orientations uniformly. An empty eligible pool yields an ordinary game.
     Metadata identifies the book state; the forced prefix has no training rows or invented root values.
     """
 
-    def __init__(self, run, max_plies):
-        self.run, self.max_plies = run, max_plies
+    def __init__(self, run, max_plies, pool=None):
+        self.run, self.max_plies, self.pool = run, max_plies, Path(pool) if pool else None
+        self.pool_nodes, self.pool_digest = [], None
         self.load()
+
+    def load_pool(self):
+        """Validate changed position data once, without model evaluation or importing outcome targets."""
+        from dense_openings import canonical
+        raw = self.pool.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest == self.pool_digest:
+            return
+        data = json.loads(raw)
+        if data['schema'] != 'hexo-training-starts-v1':
+            raise ValueError(f'{self.pool} is not a hexo-training-starts-v1 pool')
+        nodes = {}
+        for start in data['starts']:
+            if set(start) != {'key', 'moves', 'source'} or not isinstance(start['source'], dict):
+                raise ValueError('Training starts require only key, moves and source, without outcome targets')
+            moves = start['moves']
+            if not moves:
+                raise ValueError('Training starts require a nonempty legal prefix')
+            game = Game()
+            try:
+                for move in moves:
+                    game.play(*move)
+                if game.winner >= 0:
+                    raise ValueError('Training starts must be nonterminal')
+            finally:
+                game.close()
+            if canonical(moves)[0] != start['key']:
+                raise ValueError('Training start key does not match its canonical position')
+            nodes.setdefault(start['key'], dict(key=start['key'], moves=moves, depth=len(moves), status='training',
+                                                training_start=dict(source=start['source'], pool_sha256=digest)))
+        self.pool_nodes, self.pool_digest = list(nodes.values()), digest
 
     def load(self):
         from dense_openings import Book, LIVE
         book = Book(self.run, suite=LIVE)
         self.nodes = [n for n in book.training_openings() if n['depth'] < self.max_plies]
-        self.digest = hashlib.sha256(json.dumps([(n['key'], n.get('tactical')) for n in self.nodes],
-                                              sort_keys=True).encode()).hexdigest()
+        state = [(n['key'], n.get('tactical')) for n in self.nodes]
+        if self.pool:
+            self.load_pool()
+            keys = {n['key'] for n in self.nodes}
+            self.nodes += [n for n in self.pool_nodes if n['depth'] < self.max_plies and n['key'] not in keys]
+            state = dict(book=state, training_start_pool=self.pool_digest)
+        self.digest = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
 
     def draw(self, rng):
         if not self.nodes:
@@ -1135,6 +1172,9 @@ class BookStarts:
         metadata = dict(suite='book', key=node['key'], digest=self.digest, ply=len(moves), off_policy=True)
         if node['status'] == 'tactical':
             metadata['tactical'] = {k: node['tactical'][k] for k in ('winner', 'source')}
+        if 'training_start' in node:
+            metadata['suite'] = 'training-starts'
+            metadata['training_start'] = node['training_start']
         return metadata, moves.tolist()
 
 
@@ -1371,7 +1411,7 @@ def worker(args):
         historical.redraw(model.checkpoint, model.sha)
     restarts = Restarts(run, settings.restart_temperature, settings.max_plies) if settings.restart_fraction > 0 else None
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
-    book_starts = BookStarts(run, settings.max_plies) if settings.book_fraction > 0 else None
+    book_starts = BookStarts(run, settings.max_plies, settings.training_start_pool) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
     forks = Forks(settings, config.learner.validation_fraction, np.random.default_rng(seeds.spawn(1)[0])) \
         if settings.fork_early_fraction or settings.fork_anywhere_fraction else None
