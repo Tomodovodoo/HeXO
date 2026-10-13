@@ -138,6 +138,7 @@ class ActorSettings:
     restart_fraction: float = 0.
     restart_temperature: float = 1.
     book_fraction: float = 0.  # share of all games starting from live off-policy book positions
+    training_start_pool: str = ''  # optional actor-only JSON starts, drawn with the existing book_fraction
     # Game forks (dense_selfplay.Forks, KataGo's early and anywhere forks): a finished game forks with probability
     # fork_early_fraction at placement floor(Exp(mean fork_early_plies)), else with probability fork_anywhere_fraction
     # (a second draw) at a uniform placement of the game, into the best of fork_min_choices to fork_early_choices or
@@ -208,6 +209,8 @@ class ActorSettings:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
         if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
             raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
+        if self.training_start_pool and not self.book_fraction > 0:
+            raise ValueError('training_start_pool requires book_fraction > 0')
         if (not 0 <= self.fork_early_fraction <= 1 or not 0 <= self.fork_anywhere_fraction <= 1
                 or not self.fork_early_plies > 0
                 or not 1 <= self.fork_min_choices <= min(self.fork_early_choices, self.fork_anywhere_choices)):
