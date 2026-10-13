@@ -834,13 +834,20 @@ struct Tree {
  // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
  // The rescale divides by max(1e-8, range_floor, hi - lo), so a spread below range_floor is not stretched to the full scale.
  // Entries of ineligible edges are returned on the same scale but every caller discards them.
- std::vector<double>& transformed(Node& node) {
+ std::vector<double>& transformed(Node& node,double comparison_max=-1) {
   int maximum=0;auto& q=completed_q(node,maximum);double lo=1e300,hi=-1e300;
   for(size_t i=0;i<q.size();++i)if(node.edges[i].read().eligible){lo=std::min(lo,q[i]);hi=std::max(hi,q[i]);}
   if(lo>hi)lo=hi=0;
   double range=std::max(std::max(1e-8,range_floor),hi-lo);
-  for(auto& x:q)x=(x-lo)/range*(50+maximum)*0.1;
+  double maximum_count=comparison_max<0?maximum:comparison_max;
+  for(auto& x:q)x=(x-lo)/range*(50+maximum_count)*0.1;
   return q;
+ }
+ std::vector<double> policy(Node& node,double comparison_max=-1){
+  if(shared)current(node);auto weights=transformed(node,comparison_max);double maximum=-1e300,total=0;
+  for(size_t i=0;i<weights.size();++i){weights[i]=node.edges[i].read().eligible?weights[i]+node.edges[i].logit+bonus(node.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,weights[i]);}
+  for(auto& w:weights){w=std::exp(w-maximum);total+=w;}
+  for(auto& w:weights)w/=total;return weights;
  }
  // Selection needs individual Qs only for materialized edges. Every cold edge
  // has the same mixed Q; root exports still construct the full legal vector.
@@ -1478,7 +1485,8 @@ HX_API int hxg_stats(void* p,int64_t* actions,int* visits,double* values,double*
  scores[i]=e.read().eligible && (n.exact_winner>=0 || finalist)?local.gumbel+e.logit+q[i]+t.bonus(e):-std::numeric_limits<double>::infinity();
  }}t.trim_archive(false,false);return int(n.edges.size());
 }
-HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);auto q=t.transformed(n);double maximum=-1e300,total=0;for(int i=0;i<int(q.size());++i){q[i]=n.edges[i].read().eligible?q[i]+n.edges[i].logit+t.bonus(n.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,q[i]);}for(auto& v:q){v=std::exp(v-maximum);total+=v;}if(out)for(int i=0;i<int(q.size());++i)out[i]=q[i]/total;t.trim_archive(false,false);return int(q.size());}
+HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;auto weights=t.policy(n);if(out)std::copy(weights.begin(),weights.end(),out);t.trim_archive(false,false);return int(weights.size());}
+HX_API int hxg_policy_credits(void* p,const uint64_t* credits,int count,double* out){try{auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(count!=int(n.edges.size()) || (count && !credits))throw std::runtime_error("Policy credits do not match root actions");if(!n.expanded)return 0;if(t.shared)t.current(n);uint64_t maximum=0;for(int i=0;i<count;++i)if(n.edges[i].read().eligible)maximum=std::max(maximum,credits[i]);auto weights=t.policy(n,double(maximum));if(out)std::copy(weights.begin(),weights.end(),out);t.trim_archive(false,false);return count;}catch(const std::exception& e){gumbel::error=e.what();return -1;}}
 // The root edges' network logits, shifted so the largest is 0, in edge order: the prior the search started from.
 // 0 when no network evaluation expanded the root (an immediate win or a proof installs zero logits).
 HX_API int hxg_logits(void* p,double* out){auto& n=*static_cast<gumbel::Tree*>(p)->root;if(!n.expanded || !n.raw_known)return 0;if(out)for(size_t i=0;i<n.edges.size();++i)out[i]=n.edges[i].logit;return int(n.edges.size());}

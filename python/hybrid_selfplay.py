@@ -235,6 +235,8 @@ class HybridGames:
                     producer = len(self.pools)
                     self.pools.append(pool)
                     for owner,(slot,_) in enumerate(assigned):
+                        pool.proof_mode(owner,not games[slot].solver_free)
+                    for owner,(slot,_) in enumerate(assigned):
                         self.mapping[slot,model] = producer,owner
                         self.lookup[producer,owner] = slot,model
                         self.epochs[producer,owner] = 0
@@ -412,7 +414,7 @@ class HybridGames:
                 self.lookup[key] = index,model
                 self.warming[index].add(key)
                 self.service.replace(*key,game.trees[model],expected=self.epochs[key],
-                                     samples=game.samples,views=self.views,seed=game.seed+k)
+                                     samples=game.samples,views=self.views,seed=game.seed+k,proofs=not game.solver_free)
 
     def next_root(self, index):
         game = self.games[index]
@@ -453,7 +455,7 @@ class HybridGames:
         for k,model in enumerate(game.trees):
             producer,owner = self.mapping[index,model]
             self.service.replace(producer,owner,game.trees[model],expected=self.epochs[producer,owner],
-                                 samples=game.samples,views=self.views,seed=game.seed+k)
+                                 samples=game.samples,views=self.views,seed=game.seed+k,proofs=not game.solver_free)
 
     def pause(self, **options):
         self.service.pause(**options)
@@ -524,6 +526,8 @@ class HybridGames:
                 if self.progress:
                     self.progress(index,event)
                 continue
+            if event.get('proof_enabled',True)==game.solver_free:
+                raise ValueError('Native root proof mode does not match its game cohort')
             edges = np.asarray(event.pop('edges'),np.float64)
             player,winner = game.game.player,event['exact_winner']
             proven = 0 if winner<0 else 1 if winner==player else -1
@@ -534,6 +538,7 @@ class HybridGames:
                           solver_nodes=0,solver_budget=0,
                           proof_action=edges[edges[:,8].astype(bool),:2].astype(np.int64).tolist() if proven>0 else [])
             result['search'] = dict(source='native-root',model=model.sha,context=event['context'],
+                                    requested_sims=game.budget,solver_free=game.solver_free,
                                     token=event['token'],comparison_credits=int(edges[:,7].sum()),
                                     direct_max=int(edges[:,7].max()),shared_visits=int(edges[:,6].sum()),
                                     root_completed=event['root_completed'],completed=event['completed'],

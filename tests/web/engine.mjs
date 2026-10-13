@@ -191,6 +191,14 @@ if (job.kind === 'encode') {
     }
     if (job.prove && !lateProof && forwardCalls >= (job.proveAfter ?? 1)) {graph.proveLoss(1-native.game(job.history).player, 7);lateProof = true;}
     const policy = new Float32Array(count * (Array.isArray(size) ? size[0]*size[1] : size*size)), far = new Float32Array(count), value = new Float32Array(count);
+    if (job.biasedValues) {
+      const cells = policy.length / count, stride = input.length / count;
+      for (let row = 0; row < count; row++) {
+        let signal = 0;
+        for (let cell = 0; cell < 2*cells; cell++) signal += input[row*stride+cell]*(cell+1);
+        value[row] = .1*Math.sin(signal*.01);
+      }
+    }
     if (job.nonfinite) policy[0] = NaN;
     forwardsFinished++;
     return {policy, far, value};
@@ -203,6 +211,10 @@ if (job.kind === 'encode') {
     answer = {result, stats: owner.stats(), sent, snapshots, rejected, lateProof, blockedClose, readyBeforeResult, forwardsFinished, forwardCalls};
     owner.close();
     graph.at(job.history);
+    if (job.biasedValues) {
+      answer.focusPolicy = graph.result('policy', result.root_credits).policy;
+      answer.sharedPolicy = graph.result('policy').policy;
+    }
     answer.graph = graph.counters();
     answer.remainingViews = graph.counters().views;
   } finally { owner.close(); graph.close(); }

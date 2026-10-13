@@ -81,7 +81,7 @@ struct RootEvent {
   void timing(const char* name,double ms){text.pop_back();text+=",\""+std::string(name)+"\":"+std::to_string(ms)+'}';}
 };
 struct Command {int game,samples,views;uint64_t token,work;double ms,noise,concentration,temperature;std::vector<int64_t> cells;
- int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false;double range=0;uint64_t seed=0;Clock::time_point queued{};};
+ int kind=0;std::shared_ptr<gumbel::GameStore> replacement;bool tactics=false,proof_enabled=true;double range=0;uint64_t seed=0;Clock::time_point queued{};};
 struct Producer:std::enable_shared_from_this<Producer> {
  Broker& broker;owner::Pool& pool;int model,index,worker_request=0;
  std::atomic<bool> retiring=false;
@@ -337,7 +337,7 @@ struct Broker {
    for(auto& p:producers)if(p)p->thread=std::thread([source=p]{source->run();});
   }catch(...){lock.unlock();cancel();for(auto& p:producers)if(p && p->thread.joinable())p->thread.join();throw;}
  }
- void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0){
+ void retarget(int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,gumbel::Tree* source=nullptr,const char* version=nullptr,uint64_t seed=0,bool proof_enabled=true){
   auto queued=Clock::now();
   if(!continuous || !started || cancelled || producer<0 || producer>=int(producers.size()) || count<0 || (count && !cells) ||
      (!work && !(ms>0) && !source) || !std::isfinite(ms) || ms<0 || samples<1 || samples>1024 || views<1 || views>64 || !std::isfinite(noise) || noise<0 || noise>1 || !std::isfinite(concentration) || concentration<0 || !std::isfinite(temperature) || !(temperature>0))
@@ -356,7 +356,7 @@ struct Broker {
       std::any_of(source->state->pins.begin(),source->state->pins.end(),[&](const auto& pin){return pin.first!=source;}))
     throw std::runtime_error("Replacement requires a fresh graph of the slot's frozen model");
    for(int i=0;i<count;++i)if(source->board.history[i].c!=Cell{cells[2*i],cells[2*i+1]})throw std::runtime_error("Replacement history mismatch");
-   command.kind=2;command.replacement=source->state;command.tactics=source->tactics;command.range=source->range_floor;command.seed=seed;
+   command.kind=2;command.replacement=source->state;command.tactics=source->tactics;command.range=source->range_floor;command.seed=seed;command.proof_enabled=proof_enabled;
   }
   p.commands.push_back(std::move(command));p.requested[game]=true;p.progress[game]={};
   // A successful replacement transfers the source Tree. Destroy its caller
@@ -626,7 +626,7 @@ inline void Producer::run()noexcept{
      gumbel::Tree source(command.seed,command.replacement);source.shared=source.graph=true;
      source.tactics=command.tactics;source.range_floor=command.range;
      std::vector<Cell> history;for(size_t i=0;i<command.cells.size();i+=2)history.push_back({command.cells[i],command.cells[i+1]});source.root_at(history);
-     auto retired=pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.concentration,command.temperature,command.seed);
+     auto retired=pool.replace(command.game,source,command.samples,command.views,command.work,command.ms,command.noise,command.concentration,command.temperature,command.seed,command.proof_enabled);
      broker.reclaim_owner(*this,std::move(retired));
      auto& o=*pool.games[command.game];
      if(command.ms){o.started=command.queued;if(o.expired()){o.deadline=true;o.stop();}}
@@ -781,24 +781,18 @@ inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
  }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");
  t.current(n);int ignored=0;auto q=t.completed_q(n,ignored);
- uint64_t maximum=0;double lo=1e300,hi=-1e300;
- for(size_t i=0;i<n.edges.size();++i)if(n.edges[i].read().eligible){maximum=std::max(maximum,i<o.direct_root_credits.size()?o.direct_root_credits[i]:0);lo=std::min(lo,q[i]);hi=std::max(hi,q[i]);}
- if(lo>hi)throw std::runtime_error("No eligible continuous root action");
- double range=std::max({1e-8,t.range_floor,hi-lo}),highest=-1e300,total=0;
- std::vector<double> weights(n.edges.size());
- for(size_t i=0;i<n.edges.size();++i)if(n.edges[i].read().eligible)highest=std::max(highest,n.edges[i].logit+(q[i]-lo)/range*(50.+maximum)*.1+t.bonus(n.edges[i]));
- for(size_t i=0;i<n.edges.size();++i)if(n.edges[i].read().eligible)total+=weights[i]=std::exp(n.edges[i].logit+(q[i]-lo)/range*(50.+maximum)*.1+t.bonus(n.edges[i])-highest);
+ auto weights=o.policy();
  int64_t action[2];if(!o.choice(action))throw std::runtime_error("Continuous root cannot select a move");
  double raw=o.root_raw;bool raw_known=o.root_raw_known;const auto prefixes=gumbel::prefix_keys(o.focus);auto key=prefixes.back().second;
  int producer=this->index;
  std::ostringstream out;out<<std::setprecision(17);
  auto cells=[&](const std::vector<Cell>& h){out<<'[';for(size_t j=0;j<h.size();++j){if(j)out<<',';out<<'['<<h[j].q<<','<<h[j].r<<']';}out<<']';};
-  out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"history\":";cells(o.focus);
+  out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"proof_enabled\":"<<(o.proof_enabled?"true":"false")<<",\"history\":";cells(o.focus);
  if(sequence)out<<",\"kind\":\"progress\",\"snapshot_sequence\":"<<sequence<<",\"comparison_passes\":"<<o.views[0].passes<<",\"credit_source\":\"completed_comparisons\"";
  out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.q<<",\"network_value\":";
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
- for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i]/total,double(e.read().visits),double(i<o.direct_root_credits.size()?o.direct_root_credits[i]:0),double(e.read().eligible)});}
+ for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i],double(e.read().visits),double(o.direct_credit(i)),double(e.read().eligible)});}
  out<<",\"winning_turn\":";cells(winning_turn(o,{action[0],action[1]}));
  out<<",\"solver_generation\":"<<(pool.proof_owner?hxp_generation(pool.proof_owner,index):0)<<",\"context\":["<<key.a<<','<<key.b<<"],\"exact_prefixes\":[";size_t count=0;
  for(size_t ply=0;ply<o.focus.size();++ply){auto fact=o.game->outcomes.find(prefixes[ply].first);if(fact!=o.game->outcomes.end()){
@@ -838,6 +832,7 @@ HX_API int hxb_continuous(void* p){auto& b=*static_cast<inference::Broker*>(p);i
 HX_API int hxb_retarget(void* p,int producer,int game,uint64_t expected,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature){try{static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,temperature);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_release(void* p,int producer,int game,uint64_t expected){try{static_cast<inference::Broker*>(p)->release(producer,game,expected);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_replace(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,uint64_t seed){try{if(!source)throw std::runtime_error("Missing replacement graph");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,temperature,static_cast<gumbel::Tree*>(source),version,seed);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
+HX_API int hxb_replace_proofs(void* p,int producer,int game,uint64_t expected,void* source,const char* version,const int64_t* cells,int count,uint64_t work,double ms,int samples,int views,double noise,double concentration,double temperature,uint64_t seed,int enabled){try{if(!source || (enabled!=0 && enabled!=1))throw std::runtime_error("Invalid replacement proof mode");static_cast<inference::Broker*>(p)->retarget(producer,game,expected,cells,count,work,ms,samples,views,noise,concentration,temperature,static_cast<gumbel::Tree*>(source),version,seed,enabled!=0);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_wait_event(void* p,double ms){return static_cast<inference::Broker*>(p)->wait_event(ms);}
 HX_API const char* hxb_event(void* p){try{return static_cast<inference::Broker*>(p)->event();}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
 // Borrowed immutable storage lasts until the next event or service destruction.
