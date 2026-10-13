@@ -1331,7 +1331,14 @@ class Http(unittest.TestCase):
         state = json.loads(self.get('/state'))
         quiet = json.loads(self.get(f"/state?since={state['revision']}"))
         self.assertLess(time.time() - started, 1)
-        self.assertEqual(set(quiet), {'instance', 'revision', 'jobs'})
+        # Another job may start or place a stone between the two requests.
+        # A newer revision correctly returns the full state rather than a delta.
+        if quiet['revision'] == state['revision']:
+            self.assertEqual(set(quiet), {'instance', 'revision', 'jobs'})
+        else:
+            self.assertGreater(quiet['revision'], state['revision'])
+            self.assertEqual(set(quiet), set(state))
+            self.assertEqual(quiet['instance'], state['instance'])
         self.engines.hold = False
         self.post('/cancel', dict(id=state['jobs'][0]['id']))
         wait(lambda: not self.session.state()['jobs'])
