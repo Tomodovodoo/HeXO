@@ -3762,7 +3762,7 @@ class Session:
                 failure = error
             with self.lock:
                 job.ended = time.time()
-                if failure is not None:
+                if failure is not None and not job.cancelled:
                     job.status, job.error = 'failed', str(failure)
                     self.paused = self.paused or job.kind == 'move'
                     if job.kind == 'move' and not self.match:
