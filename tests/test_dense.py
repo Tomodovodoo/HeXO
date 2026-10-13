@@ -7877,13 +7877,15 @@ class PhaseTests(unittest.TestCase):
             with self.assertRaises(OSError) as raised:
                 heartbeat.write(stage='phase-idle')
             self.assertIs(raised.exception, error)
-            # The foreground exception handler can publish a terminal failure
-            # after the lock clears, releasing actors without a stale timeout.
-            heartbeat.write(stage='failed', phase_request=None, error=repr(error))
-            saved = json.loads(path.read_text())
-            self.assertEqual(saved['stage'], 'failed')
-            self.assertIsNone(saved['phase_request'])
-            self.assertEqual(saved['error'], repr(error))
+            # Both failure and interrupted-export cleanup must release actors
+            # after the lock clears, without waiting for the stale timeout.
+            for stage in ('failed', 'idle'):
+                message = repr(error) if stage == 'failed' else None
+                heartbeat.write(stage=stage, phase_request=None, error=message)
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved['stage'], stage)
+                self.assertIsNone(saved['phase_request'])
+                self.assertEqual(saved['error'], message)
             heartbeat.close()
 
     def test_training_waits_for_all_acks_and_keeps_export_heartbeat_fresh(self):

@@ -409,7 +409,7 @@ class PhaseHeartbeat:
 
     def write(self, **fields):
         with self.lock:
-            if self.error is not None and fields.get('stage') != 'failed':
+            if self.error is not None and fields.get('stage') not in ('idle', 'failed'):
                 raise self.error
             self.status.update(fields, updated_at=time.time())
             self.publish()
