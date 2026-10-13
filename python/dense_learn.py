@@ -1139,7 +1139,7 @@ def main():
         survey = dense_data.survey(args.run, config.seed, s.cheap_row_fraction, SURVEY_PROCESSES)
         window = dense_data.ReplayWindow(args.run, s.window_capacity, s.window_min_rows, s.window_expand_per_row,
                                          s.window_taper, s.validation_fraction, policy_dir(args.run, s.variant),
-                                         s.cheap_row_fraction, config.seed, survey)
+                                         s.cheap_row_fraction, config.seed, survey, search_metadata=False)
         sets = validation_sets(args.run, s, config.seed, survey)
         learner.calibrate(window)
         stream = dense_data.Renderers(args.run, s, [config.seed, variant_seed, learner.step], args.workers,

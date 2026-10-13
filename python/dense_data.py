@@ -823,7 +823,9 @@ class ReplayWindow:
     load or at the first refresh after its sidecar appears); per game its ply offset, winner, trained side and
     held-out flag; per ply its move, root value (NaN for null) and full_search flag. A Ref's row dict and its
     episode dict {moves, winner, root_values, full_search, trained_side} are rebuilt on demand. Value targets are
-    cached for the VALUE_CACHE most recently used (episode, target options) keys.
+    cached for the VALUE_CACHE most recently used (episode, target options) keys. `search_metadata=False` omits
+    per-row search audit dictionaries from this window; targets do not use them. Raw shards and index caches retain
+    them, and windows include them by default for diagnostics.
 
     Policies: on first use a shard's policy vector is written uncompressed as raw float32 to
     `policy_dir`/<shard>.f32 (default <run>/cache/policies; written under a temporary name and hard-linked into
@@ -837,9 +839,10 @@ class ReplayWindow:
     VALUE_CACHE = 4096
 
     def __init__(self, run_dir, capacity_rows, min_rows=100000, expand_per_row=.4, taper_exponent=.65, validation_fraction=0.,
-                 policy_dir=None, cheap_row_fraction=1., seed=0, survey=None):
+                 policy_dir=None, cheap_row_fraction=1., seed=0, survey=None, search_metadata=True):
         self.run_dir = Path(run_dir); self.capacity_rows = capacity_rows; self.validation_fraction = validation_fraction
         self.cheap_row_fraction, self.seed = cheap_row_fraction, seed
+        self.search_metadata = search_metadata
         self.manifests = {n: v.manifest for n, v in (survey or {}).items()}
         self.counts = {n: v.count for n, v in (survey or {}).items()}
         self.index_dir = index_dir(run_dir)
@@ -878,7 +881,10 @@ class ReplayWindow:
         path = self.run_dir/'shards'/name
         # A shard without stored surprises needs no index field for them, so older index files stay valid.
         stored = self.manifests[name]['counts'].get('surprise_rows', 0) > 0
-        x = shard_index(path, self.index_dir, [*SHARD_INDEX, 'surprise'] if stored else SHARD_INDEX)
+        fields = [k for k in SHARD_INDEX if k != 'search' or self.search_metadata]
+        x = shard_index(path, self.index_dir, [*fields, 'surprise'] if stored else fields)
+        if not self.search_metadata:
+            x['search'] = {}
         if not stored:
             x['surprise'] = np.full(len(x['game']), np.nan, np.float32)
         labels, self.deblunders[name] = proof_annotations(path)
@@ -1695,7 +1701,8 @@ def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_
     `calibration`."""
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
-                              settings.window_taper, settings.validation_fraction, policy_dir, settings.cheap_row_fraction, run_seed)
+                              settings.window_taper, settings.validation_fraction, policy_dir, settings.cheap_row_fraction, run_seed,
+                              search_metadata=False)
         if initial_regret is not None:
             window.set_regret(initial_regret)
         rng = np.random.default_rng(seed); refreshed = time.time()
