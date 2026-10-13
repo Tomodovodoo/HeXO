@@ -1119,20 +1119,22 @@ class GameGraphs(unittest.TestCase):
         from hybrid_scheduler import SearchPool
         from neural_search import GameGraph
         bubble = self.engines.bubble(None)
-        for budgets in ((16,), (64,), (16, 64)):
+        for budgets, candidates in (((16,), (8,)), ((64,), (16,)), ((16, 64), (8, 8))):
             with self.subTest(budgets=budgets):
                 graphs = [GameGraph(bubble.evaluator, bubble.sha256, [(0, 0), (1, 1), (3, 0)], seed=i)
                           for i in range(len(budgets))]
-                stats, close = [], SearchPool.close
+                stats, sampled, close = [], [], SearchPool.close
 
                 def inspected(pool):
                     stats.extend(game.stats() for game in pool.games)
+                    sampled.extend(int((game.evidence()['current_credits'] > 0).sum()) for game in pool.games)
                     return close(pool)
 
                 try:
                     with unittest.mock.patch.object(SearchPool, 'close', inspected):
                         found = play.search(bubble, list(zip(graphs, budgets)), watch=lambda n: None)
                     self.assertEqual([f['completed'] for f in found], list(budgets))
+                    self.assertEqual(sampled, list(candidates))
                     for budget, measured in zip(budgets, stats):
                         self.assertEqual(measured['completed'], budget)
                         self.assertGreater(measured['created'], 1)

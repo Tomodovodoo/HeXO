@@ -301,8 +301,11 @@ the game graph at that position. A native graph owner spends the preset's simula
 simulations over up to eight views: the position itself and positions below it that its own evidence ranks, at most
 eight placements down. Each view searches in quanta of up to 32 simulations, capped at half the requested work
 with a minimum slice of four, so a small budget leaves work for a subsequent view. A pooled search uses its
-smallest requested budget to size the shared slice. The search keeps
-16 sampled root candidates and the round barrier, and the network batches of every view share one queue of up to
+smallest requested budget to size the shared slice. Each root comparison samples up to 16 candidates, capped by
+its slice's work, with the round barrier. Lightning therefore compares eight root candidates instead of the prior
+16, spending its remaining work below an admitted candidate. This trades some breadth for a descendant view
+within the same cap; it does not guarantee a better move. A pooled larger root shares that smaller candidate cap
+when a smaller budget sets the pool's slice. The network batches of every view share one queue of up to
 128 rows. A position's simulations therefore mean neural work spent around it, not visits at its root alone.
 
 A preset's solver nodes keep two jobs. They are the budget of the root queries (a forced win for the side to move,
@@ -313,14 +316,14 @@ the game's proof table. Each lane (engine moves, and analysis with review) has o
 than the machine's threads and between 2 and 12, shared by all of its searches; the frontier may take the owner's
 whole time. Solver nodes 0 turns both off, and so does a missing tactical build.
 
-| Preset | Work per stone (GPU) | Owner quantum | Root query nodes | Proof frontier |
-|---|---|---|---|---|
-| Lightning | 16 | 8 | 1,024 | on |
-| Quick | 64 | 32 | 2,048 | on |
-| Standard | 256 | 32 | 4,096 | on |
-| Strong | 512 | 32 | 8,192 | on |
-| Deep | 1,024 | 32 | 16,384 | on |
-| Dangerous | 65,536 | 32 | 4,000,000 | on |
+| Preset | Work per stone (GPU) | Owner quantum | Root candidates | Root query nodes | Proof frontier |
+|---|---|---|---|---|---|
+| Lightning | 16 | 8 | 8 | 1,024 | on |
+| Quick | 64 | 32 | 16 | 2,048 | on |
+| Standard | 256 | 32 | 16 | 4,096 | on |
+| Strong | 512 | 32 | 16 | 8,192 | on |
+| Deep | 1,024 | 32 | 16 | 16,384 | on |
+| Dangerous | 65,536 | 32 | 16 | 4,000,000 | on |
 
 ### By hand
 
