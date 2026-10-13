@@ -1114,6 +1114,34 @@ class GameGraphs(unittest.TestCase):
     def graph(self, line):
         return self.engines.graphs[('seat', line)][1]
 
+    def test_small_work_budgets_admit_descendant_views_without_extra_sims(self):
+        import play
+        from hybrid_scheduler import SearchPool
+        from neural_search import GameGraph
+        bubble = self.engines.bubble(None)
+        for budgets in ((16,), (64,), (16, 64)):
+            with self.subTest(budgets=budgets):
+                graphs = [GameGraph(bubble.evaluator, bubble.sha256, [(0, 0), (1, 1), (3, 0)], seed=i)
+                          for i in range(len(budgets))]
+                stats, close = [], SearchPool.close
+
+                def inspected(pool):
+                    stats.extend(game.stats() for game in pool.games)
+                    return close(pool)
+
+                try:
+                    with unittest.mock.patch.object(SearchPool, 'close', inspected):
+                        found = play.search(bubble, list(zip(graphs, budgets)), watch=lambda n: None)
+                    self.assertEqual([f['completed'] for f in found], list(budgets))
+                    for budget, measured in zip(budgets, stats):
+                        self.assertEqual(measured['completed'], budget)
+                        self.assertGreater(measured['created'], 1)
+                        self.assertGreater(measured['depth'], 0)
+                        self.assertLess(measured['root_completed'], budget)
+                finally:
+                    for graph in graphs:
+                        graph.close()
+
     def test_defender_proof_uses_refuted_graph_edges_propagates_and_reloads(self):
         from play import evaluate, Proofs
         from neural_search import checked, native

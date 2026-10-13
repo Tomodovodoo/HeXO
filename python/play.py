@@ -64,7 +64,7 @@ PRESET_NAMES = list(PRESETS['bubble'])
 # this server has timed moves of its own (`Session.note_pace`).
 TURN_MS = dict(GPU=dict(lightning=250, quick=650, standard=1400, strong=2000, deep=4100),
                CPU=dict(lightning=750, quick=850, standard=1700, strong=3100, deep=6600))
-HYBRID = dict(quantum=64, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
+HYBRID = dict(quantum=32, views=8, depth=8)  # the graph owner of every Bubble search (see `search`, docs/play.md)
 PROOF_BUDGET = 1.  # share of the owner's time its proof frontier may take (ProofLoop owner_budget)
 SEEDS = itertools.count(1740)  # owner seeds: repeated searches of a position draw new root samples
 REFRESH_SHARE = .25  # share of a saved analysis's simulations, the analysis budget's at most, a refresh searches again
@@ -1248,7 +1248,9 @@ def search(bubble, roots, proofs=None, watch=lambda n: None, live=None, stamps=F
     from hybrid_scheduler import InferenceService, SearchPool
     evaluator = bubble.scheduler()
     histories = [[list(p) for p in graph.history] for graph, _ in roots]
-    quantum = max(4, min(HYBRID['quantum'], max(simulations for _, simulations in roots)))
+    # Match the browser's slices: leave work after the first root comparison.
+    # A pool shares its quantum, so its smallest budget must also fit two slices.
+    quantum = max(4, min(HYBRID['quantum'], min(simulations for _, simulations in roots) // 2))
     pool = SearchPool([graph for graph, _ in roots], quantum=quantum, views=HYBRID['views'], depth=HYBRID['depth'],
                       work=1, seed=next(SEEDS))
     service, events, records, effort = None, {}, [], {}
