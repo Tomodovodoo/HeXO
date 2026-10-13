@@ -1114,6 +1114,36 @@ class GameGraphs(unittest.TestCase):
     def graph(self, line):
         return self.engines.graphs[('seat', line)][1]
 
+    def test_small_work_budgets_admit_descendant_views_without_extra_sims(self):
+        import play
+        from hybrid_scheduler import SearchPool
+        from neural_search import GameGraph
+        bubble = self.engines.bubble(None)
+        for budgets, candidates in (((16,), (8,)), ((64,), (16,)), ((16, 64), (8, 8))):
+            with self.subTest(budgets=budgets):
+                graphs = [GameGraph(bubble.evaluator, bubble.sha256, [(0, 0), (1, 1), (3, 0)], seed=i)
+                          for i in range(len(budgets))]
+                stats, sampled, close = [], [], SearchPool.close
+
+                def inspected(pool):
+                    stats.extend(game.stats() for game in pool.games)
+                    sampled.extend(int((game.evidence()['current_credits'] > 0).sum()) for game in pool.games)
+                    return close(pool)
+
+                try:
+                    with unittest.mock.patch.object(SearchPool, 'close', inspected):
+                        found = play.search(bubble, list(zip(graphs, budgets)), watch=lambda n: None)
+                    self.assertEqual([f['completed'] for f in found], list(budgets))
+                    self.assertEqual(sampled, list(candidates))
+                    for budget, measured in zip(budgets, stats):
+                        self.assertEqual(measured['completed'], budget)
+                        self.assertGreater(measured['created'], 1)
+                        self.assertGreater(measured['depth'], 0)
+                        self.assertLess(measured['root_completed'], budget)
+                finally:
+                    for graph in graphs:
+                        graph.close()
+
     def test_defender_proof_uses_refuted_graph_edges_propagates_and_reloads(self):
         from play import evaluate, Proofs
         from neural_search import checked, native
@@ -2641,11 +2671,22 @@ class TurnTrees(unittest.TestCase):
         graph = engines.graphs[1][1]
         visits = int(graph.result(0, 0, 0, 0)['visits'].sum())
         self.assertGreaterEqual(visits, 128)
-        # Both roots of the turn already hold 128 visits, so one more tier runs one simulation at each; the second
-        # stone's also counts at the first stone's edge.
-        evaluate(bubble, None, history, 128, 0, trees=engines.game_graph(bubble, 1, keep=True))
-        graph.at(history)
-        self.assertEqual(int(graph.result(0, 0, 0, 0)['visits'].sum()), visits + 2)
+        # Descendant views need not leave 128 visits at the chosen second-stone
+        # root. Each searched position gets exactly its own missing work.
+        trees, requested = engines.game_graph(bubble, 1, keep=True), {}
+
+        def observed(cells, count, network):
+            tree, missing = trees(cells, count, network)
+            before = int(tree.result(0, 0, 0, 0)['visits'].sum())
+            requested[tuple(map(tuple, cells))] = (count, before, missing)
+            return tree, missing
+
+        found = evaluate(bubble, None, history, 128, 0, trees=observed)
+        self.assertEqual(len(requested), 2)
+        for count, before, missing in requested.values():
+            self.assertEqual(missing, max(1, count - before))
+        self.assertEqual(requested[tuple(history)][2], 1)
+        self.assertEqual(found['actual_completed'], sum(r[2] for r in requested.values()))
         trees = engines.game_graph(bubble, 1, 'abc', keep=True)
         tree, missing = trees([(0, 0)], 32, bubble.evaluator)
         self.assertIsNot(tree, graph)
