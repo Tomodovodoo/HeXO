@@ -2939,6 +2939,61 @@ def reference_window(run, capacity, min_rows, fraction):
 
 
 class WindowMemoryTests(unittest.TestCase):
+    def test_omitting_search_audits_preserves_sampling_and_targets(self):
+        for compact_first in (False, True):
+            with self.subTest(compact_first=compact_first), tempfile.TemporaryDirectory() as tmp:
+                episode, rows = episode_rows(winning_game(), 0, [.2]*12, policy_every=2)
+                for row in rows:
+                    row['search'] = dict(comparison_credits=64, queries=48, root_estimate=.2)
+                rows[6]['proven'] = -1       # cheap refuted continuation still corrects first-stone targets
+                path = Path(tmp)/'shards'/'000001'
+                dense_data.write_shard(path, dict(actor_sha256='test'), [episode], rows)
+                options = dict(capacity_rows=1000, validation_fraction=0., cheap_row_fraction=.5, seed=4)
+                first = dense_data.ReplayWindow(tmp, **options, search_metadata=not compact_first)
+                cached = dense_data.index_dir(tmp)/'000001.npz'
+                digest = hashlib.sha256(cached.read_bytes()).hexdigest()
+                unpack = dense_data._unpack
+                decoded = []
+                def record(key, value):
+                    decoded.append(key)
+                    return unpack(key, value)
+                with unittest.mock.patch.object(dense_data, '_unpack', side_effect=record):
+                    second = dense_data.ReplayWindow(tmp, **options, search_metadata=compact_first)
+                if not compact_first:
+                    self.assertNotIn('search', decoded)
+                full, compact = (second, first) if compact_first else (first, second)
+                self.assertEqual(hashlib.sha256(cached.read_bytes()).hexdigest(), digest)
+                self.assertEqual(compact.shards['000001'].search, {})
+                self.assertEqual(list(full.index), list(compact.index))
+                self.assertEqual((full.total_rows, full.total_full_rows, full.proven_rows),
+                                 (compact.total_rows, compact.total_full_rows, compact.proven_rows))
+                for window in (full, compact):
+                    refs = window.sample(np.random.default_rng(9), 32, recency=2.)
+                    keys = [(r.shard, r.index) for r in refs]
+                    if window is full:
+                        expected = keys
+                    else:
+                        self.assertEqual(keys, expected)
+                for i in range(len(rows)):
+                    a, b = full.ref('000001', i), compact.ref('000001', i)
+                    self.assertEqual(a.row['search'], rows[i]['search'])
+                    self.assertNotIn('search', b.row)
+                    self.assertEqual({k: v for k, v in a.row.items() if k != 'search'}, b.row)
+                refs = [[w.ref('000001', i) for i in range(len(rows))] for w in (full, compact)]
+                for refutations in (False, True):
+                    arrays = []
+                    for window, selected in zip((full, compact), refs):
+                        samples, targets = dense_data.examples(window, selected, np.random.default_rng(5),
+                            policy_refutations=refutations, outcome_lam=1., short_value_target='average',
+                            pair_policy_weight=.5, proof_policy_weight=1.)
+                        arrays.append(dense_data.collate_arrays(samples, targets))
+                    self.assertEqual(arrays[0].keys(), arrays[1].keys())
+                    for size in arrays[0]:
+                        self.assertEqual(arrays[0][size].keys(), arrays[1][size].keys())
+                        for key in arrays[0][size]:
+                            np.testing.assert_array_equal(arrays[0][size][key], arrays[1][size][key])
+                self.assertEqual(dense_data.read_shard(path)[1][0]['search'], rows[0]['search'])
+
     def test_sampling_matches_the_reference_walk(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic_run(tmp, 6, 8, 30)
