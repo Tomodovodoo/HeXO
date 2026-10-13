@@ -7817,6 +7817,66 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(dense_learn.waiting_actors(run, 4, 'main', 'new', now=1000), [])
             self.assertEqual(dense_learn.waiting_actors(run, 4, 'wide', 'new', now=1000), [0, 1, 2, 3])
 
+    def test_learner_heartbeat_recovers_after_windows_sharing_retries_are_exhausted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'status.json'
+            heartbeat = dense_learn.PhaseHeartbeat(path)
+            heartbeat.write(stage='phase-idle', step=1)
+            previous = path.read_text()
+            original, attempts = dense_learn.write_json, []
+            error = PermissionError('Windows reader still holds the heartbeat')
+            error.winerror = 5
+            def publish(path, data):
+                attempts.append(data.copy())
+                if len(attempts) < 3:
+                    self.assertEqual(path.read_text(), previous)
+                    raise error
+                original(path, data)
+            with unittest.mock.patch.object(dense_learn.os, 'name', 'nt'), \
+                 unittest.mock.patch.object(dense_learn, 'write_json', side_effect=publish), \
+                 unittest.mock.patch.object(dense_learn.time, 'sleep'):
+                heartbeat.write(stage='phase-idle', step=2)
+            self.assertEqual(json.loads(path.read_text())['step'], 2)
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(len({a['updated_at'] for a in attempts}), 1)
+            heartbeat.close()
+
+    def test_learner_heartbeat_persistent_windows_lock_still_fails(self):
+        heartbeat = dense_learn.PhaseHeartbeat(Path('unused-status.json'))
+        error = PermissionError('persistent sharing error')
+        error.winerror = 32
+        with unittest.mock.patch.object(dense_learn.os, 'name', 'nt'), \
+             unittest.mock.patch.object(dense_learn, 'write_json', side_effect=error), \
+             unittest.mock.patch.object(dense_learn, 'HEARTBEAT_RETRY_SECONDS', 0.), \
+             self.assertRaises(PermissionError):
+            heartbeat.write(stage='phase-idle')
+        heartbeat.close()
+
+    def test_learner_heartbeat_does_not_suppress_terminal_or_other_permission_errors(self):
+        for stage, code in (('idle', 5), ('failed', 32), ('phase-idle', 13)):
+            heartbeat = dense_learn.PhaseHeartbeat(Path('unused-status.json'))
+            error = PermissionError('publication failed')
+            error.winerror = code
+            with unittest.mock.patch.object(dense_learn.os, 'name', 'nt'), \
+                 unittest.mock.patch.object(dense_learn, 'write_json', side_effect=error) as publish, \
+                 self.assertRaises(PermissionError):
+                heartbeat.write(stage=stage)
+            self.assertEqual(publish.call_count, 1)
+            heartbeat.close()
+
+    def test_learner_heartbeat_renewal_failure_reaches_foreground(self):
+        heartbeat = dense_learn.PhaseHeartbeat(Path('unused-status.json'))
+        heartbeat.status = dict(stage='exporting', phase_request='token')
+        heartbeat.stopped = unittest.mock.Mock()
+        heartbeat.stopped.wait.return_value = False
+        error = OSError('renewal failed')
+        with unittest.mock.patch.object(dense_learn, 'write_json', side_effect=error):
+            heartbeat.renew()
+        self.assertIs(heartbeat.error, error)
+        with self.assertRaises(OSError) as raised:
+            heartbeat.write(stage='phase-idle')
+        self.assertIs(raised.exception, error)
+
     def test_training_waits_for_all_acks_and_keeps_export_heartbeat_fresh(self):
         torch.set_num_threads(2)
         with tempfile.TemporaryDirectory() as tmp:
