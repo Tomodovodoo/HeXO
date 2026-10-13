@@ -82,6 +82,9 @@ class NeuralTree(unittest.TestCase):
         for key in ('visits', 'policy', 'scores', 'values'):
             np.testing.assert_array_equal(zero[key], plain[key])
         self.assertTrue((np.flatnonzero(plain['visits']) < 8).all())
+        # Tiny prior probabilities can underflow in the policy while the move remains eligible.
+        self.assertTrue(plain['eligible'].all())
+        self.assertTrue((plain['policy'] == 0).any())
         result = noisy.search(64, root_samples=8, batch_size=8)
         sampled = np.flatnonzero(result['visits'])
         self.assertEqual(len(sampled), 8)
@@ -526,6 +529,7 @@ class NeuralTree(unittest.TestCase):
         result = search.search(64, root_samples=16, batch_size=1)
         i = result['actions'].tolist().index(list(a))
         self.assertEqual((result['values'][i], result['policy'][i]), (-1., 0.))
+        self.assertFalse(result['eligible'][i])
         self.assertLessEqual(result['visits'][i], 3)
         self.assertNotEqual(result['action'], list(a))
         self.assertEqual(result['exact_winner'], -1)

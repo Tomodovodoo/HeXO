@@ -77,6 +77,8 @@ class ActorSettings:
     cache_positions: int = 4096
     shard_games: int = 32
     opening_random_plies: float = 2.  # mean of an exponential; sampled from the search policy
+    early_prior_fraction: float = 0.  # chance per early trained placement to play the cached raw prior, not search policy
+    early_prior_plies: int = 24        # absolute placement cutoff, also for book/restart/fork games
     # Checkpoint the actor plays (dense_selfplay.resolve): 'champion' (champion.json), 'newest' (newest complete
     # checkpoint of learner.variant) or 'newest_veto' (actor.json: newest unless the evaluator vetoed it).
     model_source: str = 'newest_veto'
@@ -177,6 +179,8 @@ class ActorSettings:
             raise ValueError('native_feed does not support synchronous per-leaf proof queries')
         if self.search_choice not in ('gumbel', 'policy'):
             raise ValueError('search_choice must be gumbel or policy')
+        if not 0 <= self.early_prior_fraction <= 1 or self.early_prior_plies < 0:
+            raise ValueError('early_prior_fraction must lie in [0, 1] and early_prior_plies be nonnegative')
         if not 0 <= self.q_range_floor <= 2:
             raise ValueError('q_range_floor must lie in [0, 2]')
         if not 0 <= self.root_noise < 1:

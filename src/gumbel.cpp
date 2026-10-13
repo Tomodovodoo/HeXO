@@ -1482,6 +1482,8 @@ HX_API int hxg_policy(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p
 // The root edges' network logits, shifted so the largest is 0, in edge order: the prior the search started from.
 // 0 when no network evaluation expanded the root (an immediate win or a proof installs zero logits).
 HX_API int hxg_logits(void* p,double* out){auto& n=*static_cast<gumbel::Tree*>(p)->root;if(!n.expanded || !n.raw_known)return 0;if(out)for(size_t i=0;i<n.edges.size();++i)out[i]=n.edges[i].logit;return int(n.edges.size());}
+// Explicit proof/tactical eligibility in hxg_stats edge order. Policy zeros can instead be softmax underflow.
+HX_API int hxg_eligible(void* p,int* out){auto& t=*static_cast<gumbel::Tree*>(p);auto& n=*t.root;if(!n.expanded)return 0;if(t.shared)t.current(n);if(out)for(size_t i=0;i<n.edges.size();++i)out[i]=n.edges[i].read().eligible;return int(n.edges.size());}
 HX_API int hxg_completed(void* p){return static_cast<gumbel::Tree*>(p)->completed;}
 // Completion includes an exact root, but never permits advancement while leaf reservations are outstanding.
 HX_API int hxg_done(void* p){return static_cast<gumbel::Tree*>(p)->done();}

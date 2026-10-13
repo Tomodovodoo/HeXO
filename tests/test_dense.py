@@ -4628,7 +4628,7 @@ class EngineTests(unittest.TestCase):
         models = [dense_selfplay.Model(hexnet.HexNet(TINY),f'startup-{k}','fixed','cpu',64,128) for k in range(3)]
         settings = dense_config.ActorSettings(hybrid_scheduler=True,hybrid_producers=2,game_graph=192,
             hybrid_quantum=8,hybrid_views=2,full_sims=8,cheap_sims=4,leaf_batch=64,max_plies=3,
-            opening_random_plies=0.)
+            opening_random_plies=0.,early_prior_fraction=1.,early_prior_plies=3)
         engine = ActorEngine(settings)
         self.addCleanup(engine.close)
         for i,pair in enumerate(([models[0]]*2,[models[0],models[1]],[models[0],models[2]])):
@@ -4648,6 +4648,9 @@ class EngineTests(unittest.TestCase):
         for episode,rows in episodes:
             self.assertEqual(len(episode['moves']),3)
             self.assertTrue(all(r['search']['model']==episode['actors'][str(r['player'])] for r in rows))
+            self.assertTrue(episode['prior_moves'])
+            self.assertTrue(all(m['ply'] < 3 and dense_data.trained(episode,m['ply'])
+                                and episode['moves'][m['ply']] == m['action'] for m in episode['prior_moves']))
 
     def test_hybrid_rejected_model_pair_does_not_consume_the_retired_slot(self):
         from hybrid_selfplay import ActorEngine
@@ -6608,6 +6611,34 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(slot.moves[-1], actions[expected].tolist())
                     np.testing.assert_array_equal(slot.rows[0]['policy'], policy.astype(np.float32))
                     self.assertEqual(slot.values[-1], float(proven))
+                finally:
+                    slot.game.close()
+
+        # Raw-prior behaviour can play an eligible zero-policy move, but never a proof-excluded one.
+        for proven, cutoff, learner, expected in ((0, 2, 1, 2), (1, 2, 1, 1), (-1, 2, 1, 1),
+                                                  (0, 1, 1, 1), (0, 2, 0, 1)):
+            with self.subTest(prior=True, proven=proven, cutoff=cutoff, learner=learner):
+                settings = dense_config.ActorSettings(full_fraction=1., opening_random_plies=0., max_plies=2,
+                                                      early_prior_fraction=1., early_prior_plies=cutoff)
+                slot = dense_selfplay.SelfPlayGame([model, model], settings, 1, learner=learner,
+                                                  opponent='frozen', restart=({}, [[0, 0]]))
+                try:
+                    actions = np.asarray(slot.game.legal_moves()[:3], np.int64)
+                    policy = np.array([1., 0., 0.])
+                    result = dict(action=actions[1], actions=actions, policy=policy, values=np.zeros(3),
+                                  prior_logits=np.array([1000., -np.inf, 0.]), eligible=np.array([False, True, True]),
+                                  completed=1, exact_winner=-1, proven=proven, proof_turns=[], solver_nodes=0,
+                                  solver_budget=0)
+                    self.assertFalse(slot.searched(result))
+                    self.assertEqual(slot.moves[-1], actions[expected].tolist())
+                    np.testing.assert_array_equal(policy, [1., 0., 0.])
+                    if learner == 1 and not proven:
+                        np.testing.assert_array_equal(slot.rows[0]['policy'], policy.astype(np.float32))
+                    episode, _ = slot.episode()
+                    self.assertEqual(bool(episode.get('prior_moves')), expected == 2)
+                    if expected == 2:
+                        self.assertEqual(episode['prior_moves'][0]['search_action'], actions[1].tolist())
+                        self.assertEqual(episode['prior_moves'][0]['probability'], 1.)
                 finally:
                     slot.game.close()
 

@@ -720,6 +720,8 @@ class SelfPlayGame:
     def __init__(self, sides, settings, seed, learner=0, opponent=None, restart=None, book=None, *, fork=None,
                  hybrid=False):
         self.hybrid = hybrid
+        if settings.early_prior_fraction and not hybrid and not hasattr(native, 'hxg_eligible'):
+            raise ValueError('Raw-prior moves require native root eligibility')
         if hybrid and (settings.graph_nodes <= 0 or settings.pv_check or settings.proven_line_rows):
             raise ValueError('Hybrid self-play requires game_graph, uses native depth views, and has no certificate line rows')
         self.sides, self.settings, self.seed, self.reason, self.adjudicated = sides, settings, seed, None, None
@@ -750,6 +752,7 @@ class SelfPlayGame:
         self.game, self.moves, self.rows = Game(forced), forced, []
         self.values, self.full = [None]*len(forced), [False]*len(forced)
         self.network_values = [None]*len(forced)
+        self.prior_moves = []
         self.plan()
 
     @property
@@ -843,6 +846,25 @@ class SelfPlayGame:
             action = result['action']
             if self.settings.search_choice == 'policy' and not result.get('proven'):
                 action = actions[np.argmax(policy)]
+        # Change behaviour after recording the teacher's targets. Sampling eligible raw logits can reach moves
+        # suppressed by search-policy sharpening, without another neural evaluation or overriding an exact root.
+        s, logits = self.settings, result.get('prior_logits')
+        if (s.early_prior_fraction and trained and ply < s.early_prior_plies and not result.get('proven')
+                and logits is not None and self.rng.random() < s.early_prior_fraction):
+            eligible = np.asarray(result['eligible'], bool)
+            logits = np.asarray(logits, np.float64)
+            if eligible.shape != (len(actions),) or logits.shape != eligible.shape:
+                raise ValueError('Raw-prior actions, logits and eligibility disagree')
+            allowed = np.flatnonzero(eligible & np.isfinite(logits))
+            if not len(allowed):
+                raise ValueError('Raw-prior sampling has no eligible finite logit')
+            weights = np.exp(logits[allowed]-logits[allowed].max())
+            probabilities = weights/weights.sum()
+            draw = int(self.rng.choice(len(allowed), p=probabilities))
+            selected = int(allowed[draw])
+            self.prior_moves.append(dict(ply=ply, search_action=np.asarray(action).tolist(),
+                                         action=actions[selected].tolist(), probability=float(probabilities[draw])))
+            action = actions[selected]
         if (self.settings.adjudicate_proven and self.settings.proven_line_rows and result.get('proven', 0) > 0
                 and result.get('proof') is not None and game.remaining == 2):
             stones = result['proof'].action(self.moves)
@@ -970,6 +992,8 @@ class SelfPlayGame:
                        else 'restart' if self.restart else 'selfplay')
         if self.book is not None:
             episode['book'] = self.book
+        if self.prior_moves:
+            episode['prior_moves'] = self.prior_moves
         if self.fork is not None:
             episode['fork'] = self.fork
         if self.restart:
