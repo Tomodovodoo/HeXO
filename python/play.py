@@ -1521,7 +1521,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
                 merged[key] = fact
         facts = sorted(merged.values(), key=lambda f: len(f['history']))[:2048]
     own = (ProofWorkers(package, workers=SOLVER_WORKERS)
-           if proofs is None and prover is not None and (solver_nodes or solver_ms) else None)
+           if proofs is None and prover is not None and (solver_ms or solver_nodes and simulations) else None)
     proofs = proofs if own is None else own
     turn = None
     try:
@@ -1573,18 +1573,18 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, q_range_floor=0.,
                   known=None, proofs=None, stamps=False, ms=0):
-    """`evaluate` of every position in `histories`, as one pooled job: the solver queries run concurrently, one
-    position per prover in `provers` at a time, each distinct position solved once, their proofs added to the
-    proof table `known`; then fresh game graphs, one per position, search together with that table in one
-    SearchPool (see `search`), stone by stone, sharing network batches, with their proof frontiers on `proofs`
-    when `solver_nodes` and `provers` are given. Each result is what `evaluate` would give at that budget with the
-    table; with `ms` each turn has that clock as in `evaluate` (root queries at most a quarter, the first of two
-    stones 60% of what is left, the last stone the rest), the pooled owners sharing it. `watch` may raise Cancelled."""
+    """Pooled ordinary hybrid searches, sharing network batches and concurrent frontier proofs.
+    There are no preliminary solver queries. With positive work, `provers` and `solver_nodes` enable
+    the shared `proofs` pool, or this call's own pool when none was supplied. `known` settles saved exact
+    outcomes. Under `ms` first stones get 60% of the clock and second stones the rest. `watch` may cancel.
+    """
     keys = [position_text(h) for h in histories]
     given = [answered(h, known) for h in histories]
     end = time.monotonic() + ms / 1000 if ms else None
     network = Watched(bubble.evaluator, watch)
-    frontier = proofs if provers and solver_nodes else None
+    from hybrid_scheduler import ProofWorkers
+    own = ProofWorkers(workers=SOLVER_WORKERS) if proofs is None and provers and solver_nodes and simulations else None
+    frontier = (own if own is not None else proofs) if provers and solver_nodes else None
     turns = []
     try:
         for k, history, a in zip(keys, histories, given):
@@ -1614,8 +1614,12 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
         searched = iter(turns)
         return [a if a is not None else next(searched).record() for a in given]
     finally:
-        for turn in turns:
-            turn.close()
+        try:
+            for turn in turns:
+                turn.close()
+        finally:
+            if own is not None:
+                own.close()
 
 
 class SearchChild:

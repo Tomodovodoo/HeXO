@@ -2404,12 +2404,13 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(after['solver']['native_nodes'], 0)
         self.assertLess(after['solver']['elapsed_ms'], 1500)
 
-    def test_explicit_deep_solve_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
-        from play import evaluate
+    def test_explicit_root_proof_reaches_play_before_and_after_the_last_stone(self):
+        from play import evaluate, solve
         history, prover = self.lost_game()
         bubble = self.bubble()
         for ply in (len(history), len(history) - 1):
-            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True, solver_ms=5000)
+            given = solve(prover, history[:ply], 4096)
+            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True, solved=given)
             self.assertEqual(found['proof']['winner'], 0, ply)
             self.assertEqual(found['value'], 0, ply)
 

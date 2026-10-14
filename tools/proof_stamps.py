@@ -185,16 +185,23 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
             pending.append((list(history), options, result, 1000*(time.perf_counter()-start)))
             return result
         prover.history = query
-        budget = dict(simulations=simulations, solver_nodes=nodes, solver_ms=ms)
+        budget = dict(simulations=simulations, solver_nodes=nodes)
         for case in cases:
             pending.clear()
             start = time.perf_counter()
             result, spent, identity = engines.evaluate(dict(path=checkpoint), '', budget, case['history'],
                                                        lambda n: None, game=case['id'])
             elapsed = 1000*(time.perf_counter()-start)
+            # This certificate audit explicitly verifies exact play claims. Ordinary
+            # play no longer makes a standalone query just to produce a certificate.
+            if result.get('proof'):
+                from play import player_at
+                attacker = 'mover' if result['proof']['winner'] == player_at(len(case['history'])) else 'defender'
+                query(case['history'], attacker=attacker, nodes=nodes, ms=ms, shortest=True, stamps=stamps)
+                pending[-1][1]['phase'] = 'verification'
             verified, verification_ms, queries = 0, 0., []
             for history, options, answer, took in pending:
-                queries.append(dict(attacker=options.get('attacker', 'mover'), ms=took,
+                queries.append(dict(attacker=options.get('attacker', 'mover'), phase=options.get('phase', 'search'), ms=took,
                                     **{k: answer.get(k) for k in ('status', 'reason', 'nodes_fresh',
                                        'proof_turns', 'shortest', 'stamp_hits', 'native_verified')}))
                 certificate = answer.get('certificate')
