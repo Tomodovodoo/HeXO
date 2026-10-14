@@ -203,9 +203,10 @@ function frontierProofs(records, table, found) {
  * forcing win' once the solver rules out a mover win before spending its nodes), root_nodes, root_budget (the current
  * query's nodes), frontier (queued and running proof jobs), busy, workers, frontier_nodes, checked (frontier jobs
  * answered), proof}}, read from the running owner and solver, at most twice a second after a neural batch or a root
- * query. With no mover win it asks whether the opponent would win moving now and, if so, whether the mover is lost.
- * Resolves to {mine (a verified root answer, or null), lost and threat (the verified defender and opponent answers
- * when the mover is lost, else null), proof ({winner, turns, plies} the native search proved, or null), records (the
+ * query. Saved strategies for either winner are replay-checked before fresh root work. With no mover win it asks
+ * whether the opponent would win moving now and, if so, whether the mover is lost.
+ * Resolves to {mine (a verified root answer, or null), lost (verified defender answer, or null), threat (verified
+ * opponent answer when queried, or null), proof ({winner, turns, plies} the native search proved, or null), records (the
  * frontier's verified answers), used (nodes), solver (totals), error}.
  */
 async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool, replay = []}) {
@@ -236,6 +237,15 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
   };
   let replays = stamps ? replay.filter(r => r.winner === player) : [];
   const asking = (async () => {
+    const defence = stamps ? replay.filter(r => r.winner !== player) : [];
+    if (defence.length && !cancelled.has(id) && performance.now() < end) {
+      const lost = await solve(id, history, {attacker: 'defender', nodes: 32768, stamps, known: premises, replay: defence,
+        ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 10000)))});
+      root.nodes += lost.nodes_used || 0;
+      report();
+      if (lost.status === 'PROVEN_LOSS' && lost.native_verified) { root.lost = lost; return; }
+      if (lost.reason?.startsWith(FAILED)) { root.error = lost.reason; return; }
+    }
     for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
       root.budget = nodes;
       const options = {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
@@ -377,7 +387,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
         table.add(history, record);
         ({pv, proof} = record);
       } else if (found.lost) {
-        threat = found.threat.moves.map(m => [...m]);
+        threat = found.threat ? found.threat.moves.map(m => [...m]) : [];
         pv = principalVariation(native, history, found.lost.certificate, {attacker: 1 - player, known: facts}).pv;
         proof = {winner: 1 - player, turns: found.lost.proof_turns, plies: state.remaining + 2 + 4 * (found.lost.proof_turns - 1),
           ...proofEvidence(found.lost)};

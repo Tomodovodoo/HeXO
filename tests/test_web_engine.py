@@ -381,7 +381,8 @@ console.log(JSON.stringify({first:replay[0].history,cells:replay.reduce((n,r)=>n
                           replay=replay, replayMiss=True, proveMs=5000))
         self.assertEqual(found['proof']['winner'], 0)
         self.assertGreater(found['actual_solver_nodes'], 2600)
-        self.assertEqual([q['replay'] for q in found['root_queries']], [1, 0])
+        self.assertEqual([(q['attacker'], q['replay']) for q in found['root_queries']],
+                         [('defender', 1), ('mover', 1), ('mover', 0)])
         checked = tactical_proof.NativeTactics().history(history, root_moves=found['moves'],
                                                         nodes=32768, ms=5000, stamps=True)
         self.assertEqual(tactical_proof.independent_verify(checked['certificate'], history), 'PROVEN_WIN')
@@ -417,6 +418,29 @@ console.log(JSON.stringify({records:restored.records,replay:restored.proofs.repl
         checked = tactical_proof.NativeTactics().history(saved['changed'], root_moves=result['moves'],
                                                         nodes=32768, ms=5000, stamps=True)
         self.assertEqual(tactical_proof.independent_verify(checked['certificate'], saved['changed']), 'PROVEN_WIN')
+        # Keep an opponent-winning strategy through reload, change only a defender
+        # stone, and allow replay verification while fresh discovery is inconclusive.
+        lost = OPEN_THREE + [[-1,0],[2,1]]
+        prover = tactical_proof.NativeTactics(independent=True)
+        self.addCleanup(prover.close)
+        original = prover.history(lost, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(tactical_proof.independent_verify(original['certificate'], lost, attacker='defender'), 'PROVEN_LOSS')
+        pv = node(dict(kind='pv', history=lost, certificate=original['certificate'], options=dict(attacker=0)))
+        found = dict(proof=dict(winner=0, plies=pv['plies'], certificate=original['certificate']), pv=pv['pv'],
+                     moves=[[3,0],[4,0]], value=0, top=[], solved=True)
+        losing_source = source.replace('changed[changed.length-1]=[7,8]', 'changed[6]=[7,8]')
+        done = subprocess.run([NODE, '--input-type=module', '-e', losing_source], cwd=ROOT,
+                              input=json.dumps(dict(history=lost, found=found)), capture_output=True, text=True, check=True)
+        saved = json.loads(done.stdout)
+        self.assertEqual(saved['replay'][0]['winner'], 0)
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'],
+                           preset='solver', replayOnly=True))
+        self.assertEqual((result['proof']['winner'], result['value']), (0, 0))
+        self.assertEqual([(q['attacker'], q['replay']) for q in result['root_queries']], [('defender', 1)])
+        self.assertGreater(result['solver']['root_nodes'], 0)
+        checked = prover.history(saved['changed'], attacker='defender', replay=saved['replay'],
+                                 nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], saved['changed'], attacker='defender'), 'PROVEN_LOSS')
 
     def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
         from types import SimpleNamespace

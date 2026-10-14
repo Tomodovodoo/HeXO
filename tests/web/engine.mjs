@@ -569,13 +569,16 @@ if (job.kind === 'encode') {
         if (request) {
           const {history,...options} = request;
           // A worker's answer arrives as a task, so the owner's turn can run between proof slices.
-          const found = solver.history(history,{...options,cancel});
+          const found = job.replayOnly ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: 1, reason: 'fixture fresh proof limit'}
+            : solver.history(history,{...options,cancel});
           setTimeout(() => this.onmessage({data:{id,answer:proofAnswer(found,request)}})); return;
         }
-        queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage, replay: options.replay?.length || 0, nodes: options.nodes});
+        queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage, replay: options.replay?.length || 0, nodes: options.nodes, attacker: options.attacker});
         const result = job.replayMiss && options.replay?.length
           ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'replay work limit'}
-          : solver.history(history, options);
+          : job.replayOnly && !options.replay?.length
+            ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'fixture fresh proof limit'}
+            : solver.history(history, options);
         queueMicrotask(() => this.onmessage({data: {id, result}}));
       }
       terminate() {}
