@@ -1200,6 +1200,16 @@ class Bundle(unittest.TestCase):
                 self.assertEqual(answer['stats']['installed'], 0)
 
     def test_native_browser_owner_honors_policy_move_selection(self):
+        controlled = node(dict(kind='pair-policy-value'))
+        self.assertEqual(controlled['gumbel']['action'], [0,1])
+        self.assertEqual(controlled['policy']['action'], [0,1])
+        self.assertEqual(controlled['stats']['completed'], 64)
+        self.assertAlmostEqual(controlled['childValue'], .8, places=10)
+        self.assertLess(controlled['childMean'], -.3)
+        evicted = node(dict(kind='pair-policy-value',eviction=True))
+        self.assertAlmostEqual(evicted['detached'], .8, places=10)
+        self.assertAlmostEqual(evicted['reattached'], .8, places=10)
+        self.assertLess(evicted['reattachedMean'], -.3)
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']
         self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])

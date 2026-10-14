@@ -175,6 +175,12 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
  // Canonical legal-action order is stable for this context. One bit per move
  // records exclusions already applied to the carried average before eviction.
  std::vector<uint64_t> carried_excluded;
+ // A queried root's comparison distribution is not its improved playing policy.
+ // Retain the last root's own credits separately from shared visits. Sparse
+ // canonical indices survive eviction without pinning its expanded children.
+ std::vector<std::pair<int,uint64_t>> policy_credits;
+ double policy_q=0,policy_floor=0;
+ double evaluation()const{return exact_winner>=0?(exact_winner==player?1.:-1.):!policy_credits.empty()?policy_q:q;}
  bool carried_excludes(size_t i)const{return i/64<carried_excluded.size() && (carried_excluded[i/64]&(uint64_t(1)<<(i%64)));}
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->buffers),tracked(&memory->buffers),active(&memory->buffers),cold(&memory->buffers){empty.owner=this;}
@@ -236,7 +242,7 @@ void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
-struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded; };
+struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded;std::vector<std::pair<int,uint64_t>> policy_credits;double policy_floor=0,policy_q=0; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
 // Dormant nodes hold evidence, not scheduling rights. Each entry owns itself,
@@ -259,6 +265,7 @@ struct Archive {
   return sizeof(Node)+2*sizeof(void*)+n.edges.capacity()*sizeof(Edge)+states*sizeof(EdgeState)
    +(n.active.capacity()+n.tracked.capacity())*sizeof(int)+n.cold.capacity()*sizeof(ColdBlock)
    +n.carried_excluded.capacity()*sizeof(uint64_t)
+   +n.policy_credits.capacity()*sizeof(decltype(n.policy_credits)::value_type)
    +n.parents.capacity()*sizeof(std::weak_ptr<Node>)+size_t(n.stones)*(sizeof(HistoryLink)+2*sizeof(void*));
  }
  size_t index_bytes()const{
@@ -451,7 +458,7 @@ struct Tree {
  // parents), else the tree's running mean, else the node's own network value.
  double value(const Node& node,const Edge& e)const {
   if(e.read().exact_winner>=0)return e.read().exact_winner==node.player?1:-1;
-  if(graph && e.read().child && e.read().child->n)return e.read().child->player==node.player?e.read().child->q:-e.read().child->q;
+  if(graph && e.read().child && e.read().child->n)return e.read().child->player==node.player?e.read().child->evaluation():-e.read().child->evaluation();
   return e.read().visits?e.read().sum/e.read().visits:node.value;
  }
  bool known(const Edge& e)const {return e.read().exact_winner>=0 || e.read().visits || (graph && e.read().child && e.read().child->n);}
@@ -488,7 +495,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;n->carried_excluded=std::move(o.excluded);evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;n->carried_excluded=std::move(o.excluded);n->policy_credits=std::move(o.policy_credits);n->policy_floor=o.policy_floor;n->policy_q=o.policy_q;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -607,7 +614,7 @@ struct Tree {
  void discard(const std::shared_ptr<Node>& node){
   clean(*node);
   for(auto& w:node->parents)if(auto p=w.lock())for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.read().child==node){
-   e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->q:-node->q)*e.read().visits;
+   e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->evaluation():-node->evaluation())*e.read().visits;
    e.write().child.reset();
   }}
   if(node->n){
@@ -625,7 +632,7 @@ struct Tree {
     if(excluded.empty())excluded.resize((node->edges.size()+63)/64);
     excluded[i/64]|=uint64_t(1)<<(i%64);
    }
-   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position,std::move(excluded)};
+   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position,std::move(excluded),node->policy_credits,node->policy_floor,node->policy_q};
   }
   node->dormant=false;++state->released;
  }
@@ -724,6 +731,13 @@ struct Tree {
   double total=node.value+node.carried_sum;int count=1+node.carried;
   for(int i:node.tracked_edges()){auto& e=node.edges[i];if(e.read().eligible && e.read().visits){total+=e.read().visits*value(node,e);count+=e.read().visits;}}
   node.q=node.exact_winner>=0?(node.exact_winner==node.player?1:-1):total/count;
+  if(node.expanded && node.exact_winner<0 && !node.policy_credits.empty()){
+   uint64_t maximum=0;
+   for(auto [i,credits]:node.policy_credits)if(size_t(i)<node.edges.size() && node.edges[i].read().eligible)maximum=std::max(maximum,credits);
+   int ignored=0;auto values=completed_q(node,ignored); // Copy before the rescale reuses work.
+   auto weights=policy_current(node,double(maximum),node.policy_floor,false);
+   node.policy_q=std::inner_product(values.begin(),values.end(),weights.begin(),0.);
+  }
  }
  // After a backup changed `from`, bring its parents other than `skip` (its parent on the backup path) and their
  // ancestors up to date: an exact child's winner, distance and bound are copied to each incoming edge and the parent
@@ -734,7 +748,7 @@ struct Tree {
   for(auto& w:from.parents)if(auto p=w.lock())if(p.get()!=skip)work.emplace_back(p.get(),&from);
   while(!work.empty()){
    auto [p,c]=work.back();work.pop_back();
-   const double before=p->q;const int winner=p->exact_winner,distance=p->distance;const bool bound=p->bound;
+   const double before=p->evaluation();const int winner=p->exact_winner,distance=p->distance;const bool bound=p->bound;
    if(c->exact_winner>=0){
     bool changed=false;
     for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.read().child.get()==c)changed|=tighten(c->exact_winner,c->distance+1,c->bound,e.write().exact_winner,e.write().distance,e.write().bound);}
@@ -747,7 +761,7 @@ struct Tree {
     continue;
    }
    refresh(*p);
-   if(p->q!=before || p->exact_winner!=winner || p->distance!=distance || p->bound!=bound)for(auto& w:p->parents)if(auto g=w.lock())work.emplace_back(g.get(),p);
+   if(p->evaluation()!=before || p->exact_winner!=winner || p->distance!=distance || p->bound!=bound)for(auto& w:p->parents)if(auto g=w.lock())work.emplace_back(g.get(),p);
   }
  }
  // Records a proven node's outcome for its position (graph search), keeping the shortest bound.
@@ -834,20 +848,31 @@ struct Tree {
  // losses and the non-winning edges of a won node set neither the mixed value, the visit scale nor the range.
  // The rescale divides by max(1e-8, range_floor, hi - lo), so a spread below range_floor is not stretched to the full scale.
  // Entries of ineligible edges are returned on the same scale but every caller discards them.
- std::vector<double>& transformed(Node& node,double comparison_max=-1) {
+ std::vector<double>& transformed(Node& node,double comparison_max=-1,double policy_floor=-1) {
   int maximum=0;auto& q=completed_q(node,maximum);double lo=1e300,hi=-1e300;
   for(size_t i=0;i<q.size();++i)if(node.edges[i].read().eligible){lo=std::min(lo,q[i]);hi=std::max(hi,q[i]);}
   if(lo>hi)lo=hi=0;
-  double range=std::max(std::max(1e-8,range_floor),hi-lo);
+  double range=std::max(std::max(1e-8,policy_floor<0?range_floor:policy_floor),hi-lo);
   double maximum_count=comparison_max<0?maximum:comparison_max;
   for(auto& x:q)x=(x-lo)/range*(50+maximum_count)*0.1;
   return q;
  }
- std::vector<double> policy(Node& node,double comparison_max=-1){
-  if(shared)current(node);auto weights=transformed(node,comparison_max);double maximum=-1e300,total=0;
-  for(size_t i=0;i<weights.size();++i){weights[i]=node.edges[i].read().eligible?weights[i]+node.edges[i].logit+bonus(node.edges[i]):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,weights[i]);}
+ std::vector<double> policy_current(Node& node,double comparison_max=-1,double policy_floor=-1,bool defence_bonus=true){
+  auto weights=transformed(node,comparison_max,policy_floor);double maximum=-1e300,total=0;
+  for(size_t i=0;i<weights.size();++i){weights[i]=node.edges[i].read().eligible?weights[i]+node.edges[i].logit+(defence_bonus?bonus(node.edges[i]):0.):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,weights[i]);}
   for(auto& w:weights){w=std::exp(w-maximum);total+=w;}
   for(auto& w:weights)w/=total;return weights;
+ }
+ std::vector<double> policy(Node& node,double comparison_max=-1){if(shared)current(node);return policy_current(node,comparison_max);}
+ // Native owners export an improved policy distinct from the root comparison's
+ // visit distribution. Keep the latter's mean/counts and publish the policy value
+ // separately so ancestors do not punish a root for exploring poor options.
+ void publish_policy(const std::vector<uint64_t>& credits){
+  auto& n=*root;if(credits.empty() || !n.expanded || n.exact_winner>=0)return;
+  if(credits.size()!=n.edges.size())throw std::runtime_error("Policy credits do not match root legal actions");
+  n.policy_credits.clear();for(size_t i=0;i<credits.size();++i)if(credits[i])n.policy_credits.emplace_back(int(i),credits[i]);
+  if(n.policy_credits.empty())return;
+  n.policy_floor=range_floor;n.archive_changed();stale(n);clean(n);
  }
  // Selection needs individual Qs only for materialized edges. Every cold edge
  // has the same mixed Q; root exports still construct the full legal vector.
@@ -1076,7 +1101,7 @@ struct Tree {
     if(index<0)continue;
     auto& e=x->edges[index];
     if(e.read().exact_winner>=0){++e.write().visits;e.write().sum=(e.read().exact_winner==x->player?1:-1)*e.read().visits;}
-    else if(e.read().child && e.read().child->n){++e.write().visits;e.write().sum+=e.read().child->player==x->player?e.read().child->q:-e.read().child->q;}
+    else if(e.read().child && e.read().child->n){++e.write().visits;e.write().sum+=e.read().child->player==x->player?e.read().child->evaluation():-e.read().child->evaluation();}
     else continue;
     x->track(e);++x->n;stale(*x);
    }
@@ -1130,7 +1155,7 @@ struct Tree {
     else if(edge.read().exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.read().exact_winner;node->distance=edge.read().distance-1;node->bound=edge.read().bound;}
     int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,winner==node->player?1:-1);return -1;}
    // A transposed child already holds more visits than this edge: take its value without evaluating (MCGS).
-   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,node->q,false);return -1;}
+   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,node->evaluation(),false);return -1;}
   }
   if(node->pending)return 0;
   node->pending=true;node->player=board.player;capture(path);
@@ -1383,7 +1408,7 @@ HX_API int hxg_store(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p
 HX_API int hxg_storage(void* p,int64_t* out){auto& t=*static_cast<gumbel::Tree*>(p);if(!t.shared)return 0;
  std::array<int64_t,8> counts{};
  for(auto& [key,n]:t.store){counts[0]+=int64_t(n->edges.size());counts[2]+=int64_t(n->edges.capacity()*sizeof(gumbel::Edge));
-  counts[5]+=int64_t((n->tracked.capacity()+n->active.capacity())*sizeof(int)+n->cold.capacity()*sizeof(gumbel::ColdBlock)+n->carried_excluded.capacity()*sizeof(uint64_t));for(auto& edge:n->edges)counts[1]+=!edge.read().empty;}
+  counts[5]+=int64_t((n->tracked.capacity()+n->active.capacity())*sizeof(int)+n->cold.capacity()*sizeof(gumbel::ColdBlock)+n->carried_excluded.capacity()*sizeof(uint64_t)+n->policy_credits.capacity()*sizeof(decltype(n->policy_credits)::value_type));for(auto& edge:n->edges)counts[1]+=!edge.read().empty;}
  counts[3]=counts[1]*sizeof(gumbel::EdgeState);counts[4]=int64_t(t.store.size());counts[6]=sizeof(gumbel::Edge);counts[7]=sizeof(gumbel::EdgeState);
  std::copy(counts.begin(),counts.end(),out);return 1;
 }
@@ -1455,7 +1480,9 @@ HX_API int hxg_prove_loss(void* p,int winner,int distance){try{
  t.apply(outcome,n);t.refresh(n);t.learn(n);t.propagate(n,nullptr);t.trim_archive();return 1;
  }catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 // The node estimate, for display when the listed candidates are all refuted.
-HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);t.trim_archive(false,false);return t.root->q;}
+HX_API double hxg_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);t.trim_archive(false,false);return t.root->evaluation();}
+// Raw visit-weighted diagnostic, distinct from an owner's evaluated policy.
+HX_API double hxg_mean_value(void* p){auto& t=*static_cast<gumbel::Tree*>(p);if(t.shared)t.renew(*t.root);t.trim_archive(false,false);return t.root->q;}
 HX_API int hxg_begin(void* p,int simulations,int sample){try{auto& t=*static_cast<gumbel::Tree*>(p);t.begin(simulations,sample);t.trim_archive(false,false);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxg_next(void* p){try{auto& t=*static_cast<gumbel::Tree*>(p);int result=t.request();t.trim_archive(false,false);return result;}catch(const std::exception& e){gumbel::error=e.what();return -2;}}
 HX_API int hxg_history(void* p,int id,int64_t* out){auto& h=static_cast<gumbel::Tree*>(p)->requests.at(id).history;if(out)for(int i=0;i<int(h.size());++i){out[2*i]=h[i].q;out[2*i+1]=h[i].r;}return int(h.size());}

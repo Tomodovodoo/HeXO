@@ -780,7 +780,7 @@ inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
    for(size_t i=0;i<o.focus.size();++i){if(i)out+=',';out+='['+std::to_string(o.focus[i].q)+','+std::to_string(o.focus[i].r)+']';}return finish(out+"]}");
  }
  if(!n.expanded || n.edges.empty())throw std::runtime_error("Continuous root has no legal search result");
- t.current(n);int ignored=0;auto q=t.completed_q(n,ignored);
+ t.renew(n);int ignored=0;auto q=t.completed_q(n,ignored);
  auto weights=o.policy();
  int64_t action[2];if(!o.choice(action))throw std::runtime_error("Continuous root cannot select a move");
  double raw=o.root_raw;bool raw_known=o.root_raw_known;const auto prefixes=gumbel::prefix_keys(o.focus);auto key=prefixes.back().second;
@@ -789,7 +789,7 @@ inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
  auto cells=[&](const std::vector<Cell>& h){out<<'[';for(size_t j=0;j<h.size();++j){if(j)out<<',';out<<'['<<h[j].q<<','<<h[j].r<<']';}out<<']';};
   out<<"{\"producer\":"<<producer<<",\"model\":"<<model<<",\"game\":"<<index<<",\"token\":"<<token<<",\"proof_enabled\":"<<(o.proof_enabled?"true":"false")<<",\"history\":";cells(o.focus);
  if(sequence)out<<",\"kind\":\"progress\",\"snapshot_sequence\":"<<sequence<<",\"comparison_passes\":"<<o.views[0].passes<<",\"credit_source\":\"completed_comparisons\"";
- out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.q<<",\"network_value\":";
+ out<<",\"action\":["<<action[0]<<','<<action[1]<<"],\"exact_winner\":"<<n.exact_winner<<",\"proof_plies\":"<<n.distance<<",\"completed\":"<<o.completed<<",\"issued\":"<<o.issued<<",\"root_completed\":"<<o.views[0].completed<<",\"elapsed_ms\":"<<o.elapsed()<<",\"node_value\":"<<n.evaluation()<<",\"mean_value\":"<<n.q<<",\"network_value\":";
  if(raw_known)out<<raw;else out<<"null";
  RootEvent result;result.has_edges=true;result.edges.reserve(9*n.edges.size());
  for(size_t i=0;i<n.edges.size();++i){auto& e=n.edges[i];result.edges.insert(result.edges.end(),{double(e.action.q),double(e.action.r),e.logit,q[i],t.value(n,e),weights[i],double(e.read().visits),double(o.direct_credit(i)),double(e.read().eligible)});}

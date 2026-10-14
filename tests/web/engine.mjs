@@ -158,6 +158,49 @@ if (job.kind === 'encode') {
         reference: Buffer.from(features(sample).buffer).toString('base64'), far: sample.far});
     } finally { batch?.close(); owner.close(); graph.close(); }
   }
+} else if (job.kind === 'pair-policy-value') {
+  const history = [[0,0],[7,0],[8,0],[1,0],[2,0],[7,1],[8,1]], a = [0,1], b = [2,1], good = [1,1];
+  const same = (x,y) => x[0] === y[0] && x[1] === y[1], m = native.m;
+  const graph = new GameGraph(native,{history,seed:1740,limit:job.eviction?1:512}), child = graph.view([...history,a]);
+  const parent = job.eviction?graph.view(history):null;
+  const owner = new NativeOwner(graph,{work:64,ms:0,quantum:32,views:8,depth:8,seed:1740});
+  const buffers = [], alloc = bytes => {const p=native.alloc(bytes);buffers.push(p);return p;};
+  try {
+    for (let tick=0;!owner.done() && tick<1000;tick++) {
+      owner.step();if(!owner.admit())continue;
+      const layout=alloc(16);native.checked(m._hxgf_layout(owner.feed,128,layout));
+      const [count,cells]=Array.from(native.view(BigInt64Array,layout,2),Number);
+      if(!count)continue;
+      const ids=alloc(count*8),trees=alloc(count*4),requests=alloc(count*4),offsets=alloc((count+1)*8),histories=alloc(cells*16);
+      native.checked(m._hxgf_take(owner.feed,count,ids,trees,requests,offsets,histories,BigInt(cells)));
+      const bounds=Array.from(native.view(BigInt64Array,offsets,count+1),Number),actions=[],logits=[],values=[],ends=[0];
+      for(let i=0;i<count;i++) {
+        const h=native.pairs(histories+bounds[i]*16,bounds[i+1]-bounds[i]),legal=native.legal(h);
+        let value=.8;
+        if(h.length>history.length) value=same(h[history.length],a)?h.length===history.length+1 || same(h[history.length+1],good)?.8:-.8:same(h[history.length],b)?.2:-.4;
+        if(Math.floor((h.length+1)/2)%2)value=-value;
+        for(const action of legal) {
+          actions.push(action);values.push(value);
+          logits.push(h.length===history.length?same(action,a)?0:same(action,b)?-.4:-80:h.length===history.length+1 && same(h[history.length],a) && same(action,good)?0:-80);
+        }
+        ends.push(actions.length);
+      }
+      const ap=native.cells(actions);buffers.push(ap);
+      const lp=alloc(logits.length*8),vp=alloc(values.length*8),op=alloc(ends.length*8);
+      native.view(Float64Array,lp,logits.length).set(logits);native.view(Float64Array,vp,values.length).set(values);
+      native.view(BigInt64Array,op,ends.length).set(ends.map(BigInt));
+      native.checked(m._hxgm_install(owner.pool,ids,count,op,ap,lp,vp));
+      for(const p of buffers.splice(0))m._free(p);
+    }
+    if(!owner.done())throw new Error('Controlled browser owner did not finish');
+    answer={gumbel:owner.result(),policy:owner.result('policy'),stats:owner.stats(),childValue:m._hxg_value(child.ptr),childMean:m._hxg_mean_value(child.ptr)};
+    if(parent) {
+      owner.close();child.close();graph.at([...history,b]);
+      const detached=parent.result('policy'),i=detached.actions.findIndex(action=>same(action,a));
+      answer.detached=detached.completed_q[i];graph.at([...history,a]);
+      answer.reattached=m._hxg_value(graph.ptr);answer.reattachedMean=m._hxg_mean_value(graph.ptr);
+    }
+  } finally {for(const p of buffers)m._free(p);owner.close();child.close();parent?.close();graph.close();}
 } else if (job.kind === 'native-owner') {
   const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
     work: job.work ?? (job.ms ? 0 : 256), ...(job.defaultClock ? {} : {ms: job.ms ?? 0}), views: job.views ?? 8, quantum: 32});

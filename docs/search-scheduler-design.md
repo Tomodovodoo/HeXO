@@ -559,6 +559,35 @@ its protocol play configuration is different. HeXO's backend is already fast
 in measured cases. The opportunity is useful supply, lean graph handling and
 repeatable proof/neural cooperation, then better learning from that evidence.
 
+## Policy values of queried roots
+
+A root comparison deliberately visits alternatives the improved policy would
+rarely play. Its visit-weighted mean therefore measures the comparison
+distribution, not the improved policy's estimated value. When a descendant is
+also queried as an owner root, backing that mean into an ancestor can penalize
+its stronger estimated plan merely because the descendant explored bad options.
+
+Owner views publish a separate policy value after a completed lease or when
+stopping a partial lease. It is the expectation of current completed Q under the
+base improved policy, with that view's cumulative direct comparison credits for
+the confidence scale. Shared visits still contribute Q evidence and accounting;
+they do not inflate the policy's confidence scale. This is an estimate of the
+exported policy, not a guarantee about game-theoretic value or the exact Gumbel,
+noise or stochastic behaviour distribution.
+
+Ancestors read the child's policy estimate in the parent's player frame. Raw
+visit means and counts remain available separately. Sparse canonical-action
+credits, range floor and cached policy estimate stay with the neural context
+through dormant reuse and eviction summaries. Detaching a child freezes its
+policy estimate on incoming edges; reattachment keeps that estimate while
+prediction is pending, without substituting the raw mean. Re-expansion recomputes the policy against current
+predictions and proof eligibility; verified outcomes override both estimates.
+Retargeting clears the new view's comparison credits while retaining the stored
+node's evidence. Browser and native owners use the same C++ implementation.
+This adds no neural forwards, solver queries or simulations and changes no BCE
+loss, target construction or timing. Result metadata exposes `mean_value`
+separately from the backed-up `node_value`.
+
 ## Source map
 
 | Contract | Source |

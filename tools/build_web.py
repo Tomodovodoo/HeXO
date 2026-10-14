@@ -54,7 +54,7 @@ GUMBEL_EXPORTS = ('malloc', 'free', 'hxg_new', 'hxg_free', 'hxg_error', 'hxg_beg
                   'hxg_legal', 'hxg_fulfill', 'hxg_cancel', 'hxg_advance', 'hxg_stats', 'hxg_policy', 'hxg_policy_credits', 'hxg_completed',
                   'hxg_done', 'hxg_tactics', 'hxg_graph', 'hxg_q_range_floor', 'hxg_root_noise', 'hxg_round_barrier', 'hxg_exact',
                   'hxg_distance', 'hxg_census', 'hxg_mark_exact', 'hxg_prove', 'hxg_share', 'hxg_archive', 'hxg_archive_forward', 'hxg_archive_stats', 'hxg_root_at', 'hxg_store', 'hxg_q', 'hxg_eligible',
-                  'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
+                  'hxg_facts', 'hxg_prove_loss', 'hxg_value', 'hxg_mean_value', 'hxg_view', 'hxg_view_counters', 'hxg_root_credits',
                   'hxgo_new', 'hxgo_free', 'hxgo_step', 'hxgo_step_ready', 'hxgo_cancel', 'hxgo_done', 'hxgo_feed', 'hxgo_admit',
                   'hxgo_root', 'hxgo_install', 'hxgo_choice', 'hxgo_policy', 'hxgo_root_credits', 'hxgo_stats', 'hxgo_records', 'hxgo_record_history',
                   'hxgm_new', 'hxgm_free', 'hxgm_step', 'hxgm_step_neural', 'hxgm_cancel', 'hxgm_done', 'hxgm_feed', 'hxgm_admit',
