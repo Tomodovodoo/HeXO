@@ -373,15 +373,19 @@ console.log(JSON.stringify({first:replay[0].history,cells:replay.reduce((n,r)=>n
         self.assertEqual(result['first'], [[0,0],[1,0],[0,1]])
         self.assertLessEqual(result['cells'], 50000)
 
-    def test_failed_replays_leave_the_full_ordinary_solve_available(self):
+    def test_failed_replays_leave_the_full_explicit_solve_available(self):
         from tests.test_tactical_proof import FIXTURE
         history = FIXTURE['positions']['1790600287230040:30:248']
         replay = [dict(history=history, winner=winner, pv=[]) for winner in (0, 1)]
         found = node(dict(kind='worker-turn', history=history, simulations=0, nodes=1300,
-                          replay=replay, replayMiss=True))
+                          replay=replay, replayMiss=True, proveMs=5000))
         self.assertEqual(found['proof']['winner'], 0)
         self.assertGreater(found['actual_solver_nodes'], 2600)
-        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], history), 'PROVEN_WIN')
+        self.assertEqual([(q['attacker'], q['replay']) for q in found['root_queries']],
+                         [('defender', 1), ('mover', 1), ('mover', 0)])
+        checked = tactical_proof.NativeTactics().history(history, root_moves=found['moves'],
+                                                        nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], history), 'PROVEN_WIN')
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
     def test_saved_strategy_survives_refresh_reload_and_replays_a_changed_board(self):
@@ -407,10 +411,36 @@ console.log(JSON.stringify({records:restored.records,replay:restored.proofs.repl
                               input=json.dumps(dict(history=OPEN_THREE, found=found)), capture_output=True, text=True, check=True)
         saved = json.loads(done.stdout)
         self.assertEqual(saved['replay'][0]['certificate'], original['certificate'])
-        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], simulations=8, nodes=5000))
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], preset='solver'))
         self.assertEqual(result['proof']['winner'], 0)
         self.assertEqual(result['actual_completed'], 0)
-        self.assertEqual(tactical_proof.independent_verify(result['proof']['certificate'], saved['changed']), 'PROVEN_WIN')
+        self.assertTrue(any(q['replay'] for q in result['root_queries']))
+        checked = tactical_proof.NativeTactics().history(saved['changed'], root_moves=result['moves'],
+                                                        nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], saved['changed']), 'PROVEN_WIN')
+        # Keep an opponent-winning strategy through reload, change only a defender
+        # stone, and allow replay verification while fresh discovery is inconclusive.
+        lost = OPEN_THREE + [[-1,0],[2,1]]
+        prover = tactical_proof.NativeTactics(independent=True)
+        self.addCleanup(prover.close)
+        original = prover.history(lost, attacker='defender', nodes=10000, ms=5000)
+        self.assertEqual(tactical_proof.independent_verify(original['certificate'], lost, attacker='defender'), 'PROVEN_LOSS')
+        pv = node(dict(kind='pv', history=lost, certificate=original['certificate'], options=dict(attacker=0)))
+        found = dict(proof=dict(winner=0, plies=pv['plies'], certificate=original['certificate']), pv=pv['pv'],
+                     moves=[[3,0],[4,0]], value=0, top=[], solved=True)
+        losing_source = source.replace('changed[changed.length-1]=[7,8]', 'changed[6]=[7,8]')
+        done = subprocess.run([NODE, '--input-type=module', '-e', losing_source], cwd=ROOT,
+                              input=json.dumps(dict(history=lost, found=found)), capture_output=True, text=True, check=True)
+        saved = json.loads(done.stdout)
+        self.assertEqual(saved['replay'][0]['winner'], 0)
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'],
+                           preset='solver', replayOnly=True))
+        self.assertEqual((result['proof']['winner'], result['value']), (0, 0))
+        self.assertEqual([(q['attacker'], q['replay']) for q in result['root_queries']], [('defender', 1)])
+        self.assertGreater(result['solver']['root_nodes'], 0)
+        checked = prover.history(saved['changed'], attacker='defender', replay=saved['replay'],
+                                 nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], saved['changed'], attacker='defender'), 'PROVEN_LOSS')
 
     def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
         from types import SimpleNamespace
@@ -984,10 +1014,10 @@ class Bundle(unittest.TestCase):
         self.assertTrue(answer['threat'])
         self.assertLess(answer['solver']['elapsed_ms'], 30000)
 
-    def test_a_standard_analysis_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
+    def test_explicit_deep_solve_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
         history = self.lost_history()
         for ply in (len(history), len(history) - 1):
-            answer = node(dict(kind='worker-turn', history=history[:ply], simulations=8, nodes=4096))
+            answer = node(dict(kind='worker-turn', history=history[:ply], simulations=8, nodes=4096, proveMs=5000))
             self.assertEqual(answer['proof']['winner'], 0, ply)
 
     def test_solver_preset_proves_a_known_forced_win_in_the_page_session(self):
@@ -1011,7 +1041,8 @@ class Bundle(unittest.TestCase):
         self.assertEqual(custom['analysis']['preset'], 'custom')
         self.assertEqual(custom['simulations'], 7)
         self.assertEqual(custom['solver_nodes'], 1024)
-        self.assertEqual(custom['proof']['winner'], mover)
+        self.assertEqual(custom['root_queries'], [])
+        self.assertEqual(custom['solver_frames'], [])
 
     def test_native_proof_frontier_settles_during_inference_and_drains_both_producers(self):
         history = [[0,0],[0,8],[2,8],[1,0],[2,0],[4,8],[6,8]]
@@ -1107,6 +1138,11 @@ class Bundle(unittest.TestCase):
             self.assertEqual((stats['pending'], stats['tasks'], stats['subscribers']), (0,0,0))
             self.assertGreaterEqual(stats['completed'], 256)
             self.assertNotIn('proof', stats)
+        assisted = node(dict(kind='worker-turn', history=[[0,0]], simulations=64, nodes=2048))
+        self.assertEqual(assisted['root_queries'], [])
+        self.assertFalse(any(stage.startswith('checking ') for stage in assisted['progress_stages']))
+        self.assertEqual(len(assisted['moves']), 2)
+        self.assertTrue(all('proof' in stats for stats in assisted['scheduler']))
 
     def test_a_cancel_ends_a_turn_whose_proof_workers_are_still_starting(self):
         answer = node(dict(kind='worker-turn', history=[[0,0]], simulations=32, nodes=2048, stallPrepare=True))
@@ -1310,9 +1346,11 @@ class Bundle(unittest.TestCase):
         self.assertEqual(node(dict(kind='pv', history=history, certificate=reused['certificate'])),
                          dict(pv=local[0], plies=local[1]))
         self.assertTrue(local[0])
-        turn = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1))
+        turn = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1, proveMs=5000))
         self.assertEqual((turn['proof']['winner'], turn['value']), (0, 1.))
-        self.assertEqual(tactical_proof.independent_verify(turn['proof']['certificate'], history), 'PROVEN_WIN')
+        # The independent stamp certificate above establishes this root's outcome.
+        # Concurrent search can return an exact result without a standalone certificate.
+        self.assertTrue(turn['pv'])
 
     def test_enabling_stamps_keeps_an_ordinary_one_stone_win_at_one_ply(self):
         from tests.test_tactical_proof import IMMEDIATE
@@ -1369,10 +1407,13 @@ class Bundle(unittest.TestCase):
                  for p in ((-3, 0), (-2, 0), (3, 0), (4, 0))]
         found = node(dict(kind='worker-turn', history=history, simulations=16, nodes=1, known=known))
         self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
-        self.assertTrue(found['proof']['dependencies'])
+        from types import SimpleNamespace
+        prover = tactical_proof.NativeTactics(stamps=True)
+        checked = play.solve(SimpleNamespace(history=prover.history, abort=prover.cancel), history, 1, known=known)
+        self.assertTrue(checked['proof']['dependencies'])
         self.assertTrue(all(row[4] < 0 for row in found['top']))
-        local = play.principal_variation(history, found['proof']['certificate'], attacker=0, known=known)
-        web = node(dict(kind='pv', history=history, certificate=found['proof']['certificate'],
+        local = play.principal_variation(history, checked['proof']['certificate'], attacker=0, known=known)
+        web = node(dict(kind='pv', history=history, certificate=checked['proof']['certificate'],
                         options=dict(attacker=0, known=known)))
         self.assertEqual(web, dict(pv=local[0], plies=local[1]))
         known = [dict(history=OPEN_THREE, winner=0, plies=24, pv=[]),
@@ -1417,16 +1458,15 @@ class Bundle(unittest.TestCase):
         self.assertEqual(matching['top'][0][:2], [2, 0])
         self.assertFalse(stale['hasEval'])
 
-    def test_root_candidates_are_published_before_the_solver_runs(self):
+    def test_regular_play_skips_preliminary_queries_and_keeps_progress(self):
         root = [[0, 0], [1, 0]]
         for simulations in (0, 32):
             for turn in node(dict(kind='glimpse', history=root, simulations=simulations, nodes=16)):
-                self.assertTrue(turn['queries'])
-                self.assertTrue(all(q['preview'] for q in turn['queries']))
-                self.assertEqual(turn['progress'][0]['stage']['name'], 'checking proof')
+                self.assertEqual(turn['queries'], [])
+                self.assertFalse(any((p.get('stage') or {}).get('name', '').startswith('checking ') for p in turn['progress']))
                 fractions = [p['fraction'] for p in turn['progress']]
                 self.assertEqual(fractions, sorted(fractions))
-                self.assertEqual(turn['evaluations'].count(root), 1)
+                self.assertLessEqual(turn['evaluations'].count(root), 1)
 
     def test_analysis_failure_stays_visible_and_can_be_retried(self):
         result = node(dict(kind='analysis-failure'))

@@ -90,7 +90,7 @@ class FakeEngines:
         value = .5 + getattr(self, 'drift', 0) * len(self.refreshes) if refresh is not None else .5
         found = dict(moves=moves, value=value, top=[[*moves[0], .9, .5]], proof=None, line=[], threat=[], ms=1,
                      actual_completed=budget['simulations'])
-        return found, budget, f'{model_key(export_path(entry, checkpoint))}:none' + (':kept' if keep or line is not None else '')
+        return found, budget, f'{search_key(model_key(export_path(entry, checkpoint)), entry, budget)}:none' + (':kept' if keep or line is not None else '')
 
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, known=None):
         return [self.evaluate(entry, checkpoint, budget, history, watch) for history in histories]
@@ -1145,7 +1145,7 @@ class GameGraphs(unittest.TestCase):
                         graph.close()
 
     def test_defender_proof_uses_refuted_graph_edges_propagates_and_reloads(self):
-        from play import evaluate, Proofs
+        from play import evaluate, solve, Proofs
         from neural_search import checked, native
         from tactical_proof import NativeTactics
         from tests.test_tactical_proof import OPEN_THREE
@@ -1172,7 +1172,9 @@ class GameGraphs(unittest.TestCase):
         self.assertEqual(graph.result(0, 0, 0, 0)['proven'], 0)
         self.assertEqual(len(graph.facts()), 4)
         from types import SimpleNamespace
-        found = evaluate(bubble, SimpleNamespace(history=prover.history, abort=prover.cancel), history, 32, 1, trees=trees)
+        root = SimpleNamespace(history=prover.history, abort=prover.cancel)
+        given = solve(root, history, 1, known=graph.facts())
+        found = evaluate(bubble, root, history, 32, 1, trees=trees, solved=given)
         self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
         self.assertTrue(found['proof']['dependencies'])
         checked_proof = prover.history(history, attacker='defender', certificate=found['proof']['certificate'],
@@ -1191,7 +1193,7 @@ class GameGraphs(unittest.TestCase):
             self.assertEqual(known.known(history[:-1])['winner'], 0)
 
     def test_fresh_losing_roots_still_play_in_single_and_pooled_evaluations(self):
-        from play import evaluate, evaluate_many, Proofs, replay
+        from play import evaluate, evaluate_many, solve, Proofs, replay
         from tactical_proof import NativeTactics
         from tests.test_tactical_proof import OPEN_THREE
         from types import SimpleNamespace
@@ -1199,10 +1201,10 @@ class GameGraphs(unittest.TestCase):
         prover = SimpleNamespace(history=engine.history, abort=engine.cancel)
         history = OPEN_THREE + [[-1, 0], [2, 1]]
         bubble = self.engines.bubble(None)
-        single = evaluate(bubble, prover, history, 16, 10000)
-        pooled = evaluate_many(bubble, [prover], [history], 16, 10000)[0]
         known = Proofs()
-        known.add(history, single)
+        known.add(history, solve(prover, history, 10000))
+        single = evaluate(bubble, prover, history, 16, 10000, known=known)
+        pooled = evaluate_many(bubble, [prover], [history], 16, 10000, known=known)[0]
         restored = evaluate(bubble, None, history, 16, 0, known=known)
         for found in (single, pooled, restored):
             self.assertEqual((found['proof']['winner'], found['value']), (0, 0.))
@@ -2252,7 +2254,7 @@ class TurnTrees(unittest.TestCase):
         history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
         from types import SimpleNamespace
         engine = tactical_proof.NativeTactics()
-        found = evaluate(self.bubble(), SimpleNamespace(history=engine.history, abort=engine.cancel), history, 8, 32768)
+        found = evaluate(self.bubble(), SimpleNamespace(history=engine.history, abort=engine.cancel), history, 8, 32768, solver_ms=5000)
         self.assertEqual(found['proof']['winner'], 0)
         self.assertEqual(len(found['moves']), 1)
         self.assertGreater(len(found['pv']), 5)
@@ -2307,7 +2309,29 @@ class TurnTrees(unittest.TestCase):
         self.assertGreater(report['rows'][0]['verified_certificates'], 0)
         self.assertGreater(report['rows'][0]['verification_ms'], 0)
         self.assertEqual(report['rows'][1]['verified_certificates'], 0)
+        self.assertEqual(report['summary']['nodes'], sum(r['actual_solver_nodes'] or 0 for r in report['rows']))
+        verification = sum(q['nodes_fresh'] or 0 for r in report['rows'] for q in r['queries'] if q['phase'] == 'verification')
+        self.assertGreater(verification, 0)
+        self.assertEqual(report['summary']['verification_query_nodes'], verification)
         self.assertEqual(json.loads(target.read_text())['rows'], report['rows'])
+        import tactical_proof
+        checker = tactical_proof.NativeTactics()
+        self.addCleanup(checker.close)
+        answer = checker.history(IMMEDIATE, nodes=1000, ms=5000)
+        # A root claim needs this query's matching verdict and checked certificate,
+        # regardless of any other certificates returned during search.
+        for rejected in (dict(status='UNKNOWN', native_verified=False, reason='work limit'),
+                         answer | dict(status='PROVEN_LOSS'), answer | dict(native_verified=False),
+                         answer | dict(certificate=None, certificate_json=None)):
+            with self.subTest(status=rejected['status'], verified=rejected['native_verified']), \
+                    unittest.mock.patch.object(tactical_proof.IsolatedTactics, 'history', return_value=rejected):
+                with self.assertRaises(RuntimeError):
+                    engine_benchmark(source, target, self.path, simulations=4, nodes=1000, ms=5000, stamps=True)
+                rejected_report = json.loads(target.read_text())
+                self.assertEqual((rejected_report['rows'], rejected_report['summary']['solved']), ([], 0))
+        with unittest.mock.patch('tools.proof_stamps.independent_verify', return_value='PROVEN_LOSS'):
+            with self.assertRaisesRegex(RuntimeError, 'disagrees with independent verdict'):
+                engine_benchmark(source, target, self.path, simulations=4, nodes=1000, ms=5000, stamps=True)
 
     def test_play_evaluation_keeps_one_tree_for_the_turn(self):
         from play import evaluate
@@ -2404,12 +2428,13 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(after['solver']['native_nodes'], 0)
         self.assertLess(after['solver']['elapsed_ms'], 1500)
 
-    def test_a_standard_analysis_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
-        from play import evaluate
+    def test_explicit_root_proof_reaches_play_before_and_after_the_last_stone(self):
+        from play import evaluate, solve
         history, prover = self.lost_game()
         bubble = self.bubble()
         for ply in (len(history), len(history) - 1):
-            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True)
+            given = solve(prover, history[:ply], 4096)
+            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True, solved=given)
             self.assertEqual(found['proof']['winner'], 0, ply)
             self.assertEqual(found['value'], 0, ply)
 
@@ -2645,9 +2670,9 @@ class TurnTrees(unittest.TestCase):
                 game.close()
             self.assertAlmostEqual(found['value'], alone['value'], places=1)
 
-    def test_a_pooled_review_asks_the_solver_once_per_position(self):
+    def test_regular_single_and_pooled_review_skip_preliminary_queries(self):
         from dense_solver import VERDICTS
-        from play import evaluate_many
+        from play import evaluate, evaluate_many
         asked = []
 
         class Prover:
@@ -2659,8 +2684,33 @@ class TurnTrees(unittest.TestCase):
                 pass
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0)]]
         found = evaluate_many(self.bubble(), [Prover(), Prover()], histories, 0, 64)
-        self.assertEqual(sorted(asked), sorted((position_text(h), side) for h in histories[:2] for side in ('mover', 'opponent')))
+        self.assertEqual(asked, [])
+        with unittest.mock.patch('hybrid_scheduler.ProofWorkers'):
+            single = evaluate(self.bubble(), Prover(), histories[0], 0, 64)
+        self.assertEqual(asked, [])
+        self.assertTrue(single['solved'])
         self.assertTrue(all(f['solved'] for f in found))
+        import tactical_proof
+        from tests.test_tactical_proof import OPEN_THREE
+        engines = Engines('cpu')
+        self.addCleanup(engines.close)
+        budget = dict(simulations=512, solver_nodes=64)
+        with unittest.mock.patch.object(tactical_proof, 'IsolatedTactics',
+                                        side_effect=AssertionError('ordinary play has no root-query process')):
+            ordinary = engines.evaluate(dict(path=self.path), '', budget, OPEN_THREE, lambda n: None)[0]
+            pooled = engines.evaluate_many(dict(path=self.path), '', budget, [OPEN_THREE], lambda n: None)[0][0]
+            raw = engines.evaluate(dict(path=self.path), '', budget | dict(simulations=0), histories[0], lambda n: None)[0]
+        self.assertIsNone(engines.prover)
+        self.assertIsNotNone(engines.workers)
+        self.assertGreater(ordinary['actual_solver_nodes'], 0)
+        self.assertGreater(pooled['actual_solver_nodes'], 0)
+        self.assertEqual(raw['actual_solver_nodes'], 0)
+        with unittest.mock.patch.object(tactical_proof, 'IsolatedTactics', wraps=tactical_proof.IsolatedTactics) as isolated:
+            explicit = engines.evaluate(dict(path=self.path), '', budget | dict(solver_ms=5000),
+                                        OPEN_THREE, lambda n: None)[0]
+            isolated.assert_called_once()
+        self.assertIsNotNone(engines.prover)
+        self.assertEqual(explicit['proof']['winner'], 0)
 
     def test_a_tier_runs_only_the_simulations_its_root_lacks(self):
         from play import evaluate
@@ -2767,7 +2817,7 @@ class GameProofs(unittest.TestCase):
 
     def found_win(self):
         """The solver's win for side 0 at ply 80, checked against the position's known length and its own line."""
-        found = self.analyse(80, 32768)
+        found = self.analyse(80, 32768, preset='solver')
         self.assertIsNotNone(found['proof'], (found, self.answers))
         plies = found['proof']['plies']
         self.assertEqual(found['proof'], self.label(self.start + [(-1, -11)], plies))
@@ -3015,7 +3065,7 @@ class Registry(unittest.TestCase):
         self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'drip:Drip'])
         self.assertNotIn('q_range_floor', found['bubble:alpha'])
         self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
-        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
+        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab~hybrid-frontier-v1', 'ab~q0.5~hybrid-frontier-v1'])
         self.assertNotEqual(*(play.search_key('ab', dict(q_range_floor=x)) for x in (.5000001, .5000002)))
         bubble = unittest.mock.Mock(sha256='ab'*32)
         with unittest.mock.patch('neural_search.GameGraph') as tree:

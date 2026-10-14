@@ -531,7 +531,7 @@ export class NativeOwner {
 /** Transport for the compiled proof frontier. query(worker, request) must keep
  * each worker's resident solver table and resolve only after its slice stops. */
 export class NativeProofs {
-  constructor(owner, {query, cancel = null, maxSlice = cancel ? 1000 : 64, workers = 1, slice = 8, table = 4, tasks = 256, stamps = false, endpoints = 8, stop = () => false} = {}) {
+  constructor(owner, {query, cancel = null, maxSlice = cancel ? 1000 : 64, workers = 1, slice = 8, table = 4, tasks = 256, stamps = false, endpoints = 8, budget = 1, stop = () => false} = {}) {
     if (!owner.pool || owner.proofs || typeof query !== 'function') throw new Error('A free native owner and proof transport are required');
     if (!Number.isInteger(endpoints) || endpoints < 0 || endpoints > 8) throw new Error('Neural frontier limit must be an integer from 0 to 8');
     if (maxSlice > 64 && typeof cancel !== 'function') throw new Error('Long solver slices require cooperative cancellation');
@@ -539,7 +539,10 @@ export class NativeProofs {
     this.pending = new Map(); this.failure = null; this.workerError = null; this.closing = null; this.records = []; this.neuralRecords = [];
     this.ptr = this.m._hxpe_new(owner.pool, workers, workers, slice, table, tasks, Number(stamps), maxSlice);
     this.n.checked(this.ptr);
-    try { this.n.checked(this.m._hxp_neural(this.ptr, 0n, endpoints)); }
+    try {
+      this.n.checked(this.m._hxp_budget(this.ptr, budget));
+      this.n.checked(this.m._hxp_neural(this.ptr, 0n, endpoints));
+    }
     catch (error) { this.m._hxp_free(this.ptr); this.ptr = 0; throw error; }
     owner.proofs = this;
   }

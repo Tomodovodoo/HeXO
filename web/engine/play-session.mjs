@@ -220,7 +220,8 @@ export class BrowserSession extends OfflineSession {
     const entry = this.entries.get(spec.engine), budget = spec.budget || {};
     // A Bubble or Six budget in time keeps its own evaluations (python/play.py search_key).
     const search = formKind(entry) && budget.ms ? `~ms${budget.ms}` : '';
-    return [spec.engine, spec.checkpoint, (entry?.version || '') + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
+    const protocol = formKind(entry) === 'bubble' ? '~hybrid-frontier-v1' : '';
+    return [spec.engine, spec.checkpoint, (entry?.version || '') + protocol + search, entry?.models?.[spec.checkpoint ?? ''] ?? ''].join('|');
   }
   cacheKey(history, spec) { return `${this.engineKey(spec)}|${JSON.stringify(spec.budget)}|${position(history)}`; }
   lookup(history, spec = this.analysis, exact = false) { return this.lookupAt(position(history), spec, exact); }

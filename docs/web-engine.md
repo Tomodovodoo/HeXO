@@ -17,10 +17,10 @@ verified proof (`proveRoot` in `worker.mjs`).
 Every Bubble search on the page runs the hybrid scheduler, for analysis, review, refreshes, seats and matches. That
 is the native graph owner (`NativeOwner` in `search.mjs`, `src/gumbel_owner.cpp`) on the game's `GameGraph`, with the
 served page's settings of 8 views, depth 8, 16 root samples and the round barrier on. The preset's simulations are
-the owner's work per stone, counted as completed simulations over all its views, in quanta of 64, or of the
-stone's work when that is smaller (the owner takes 4 at least). With solver nodes above 0 the root queries (a win for the side to move, the opponent's
-threat, the defence) run first at that node budget, and then the owner's proof frontier runs on the proof workers
-during each stone's search; 0 solver nodes means no proof work. There are `PROOF_WORKERS` proof workers
+the owner's work per stone, counted as completed simulations over all its views, in quanta of at most 32, or half the selected stone budget when smaller, at least 4. Playing chooses the highest improved-policy move, as in league evaluation; actors use Gumbel for training. With solver nodes above 0 the owner's proof frontier runs concurrently at
+0.1 owner-time share; no preliminary win, threat or defence checks delay ordinary search. Zero solver nodes
+means no proof work. Deep Solve explicitly requests a separate proof clock.
+There are `PROOF_WORKERS` proof workers
 (`bubble.mjs`), each a Web Worker: half of `navigator.hardwareConcurrency` less one, from 1 to 8, so the main
 thread and inference keep the other half; ONNX Runtime's WebAssembly build alone asks for up to 8 threads. An
 8-thread laptop gets 3 proof workers, a 16-thread desktop 7, and 18 threads or more get 8. The solver preset uses the
