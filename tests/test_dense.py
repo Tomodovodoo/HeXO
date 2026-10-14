@@ -11749,7 +11749,7 @@ class DenseBrowser(unittest.TestCase):
         self.assertTrue(self.complete(history, result['moves']))
 
     def test_engines_reload_changed_weights_and_record_the_budget_they_ran(self):
-        from play import Engines
+        from play import Engines, search_key
         path = Path(self.temp.name)/'ema.pt'
         engines = Engines('cpu', tactical_package=Path(self.temp.name)/'missing')
         first = engines.bubble(path)
@@ -11762,15 +11762,15 @@ class DenseBrowser(unittest.TestCase):
         with unittest.mock.patch.object(engines, 'solver') as solver:
             engines.evaluate(entry, '', dict(simulations=0, solver_nodes=0), [(0, 0)], lambda n: None)
         solver.assert_not_called()
-        self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), engines.bubble(path).sha256[:16] + ':none'))
+        self.assertEqual((spent, weights), (dict(simulations=0, solver_nodes=0), search_key(engines.bubble(path).sha256[:16], entry) + ':none'))
 
     def test_solver_failures_do_not_count_as_checked(self):
-        from play import evaluate
+        from play import solve
         for result, solved in ((dict(status='UNKNOWN', reason='tactical worker starting'), False),
                                (dict(status='UNKNOWN', reason='no verified strategy'), True),
                                (dict(status='UNKNOWN', reason='defender counterwin'), True)):
             prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
-            self.assertEqual(evaluate(self.bubble, prover, [(0, 0)], 0, 2048)['solved'], solved)
+            self.assertEqual(solve(prover, [(0, 0)], 2048)['solved'], solved)
 
     def test_cancelling_stops_the_search(self):
         from play import Cancelled, evaluate
@@ -11780,14 +11780,14 @@ class DenseBrowser(unittest.TestCase):
             evaluate(self.bubble, None, [(0, 0)], 64, 0, watch)
 
     def test_cancelling_leaves_a_slow_solver_behind(self):
-        from play import Cancelled, evaluate
+        from play import Cancelled, evaluate, solve
         prover = unittest.mock.Mock(history=unittest.mock.Mock(side_effect=lambda *a, **k: time.sleep(2)))
         started = time.time()
         def watch(n):
             if time.time() - started > .2:
                 raise Cancelled()
         with self.assertRaises(Cancelled):
-            evaluate(self.bubble, prover, [(0, 0)], 4, 2048, watch)
+            solve(prover, [(0, 0)], 2048, watch)
         self.assertLess(time.time() - started, 1)
         prover.abort.assert_called_once()
         idle = unittest.mock.Mock(history=unittest.mock.Mock(return_value=dict(status='UNKNOWN', reason='no verified strategy')))
@@ -11799,13 +11799,13 @@ class DenseBrowser(unittest.TestCase):
         idle.abort.assert_not_called()
 
     def test_verified_line_replays_to_a_win(self):
-        from play import evaluate
+        from play import evaluate, solve
         history = [(0, 0), (0, 5), (1, 5), (1, 0), (2, 0), (2, 5), (3, 5), (3, 0),
                    (-1, 3), (5, 5), (6, 5)]
         result = dict(status='PROVEN_WIN', native_verified=True, moves=[[4, 0], [5, 0]], proof_turns=1,
                       certificate=dict(root=0, nodes=[dict(kind='immediate_win', action=[[4, 0], [5, 0]])]))
         prover = unittest.mock.Mock(history=unittest.mock.Mock(return_value=result))
-        found = evaluate(self.bubble, prover, history, 4, 2048)
+        found = evaluate(self.bubble, None, history, 4, 0, solved=solve(prover, history, 2048))
         self.assertEqual((found['value'], found['proof'], found['moves']), (1., dict(winner=0, turns=1, plies=2), [[4, 0], [5, 0]]))
         game = Game(history)
         try:

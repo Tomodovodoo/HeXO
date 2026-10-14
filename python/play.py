@@ -72,7 +72,6 @@ REFRESH_PRIORITY = 4  # background refreshes run after every other analysis job,
 REFRESH_PLIES = 4  # earlier placements whose saved analysis a finished analysis searches again (Session.refresh)
 REFRESH_ROUNDS = 3  # further refreshes of one position while each refresh still moves its result
 REFRESH_MOVE = .05  # a refresh moved its result when its value changed by more than this, or its stones changed
-REVIEW_SOLVERS = 4                      # tactical workers a review queries at once
 REVIEW_CHUNK = 24                       # positions per pooled review step; urgent analysis waits at most one step
 RETRY = 4  # an untimed defender query that spends all its nodes against a verified threat runs again with this many times as many
 SOLVER = dict(simulations=128, solver_nodes=32768, solver_ms=120_000)  # the analysis solver preset (see `prove`)
@@ -1534,7 +1533,7 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
         turn = TurnSearch(bubble, network, history, simulations,
                           solved or solve(None, history, 0),
                           trees, q_range_floor, known)
-        frontier = proofs if prover is not None and solver_nodes else None
+        frontier = proofs if solver_nodes else None
         while (asked := turn.request()) is not None:
             tree, count = asked
             if tree is None:
@@ -1574,8 +1573,8 @@ def evaluate(bubble, prover, history, simulations, solver_nodes, watch=lambda n:
 def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=lambda n: None, q_range_floor=0.,
                   known=None, proofs=None, stamps=False, ms=0):
     """Pooled ordinary hybrid searches, sharing network batches and concurrent frontier proofs.
-    There are no preliminary solver queries. With positive work, `provers` and `solver_nodes` enable
-    the shared `proofs` pool, or this call's own pool when none was supplied. `known` settles saved exact
+    There are no preliminary solver queries. With positive work, `solver_nodes` enables the shared
+    `proofs` pool, or this call's own pool when `provers` is given and no pool was supplied. `known` settles saved exact
     outcomes. Under `ms` first stones get 60% of the clock and second stones the rest. `watch` may cancel.
     """
     keys = [position_text(h) for h in histories]
@@ -1584,7 +1583,7 @@ def evaluate_many(bubble, provers, histories, simulations, solver_nodes, watch=l
     network = Watched(bubble.evaluator, watch)
     from hybrid_scheduler import ProofWorkers
     own = ProofWorkers(workers=SOLVER_WORKERS) if proofs is None and provers and solver_nodes and simulations else None
-    frontier = (own if own is not None else proofs) if provers and solver_nodes else None
+    frontier = (own if own is not None else proofs) if solver_nodes else None
     turns = []
     try:
         for k, history, a in zip(keys, histories, given):
@@ -1658,7 +1657,7 @@ class Engines:
         self.proof_stamps = proof_stamps
         self.device, self.tactical_package, self.seal_path = device, tactical_package, seal
         self.bubbles, self.prover, self.prover_build = OrderedDict(), None, None
-        self.helpers, self.kept, self.graphs, self.graph_ids = [], None, OrderedDict(), itertools.count(1)
+        self.kept, self.graphs, self.graph_ids = None, OrderedDict(), itertools.count(1)
         self.workers = None
         self.external = {}
         self.children = {}
@@ -1707,8 +1706,11 @@ class Engines:
         ones. `used`, a list, receives the number `game_graph` gave each graph searched, before the search, so a
         caller sees it even when the search is cancelled."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        solver, build = self.solver() if budget['solver_nodes'] and refresh is None else (None, 'none')
-        spent = budget if solver or refresh is not None else budget | dict(solver_nodes=0)
+        build = self.solver_build() if budget['solver_nodes'] else 'none'
+        solver = None
+        if build != 'none' and budget.get('solver_ms') and refresh is None:
+            solver, build = self.solver()
+        spent = budget if build != 'none' or refresh is not None else budget | dict(solver_nodes=0)
         trees = solved = None
         floor = entry.get('q_range_floor', 0.)
         if refresh is not None:
@@ -1722,7 +1724,8 @@ class Engines:
             trees = self.game_graph(bubble, game if line is None else ('seat', line), build, floor, keep=keep, used=used)
         found = evaluate(bubble, solver, history, spent['simulations'], spent['solver_nodes'], watch, live, trees,
                          solved, floor, known, solver_ms=spent.get('solver_ms', 0) if solver else 0,
-                         package=self.tactical_package, proofs=self.proof_workers() if solver else None,
+                         package=self.tactical_package, proofs=self.proof_workers() if refresh is None and build != 'none'
+                         and (spent['simulations'] or spent.get('solver_ms')) else None,
                          stamps=self.proof_stamps, ms=spent.get('ms', 0), placed=placed)
         # A budget in time ends its root queries at its clock on purpose: that still counts as spending them.
         if not found.pop('solved') and not spent.get('ms'):
@@ -1763,33 +1766,15 @@ class Engines:
             return graph, max(1, count - int(graph.result(0, 0, 0, 0)['visits'].sum())) if keep else count
         return trees
 
-    def solvers(self, count):
-        """Up to `count` tactical workers of one build, and that build: the solver and helpers kept for pooled
-        work; ([], 'none') when the solver is not built."""
-        import tactical_proof
-        prover, build = self.solver()
-        if prover is None:
-            return [], 'none'
-        if any(helper_build != build for _, helper_build in self.helpers):
-            for helper, _ in self.helpers:
-                helper.abort()
-                threading.Thread(target=helper.close, daemon=True).start()
-            self.helpers = []
-        package = self.tactical_package or tactical_proof.PACKAGE
-        while len(self.helpers) < count - 1:
-            self.helpers.append((tactical_proof.IsolatedTactics(package, priority='below_normal',
-                                                               **(dict(stamps=True) if self.proof_stamps else {})), build))
-        return [prover, *(helper for helper, _ in self.helpers[:count - 1])], build
-
     def evaluate_many(self, entry, checkpoint, budget, histories, watch, device=None, known=None):
-        """`evaluate_many` of `histories` with the entry's export and the proof table `known`, its solver queries
-        spread over REVIEW_SOLVERS workers and its proof frontiers on `proof_workers`; returns (evaluation, budget it really had, key of the weights) per
-        position as `evaluate` does."""
+        """`evaluate_many` of `histories` with the entry's export, the proof table `known` and this lane's
+        concurrent `proof_workers`; returns (evaluation, actual budget, weight key) per position as `evaluate` does.
+        Ordinary pooled search starts no isolated root-query processes."""
         bubble = self.bubble(export_path(entry, checkpoint), device)
-        provers, build = self.solvers(REVIEW_SOLVERS) if budget['solver_nodes'] else ([], 'none')
-        spent = budget if provers else budget | dict(solver_nodes=0)
-        found = evaluate_many(bubble, provers, histories, spent['simulations'], spent['solver_nodes'], watch,
-                              entry.get('q_range_floor', 0.), known, proofs=self.proof_workers() if provers else None,
+        build = self.solver_build() if budget['solver_nodes'] else 'none'
+        spent = budget if build != 'none' else budget | dict(solver_nodes=0)
+        found = evaluate_many(bubble, [], histories, spent['simulations'], spent['solver_nodes'], watch,
+                              entry.get('q_range_floor', 0.), known, proofs=self.proof_workers() if build != 'none' and spent['simulations'] else None,
                               stamps=self.proof_stamps, ms=spent.get('ms', 0))
         out = []
         for record in found:
@@ -1913,9 +1898,6 @@ class Engines:
         self.kept = None
         while self.graphs:
             self.graphs.popitem()[1][1].close()
-        for helper, _ in self.helpers:
-            helper.close()
-        self.helpers = []
         if self.workers is not None:
             self.workers[0].close()
             self.workers = None

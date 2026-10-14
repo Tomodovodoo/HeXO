@@ -148,7 +148,7 @@ def puzzle_benchmark(source, target, nodes, ms, stamps):
 
 
 def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps, case_ids=()):
-    """The player's complete CPU analysis: root queries and the hybrid graph search with its proof frontier.
+    """The player's ordinary CPU hybrid analysis, with a separate audit of any returned root proof.
 
     One resident engine reads the archive in order. Each puzzle has its own game
     graph; the network cache and bounded stamp library survive between puzzles.
@@ -194,11 +194,15 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
             elapsed = 1000*(time.perf_counter()-start)
             # This certificate audit explicitly verifies exact play claims. Ordinary
             # play no longer makes a standalone query just to produce a certificate.
-            if result.get('proof'):
+            proof = result.get('proof')
+            expected = ('PROVEN_WIN' if proof['winner'] == case['mover'] else 'PROVEN_LOSS') if proof else 'UNKNOWN'
+            if proof:
                 from play import player_at
                 attacker = 'mover' if result['proof']['winner'] == player_at(len(case['history'])) else 'defender'
-                query(case['history'], attacker=attacker, nodes=nodes, ms=ms, shortest=True, stamps=stamps)
+                checked = query(case['history'], attacker=attacker, nodes=nodes, ms=ms, shortest=True, stamps=stamps)
                 pending[-1][1]['phase'] = 'verification'
+                if not checked.get('native_verified') or checked['status'] != expected:
+                    raise RuntimeError(f"Root claim {case['id']} {expected} was not verified: {checked.get('status')} / {checked.get('reason')}")
             verified, verification_ms, queries = 0, 0., []
             for history, options, answer, took in pending:
                 queries.append(dict(attacker=options.get('attacker', 'mover'), phase=options.get('phase', 'search'), ms=took,
@@ -211,13 +215,14 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
                     raise RuntimeError('Verified solver answer is missing its certificate')
                 if certificate is not None:
                     start = time.perf_counter()
-                    independent_verify(certificate, history, attacker=options.get('attacker', 'mover'),
-                                       known=options.get('known', ()), deadline_seconds=45.)
+                    verdict = independent_verify(certificate, history, attacker=options.get('attacker', 'mover'),
+                                                 known=options.get('known', ()), deadline_seconds=45.)
+                    if options.get('phase') == 'verification' and verdict != expected:
+                        raise RuntimeError(f"Root claim {case['id']} {expected} disagrees with independent verdict {verdict}")
                     verification_ms += 1000*(time.perf_counter()-start)
                     verified += 1
-            proof = result.get('proof')
             row = dict(id=case['id'], ms=elapsed, queries=queries, verification_ms=verification_ms,
-                       verified_certificates=verified, status=('PROVEN_WIN' if proof['winner']==case['mover'] else 'PROVEN_LOSS') if proof else 'UNKNOWN',
+                       verified_certificates=verified, status=expected,
                        proof=proof, moves=result['moves'], value=result['value'], budget=spent, engine=identity,
                        actual_completed=result.get('actual_completed'), actual_solver_nodes=result.get('actual_solver_nodes'))
             report['rows'].append(row)

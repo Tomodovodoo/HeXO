@@ -316,7 +316,9 @@ There is no preliminary mover-win, opponent-threat or defence query. Training-on
 and opponent mixtures are not enabled for human play. The `solver_nodes` budget field remains compatible with
 saved settings: above zero it enables the proof frontier; zero or a missing tactical build disables it. It no
 longer budgets standalone root queries. Deep Solve remains an explicit analysis action with its own proof clock.
-Each server lane shares its proof workers across searches. Completed league reports retain their recorded
+Each server lane shares its native frontier proof workers across searches. Ordinary single and pooled searches
+use the solver build directly and start no isolated root-query processes. Explicit Deep Solve starts its root prover
+on demand. Completed league reports retain their recorded
 classic-search/POLICY protocol and are not retroactively comparable to this play protocol.
 
 | Preset | Work per stone (GPU) | Owner quantum | Root candidates | Solver-enabled field | Proof frontier |
@@ -418,9 +420,9 @@ budget), and labels each turn only from evaluations at exactly that budget, so a
 evaluation with a shallow one. It evaluates every position of the game, the ones after a turn's first stone too, so
 a review costs about twice the turns. The Review button carries that preset's mark and counts the positions done. It evaluates the missing positions from the
 last one backwards, so what a later position proves is already known when an earlier one is searched, in pooled
-steps: the solver queries run on four tactical workers at once, each distinct position solved once and its proof
-added to the game's proof table, then fresh game graphs, one per position, search together with that table on one
-hybrid scheduler pool, so their owners share network batches and proof workers. Between
+steps: fresh game graphs, one per position, search together with the game's proof table on one hybrid scheduler
+pool. Their owners share network batches and frontier proof workers, and verified frontier results extend the
+proof table. No standalone root-query worker pool is started for ordinary review. Between
 steps it gives way to more urgent analysis, and it holds its network work while an engine seat searches. It labels each turn
 from the mover's win probability before and after it, and each stone the same way on its own. A first stone is
 judged against the engine's stones from the turn start, a second stone against the engine's second stone given
