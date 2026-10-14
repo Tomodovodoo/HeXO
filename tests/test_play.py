@@ -2307,6 +2307,10 @@ class TurnTrees(unittest.TestCase):
         self.assertGreater(report['rows'][0]['verified_certificates'], 0)
         self.assertGreater(report['rows'][0]['verification_ms'], 0)
         self.assertEqual(report['rows'][1]['verified_certificates'], 0)
+        self.assertEqual(report['summary']['nodes'], sum(r['actual_solver_nodes'] or 0 for r in report['rows']))
+        verification = sum(q['nodes_fresh'] or 0 for r in report['rows'] for q in r['queries'] if q['phase'] == 'verification')
+        self.assertGreater(verification, 0)
+        self.assertEqual(report['summary']['verification_query_nodes'], verification)
         self.assertEqual(json.loads(target.read_text())['rows'], report['rows'])
 
     def test_play_evaluation_keeps_one_tree_for_the_turn(self):

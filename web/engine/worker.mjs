@@ -208,7 +208,7 @@ function frontierProofs(records, table, found) {
  * when the mover is lost, else null), proof ({winner, turns, plies} the native search proved, or null), records (the
  * frontier's verified answers), used (nodes), solver (totals), error}.
  */
-async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool}) {
+async function proveRoot(id, history, player, {ms, workers, facts, stamps, batchSize, pool, replay = []}) {
   const start = performance.now(), end = start + ms, remaining = native.game(history).remaining;
   const premises = facts.filter(f => f.history.length !== history.length || f.winner !== player).map(({history, winner, plies}) => ({history, winner, plies}));
   const root = {nodes: 0, budget: 32768, mine: null, lost: null, threat: null, done: false, error: null, ruled: false};
@@ -234,12 +234,23 @@ async function proveRoot(id, history, player, {ms, workers, facts, stamps, batch
       nodes = Math.min(4 * nodes, 10000000);
     }
   };
+  let replays = stamps ? replay.filter(r => r.winner === player) : [];
   const asking = (async () => {
     for (let nodes = 32768; !root.done && !cancelled.has(id) && performance.now() < end;) {
       root.budget = nodes;
-      const found = await solve(id, history, {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
-        ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 60000, Math.max(10000, nodes / 8))))});
-      root.nodes += found.nodes_used || 0;
+      const options = {attacker: 'mover', nodes, shortest: true, stamps, known: premises,
+        ms: Math.max(1, Math.floor(Math.min(end - performance.now(), 60000, Math.max(10000, nodes / 8))))};
+      let found = null;
+      if (replays.length) {
+        found = await solve(id, history, {...options, replay: replays});
+        replays = [];
+        root.nodes += found.nodes_used || 0;
+      }
+      if ((!found || !verified(found)) && !root.done && !cancelled.has(id) && performance.now() < end) {
+        found = await solve(id, history, {...options, ms: Math.max(1, Math.floor(Math.min(options.ms, end - performance.now())))});
+        root.nodes += found.nodes_used || 0;
+      }
+      if (!found) return;
       report();
       if (verified(found) && found.moves.length) { root.mine = found; return; }
       if (found.reason?.startsWith(FAILED)) { root.error = found.reason; return; }   // no solver worker in this browser
@@ -356,7 +367,7 @@ async function playTurn({id, history, model, simulations, solverNodes, batchSize
   };
   try {
     if (proveMs) {
-      const found = await proveRoot(id, history, player, {ms: proveMs, workers: solverWorkers, facts, stamps: proofStamps, batchSize, pool: proofPool});
+      const found = await proveRoot(id, history, player, {ms: proveMs, workers: solverWorkers, facts, stamps: proofStamps, batchSize, pool: proofPool, replay});
       check();
       solverUsed += found.used; solverStats = found.solver; failure ||= found.error;
       frontierProofs(found.records, table, frontier);

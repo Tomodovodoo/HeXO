@@ -224,7 +224,9 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
             report['summary'] = dict(completed=len(report['rows']), total=len(cases),
                                     solved=sum(r['status']=='PROVEN_WIN' for r in report['rows']),
                                     ms=sum(r['ms'] for r in report['rows']),
-                                    nodes=sum(q['nodes_fresh'] or 0 for r in report['rows'] for q in r['queries']))
+                                    nodes=sum(r['actual_solver_nodes'] or 0 for r in report['rows']),
+                                    verification_query_nodes=sum(q['nodes_fresh'] or 0 for r in report['rows']
+                                                                 for q in r['queries'] if q['phase'] == 'verification'))
             target.write_text(json.dumps(report, separators=(',', ':'))+'\n', encoding='utf-8')
             print(json.dumps({k: row[k] for k in ('id', 'ms', 'status', 'actual_completed', 'actual_solver_nodes')}), flush=True)
     finally:

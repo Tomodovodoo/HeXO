@@ -572,7 +572,7 @@ if (job.kind === 'encode') {
           const found = solver.history(history,{...options,cancel});
           setTimeout(() => this.onmessage({data:{id,answer:proofAnswer(found,request)}})); return;
         }
-        queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage});
+        queries.push({preview: messages.some(m => m.live?.top?.length), stage: messages.at(-1)?.stage, replay: options.replay?.length || 0, nodes: options.nodes});
         const result = job.replayMiss && options.replay?.length
           ? {status: 'UNKNOWN', native_verified: false, moves: [], nodes_used: options.nodes, reason: 'replay work limit'}
           : solver.history(history, options);

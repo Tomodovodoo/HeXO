@@ -373,15 +373,18 @@ console.log(JSON.stringify({first:replay[0].history,cells:replay.reduce((n,r)=>n
         self.assertEqual(result['first'], [[0,0],[1,0],[0,1]])
         self.assertLessEqual(result['cells'], 50000)
 
-    def test_failed_replays_leave_the_full_ordinary_solve_available(self):
+    def test_failed_replays_leave_the_full_explicit_solve_available(self):
         from tests.test_tactical_proof import FIXTURE
         history = FIXTURE['positions']['1790600287230040:30:248']
         replay = [dict(history=history, winner=winner, pv=[]) for winner in (0, 1)]
         found = node(dict(kind='worker-turn', history=history, simulations=0, nodes=1300,
-                          replay=replay, replayMiss=True))
+                          replay=replay, replayMiss=True, proveMs=5000))
         self.assertEqual(found['proof']['winner'], 0)
         self.assertGreater(found['actual_solver_nodes'], 2600)
-        self.assertEqual(tactical_proof.independent_verify(found['proof']['certificate'], history), 'PROVEN_WIN')
+        self.assertEqual([q['replay'] for q in found['root_queries']], [1, 0])
+        checked = tactical_proof.NativeTactics().history(history, root_moves=found['moves'],
+                                                        nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], history), 'PROVEN_WIN')
     """The game's proof table in the browser: proof.mjs Proofs against play.Proofs, and the static page's session."""
 
     def test_saved_strategy_survives_refresh_reload_and_replays_a_changed_board(self):
@@ -407,10 +410,13 @@ console.log(JSON.stringify({records:restored.records,replay:restored.proofs.repl
                               input=json.dumps(dict(history=OPEN_THREE, found=found)), capture_output=True, text=True, check=True)
         saved = json.loads(done.stdout)
         self.assertEqual(saved['replay'][0]['certificate'], original['certificate'])
-        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], simulations=8, nodes=5000))
+        result = node(dict(kind='worker-turn', adapter=True, history=saved['changed'], records=saved['records'], preset='solver'))
         self.assertEqual(result['proof']['winner'], 0)
         self.assertEqual(result['actual_completed'], 0)
-        self.assertEqual(tactical_proof.independent_verify(result['proof']['certificate'], saved['changed']), 'PROVEN_WIN')
+        self.assertTrue(any(q['replay'] for q in result['root_queries']))
+        checked = tactical_proof.NativeTactics().history(saved['changed'], root_moves=result['moves'],
+                                                        nodes=32768, ms=5000, stamps=True)
+        self.assertEqual(tactical_proof.independent_verify(checked['certificate'], saved['changed']), 'PROVEN_WIN')
 
     def test_longer_defence_propagates_back_under_a_coarse_proof_bound(self):
         from types import SimpleNamespace
