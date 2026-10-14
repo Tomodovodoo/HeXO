@@ -19,7 +19,7 @@ extern "C" int hxgf_install(void*,const uint64_t*,int,const int64_t*,const int64
 namespace owner {
 using gumbel::Tree;using gumbel::Key;using gumbel::KeyHash;
 struct Candidate {std::vector<Cell> history;double relevance=0,cost=1;uint64_t seen=0,last=0,completed=0;int depth=0;bool solver=false,active=false,settled=false;};
-struct View {std::unique_ptr<Tree> tree;Key key;std::vector<Cell> history;double relevance=1;uint64_t id=0,generation=0,completed=0,issued=0,cancelled=0;int depth=0,passes=0;bool active=false,discovered=false;};
+struct View {std::unique_ptr<Tree> tree;Key key;std::vector<Cell> history;std::vector<uint64_t> policy_credits;double relevance=1;uint64_t id=0,generation=0,completed=0,issued=0,cancelled=0;int depth=0,passes=0;bool active=false,discovered=false;};
 struct Record {uint64_t id,generation,completed,shared,context_a,context_b;int depth,exact;bool raw_known,estimate_known;double value,net,ms;std::vector<Cell> history;};
 struct FeedDeleter {void operator()(void* p)const{if(p)hxgf_free(p);}};
 struct Owner {
@@ -63,15 +63,24 @@ struct Owner {
   if(!v.depth && raw_known){root_raw=raw;root_raw_known=true;}
   int winner=t.board.winner>=0?t.board.winner:node.exact_winner;
   bool known=winner>=0 || node.expanded || node.n>0;
-  double estimate=winner>=0?(winner==node.player?1.:-1.):node.q;
+  double estimate=winner>=0?(winner==node.player?1.:-1.):node.evaluation();
   records.push_back({v.id,v.generation,credits,uint64_t(node.n),v.key.a,v.key.b,v.depth,winner,raw_known,known,estimate,raw,elapsed(),v.history});
   if(records.size()>2048)records.pop_front();
+ }
+ void publish_policy(View& v){
+  auto& t=*v.tree;
+  if(!t.root->expanded || t.root->exact_winner>=0)return;
+  if(v.policy_credits.empty())v.policy_credits.resize(t.root_edges.size());
+  if(v.policy_credits.size()!=t.root_edges.size())throw std::runtime_error("View policy legal set changed");
+  for(size_t i=0;i<t.root_edges.size();++i)v.policy_credits[i]+=t.root_edges[i].credits;
+  t.publish_policy(v.policy_credits);
  }
  void finish(View& v){
   auto& t=*v.tree;if(t.root->expanded)t.renew(*t.root);
   uint64_t credits=t.completed;completed+=credits;issued+=t.issued;cancelled+=t.cancelled;
   v.completed+=credits;v.issued+=t.issued;v.cancelled+=t.cancelled;++v.passes;v.active=false;
   if(!v.depth)save_credits(t);
+  publish_policy(v);
   auto& c=candidates[v.key];c.active=false;c.history=v.history;c.depth=v.depth;c.relevance=std::max(c.relevance,v.relevance);c.completed+=credits;c.last=allocations;c.seen=allocations;
   record(v,credits);
   if(v.depth==0 && t.completed){last_root=t.root_edges;last_members=t.round.members;}
@@ -214,7 +223,7 @@ struct Owner {
     if(!v.depth)save_credits(t);
     // The last install may complete a lease before step() calls finish().
     if(t.done()){++v.passes;if(!v.depth && t.completed){last_root=t.root_edges;last_members=t.round.members;}}
-    record(v,t.completed);
+    publish_policy(v);record(v,t.completed);
    }
    hxgf_detach(feed,v.tree.get());v.tree->cancel();if(active){cancelled+=v.tree->cancelled;v.cancelled+=v.tree->cancelled;}v.active=false;
    if(auto c=candidates.find(v.key);c!=candidates.end())c->second.active=false;
@@ -361,7 +370,7 @@ struct Pool {
   // Keep this Tree address alive for outstanding solver DTOs. Packed neural rows
   // already own their encoding snapshot; cancelled subscribers never install late.
   root.tree->root_at(history);root.history=history;root.key=gumbel::keys(history).second;
-  root.completed=root.issued=root.cancelled=0;root.passes=0;root.active=root.discovered=false;
+  root.completed=root.issued=root.cancelled=0;root.passes=0;root.active=root.discovered=false;root.policy_credits.clear();
   o.focus=std::move(history);o.candidates.clear();o.last_root.clear();o.last_members.clear();o.direct_root_credits.clear();
   o.root_raw_known=false;o.root_raw=0;
   o.completed=o.issued=o.cancelled=o.ticks=o.allocations=o.reclaimed=o.retired=o.step_ns=o.discover_ns=0;o.created=1;o.view_cursor=0;

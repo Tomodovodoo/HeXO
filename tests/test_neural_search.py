@@ -1454,6 +1454,99 @@ class SharedGraph(unittest.TestCase):
         self.assertEqual((graph.history, late.summary()['searched'], late.step(None)), (a, False, 0))
 
 class HybridScheduler(unittest.TestCase):
+    def test_root_policy_value_does_not_back_up_exploration_blunders(self):
+        import ctypes as C
+        from neural_search import bind, ptr, checked
+        bind('hxg_mean_value', C.c_double, ptr)
+        bind('hxgo_root', ptr, ptr)
+        base = [(0,0),(7,0),(8,0),(1,0),(2,0),(7,1),(8,1)]
+        a, b, good = (0,1), (2,1), (1,1)
+
+        class PairValues(Uniform):
+            def __init__(self, history):
+                self.history = history
+                self.mover = (len(history)+1)//2%2
+
+            def evaluate(self, histories):
+                out = super().evaluate(histories)
+                for h, p in zip(histories, out):
+                    logits = np.full(len(p['actions']), -80.)
+                    if len(h) == len(self.history):
+                        value = .8
+                        for action, logit in ((a,0.),(b,-.4)):
+                            logits[np.all(p['actions'] == action, axis=1)] = logit
+                    elif tuple(h[len(self.history)]) == a:
+                        # The child plays its strong reply, but comparisons
+                        # also deliberately visit many very poor alternatives.
+                        value = .8 if len(h) == len(self.history)+1 or tuple(h[len(self.history)+1]) == good else -.8
+                        if len(h) == len(self.history)+1:
+                            logits[np.all(p['actions'] == good, axis=1)] = 0.
+                        if len(self.history)%2 == 0:
+                            value = -value  # This child belongs to the opponent.
+                    else:
+                        value = .2 if tuple(h[len(self.history)]) == b else -.4
+                    if (len(h)+1)//2%2 != self.mover:
+                        value = -value
+                    p.update(logits=logits, q=np.full(len(p['actions']), value))
+                return out
+
+        def finish(pool, evaluator):
+            for _ in range(1000):
+                pool.step()
+                batch = pool.feed.take(128)
+                if batch is not None:
+                    ids, leaves = batch
+                    predictions = evaluator.evaluate([h.tolist() for _,_,h in leaves])
+                    pool.feed.install(ids, [(p['actions'],p['logits'],p['q']) for p in predictions])
+                if pool.done():
+                    return
+            self.fail('Controlled policy-value search did not finish')
+
+        # Both same-player stones and the sign change to an opponent root.
+        for history, limit in ((base,512), (base+[(0,2)],512), (base,1)):
+            with self.subTest(history=history, limit=limit):
+                evaluator = PairValues(history)
+                graph = GameGraph(evaluator, 'policy-value', history, seed=1740, limit=limit)
+                child = graph.view(history+[a])
+                try:
+                    pool = self.pool([graph], quantum=32, views=8, depth=8, work=64, seed=1740, cache=4096)
+                    pool.proof_mode(0, False)
+                    finish(pool, evaluator)
+                    game = pool.games[0]
+                    expected = a if len(history)%2 else b
+                    self.assertEqual(game.choice(), list(expected))
+                    evidence = game.evidence()
+                    self.assertEqual(int(evidence['lifetime_credits'].sum()), game.stats()['root_completed'])
+                    self.assertEqual(game.stats()['completed'], 64)
+                    try:
+                        self.assertAlmostEqual(native.hxg_value(child.ptr), .8, places=10)
+                        self.assertLess(native.hxg_mean_value(child.ptr), -.3)
+                        if limit == 1:
+                            # Release all pins, evict the queried child, then
+                            # reconstruct its policy from current predictions.
+                            pool.close(); child.close()
+                            graph.at(history+[b])
+                            self.assertGreater(graph.store()['evicted'], 0)
+                            graph.at(history+[a])
+                            graph.search(1, root_samples=1, batch_size=1)
+                            self.assertAlmostEqual(native.hxg_value(graph.ptr), .8, places=10)
+                            self.assertLess(native.hxg_mean_value(graph.ptr), -.2)
+                            continue
+                        # A verified new loss overrides the cached policy value
+                        # and refutes the parent edge without deleting its credits.
+                        winner = 1-((len(history)+2)//2%2)
+                        checked(native.hxg_prove_loss(child.ptr, winner, 5))
+                        self.assertEqual(native.hxg_value(child.ptr), -1.)
+                        if len(history)%2:
+                            self.assertEqual(game.choice(), list(b))
+                        self.assertEqual(int(game.evidence()['lifetime_credits'].sum()), game.stats()['root_completed'])
+                    finally:
+                        child.close()
+                    pool.close()
+                finally:
+                    child.close()
+                    graph.close()
+
     def test_launcher_feeds_arriving_rows_during_gpu_wait_and_before_return(self):
         import sys
         from types import SimpleNamespace
