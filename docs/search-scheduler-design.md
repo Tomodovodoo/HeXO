@@ -577,8 +577,10 @@ noise or stochastic behaviour distribution.
 
 Ancestors read the child's policy estimate in the parent's player frame. Raw
 visit means and counts remain available separately. Sparse canonical-action
-credits and the range floor stay with the neural context through dormant reuse
-and eviction summaries. Re-expansion recomputes the policy against current
+credits, range floor and cached policy estimate stay with the neural context
+through dormant reuse and eviction summaries. Detaching a child freezes its
+policy estimate on incoming edges; reattachment keeps that estimate while
+prediction is pending, without substituting the raw mean. Re-expansion recomputes the policy against current
 predictions and proof eligibility; verified outcomes override both estimates.
 Retargeting clears the new view's comparison credits while retaining the stored
 node's evidence. Browser and native owners use the same C++ implementation.

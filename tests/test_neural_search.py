@@ -1503,11 +1503,12 @@ class HybridScheduler(unittest.TestCase):
             self.fail('Controlled policy-value search did not finish')
 
         # Both same-player stones and the sign change to an opponent root.
-        for history, limit in ((base,512), (base+[(0,2)],512), (base,1)):
+        for history, limit in ((base,512), (base+[(0,2)],512), (base,1), (base+[(0,2)],1)):
             with self.subTest(history=history, limit=limit):
                 evaluator = PairValues(history)
                 graph = GameGraph(evaluator, 'policy-value', history, seed=1740, limit=limit)
                 child = graph.view(history+[a])
+                parent = graph.view(history) if limit == 1 else None
                 try:
                     pool = self.pool([graph], quantum=32, views=8, depth=8, work=64, seed=1740, cache=4096)
                     pool.proof_mode(0, False)
@@ -1527,7 +1528,12 @@ class HybridScheduler(unittest.TestCase):
                             pool.close(); child.close()
                             graph.at(history+[b])
                             self.assertGreater(graph.store()['evicted'], 0)
+                            detached = parent.result(0,0,0,0,choice='policy')
+                            i = int(np.flatnonzero(np.all(detached['actions'] == a, axis=1))[0])
+                            self.assertAlmostEqual(detached['completed_q'][i], .8 if len(history)%2 else -.8, places=10)
                             graph.at(history+[a])
+                            self.assertAlmostEqual(native.hxg_value(graph.ptr), .8, places=10)
+                            self.assertLess(native.hxg_mean_value(graph.ptr), -.3)
                             graph.search(1, root_samples=1, batch_size=1)
                             self.assertAlmostEqual(native.hxg_value(graph.ptr), .8, places=10)
                             self.assertLess(native.hxg_mean_value(graph.ptr), -.2)
@@ -1545,7 +1551,21 @@ class HybridScheduler(unittest.TestCase):
                     pool.close()
                 finally:
                     child.close()
+                    if parent is not None: parent.close()
                     graph.close()
+
+    def test_cancel_after_root_prediction_before_comparisons(self):
+        graph = self.graph()
+        pool = self.pool([graph], quantum=32, views=8, work=64)
+        pool.step()
+        self.assertEqual(self.answer(pool), 1)
+        root = native.hxgo_root(pool.games[0].ptr)
+        self.assertEqual(pool.games[0].stats()['root_completed'], 0)
+        self.assertGreater(len(pool.games[0].evidence()['actions']), 0)
+        pool.cancel()
+        pool.abandon_fenced()
+        self.assertEqual(pool.games[0].stats()['pending'], 0)
+        self.assertEqual(native.hxg_value(root), 0.)
 
     def test_launcher_feeds_arriving_rows_during_gpu_wait_and_before_return(self):
         import sys

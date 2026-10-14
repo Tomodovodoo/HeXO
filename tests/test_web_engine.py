@@ -1206,6 +1206,10 @@ class Bundle(unittest.TestCase):
         self.assertEqual(controlled['stats']['completed'], 64)
         self.assertAlmostEqual(controlled['childValue'], .8, places=10)
         self.assertLess(controlled['childMean'], -.3)
+        evicted = node(dict(kind='pair-policy-value',eviction=True))
+        self.assertAlmostEqual(evicted['detached'], .8, places=10)
+        self.assertAlmostEqual(evicted['reattached'], .8, places=10)
+        self.assertLess(evicted['reattachedMean'], -.3)
         answer = node(dict(kind='native-owner', history=[[0,0]], work=128, choice='policy'))
         result = answer['result']
         self.assertEqual(result['action'], result['actions'][int(np.argmax(result['policy']))])

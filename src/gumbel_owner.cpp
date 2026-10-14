@@ -69,7 +69,7 @@ struct Owner {
  }
  void publish_policy(View& v){
   auto& t=*v.tree;
-  if(!t.root->expanded || t.root->exact_winner>=0)return;
+  if(!t.completed || !t.root->expanded || t.root->exact_winner>=0)return;
   if(v.policy_credits.empty())v.policy_credits.resize(t.root_edges.size());
   if(v.policy_credits.size()!=t.root_edges.size())throw std::runtime_error("View policy legal set changed");
   for(size_t i=0;i<t.root_edges.size();++i)v.policy_credits[i]+=t.root_edges[i].credits;

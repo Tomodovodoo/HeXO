@@ -161,7 +161,8 @@ if (job.kind === 'encode') {
 } else if (job.kind === 'pair-policy-value') {
   const history = [[0,0],[7,0],[8,0],[1,0],[2,0],[7,1],[8,1]], a = [0,1], b = [2,1], good = [1,1];
   const same = (x,y) => x[0] === y[0] && x[1] === y[1], m = native.m;
-  const graph = new GameGraph(native,{history,seed:1740,limit:512}), child = graph.view([...history,a]);
+  const graph = new GameGraph(native,{history,seed:1740,limit:job.eviction?1:512}), child = graph.view([...history,a]);
+  const parent = job.eviction?graph.view(history):null;
   const owner = new NativeOwner(graph,{work:64,ms:0,quantum:32,views:8,depth:8,seed:1740});
   const buffers = [], alloc = bytes => {const p=native.alloc(bytes);buffers.push(p);return p;};
   try {
@@ -193,7 +194,13 @@ if (job.kind === 'encode') {
     }
     if(!owner.done())throw new Error('Controlled browser owner did not finish');
     answer={gumbel:owner.result(),policy:owner.result('policy'),stats:owner.stats(),childValue:m._hxg_value(child.ptr),childMean:m._hxg_mean_value(child.ptr)};
-  } finally {for(const p of buffers)m._free(p);owner.close();child.close();graph.close();}
+    if(parent) {
+      owner.close();child.close();graph.at([...history,b]);
+      const detached=parent.result('policy'),i=detached.actions.findIndex(action=>same(action,a));
+      answer.detached=detached.completed_q[i];graph.at([...history,a]);
+      answer.reattached=m._hxg_value(graph.ptr);answer.reattachedMean=m._hxg_mean_value(graph.ptr);
+    }
+  } finally {for(const p of buffers)m._free(p);owner.close();child.close();parent?.close();graph.close();}
 } else if (job.kind === 'native-owner') {
   const graph = new GameGraph(native, {history: job.history, roundBarrier: true}), owner = new NativeOwner(graph, {
     work: job.work ?? (job.ms ? 0 : 256), ...(job.defaultClock ? {} : {ms: job.ms ?? 0}), views: job.views ?? 8, quantum: 32});

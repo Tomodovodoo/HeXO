@@ -180,7 +180,7 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
  // canonical indices survive eviction without pinning its expanded children.
  std::vector<std::pair<int,uint64_t>> policy_credits;
  double policy_q=0,policy_floor=0;
- double evaluation()const{return exact_winner>=0?(exact_winner==player?1.:-1.):expanded && !policy_credits.empty()?policy_q:q;}
+ double evaluation()const{return exact_winner>=0?(exact_winner==player?1.:-1.):!policy_credits.empty()?policy_q:q;}
  bool carried_excludes(size_t i)const{return i/64<carried_excluded.size() && (carried_excluded[i/64]&(uint64_t(1)<<(i%64)));}
  static constexpr int block_size=32;
  explicit Node(std::shared_ptr<EdgeMemory> resource=std::make_shared<EdgeMemory>()):memory(std::move(resource)),empty(&memory->states),edges(&memory->buffers),tracked(&memory->buffers),active(&memory->buffers),cold(&memory->buffers){empty.owner=this;}
@@ -242,7 +242,7 @@ void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
 struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
-struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded;std::vector<std::pair<int,uint64_t>> policy_credits;double policy_floor=0; };
+struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded;std::vector<std::pair<int,uint64_t>> policy_credits;double policy_floor=0,policy_q=0; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
 // Dormant nodes hold evidence, not scheduling rights. Each entry owns itself,
@@ -495,7 +495,7 @@ struct Tree {
   if(shared){
    store[context]=n;n->used=clock;
    if(auto old=evicted_stats.find(context);old!=evicted_stats.end()){
-    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;n->carried_excluded=std::move(o.excluded);n->policy_credits=std::move(o.policy_credits);n->policy_floor=o.policy_floor;evicted_stats.erase(old);
+    auto& o=old->second;n->n=o.n;n->q=o.q;n->value=o.value;n->carried=o.count-1;n->carried_sum=o.q*o.count-o.value;n->carried_excluded=std::move(o.excluded);n->policy_credits=std::move(o.policy_credits);n->policy_floor=o.policy_floor;n->policy_q=o.policy_q;evicted_stats.erase(old);
    }
   }
   if(auto o=outcomes.find(position);o!=outcomes.end())apply(o->second,*n);
@@ -614,7 +614,7 @@ struct Tree {
  void discard(const std::shared_ptr<Node>& node){
   clean(*node);
   for(auto& w:node->parents)if(auto p=w.lock())for(int i:p->tracked_edges()){auto& e=p->edges[i];if(e.read().child==node){
-   e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->q:-node->q)*e.read().visits;
+   e.write().sum=(e.read().exact_winner>=0?(e.read().exact_winner==p->player?1:-1):node->player==p->player?node->evaluation():-node->evaluation())*e.read().visits;
    e.write().child.reset();
   }}
   if(node->n){
@@ -632,7 +632,7 @@ struct Tree {
     if(excluded.empty())excluded.resize((node->edges.size()+63)/64);
     excluded[i/64]|=uint64_t(1)<<(i%64);
    }
-   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position,std::move(excluded),node->policy_credits,node->policy_floor};
+   evicted_stats[node->context]={node->n,count,node->q,node->value,node->position,std::move(excluded),node->policy_credits,node->policy_floor,node->policy_q};
   }
   node->dormant=false;++state->released;
  }
@@ -868,7 +868,7 @@ struct Tree {
  // visit distribution. Keep the latter's mean/counts and publish the policy value
  // separately so ancestors do not punish a root for exploring poor options.
  void publish_policy(const std::vector<uint64_t>& credits){
-  auto& n=*root;if(!n.expanded || n.exact_winner>=0)return;
+  auto& n=*root;if(credits.empty() || !n.expanded || n.exact_winner>=0)return;
   if(credits.size()!=n.edges.size())throw std::runtime_error("Policy credits do not match root legal actions");
   n.policy_credits.clear();for(size_t i=0;i<credits.size();++i)if(credits[i])n.policy_credits.emplace_back(int(i),credits[i]);
   if(n.policy_credits.empty())return;
@@ -1101,7 +1101,7 @@ struct Tree {
     if(index<0)continue;
     auto& e=x->edges[index];
     if(e.read().exact_winner>=0){++e.write().visits;e.write().sum=(e.read().exact_winner==x->player?1:-1)*e.read().visits;}
-    else if(e.read().child && e.read().child->n){++e.write().visits;e.write().sum+=e.read().child->player==x->player?e.read().child->q:-e.read().child->q;}
+    else if(e.read().child && e.read().child->n){++e.write().visits;e.write().sum+=e.read().child->player==x->player?e.read().child->evaluation():-e.read().child->evaluation();}
     else continue;
     x->track(e);++x->n;stale(*x);
    }

@@ -1,7 +1,7 @@
 {
  "sources": {
-  "src/gumbel.cpp": "3b32477001895f822956879cc79fd68bc128a022e2eea845f34c7f30fd3cb2a9",
-  "src/gumbel_owner.cpp": "ee258fe98de1fc84b7c8b5b6bb36951b00791250326702532374d48521916712",
+  "src/gumbel.cpp": "f81d25028129a0590bd6fccdec0c71a835338969334e8db9b0b57155df38e1df",
+  "src/gumbel_owner.cpp": "d79046ecf2c983bd7efba2dc3963b5d51152ed7fa939e3ff31d3d8dd2eccc16c",
   "src/gumbel_proof.cpp": "e2466f487f2439b89cb5506eaaa456a3cd4bd313e3c336140592a679ace29c9f",
   "src/gumbel_feed.cpp": "5f96d1f920fa5503210179a9d2ff49a8efad024fe7f6a8ed28fb1fb7832e45fd",
   "src/gumbel_batch.cpp": "a5defcd282fd94191c9db41ba069ecff5b11ee058f5b91dcb6523ef551bebf28",
@@ -91,7 +91,7 @@
  },
  "artefacts": {
   "gumbel.mjs": "36a2f7059a2bce81157179efa7a5e5b0508dcd6cd4414123252757ff260a4319",
-  "gumbel.wasm": "7fb21db041a24f8e3f52167fc6a31c9d4e47f7c1d0e3f7e26903ebd83998c413",
+  "gumbel.wasm": "a54172a222223d3dcd4d7eda8843f0f546e00bb48fb0cf4de4336cf284fb6fea",
   "tactical.wasm": "8701ab6f52ce7b9ca8c07e29ea030facbf532849b163a0e747a09aa4aff336b2",
   "native/native.mjs": "4459d105e370c980e92e60d7f6588534d2187ecedd61e7ff5c63d5ef633195f7",
   "native/native.wasm": "371a7e1214b7ad14eaa4f3127e910555799b67d67b68f6fecf2c1d8cc57b2ea4",
