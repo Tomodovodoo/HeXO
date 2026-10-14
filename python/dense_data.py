@@ -66,6 +66,7 @@ toward `total_rows`.
 """
 from collections import Counter, OrderedDict, namedtuple
 import contextlib
+import gc
 import hashlib
 import json
 import math
@@ -1698,7 +1699,9 @@ def start_hidden(processes):
 def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_updates, initial_regret, run_seed):
     """Worker process body: put `batches` from a private ReplayWindow on `policy_dir` (refreshed every 30 s; cheap rows
     retained per settings.cheap_row_fraction keyed by `run_seed`), with the Calibration packed in the shared array
-    `calibration`."""
+    `calibration`. Collect cycles at refresh points rather than repeatedly scanning the large, long-lived window
+    between batches; reference counting still releases ordinary batch objects as they go out of scope."""
+    automatic_gc = gc.isenabled()
     try:
         window = ReplayWindow(run, settings.window_capacity, settings.window_min_rows, settings.window_expand_per_row,
                               settings.window_taper, settings.validation_fraction, policy_dir, settings.cheap_row_fraction, run_seed,
@@ -1708,6 +1711,7 @@ def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_
         rng = np.random.default_rng(seed); refreshed = time.time()
         while not window.index:
             time.sleep(5); window.refresh(); refreshed = time.time()
+        gc.disable()
         for batch in batches(window, rng, settings.batch, lambda: settings, calibration=lambda: unpack_calibration(calibration[:])):
             output.put(batch)
             latest_regret = None
@@ -1719,9 +1723,12 @@ def _render_worker(run, settings, seed, output, calibration, policy_dir, regret_
             if latest_regret is not None:
                 window.set_regret(latest_regret)
             if time.time()-refreshed > 30:
-                window.refresh(); refreshed = time.time()
+                window.refresh(); gc.collect(); refreshed = time.time()
     except BaseException:
         output.put(RuntimeError('Render worker failed:\n'+traceback.format_exc()))
+    finally:
+        if automatic_gc:
+            gc.enable()
 
 
 class Renderers:

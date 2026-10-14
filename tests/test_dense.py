@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import gc
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -21,6 +22,7 @@ from collections import Counter
 from types import SimpleNamespace
 import unittest
 import unittest.mock
+import weakref
 import zlib
 
 import numpy as np
@@ -2676,6 +2678,47 @@ class DenseDataTests(unittest.TestCase):
             finally:
                 stream.close()
             self.assertTrue(any((Path(tmp)/'cache'/'policies').glob('*.f32')))
+
+            # Refresh-time cycle cleanup must preserve the exact seeded stream and
+            # restore the caller's collector state, including on worker failure.
+            original_gc = gc.isenabled()
+            try:
+                for enabled in (False, True):
+                    gc.enable() if enabled else gc.disable()
+                    batches = dense_data.batches(window, np.random.default_rng([4, 0]), 8, lambda: settings)
+                    expected = [next(batches) for _ in range(3)]
+                    got, cycles, clock = [], [], [0.]
+                    def put(batch):
+                        if isinstance(batch, BaseException):
+                            raise batch
+                        self.assertFalse(gc.isenabled())
+                        got.append(batch)
+                        if len(got) == 1:
+                            cycle = argparse.Namespace()
+                            cycle.cycle = cycle
+                            cycles.append(weakref.ref(cycle))
+                        else:
+                            self.assertIsNone(cycles[0]())
+                        clock[0] += 31
+                        if len(got) == 3:
+                            raise KeyboardInterrupt
+                    output = unittest.mock.Mock(put=put)
+                    updates = unittest.mock.Mock()
+                    updates.get_nowait.side_effect = dense_data.queue.Empty
+                    with unittest.mock.patch.object(dense_data.time, 'time', side_effect=lambda: clock[0]), \
+                         unittest.mock.patch.object(gc, 'collect', wraps=gc.collect) as collect:
+                        with self.assertRaisesRegex(RuntimeError, 'KeyboardInterrupt'):
+                            dense_data._render_worker(tmp, settings, [4, 0], output, calibration,
+                                                      str(Path(tmp)/'periodic'), updates, None, 0)
+                        self.assertEqual(collect.call_count, 2)
+                    self.assertEqual(gc.isenabled(), enabled)
+                    for batch, first in zip(got, expected):
+                        self.assertEqual(list(batch), list(first))
+                        for size in batch:
+                            for key in batch[size]:
+                                np.testing.assert_array_equal(batch[size][key], first[size][key], key)
+            finally:
+                gc.enable() if original_gc else gc.disable()
 
     def test_render_worker_failures_reach_the_consumer(self):
         settings = dense_config.LearnerSettings(batch=8, window_min_rows=10**6, validation_fraction=0.)
