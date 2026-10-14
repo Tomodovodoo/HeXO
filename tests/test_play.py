@@ -2252,7 +2252,7 @@ class TurnTrees(unittest.TestCase):
         history = [tuple(p) for p in LATE_WIN] + [(-1, -11)]
         from types import SimpleNamespace
         engine = tactical_proof.NativeTactics()
-        found = evaluate(self.bubble(), SimpleNamespace(history=engine.history, abort=engine.cancel), history, 8, 32768)
+        found = evaluate(self.bubble(), SimpleNamespace(history=engine.history, abort=engine.cancel), history, 8, 32768, solver_ms=5000)
         self.assertEqual(found['proof']['winner'], 0)
         self.assertEqual(len(found['moves']), 1)
         self.assertGreater(len(found['pv']), 5)
@@ -2404,12 +2404,12 @@ class TurnTrees(unittest.TestCase):
         self.assertEqual(after['solver']['native_nodes'], 0)
         self.assertLess(after['solver']['elapsed_ms'], 1500)
 
-    def test_a_standard_analysis_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
+    def test_explicit_deep_solve_proves_the_side_to_move_lost_before_and_after_its_last_stone(self):
         from play import evaluate
         history, prover = self.lost_game()
         bubble = self.bubble()
         for ply in (len(history), len(history) - 1):
-            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True)
+            found = evaluate(bubble, prover, history[:ply], 8, 4096, stamps=True, solver_ms=5000)
             self.assertEqual(found['proof']['winner'], 0, ply)
             self.assertEqual(found['value'], 0, ply)
 
@@ -2645,9 +2645,9 @@ class TurnTrees(unittest.TestCase):
                 game.close()
             self.assertAlmostEqual(found['value'], alone['value'], places=1)
 
-    def test_a_pooled_review_asks_the_solver_once_per_position(self):
+    def test_regular_single_and_pooled_review_skip_preliminary_queries(self):
         from dense_solver import VERDICTS
-        from play import evaluate_many
+        from play import evaluate, evaluate_many
         asked = []
 
         class Prover:
@@ -2659,7 +2659,11 @@ class TurnTrees(unittest.TestCase):
                 pass
         histories = [[(0, 0)], [(0, 0), (1, 0), (1, 1)], [(0, 0)]]
         found = evaluate_many(self.bubble(), [Prover(), Prover()], histories, 0, 64)
-        self.assertEqual(sorted(asked), sorted((position_text(h), side) for h in histories[:2] for side in ('mover', 'opponent')))
+        self.assertEqual(asked, [])
+        with unittest.mock.patch('hybrid_scheduler.ProofWorkers'):
+            single = evaluate(self.bubble(), Prover(), histories[0], 0, 64)
+        self.assertEqual(asked, [])
+        self.assertTrue(single['solved'])
         self.assertTrue(all(f['solved'] for f in found))
 
     def test_a_tier_runs_only_the_simulations_its_root_lacks(self):
@@ -3015,7 +3019,7 @@ class Registry(unittest.TestCase):
         self.assertEqual(list(found), ['bubble:alpha', 'bubble:flat', 'drip:Drip'])
         self.assertNotIn('q_range_floor', found['bubble:alpha'])
         self.assertEqual(found['bubble:flat']['q_range_floor'], .5)
-        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab', 'ab~q0.5'])
+        self.assertEqual([play.search_key('ab', e) for e in (found['bubble:alpha'], found['bubble:flat'])], ['ab~hybrid-frontier-v1', 'ab~q0.5~hybrid-frontier-v1'])
         self.assertNotEqual(*(play.search_key('ab', dict(q_range_floor=x)) for x in (.5000001, .5000002)))
         bubble = unittest.mock.Mock(sha256='ab'*32)
         with unittest.mock.patch('neural_search.GameGraph') as tree:

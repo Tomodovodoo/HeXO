@@ -660,8 +660,13 @@ if (job.kind === 'encode') {
   answer ??= glimpsing ? [1, 2].map(id => ({result: messages.find(m => m.id === id && m.type === 'result').result,
     progress: messages.filter(m => m.id === id && m.type === 'progress').map(m => ({fraction: m.fraction, stage: m.stage})), queries, evaluations,
     live: messages.filter(m => m.id === id && m.live).map(m => ({...m.live, root: m.root}))}))
-    : {...messages.find(m => m.type === 'result').result, solver_frames: messages.filter(m => m.live?.solver).length,
+    : {...messages.find(m => m.type === 'result').result, root_queries: queries,
+      progress_stages: messages.filter(m => m.stage).map(m => m.stage.name), solver_frames: messages.filter(m => m.live?.solver).length,
       solver_live: messages.filter(m => m.live?.solver).map(m => m.live.solver)};
+  if (!glimpsing) {
+    answer.root_queries ??= queries;
+    answer.progress_stages ??= messages.filter(m => m.stage).map(m => m.stage.name);
+  }
 } else if (job.kind === 'page-dismissal') {
   // The page with Auto on: the analysis requests it sends after Cancel, after stepping back and after stepping forward.
   const source = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8'), session = new BrowserSession(native);

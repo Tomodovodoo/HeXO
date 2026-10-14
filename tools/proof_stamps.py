@@ -185,7 +185,7 @@ def engine_benchmark(source, target, checkpoint, simulations, nodes, ms, stamps,
             pending.append((list(history), options, result, 1000*(time.perf_counter()-start)))
             return result
         prover.history = query
-        budget = dict(simulations=simulations, solver_nodes=nodes)
+        budget = dict(simulations=simulations, solver_nodes=nodes, solver_ms=ms)
         for case in cases:
             pending.clear()
             start = time.perf_counter()

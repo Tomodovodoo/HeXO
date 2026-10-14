@@ -281,9 +281,9 @@ and exactly one of them applies: editing one makes it the budget and greys the o
 later. Time starts at the expected turn time of the preset the seat had, where the page knows one, else 1,000 ms.
 There is no width field: every Play search runs the hybrid scheduler with 8 views per position (`HYBRID` in
 `python/play.py`), the width the actors and the evaluator search with, so a custom budget changes only the amount of
-work. An older custom budget's Width is dropped. The root queries get 16
-nodes per node of work, or 4 per ms, between 1,024 and 4,000,000; under Time they get at most a quarter of the
-clock, the first of two stones 60% of the rest and Nodes is not a limit (65,536 per stone at most). Six has Positions
+work. An older custom budget's Width is dropped. The saved solver-nodes field follows the historical preset ladder but ordinary play uses it only to enable
+concurrent frontier proofs. Under Time, the first of two stones gets 60% of the clock and Nodes is not a limit
+(65,536 per stone at most). Six has Positions
 or Time on the same rule. Strix has Search (at least 1), Drip and Seal ms (at least 10). The choice is saved with the
 custom budget. An older custom Bubble budget opens with its simulations as Nodes; its solver nodes are dropped. Any
 larger whole number up to 2,147,483,647 (the engines take 32-bit budgets) is accepted on both pages; it only takes
@@ -308,15 +308,18 @@ within the same cap; it does not guarantee a better move. A pooled larger root s
 when a smaller budget sets the pool's slice. The network batches of every view share one queue of up to
 128 rows. A position's simulations therefore mean neural work spent around it, not visits at its root alone.
 
-A preset's solver nodes keep two jobs. They are the budget of the root queries (a forced win for the side to move,
-the opponent's threat if it moved now, and the defence when a threat or a known proof makes one worth asking), and
-when they are above 0 each search also runs a proof frontier: the owner hands the positions its search reaches to
-native proof workers, each answer checked before it enters the graph, and every position the frontier proves joins
-the game's proof table. Each lane (engine moves, and analysis with review) has one set of proof workers, four fewer
-than the machine's threads and between 2 and 12, shared by all of its searches; the frontier may take the owner's
-whole time. Solver nodes 0 turns both off, and so does a missing tactical build.
+Ordinary Bubble play uses the actors' hybrid search core with 8 views, depth 8 and 16 root candidates.
+Playing selects the highest improved-policy move, as in the current league evaluation; actors retain Gumbel
+selection for training. The saved 185000 comparison favoured POLICY over Gumbel, without establishing a
+universal advantage for later engines. It starts neural search immediately, with concurrent proof workers at a 0.1 owner-time share.
+There is no preliminary mover-win, opponent-threat or defence query. Training-only root noise, randomized budgets
+and opponent mixtures are not enabled for human play. The `solver_nodes` budget field remains compatible with
+saved settings: above zero it enables the proof frontier; zero or a missing tactical build disables it. It no
+longer budgets standalone root queries. Deep Solve remains an explicit analysis action with its own proof clock.
+Each server lane shares its proof workers across searches. Completed league reports retain their recorded
+classic-search/POLICY protocol and are not retroactively comparable to this play protocol.
 
-| Preset | Work per stone (GPU) | Owner quantum | Root candidates | Root query nodes | Proof frontier |
+| Preset | Work per stone (GPU) | Owner quantum | Root candidates | Solver-enabled field | Proof frontier |
 |---|---|---|---|---|---|
 | Lightning | 16 | 8 | 8 | 1,024 | on |
 | Quick | 64 | 32 | 16 | 2,048 | on |
@@ -546,8 +549,8 @@ order. Bubble had it the other way round.
 ## Bubble in the browser
 
 On the static page every Bubble search runs the hybrid scheduler on the game's graph, as the served page does: a
-preset's simulations are the owner's work per stone, and its solver nodes the root queries' budget, with the
-owner's proof frontier on the page's proof workers whenever that budget is above 0. A refresh searches with a quarter
+preset's simulations are the owner's work per stone, with its concurrent proof frontier enabled when
+`solver_nodes` is above 0; ordinary play makes no preliminary root queries. A refresh searches with a quarter
 of the saved evaluation's simulations, of the analysis budget's at most, and no proof work. [web-engine.md](web-engine.md) has the settings.
 
 On an isolated page ONNX Runtime runs on the cores but one WebAssembly threads, at most 8. On hosts where the
