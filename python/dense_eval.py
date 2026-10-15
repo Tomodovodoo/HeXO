@@ -922,8 +922,10 @@ class Evaluator:
         self.openings = dense_openings.Book(run, settings)
         # Probes draw from a frozen suite: the live book changes its openings at every refresh.
         self.probe_openings = dense_openings.Book(run, settings, settings.probe_suite) if settings.probe_games else None
-        # Probe reports (stamped with probe_games) count in no opening book, whatever suite the main games use.
-        missed = self.openings.reconcile([r for r in dense_openings.stamp(run) if not r['settings'].get('probe_games')])
+        # Probe reports (against the anchor, stamped with probe_games) count in no opening book, whatever suite the
+        # main games use; every other report reconciles as before.
+        probe = lambda r: r['opponent'] == anchor_name(settings) and r['settings'].get('probe_games')
+        missed = self.openings.reconcile([r for r in dense_openings.stamp(run) if not probe(r)])
         settings = replace(settings, opening_book=self.openings.digest())
         config = replace(config, evaluation=settings)
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
