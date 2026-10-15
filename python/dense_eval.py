@@ -43,16 +43,27 @@ def anchor_name(settings):
     return settings.external_name if settings.external_engine else SEAL
 
 
+class NodeBudget:
+    """An external engine that searches `nodes` positions per complete turn (go nodes), whatever time it is given."""
+
+    def __init__(self, engine, nodes):
+        self.engine, self.nodes = engine, nodes
+
+    def __call__(self, game, ms):
+        return self.engine(game, nodes=self.nodes)
+
+    def close(self):
+        self.engine.close()
+
+
 def anchor_engine(settings):
     """Seal, or the external Six-protocol engine. That engine searches external_nodes positions per complete turn
-    (go nodes) when set, else seal_ms per turn; its startup allows minutes, as Six on TensorRT builds its plan
-    on a first start."""
+    when set, else seal_ms per turn; its startup allows minutes, as Six on TensorRT builds its plan on a first
+    start."""
     if not settings.external_engine:
         return Seal()
     engine = SixEngine(shlex.split(settings.external_engine), timeout=60., startup=900.)
-    if not settings.external_nodes:
-        return engine
-    return lambda game, ms: engine(game, nodes=settings.external_nodes)
+    return NodeBudget(engine, settings.external_nodes) if settings.external_nodes else engine
 
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
@@ -909,6 +920,8 @@ class Evaluator:
 
     def __init__(self, run, config, settings, pacer):
         self.openings = dense_openings.Book(run, settings)
+        # Probes draw from a frozen suite: the live book changes its openings at every refresh.
+        self.probe_openings = dense_openings.Book(run, settings, settings.probe_suite) if settings.probe_games else None
         missed = self.openings.reconcile(dense_openings.stamp(run))
         settings = replace(settings, opening_book=self.openings.digest())
         config = replace(config, evaluation=settings)
@@ -1065,9 +1078,10 @@ class Evaluator:
         side searching with its own settings (`side`)."""
         a, b, kind = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
-        label = f'probe/{b}' if kind == 'probe' else a  # every checkpoint probes the anchor on the same openings
-        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2, label, self.config, self.settings,
-                                    self.seal, self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
+        probe = kind == 'probe'  # every checkpoint probes the anchor on the same openings of probe_suite
+        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2,
+                                    f'probe/{b}' if probe else a, self.config, self.settings,
+                                    self.seal, self.probe_openings if probe else self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
         """Append a completed colour pair to report a-vs-b and rewrite it (kind 'sprt' recomputes metrics.sprt,
@@ -1085,7 +1099,8 @@ class Evaluator:
         path = report_path(self.run, a, b)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
-        self.openings.record(pair, self.ids[a, b])
+        if kind != 'probe':
+            self.openings.record(pair, self.ids[a, b])
         for record in pair:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
