@@ -554,7 +554,7 @@ class Pass:
         for p in dense_data.shard_dirs(self.run)[::-1] if limit != 0 else ():
             if p.name not in self.origins:
                 self.origins[p.name] = dense_data.origin(dense_data.manifest(p))
-            if self.origins[p.name] == 'proof':
+            if self.origins[p.name] in ('proof', 'reanalysis'):
                 continue
             names.append(p.name)
             if limit is not None and len(names) >= limit:
