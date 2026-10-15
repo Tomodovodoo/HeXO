@@ -135,8 +135,11 @@ class ActorSettings:
     proven_line_rows: bool = False
     # Restarts (dense_selfplay.Restarts): a self-play game starts with probability restart_fraction from a position
     # of restarts.json, drawn with probability proportional to regret^(1/restart_temperature); 0 = never.
+    # restart_saving_weight multiplies that weight for 'defence' entries with a saving turn: the loser's last turn
+    # that could still hold the attack (dense_solve lookback).
     restart_fraction: float = 0.
     restart_temperature: float = 1.
+    restart_saving_weight: float = 1.
     book_fraction: float = 0.  # share of all games starting from live off-policy book positions
     training_start_pool: str = ''  # optional actor-only JSON starts, drawn with the existing book_fraction
     # Game forks (dense_selfplay.Forks, KataGo's early and anywhere forks): a finished game forks with probability
@@ -207,6 +210,8 @@ class ActorSettings:
             raise ValueError('cuda_graphs requires net_kernels=fused')
         if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
+        if not 0 < self.restart_saving_weight < float('inf'):
+            raise ValueError('restart_saving_weight must be positive and finite')
         if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
             raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
         if self.training_start_pool and not self.book_fraction > 0:

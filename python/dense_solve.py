@@ -40,11 +40,14 @@ Per game:
                 `plies` are those turn starts and each following mid-turn t+1 (before the game's end) proven by
                 attack(t+1, solve_nodes); last_ply is the latest of them. A window is persistent when m won the game
                 and it reaches m's last turn start, else transient (the forced win was lost).
-  lookback      for each window of the game's winner, the loser's `lookback_turns` turn starts before the window's
-                first ply (latest first, at or after start) get threat(d, scan_nodes). When it is proven,
-                `saving_turns` lists the candidate turns of the loser at d after which attack(., saving_nodes) for
-                the winner is a search verdict UNKNOWN (a failed query does not count): the unordered pairs of cells
-                empty at d among the threat's first turn and the first turn of the window's opening proof.
+  lookback      for the persistent window (the winner's last forced win), the loser's turn starts before the
+                window's first ply (latest first, at or after start, at most `lookback_turns`) get threat(d,
+                scan_nodes). When it is proven, `saving_turns` lists the candidate turns of the loser at d after
+                which attack(., saving_nodes) for the winner is a search verdict UNKNOWN (a failed query does not
+                count): the unordered pairs of cells empty at d among the threat's first turn and the first turn of
+                the window's opening proof. The walk goes back while the loser was already lost (threat proven, no
+                saving turn), so it ends at the latest turn where the loser could still defend; an unproven threat
+                (the loss came later) ends it too.
 Sidecar: one JSON line per window {game, first_ply, last_ply, mover, plies, proof_turns,
 budget (nodes of the first ply's proof), certificate_hash (sha256 of its certificate JSON),
 proof_action (mapping from each proven ply string to that proof's first-turn placements),
@@ -54,7 +57,7 @@ uses these only with a positive --deblunder-weight; existing sidecars stay uncha
 
 Restart buffer (RestartBuffer). Entries {shard, game, ply, side_to_move, regret, kind, added_at, checkpoint,
 plies_to_proof, value_source?, saving_turns?, observed?}: an 'attack' entry at each window's first ply with regret (1 - v)/2, and
-a 'defence' entry at each lookback ply d with regret (1 + v)/2 and the saving_turns found there, v the recorded
+a 'defence' entry at each lookback ply d with a proven threat, with regret (1 + v)/2 and the saving_turns found there, v the recorded
 root value of the side to move at that ply (no entry where it is null). Attack entries use network_values when
 available and record value_source 'network', so solver-corrected +1 values cannot hide network errors.
 Defence entries and legacy games keep search values. Observations must match the entry's value_source;
@@ -121,7 +124,7 @@ class PassSettings:
     solve_nodes: int = 540         # forward attack query per gated turn start (about 20 ms)
     scan_nodes: int = 27000        # window extension and threat queries (about 1 s)
     saving_nodes: int = 2700       # attack query after each candidate saving turn
-    lookback_turns: int = 2        # the loser's turn starts before a window that get defence entries
+    lookback_turns: int = 2        # most loser turn starts searched back from the persistent window (module lookback)
     verify_fraction: float = .1    # proofs checked again by independent_verify
     verify_seconds: float = 120.   # time limit of one independent check
     buffer_size: int = 20000
@@ -401,14 +404,15 @@ class Solver:
             opening = memo[plies[0], budget]
             actions = {str(t): [list(a) for a in (memo.get((t, s.solve_nodes)) or memo[t, s.scan_nodes])[0]] for t in plies}
             persistent = e['winner'] == m and turns[-1] == starts[-1]
-            defence = self.lookback(shard, g, moves, plies[0], m, opening[0], start) if e['winner'] == m else []
+            defence = self.lookback(shard, g, moves, plies[0], m, opening[0], start) if persistent else []
             windows.append(dict(game=g, first_ply=plies[0], last_ply=plies[-1], mover=m, plies=plies, proof_turns=opening[1],
                                 budget=budget, certificate_hash=opening[2], search_value_at_first_ply=roots[plies[0]],
                                 persistent=persistent, defence=defence, proof_action=actions))
             self.stats['windows'] += 1
             self.stats['persistent' if persistent else 'transient'] += 1
             self.stats['window_plies'][plies[-1]-plies[0]+1] += 1
-            candidates = [(plies[0], m, 'attack', None)] + [(d['ply'], 1-m, 'defence', d['saving_turns']) for d in defence]
+            candidates = [(plies[0], m, 'attack', None)] + [(d['ply'], 1-m, 'defence', d['saving_turns']) for d in defence
+                                                          if d['threat']]
             for ply, side, kind, saving in candidates:
                 if roots[ply] is None or (e.get('origin') == 'restart' and ply <= start):
                     continue
@@ -443,7 +447,8 @@ class Solver:
         return windows, entries
 
     def lookback(self, shard, g, moves, first, winner, opening, start):
-        """[{ply, threat, saving_turns}] at the loser's lookback turn starts before ply `first`, latest first."""
+        """[{ply, threat, saving_turns}] at the loser's lookback turn starts before ply `first`, latest first, up to
+        and including the first one where the threat is unproven or a saving turn exists."""
         latest = max((t for t in range(1, first, 2) if player_at(t) != winner), default=None)
         found = []
         for d in range(latest, max(start, 1)-1, -4) if latest is not None else ():
@@ -458,6 +463,8 @@ class Solver:
                 saving = [[list(a), list(b)] for a, b in itertools.combinations(cells, 2)
                           if self.query((shard, g, d, a, b), history+[a, b], 'mover', self.s.saving_nodes, 'saving') is None]
             found.append(dict(ply=d, threat=bool(threat), saving_turns=saving))
+            if not threat or saving:
+                break
         return found
 
     def solve(self, name):

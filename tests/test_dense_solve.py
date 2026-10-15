@@ -124,7 +124,11 @@ class PassTests(unittest.TestCase):
         if first-4 >= 1:
             result = self.engine.history(self.moves[:first-4], nodes=SMALL.scan_nodes, ms=60000)
             self.assertEqual(result['status'], 'UNKNOWN')
-        self.assertEqual([d['ply'] for d in window['defence']], [first-2, first-6])
+        defence = window['defence']
+        self.assertEqual([d['ply'] for d in defence], [first-2-4*i for i in range(len(defence))])
+        self.assertTrue(all(d['threat'] and not d['saving_turns'] for d in defence[:-1]))
+        last = defence[-1]
+        self.assertTrue(not last['threat'] or last['saving_turns'] or len(defence) == SMALL.lookback_turns)
         for d in window['defence']:
             self.assertEqual(d['saving_turns'] is None, not d['threat'])
             for a, b in d['saving_turns'] or ():
@@ -138,7 +142,7 @@ class PassTests(unittest.TestCase):
         attack = entries[first, 'attack']
         self.assertEqual((attack['side_to_move'], attack['regret'], attack['plies_to_proof'], attack['checkpoint']),
                          (m, .5, 0, 'main/000010'))
-        for d in window['defence']:
+        for d in (d for d in window['defence'] if d['threat']):
             defence = entries[d['ply'], 'defence']
             self.assertEqual((defence['side_to_move'], defence['plies_to_proof'], defence['saving_turns']),
                              (1-m, first-d['ply'], d['saving_turns']))
