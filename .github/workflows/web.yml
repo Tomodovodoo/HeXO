@@ -1,29 +1,6 @@
 name: Browser engine
 on:
-  pull_request:
-    paths:
-      - 'web/engine/**'
-      - 'web/coi-sw.js'
-      - 'src/**'
-      - 'python/export_web.py'
-      - 'python/hexcrop.py'
-      - 'python/hexnet.py'
-      - 'python/neural_search.py'
-      - 'python/play.py'
-      - 'python/tactical_proof.py'
-      - 'tools/tactical/**'
-      - 'tools/shrimp_web/**'
-      - 'tools/strix_web/**'
-      - 'tools/build_web.py'
-      - 'tools/seal_adapter.cpp'
-      - 'tools/engines.json'
-      - 'tests/__init__.py'
-      - 'tests/__main__.py'
-      - 'tests/fixtures/**'
-      - 'tests/test_web_*.py'
-      - 'tests/web/**'
-      - 'requirements/**'
-      - '.github/workflows/web.yml'
+  # Manual only: pull requests run the seconds-long contracts check.
   workflow_dispatch:
 permissions:
   contents: read
