@@ -1524,7 +1524,7 @@ def worker(args):
                 opponents[e['opponent']] = opponents.get(e['opponent'], 0)+1
         identity = dict(actor_sha256=model.sha, actors=actors, opponents=sorted(opponents), checkpoint=model.checkpoint,
                         process=args.worker,
-                        pid=os.getpid(), seed_entropy=str(entropy), model=asdict(model.config),
+                        pid=os.getpid(), seed_entropy=str(entropy), model=hexnet.saved_config(model.config),
                         actor=asdict(settings), value_targets='not stored; derive from episode root_values and winner')
         games = len(episodes); terminal = sum(e['winner'] >= 0 for e in episodes)
         elapsed = now-since['time']

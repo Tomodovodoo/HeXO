@@ -326,7 +326,7 @@ def e2e_stage(report, run):
     good = [p.name for p in saved] == ['000010', '000020']
     for path in saved:
         manifest = json.loads((path/'manifest.json').read_text(encoding='utf-8'))
-        good &= manifest['learner'] == asdict(config.learner) and manifest['model'] == asdict(config.model)
+        good &= manifest['learner'] == asdict(config.learner) and manifest['model'] == hexnet.saved_config(config.model)
         good &= manifest['model_sha256'] == hexnet.model_digest(hexnet.load_model(path/'model.pt'))
         good &= manifest['ema_sha256'] == hexnet.model_digest(hexnet.load_model(path/'ema.pt'))
     report.add('e2e', 'learner: 20 steps, checkpoint manifests', f'{", ".join(p.name for p in saved)} in {seconds:.0f}s',

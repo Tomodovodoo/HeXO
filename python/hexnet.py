@@ -520,8 +520,17 @@ def memory_format(config, fused_cuda=False):
     return torch.contiguous_format if config.line_length and not fused_cuda else torch.channels_last
 
 
+def saved_config(config):
+    """asdict(config) without block 'pre', so pre-activation networks keep the config, and digest, they had
+    before the field existed."""
+    out = asdict(config)
+    if out.get('block') == 'pre':
+        del out['block']
+    return out
+
+
 def model_digest(model):
-    digest = hashlib.sha256(json.dumps(asdict(model.config), sort_keys=True).encode())
+    digest = hashlib.sha256(json.dumps(saved_config(model.config), sort_keys=True).encode())
     if model.future_target != 'legacy':
         digest.update(model.future_target.encode())
     for name, tensor in model.state_dict().items():
@@ -534,7 +543,7 @@ def save_model(path, model):
     """Write via a sibling temporary file and os.replace so readers never see a partial checkpoint."""
     path = Path(path)
     pending = path.with_name(path.name+'.tmp')
-    torch.save(dict(schema=SCHEMA, config=asdict(model.config), future_target=model.future_target,
+    torch.save(dict(schema=SCHEMA, config=saved_config(model.config), future_target=model.future_target,
                     state=model.state_dict()), pending)
     for attempt in range(8):
         try:
