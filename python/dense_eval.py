@@ -504,6 +504,13 @@ def load_reports(run, settings=None):
     return [r for r in reports if settings is None or same_protocol(r, settings)]
 
 
+def probe_report(report):
+    """Whether `report` holds probe games: stamped with probe_games and played against the external anchor it names
+    itself, so a later anchor name or matching main suite cannot make it look ordinary."""
+    s = report['settings']
+    return bool(s.get('probe_games')) and report['opponent'] == s.get('external_name')
+
+
 def same_protocol(report, settings):
     """Whether `report` was played under the PROTOCOL of `settings` (dense_stats.same_protocol on the settings' fields)."""
     return dense_stats.same_protocol(report['settings'], {k: getattr(settings, k) for k in PROTOCOL})
@@ -922,10 +929,8 @@ class Evaluator:
         self.openings = dense_openings.Book(run, settings)
         # Probes draw from a frozen suite: the live book changes its openings at every refresh.
         self.probe_openings = dense_openings.Book(run, settings, settings.probe_suite) if settings.probe_games else None
-        # Probe reports (against the anchor, stamped with probe_games) count in no opening book, whatever suite the
-        # main games use; every other report reconciles as before.
-        probe = lambda r: r['opponent'] == anchor_name(settings) and r['settings'].get('probe_games')
-        missed = self.openings.reconcile([r for r in dense_openings.stamp(run) if not probe(r)])
+        # Probe reports count in no opening book, whatever suite the main games use; every other report reconciles.
+        missed = self.openings.reconcile([r for r in dense_openings.stamp(run) if not probe_report(r)])
         settings = replace(settings, opening_book=self.openings.digest())
         config = replace(config, evaluation=settings)
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
@@ -1499,10 +1504,12 @@ class Evaluator:
 
     def inputs(self, cid, champion):
         """(ids, reports) of the `verdict` posterior on cid against the champion: the league's rated ids, the
-        champion, cid and Seal when it has a report among them; every protocol-matching report among those."""
+        champion, cid and Seal when it has a report among them; every protocol-matching report among those except
+        probes, which measure against the fixed anchor and never decide a promotion."""
         rated = [c['id'] for c in self.league['checkpoints']+self.variants() if c.get('elo') is not None and not c.get('skipped')]
         ids = list(dict.fromkeys(rated+[champion, cid]))
-        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[self.anchor_id] and r['opponent'] in ids+[self.anchor_id]]
+        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[self.anchor_id]
+                   and r['opponent'] in ids+[self.anchor_id] and not probe_report(r)]
         if any(self.anchor_id in (r['candidate'], r['opponent']) for r in reports):
             ids.append(self.anchor_id)
         return ids, reports
