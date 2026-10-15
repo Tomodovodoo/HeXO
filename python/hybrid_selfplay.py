@@ -181,6 +181,7 @@ class HybridGames:
         self.batch_size = batch_size
         self.groups, self.idle, self.waiting, self.unbound = {}, {}, set(), set()
         self.archived_proofs, self.archived_stats = deque(maxlen=512), deque(maxlen=512)
+        self.detached = []  # producers' pools detached from the service, awaiting native reclamation
         self.options = dict(quantum=quantum,views=views,depth=depth,work=quantum,cache=cache,
                             workers=max(1,producers//len(self.models)))
         self.host_budget = min(16,producers if dynamic else max(producers,len(self.models)))
@@ -358,9 +359,23 @@ class HybridGames:
                 self.groups[model.sha]['free'].add(index)
             self.unbound.add(index)
 
+    def reclaim_detached(self):
+        """Hand detached pools to native cleanup, oldest first. Producer threads reserve retirement room
+        concurrently, so the room reclaim_ready() saw can be gone when reclaim() asks for it; a refused pool waits
+        for a later call (InferenceService.reclaim is safe to repeat: the pool's proof loop closes once)."""
+        while self.detached and self.service.reclaim_ready():
+            try:
+                self.service.reclaim(self.detached[0])
+            except ValueError as error:
+                if str(error) != 'Retired pool reclamation is unavailable':
+                    raise
+                return
+            self.detached.pop(0)
+
     def maintain(self):
         """Retire unused weights only after graph retirement and device work finish."""
         self.unbind()
+        self.reclaim_detached()
         active = {m.sha for i,g in enumerate(self.games) if i not in self.finished and i not in self.waiting for m in g.trees}
         needed = set(active)
         for index in sorted(self.waiting):
@@ -373,7 +388,7 @@ class HybridGames:
                 continue
             # Reclamation is bounded, so a model's producers may leave over several calls.
             group['retiring'] = True
-            while group['producers'] and self.service.reclaim_ready():
+            while group['producers'] and not self.detached and self.service.reclaim_ready():
                 producer = group['producers'].pop()
                 group['slots'] = {key:index for key,index in group['slots'].items() if key[0]!=producer}
                 self.service.detach(producer)
@@ -381,8 +396,9 @@ class HybridGames:
                 if loop:
                     self.archived_stats.append(dict(loop.stats(),model=sha))
                     self.archived_proofs.extend(dict(r,model=sha) for r in loop.records())
-                self.service.reclaim(self.pools[producer])
+                self.detached.append(self.pools[producer])
                 self.pools[producer],self.proof_loops[producer] = None,None
+                self.reclaim_detached()
             if not group['producers']:
                 del self.groups[sha]
         for model_id,model in enumerate(self.models):
@@ -569,9 +585,10 @@ class HybridGames:
                 self.receipt = dict(inference=self.service.stats(),
                     proofs=[*self.archived_proofs,*[dict(r,producer=p) for p,loop in enumerate(self.proof_loops) if loop for r in loop.records()]],
                     proof_stats=[*self.archived_stats,*[dict(loop.stats(),producer=p) for p,loop in enumerate(self.proof_loops) if loop]])
-        for pool in reversed(self.pools):
+        for pool in [*reversed(self.pools),*self.detached]:
             if pool is not None:
                 pool.close()
+        self.detached.clear()
         for tree in self.idle.values():
             tree.close()
         self.idle.clear()
