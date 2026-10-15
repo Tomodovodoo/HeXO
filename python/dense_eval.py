@@ -1045,6 +1045,13 @@ class Evaluator:
             return replace(s, opening_suite=s.probe_suite, opening_book='')
         return s
 
+    def current(self, report, opponent):
+        """Whether `report` against `opponent` counts under the current settings: its protocol matches (`protocol`), and
+        while probes are on, a report against the anchor is a probe (`probe_report`). The probe quota is a game
+        count, not protocol, so changing it tops reports up instead of restarting them."""
+        anchor = self.settings.probe_games and opponent == self.anchor_id
+        return same_protocol(report, self.protocol(opponent)) and (not anchor or probe_report(report))
+
     def weights(self, name):
         """The ema.pt of checkpoint or variant `name`."""
         return self.run/'checkpoints'/split_id(name)[0]/'ema.pt'
@@ -1064,7 +1071,7 @@ class Evaluator:
             return self.book[a, b]
         path = report_path(self.run, a, b)
         report = json.loads(path.read_text()) if path.exists() else None
-        return report['games'] if report and same_protocol(report, self.protocol(b)) else []
+        return report['games'] if report and self.current(report, b) else []
 
     def direct(self, a, b):
         """Every recorded game of a against b under the current protocol, from a's side (`oriented`): the games of
@@ -1080,7 +1087,7 @@ class Evaluator:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
-        if old and not same_protocol(old, self.protocol(b)):
+        if old and not self.current(old, b):
             kept = path.with_name(f'report-{int(old["created_at"])}-{dense_openings.report_id(old)}.json')
             path.replace(kept)
             log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
