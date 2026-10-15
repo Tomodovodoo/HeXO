@@ -1882,11 +1882,15 @@ class Evaluator:
         return True
 
     def probe_due(self):
-        """The champion, then the newest rated checkpoint, when either still owes probe games (after a restart or
-        when probes were switched on), else None."""
+        """The first checkpoint still owing probe games (after a restart, or when probes were switched on), else None:
+        the champion, then newest first every rated checkpoint from the earliest one probed under this anchor (just the
+        newest before any probe), so a probe cut short by a stop is resumed later even behind newer checkpoints."""
         rated = [c['id'] for c in self.league['checkpoints'] if not c.get('skipped')]
-        for cid in dict.fromkeys([self.league['champion'], *rated[-1:]]):
-            if cid and (cid, self.anchor_id, 'probe', self.settings.opening_book) not in self.failed_seal                     and len(self.games(cid, self.anchor_id)) < self.settings.probe_games:
+        owed = lambda cid: len(self.games(cid, self.anchor_id)) < self.settings.probe_games
+        probed = [i for i, cid in enumerate(rated) if not owed(cid)]
+        start = probed[0] if probed else len(rated)-1
+        for cid in dict.fromkeys([self.league['champion'], *rated[start:][::-1]]):
+            if cid and (cid, self.anchor_id, 'probe', self.settings.opening_book) not in self.failed_seal and owed(cid):
                 return cid
         return None
 
