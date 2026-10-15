@@ -210,8 +210,8 @@ class ActorSettings:
             raise ValueError('cuda_graphs requires net_kernels=fused')
         if not 0 <= self.restart_fraction <= 1 or not self.restart_temperature > 0:
             raise ValueError('restart_fraction must lie in [0, 1] and restart_temperature must be positive')
-        if not self.restart_saving_weight > 0:
-            raise ValueError('restart_saving_weight must be positive')
+        if not 0 < self.restart_saving_weight < float('inf'):
+            raise ValueError('restart_saving_weight must be positive and finite')
         if not 0 <= self.book_fraction <= 1 or self.book_fraction+self.restart_fraction > 1:
             raise ValueError('book_fraction and restart_fraction must be nonnegative and sum to at most 1')
         if self.training_start_pool and not self.book_fraction > 0:
