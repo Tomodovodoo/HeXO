@@ -13,7 +13,8 @@ the actors' tactics), `batch` trees at a time, and pauses while a phased learner
 Output. Shard <source>1 of origin 'reanalysis' (dense_data): one episode per point holding the whole source game,
 so its outcome and future targets are the source's, with root value and full_search set only at the point and
 `reanalysis` {shard, game, ply, holdout_key, checkpoint, sims}; one row at the point with the deep search's improved
-policy, and proven fields when the search proved the root. Episodes keep the source game's validation key.
+policy, and proven fields when the search proved the root; an empty proof sidecar. Episodes keep the source game's
+validation key.
 <run>/reanalysis-status.json records the shards done (newest RECENT kept) and counters.
 """
 import argparse
@@ -21,6 +22,7 @@ from collections import namedtuple
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import time
 
@@ -74,6 +76,16 @@ def point(episode, settings, validation_fraction):
         if settings.high <= v < 1 and t != labelled and later and min(later) <= settings.low:
             found = t
     return found
+
+
+def settled(path):
+    """Give a published shard an empty proof sidecar: the proof pass skips reanalysis shards, and readers stop
+    looking for labels once the sidecar exists."""
+    sidecar = path/dense_data.SIDECAR
+    if not sidecar.exists():
+        temporary = path/(dense_data.SIDECAR+'.tmp')
+        temporary.write_text('', encoding='utf-8')
+        os.replace(temporary, sidecar)
 
 
 def seed(name, game, ply):
@@ -146,6 +158,7 @@ class Reanalysis:
             published = dense_data.verify(path)
             if published['identity'].get('reanalysis_source') != name:
                 raise ValueError(f'Reanalysis shard collision: {path}')
+            settled(path)
             return 0
         source = dense_data.verify(self.run/'shards'/name)
         episodes = json.loads((self.run/'shards'/name/'episodes.json').read_text(encoding='utf-8'))
@@ -182,6 +195,7 @@ class Reanalysis:
                         reanalysis_checkpoint=model.checkpoint)
         identity.pop('process', None)
         dense_data.write_shard(path, identity, out_episodes, rows, origin='reanalysis')
+        settled(path)
         return len(rows)
 
     def loop(self):
