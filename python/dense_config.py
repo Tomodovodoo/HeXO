@@ -56,6 +56,12 @@ class ActorSettings:
     full_turns: bool = False     # a turn's second stone repeats its first stone's full or cheap draw
     search_budget_jitter: float = 0. # uniform fractional band around each full/cheap budget; keeps its mean
     solver_free_fraction: float = 0. # per-game hybrid cohort without frontier proofs or certificate reuse
+    # Deep-side self-play cohort: in a game drawn with probability deep_fraction (own-model games only), one random
+    # side makes every search full, at deep_multiplier times full_sims (same jitter band) with deep_root_samples
+    # (0 = root_samples). It plays the attacks the other side misjudges; both sides train.
+    deep_fraction: float = 0.
+    deep_multiplier: float = 8.
+    deep_root_samples: int = 0
     root_samples: int = 16       # Gumbel m
     cheap_root_samples: int = 4  # leave cheap searches enough visits to descend beyond the root
     max_plies: int = 256
@@ -158,6 +164,8 @@ class ActorSettings:
         return self.game_graph or (HYBRID_GAME_GRAPH if self.hybrid_scheduler else 0)
 
     def __post_init__(self):
+        if not 0 <= self.deep_fraction <= 1 or self.deep_multiplier < 1 or not 0 <= self.deep_root_samples <= 1024:
+            raise ValueError('deep_fraction must lie in [0, 1], deep_multiplier be at least 1, deep_root_samples in [0, 1024]')
         if self.hybrid_round_barrier and not self.hybrid_scheduler:
             raise ValueError('hybrid_round_barrier requires hybrid_scheduler')
         if not 1 <= self.hybrid_producers <= 16 or not 4 <= self.hybrid_quantum <= 128 or not 1 <= self.hybrid_views <= 64 or not 1 <= self.hybrid_depth <= 32:
