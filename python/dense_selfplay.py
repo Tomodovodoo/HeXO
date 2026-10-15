@@ -1182,13 +1182,13 @@ class Restarts:
     """The run's restart buffer (restarts.json, dense_solve) as an actor worker uses it. load() re-reads it (missing:
     empty; unreadable: the previous entries are kept) and keeps the entries whose ply is below `max_plies`, so every
     restart game searches at least one ply. draw(rng) returns (entry, moves) for an entry drawn with probability
-    proportional to regret^(1/temperature), `moves` the first entry['ply'] moves of its source game, or None when
-    no entry is kept or the source shard is gone. Validation source games and their restart descendants are
+    proportional to regret^(1/temperature), times saving_weight for a 'defence' entry with saving turns, `moves`
+    the first entry['ply'] moves of its source game, or None when no entry is kept or the source shard is gone. Validation source games and their restart descendants are
     rejected, so the worker starts an ordinary game instead. The RESTART_SHARDS most recently used source shards
     are kept."""
 
-    def __init__(self, run, temperature, max_plies):
-        self.run, self.temperature, self.max_plies = Path(run), temperature, max_plies
+    def __init__(self, run, temperature, max_plies, saving_weight=1.):
+        self.run, self.temperature, self.max_plies, self.saving_weight = Path(run), temperature, max_plies, saving_weight
         self.validation_fraction = dense_config.load(self.run).learner.validation_fraction
         self.entries, self.shards, self.p = [], OrderedDict(), None
         self.load()
@@ -1208,6 +1208,7 @@ class Restarts:
         logs = np.log(regrets[positive])/self.temperature
         weights = np.zeros(len(regrets))
         weights[positive] = np.exp(logs-logs.max())
+        weights *= [self.saving_weight if e['kind'] == 'defence' and e.get('saving_turns') else 1. for e in self.entries]
         self.p = weights/weights.sum()
 
     def episodes(self, shard):
@@ -1409,7 +1410,7 @@ def worker(args):
     historical = Historical(run, config, np.random.default_rng(seeds.spawn(1)[0]), args.games) if settings.historical_fraction > 0 else None
     if historical:
         historical.redraw(model.checkpoint, model.sha)
-    restarts = Restarts(run, settings.restart_temperature, settings.max_plies) if settings.restart_fraction > 0 else None
+    restarts = Restarts(run, settings.restart_temperature, settings.max_plies, settings.restart_saving_weight) if settings.restart_fraction > 0 else None
     restart_rng = np.random.default_rng(seeds.spawn(1)[0]) if restarts else None
     book_starts = BookStarts(run, settings.max_plies, settings.training_start_pool) if settings.book_fraction > 0 else None
     start_rng = np.random.default_rng(seeds.spawn(1)[0]) if book_starts else restart_rng
