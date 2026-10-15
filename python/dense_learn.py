@@ -1044,7 +1044,7 @@ class Learner:
                         model_sha256=hexnet.model_digest(self.model), ema_sha256=hexnet.model_digest(self.ema),
                         metrics=dict(self.metrics or {h: None for h in self.heads}, validation=validation, validation_sources=sources,
                                      calibration=self.calibration_report),
-                        learner=asdict(s), model=asdict(self.config.model),
+                        learner=asdict(s), model=hexnet.saved_config(self.config.model),
                         rows=window.total_rows, pacing=self.pacing)
         write_json(stage/'manifest.json', manifest)
         stage.rename(final)

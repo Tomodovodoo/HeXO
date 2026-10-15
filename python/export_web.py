@@ -56,6 +56,7 @@ class WebNet(nn.Module):
             tensors.update({f'{name}_mean': norm.running_mean, f'{name}_var': norm.running_var,
                             f'{name}_weight': norm.weight, f'{name}_bias': norm.bias})
         self.eps = model.norm.eps
+        self.post = model.config.block == 'post'
         self.blocks = []
         for i, block in enumerate(model.blocks):
             tensors.update({f'b{i}_conv1': block.conv1.weight*block.conv1.hex, f'b{i}_conv2': block.conv2.weight*block.conv2.hex})
@@ -73,11 +74,13 @@ class WebNet(nn.Module):
     def t(self, name):
         return getattr(self, name)
 
+    def norm(self, x, norm):
+        t = self.t
+        return F.batch_norm(x, t(f'{norm}_mean'), t(f'{norm}_var'), t(f'{norm}_weight'), t(f'{norm}_bias'), False, 0., self.eps)
+
     def act(self, x, norm, mask):
         """relu(batch norm `norm`(x)) on the crop, 0 on padding."""
-        t = self.t
-        return F.relu(F.batch_norm(x, t(f'{norm}_mean'), t(f'{norm}_var'), t(f'{norm}_weight'), t(f'{norm}_bias'),
-                                   False, 0., self.eps))*mask
+        return F.relu(self.norm(x, norm))*mask
 
     @staticmethod
     def pool(x, scale):
@@ -88,6 +91,14 @@ class WebNet(nn.Module):
         t, mask = self.t, features[:, 3:4]
         scale = 1/mask.float().sum((2, 3), keepdim=True)
         x = F.conv2d(features, self.stem, padding=1)
+        if self.post:  # PostBlock trunk (hexnet): conv-norm-act blocks after a normed stem
+            x = self.act(x, 'norm', mask)
+            for i, _, pooled in self.blocks:
+                y = self.act(F.conv2d(x, t(f'b{i}_conv1'), padding=1), f'b{i}_norm1', mask)
+                if pooled:
+                    y = F.relu(y+F.linear(self.pool(y, scale), t(f'b{i}_pool_w'), t(f'b{i}_pool_b'))[:, :, None, None])*mask
+                x = F.relu(x+self.norm(F.conv2d(y, t(f'b{i}_conv2'), padding=1), f'b{i}_norm2'))*mask
+            return self.heads(x, scale)
         for i, line, pooled in self.blocks:
             y = F.conv2d(self.act(x, f'b{i}_norm1', mask), t(f'b{i}_conv1'), padding=1)
             if pooled:
@@ -97,7 +108,9 @@ class WebNet(nn.Module):
                 kernel = t(f'b{i}_line')
                 y = y+F.conv2d(y, kernel, padding=kernel.shape[-1]//2, groups=kernel.shape[0])
             x = x+F.conv2d(self.act(y, f'b{i}_norm2', mask), t(f'b{i}_conv2'), padding=1)
-        x = self.act(x, 'norm', mask)
+        return self.heads(self.act(x, 'norm', mask), scale)
+
+    def heads(self, x, scale):
         pooled = self.pool(x, scale)
         hidden = F.relu(F.conv2d(x, self.policy_hidden_w, self.policy_hidden_b))
         value = F.relu(F.linear(pooled, self.value_hidden_w, self.value_hidden_b))
