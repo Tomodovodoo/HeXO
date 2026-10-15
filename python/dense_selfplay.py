@@ -1205,10 +1205,10 @@ class Restarts:
         if not positive.any():
             self.p = None
             return
-        logs = np.log(regrets[positive])/self.temperature
+        saving = np.array([e['kind'] == 'defence' and bool(e.get('saving_turns')) for e in self.entries])
+        logs = np.log(regrets[positive])/self.temperature+np.log(self.saving_weight)*saving[positive]
         weights = np.zeros(len(regrets))
         weights[positive] = np.exp(logs-logs.max())
-        weights *= [self.saving_weight if e['kind'] == 'defence' and e.get('saving_turns') else 1. for e in self.entries]
         self.p = weights/weights.sum()
 
     def episodes(self, shard):
