@@ -5,10 +5,10 @@ import numpy as np
 
 # Settings a reused report must share; a report without one of PROTOCOL_DEFAULTS was played at that value.
 PROTOCOL = ('sims', 'root_samples', 'max_plies', 'tactics', 'search_graph', 'search_choice', 'q_range_floor', 'opening_suite', 'opening_book', 'seal_ms',
-            'external_engine', 'external_name',
+            'external_engine', 'external_name', 'external_nodes',
             'solver_root_nodes', 'solver_finalists', 'solver_finalist_nodes', 'solver_threat_nodes',
             'solver_defence', 'solver_defence_candidates', 'solver_gate_cap_nodes', 'pipeline')
-PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', q_range_floor=0., external_engine='', external_name='seal', solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
+PROTOCOL_DEFAULTS = dict(opening_book='', search_graph=False, search_choice='gumbel', q_range_floor=0., external_engine='', external_name='seal', external_nodes=0, solver_root_nodes=0, solver_finalists=0, solver_finalist_nodes=0,
                          solver_threat_nodes=0, solver_defence=False, solver_defence_candidates=8,
                          solver_gate_cap_nodes=0, pipeline=False)
 

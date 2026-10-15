@@ -334,6 +334,8 @@ class EvaluationSettings:
     seal_ms: int = 100
     external_engine: str = ''    # Six-protocol command for the anchor; empty keeps Seal
     external_name: str = 'seal'  # league id and dashboard label of that anchor
+    external_nodes: int = 0      # the external anchor's positions per complete turn (go nodes); 0 plays seal_ms per turn
+    probe_games: int = 0         # games of every rated checkpoint against the external anchor, same openings for all
     decision: str = 'posterior'   # promotion rule: 'posterior' (dense_eval.Evaluator.verdict) or 'sprt'
     promote_confidence: float = .9  # posterior: P(candidate - champion > sprt_elo0) needed to promote (1 - it rejects)
     matchup_prior_elo: float = 30.  # posterior: prior sd of a pair's deviation from the transitive rating difference
@@ -402,6 +404,10 @@ class EvaluationSettings:
                                      not name[0].isalpha() or
                                      any(not (c.isalnum() or c in '_-') for c in name)):
             raise ValueError('external_name must be a distinct league ID; set --eval-external-name')
+        if self.external_nodes < 0 or self.probe_games < 0 or self.probe_games % 2:
+            raise ValueError('external_nodes must be nonnegative and probe_games a nonnegative even count')
+        if self.probe_games and not self.external_engine:
+            raise ValueError('probe_games needs an external_engine to probe against')
 
 
 @dataclass(frozen=True)

@@ -44,7 +44,15 @@ def anchor_name(settings):
 
 
 def anchor_engine(settings):
-    return SixEngine(shlex.split(settings.external_engine)) if settings.external_engine else Seal()
+    """Seal, or the external Six-protocol engine. That engine searches external_nodes positions per complete turn
+    (go nodes) when set, else seal_ms per turn; its startup allows minutes, as Six on TensorRT builds its plan
+    on a first start."""
+    if not settings.external_engine:
+        return Seal()
+    engine = SixEngine(shlex.split(settings.external_engine), timeout=60., startup=900.)
+    if not settings.external_nodes:
+        return engine
+    return lambda game, ms: engine(game, nodes=settings.external_nodes)
 
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
@@ -1055,9 +1063,10 @@ class Evaluator:
     def start(self, pool, lane):
         """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`), each
         side searching with its own settings (`side`)."""
-        a, b, _ = lane
+        a, b, kind = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
-        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2, a, self.config, self.settings,
+        label = f'probe/{b}' if kind == 'probe' else a  # every checkpoint probes the anchor on the same openings
+        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2, label, self.config, self.settings,
                                     self.seal, self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
@@ -1487,11 +1496,13 @@ class Evaluator:
         vs the previous champion (`met` of the champion) and vs Seal, the one whose `games` most reduce the
         posterior variance of delta (value of information, `Posterior.after`), when that beats as many direct
         games; only pairings whose report can grow (`rematch_pair`) and that are `close`. The decision posterior
-        also checks the score limit, including for a candidate whose league rating is not published yet."""
+        also checks the score limit, including for a candidate whose league rating is not published yet. With
+        probe_games the anchor plays probes only, so its reports keep the shared probe openings."""
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, self.anchor_id), (champion, self.anchor_id)):
-            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b):
+            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b) \
+                    or b == self.anchor_id and s.probe_games:
                 continue
             if b == self.anchor_id:
                 path = report_path(self.run, a, self.anchor_id)
@@ -1812,6 +1823,38 @@ class Evaluator:
         write_league(self.run, self.league, self.config, self.settings.fill_top)
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
                                       for o, r in reports.items()) + (' -> champion' if promoted else f' ({decision})' if decision else ''), flush=True)
+        self.probe(cid)
+
+    def probe(self, cid):
+        """Play cid's missing probe_games against the external anchor (lane kind 'probe', the same openings for every
+        checkpoint) and record them; True when it played. Unlike the champion ladder, these scores share one fixed
+        opponent, so they compare checkpoints far apart. No Elo gate: a lopsided score still tracks progress."""
+        s, anchor = self.settings, self.anchor_id
+        if not s.probe_games:
+            return False
+
+        def want():
+            done = len(self.games(cid, anchor))
+            if done >= s.probe_games or (cid, anchor, 'probe', s.opening_book) in self.failed_seal:
+                return {}
+            return {(cid, anchor, 'probe'): even(min(s.pool_games, s.probe_games-done))}
+        if not want():
+            return False
+        self.filling(None)
+        self.session(want, s.probe_games)
+        path = report_path(self.run, cid, anchor)
+        if path.exists():
+            self.record(cid, anchor, json.loads(path.read_text()))
+        return True
+
+    def probe_due(self):
+        """The champion, then the newest rated checkpoint, when either still owes probe games (after a restart or
+        when probes were switched on), else None."""
+        rated = [c['id'] for c in self.league['checkpoints'] if not c.get('skipped')]
+        for cid in dict.fromkeys([self.league['champion'], *rated[-1:]]):
+            if cid and (cid, self.anchor_id, 'probe', self.settings.opening_book) not in self.failed_seal                     and len(self.games(cid, self.anchor_id)) < self.settings.probe_games:
+                return cid
+        return None
 
     def sealed(self, cid):
         """The champion-vs-Seal report of cid, or None."""
@@ -1849,9 +1892,10 @@ class Evaluator:
         checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor.
-        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents."""
+        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents. Probes
+        (probe_games) replace these quotas."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or not self.close(champion['id'], self.anchor_id) \
+        if not s.anchor_games or s.probe_games or champion is None or not self.close(champion['id'], self.anchor_id) \
                 or (champion['id'], self.anchor_id, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
@@ -2069,6 +2113,8 @@ class Evaluator:
                     self.trial(entry)
                     self.set_anchor_turn(True)
                     return True
+        if not anchor_task and (due := self.probe_due()):
+            return self.probe(due)
         task = anchor_task or self.anchor() or self.optional() or self.fill()
         self.filling(None if task is None or task[2] not in ('fill', 'generalization') else self.anchor_id if task[1] == self.anchor_id
                      else f'{"generalization " if task[2] == "generalization" else ""}{task[0]["id"]} vs {task[1]}')
