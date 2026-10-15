@@ -38,8 +38,14 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
-SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'choice'},
+SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'choice', 'views',
+                        'pass_simulations'},
                 solver={'enabled', 'stamps', 'workers', 'budget'})
+
+
+# A turn's graph owner runs `views` searches, its root and positions below it, each in passes of at most
+# `pass_simulations`; a pass is one Gumbel sequential halving, and only the root view's visits are root visits.
+VIEWS, PASS_SIMULATIONS = 8, 64
 
 
 def check_settings(search, solver):
@@ -53,6 +59,9 @@ def check_settings(search, solver):
         raise ValueError('simulation cap must be a positive integer')
     if search.get('choice', 'gumbel') not in ('gumbel', 'policy'):
         raise ValueError('search.choice must be gumbel or policy')
+    views, passes = search.get('views', VIEWS), search.get('pass_simulations', PASS_SIMULATIONS)
+    if type(views) is not int or not 1 <= views <= 64 or type(passes) is not int or not 4 <= passes <= 1 << 20:
+        raise ValueError('search.views must lie in [1, 64] and search.pass_simulations in [4, 2^20]')
     if search.get('enabled', True) and solver.get('enabled', True):
         proof_settings(solver)
     elif {'workers', 'budget'} & solver.keys():
@@ -308,8 +317,10 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         if stopped():
             result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline'
             return result
+        views, passes = limits.get('views', VIEWS), limits.get('pass_simulations', PASS_SIMULATIONS)
         signature = (player.model_sha256, player.options['solver'],
-                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget)
+                     bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget,
+                     views, passes)
         kept = getattr(player, '_timed_hybrid', None)
         if kept is not None and kept[2] != signature:
             player.set_history(history)
@@ -319,7 +330,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                               cache=player.cache, tactics=True, q_range_floor=signature[3], round_barrier=True)
             pool = None
             try:
-                pool = SearchPool([graph], quantum=64, views=8, depth=8, work=1, seed=1740)
+                pool = SearchPool([graph], quantum=passes, views=views, depth=8, work=1, seed=1740)
                 if player.options['solver']:
                     pool.enable_proofs(player.tactical_package, workers=workers, queue=8*workers,
                                        slice_ms=8, stamps=signature[2], owner_budget=budget)
@@ -334,7 +345,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         # while detached, before a new service takes exclusive ownership.
         pool.retarget(0, history, work=1)
         before = pool.proofs.stats() if pool.proofs is not None else None
-        service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=64,
+        service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=min(128, max(64, passes)),
                                    pending=2, flights=2, interleave_feedback=True, progress=True)
         service.start(continuous=True)
         # Inference collection may wait for a whole CPU/GPU batch. Keep it off
@@ -358,7 +369,7 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
                                queued_ms=(time.monotonic()-started)*1000)
             result['root_searches'].append(root_search)
             service.retarget(0, 0, current, expected=token, work=work, ms=ms,
-                             samples=limits.get('root_samples', 16), views=8)
+                             samples=limits.get('root_samples', 16), views=views)
             found = progress_candidate = None
             progress_sequence = 0
             progress_context = None
@@ -550,6 +561,8 @@ def _worker(connection, cancellation, config):
                     budget_exhausted=player.evaluator.graph.budget_exhausted)
             search_limits = dict(simulations=search.get('max_simulations', search.get('simulations')),
                                  root_samples=search.get('root_samples', 16),
+                                 views=search.get('views', VIEWS),
+                                 pass_simulations=search.get('pass_simulations', PASS_SIMULATIONS),
                                  choice=search.get('choice', 'gumbel'),
                                  q_range_floor=search.get('q_range_floor', 0.))
             search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
@@ -689,7 +702,8 @@ class TimedEngine:
         if not self.lock.acquire(timeout=max(0, timeout)):
             raise TimeoutError('Engine controller did not become idle')
         try:
-            if self.busy:
+            cancelled = self.busy
+            if cancelled:
                 self.cancellation.set()
             while self.busy:
                 left = deadline-time.monotonic()
@@ -701,7 +715,8 @@ class TimedEngine:
                         continue
                     if status in ('done', 'error'):
                         self.busy = False
-                    if status == 'error':
+                    # The turn this call cancelled may end in the cancellation's own error; the engine is idle.
+                    if status == 'error' and not (cancelled and result['message'] == 'engine request cancelled'):
                         raise RuntimeError(result['message'])
                 elif not self.process.is_alive():
                     raise RuntimeError('Engine worker exited')
