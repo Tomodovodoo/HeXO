@@ -4,12 +4,6 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
-      - 'tests/web/**'
-      - 'tests/test_web_*.py'
-      - '.github/workflows/native.yml'
-      - '.github/workflows/web.yml'
-      - '.github/workflows/engines.yml'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 permissions:
   contents: read
