@@ -1047,10 +1047,10 @@ class Evaluator:
 
     def current(self, report, opponent):
         """Whether `report` against `opponent` counts under the current settings: its protocol matches (`protocol`), and
-        while probes are on, a report against the anchor is a probe (`probe_report`). The probe quota is a game
-        count, not protocol, so changing it tops reports up instead of restarting them."""
-        anchor = self.settings.probe_games and opponent == self.anchor_id
-        return same_protocol(report, self.protocol(opponent)) and (not anchor or probe_report(report))
+        a report against the anchor is a probe (`probe_report`) exactly while probes are on. The probe quota is a
+        game count, not protocol, so changing it tops reports up instead of restarting them."""
+        return same_protocol(report, self.protocol(opponent)) and \
+            (opponent != self.anchor_id or probe_report(report) == bool(self.settings.probe_games))
 
     def weights(self, name):
         """The ema.pt of checkpoint or variant `name`."""
