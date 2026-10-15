@@ -11188,7 +11188,7 @@ class DenseTimedWorker(unittest.TestCase):
                 first = [1,0] if choice == 'policy' else [0,1]
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False), model_sha256='fixed', checkpoint='fixed',
-                    prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+                    prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1., 8, 64)))
                 frames = [dict(producer=0, game=0, model=0, token=1, history=history, context='first',
                     action=[0,1], exact_winner=-1, root_completed=20, completed=20,
                     edges=np.array([[1,0,0,0,.2,.99,1,1,1], [0,1,0,0,.4,.01,40,15,1]], float)),
@@ -11228,7 +11228,7 @@ class DenseTimedWorker(unittest.TestCase):
         clock = [0.]
         pool = unittest.mock.Mock(proofs=None)
         player = SimpleNamespace(options=dict(solver=False), model_sha256='fixed', checkpoint='fixed',
-            prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+            prover=None, evaluator=None, _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1., 8, 64)))
         frames = [
             dict(producer=0, game=0, model=0, token=1, history=history, context='first',
                  action=[1, 0], exact_winner=-1, root_completed=2, completed=3,
@@ -11318,7 +11318,7 @@ class DenseTimedWorker(unittest.TestCase):
                 pool = unittest.mock.Mock(proofs=None)
                 player = SimpleNamespace(options=dict(solver=False),
                     model_sha256='fixed', checkpoint='fixed', prover=None, evaluator=None,
-                    _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1.)))
+                    _timed_hybrid=(None, pool, ('fixed', False, False, 0., 2, 1., 8, 64)))
                 service = service_type.return_value
                 service.stats.return_value = dict(launched_rows=80)
                 service.progress.return_value = None
