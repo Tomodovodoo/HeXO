@@ -1028,6 +1028,15 @@ class Evaluator:
         for name in [n for n in self.models if n not in names]:
             del self.models[name]
 
+    def protocol(self, opponent):
+        """The settings a report against `opponent` is played and stamped under: with probe_games every anchor game is a
+        probe, drawn from the frozen probe_suite, so those reports name that suite and no live book digest (a book
+        refresh leaves them current and the live book never counts them)."""
+        s = self.settings
+        if s.probe_games and opponent == self.anchor_id:
+            return replace(s, opening_suite=s.probe_suite, opening_book='')
+        return s
+
     def weights(self, name):
         """The ema.pt of checkpoint or variant `name`."""
         return self.run/'checkpoints'/split_id(name)[0]/'ema.pt'
@@ -1047,7 +1056,7 @@ class Evaluator:
             return self.book[a, b]
         path = report_path(self.run, a, b)
         report = json.loads(path.read_text()) if path.exists() else None
-        return report['games'] if report and same_protocol(report, self.settings) else []
+        return report['games'] if report and same_protocol(report, self.protocol(b)) else []
 
     def direct(self, a, b):
         """Every recorded game of a against b under the current protocol, from a's side (`oriented`): the games of
@@ -1063,7 +1072,7 @@ class Evaluator:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
-        if old and not same_protocol(old, self.settings):
+        if old and not same_protocol(old, self.protocol(b)):
             kept = path.with_name(f'report-{int(old["created_at"])}-{dense_openings.report_id(old)}.json')
             path.replace(kept)
             log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
@@ -1091,7 +1100,7 @@ class Evaluator:
         for name in (a, b):
             if name != self.anchor_id and name not in self.shas:
                 self.shas[name] = digest(self.weights(name))
-        report = make_report(a, b, records, self.shas, self.settings,
+        report = make_report(a, b, records, self.shas, self.protocol(b),
                              {name: self.overrides(name) for name in (a, b) if self.overrides(name)}, self.ids[a, b])
         if kind == 'sprt':
             result = self.test(records)
@@ -1987,7 +1996,7 @@ class Evaluator:
                         and len(models | {name for name in (a, b) if name != self.anchor_id}) > 3:
                     continue
                 if b == self.anchor_id:
-                    if s.anchor_target_halfwidth <= 0 or (a, b, 'fill', s.opening_book) in self.failed_seal:
+                    if s.anchor_target_halfwidth <= 0 or s.probe_games or (a, b, 'fill', s.opening_book) in self.failed_seal:
                         continue
                     pair = a, b
                 else:
