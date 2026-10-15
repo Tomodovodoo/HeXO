@@ -164,8 +164,9 @@ class ActorSettings:
         return self.game_graph or (HYBRID_GAME_GRAPH if self.hybrid_scheduler else 0)
 
     def __post_init__(self):
-        if not 0 <= self.deep_fraction <= 1 or self.deep_multiplier < 1 or not 0 <= self.deep_root_samples <= 1024:
-            raise ValueError('deep_fraction must lie in [0, 1], deep_multiplier be at least 1, deep_root_samples in [0, 1024]')
+        if not 0 <= self.deep_fraction <= 1 or not 1 <= self.deep_multiplier < float('inf')                 or not 0 <= self.deep_root_samples <= 1024:
+            raise ValueError('deep_fraction must lie in [0, 1], deep_multiplier be finite and at least 1, '
+                             'deep_root_samples in [0, 1024]')
         if self.hybrid_round_barrier and not self.hybrid_scheduler:
             raise ValueError('hybrid_round_barrier requires hybrid_scheduler')
         if not 1 <= self.hybrid_producers <= 16 or not 4 <= self.hybrid_quantum <= 128 or not 1 <= self.hybrid_views <= 64 or not 1 <= self.hybrid_depth <= 32:
