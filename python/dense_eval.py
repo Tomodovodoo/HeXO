@@ -43,8 +43,27 @@ def anchor_name(settings):
     return settings.external_name if settings.external_engine else SEAL
 
 
+class NodeBudget:
+    """An external engine that searches `nodes` positions per complete turn (go nodes), whatever time it is given."""
+
+    def __init__(self, engine, nodes):
+        self.engine, self.nodes = engine, nodes
+
+    def __call__(self, game, ms):
+        return self.engine(game, nodes=self.nodes)
+
+    def close(self):
+        self.engine.close()
+
+
 def anchor_engine(settings):
-    return SixEngine(shlex.split(settings.external_engine)) if settings.external_engine else Seal()
+    """Seal, or the external Six-protocol engine. That engine searches external_nodes positions per complete turn
+    when set, else seal_ms per turn; its startup allows minutes, as Six on TensorRT builds its plan on a first
+    start."""
+    if not settings.external_engine:
+        return Seal()
+    engine = SixEngine(shlex.split(settings.external_engine), timeout=60., startup=900.)
+    return NodeBudget(engine, settings.external_nodes) if settings.external_nodes else engine
 
 PACE_WINDOW = 3600.  # a Pacer banks at most share * PACE_WINDOW seconds of idle credit
 STATUS_SECONDS = 2.
@@ -485,6 +504,13 @@ def load_reports(run, settings=None):
     return [r for r in reports if settings is None or same_protocol(r, settings)]
 
 
+def probe_report(report):
+    """Whether `report` holds probe games: stamped with probe_games and played against the external anchor it names
+    itself, so a later anchor name or matching main suite cannot make it look ordinary."""
+    s = report['settings']
+    return bool(s.get('probe_games')) and report['opponent'] == s.get('external_name')
+
+
 def same_protocol(report, settings):
     """Whether `report` was played under the PROTOCOL of `settings` (dense_stats.same_protocol on the settings' fields)."""
     return dense_stats.same_protocol(report['settings'], {k: getattr(settings, k) for k in PROTOCOL})
@@ -901,7 +927,10 @@ class Evaluator:
 
     def __init__(self, run, config, settings, pacer):
         self.openings = dense_openings.Book(run, settings)
-        missed = self.openings.reconcile(dense_openings.stamp(run))
+        # Probes draw from a frozen suite: the live book changes its openings at every refresh.
+        self.probe_openings = dense_openings.Book(run, settings, settings.probe_suite) if settings.probe_games else None
+        # Probe reports count in no opening book, whatever suite the main games use; every other report reconciles.
+        missed = self.openings.reconcile([r for r in dense_openings.stamp(run) if not probe_report(r)])
         settings = replace(settings, opening_book=self.openings.digest())
         config = replace(config, evaluation=settings)
         self.run, self.config, self.settings, self.pacer = Path(run), config, settings, pacer
@@ -1007,6 +1036,22 @@ class Evaluator:
         for name in [n for n in self.models if n not in names]:
             del self.models[name]
 
+    def protocol(self, opponent):
+        """The settings a report against `opponent` is played and stamped under: with probe_games every anchor game is a
+        probe, drawn from the frozen probe_suite, so those reports name that suite and no live book digest (a book
+        refresh leaves them current and the live book never counts them)."""
+        s = self.settings
+        if s.probe_games and opponent == self.anchor_id:
+            return replace(s, opening_suite=s.probe_suite, opening_book='')
+        return s
+
+    def current(self, report, opponent):
+        """Whether `report` against `opponent` counts under the current settings: its protocol matches (`protocol`), and
+        a report against the anchor is a probe (`probe_report`) exactly while probes are on. The probe quota is a
+        game count, not protocol, so changing it tops reports up instead of restarting them."""
+        return same_protocol(report, self.protocol(opponent)) and \
+            (opponent != self.anchor_id or probe_report(report) == bool(self.settings.probe_games))
+
     def weights(self, name):
         """The ema.pt of checkpoint or variant `name`."""
         return self.run/'checkpoints'/split_id(name)[0]/'ema.pt'
@@ -1026,7 +1071,7 @@ class Evaluator:
             return self.book[a, b]
         path = report_path(self.run, a, b)
         report = json.loads(path.read_text()) if path.exists() else None
-        return report['games'] if report and same_protocol(report, self.settings) else []
+        return report['games'] if report and self.current(report, b) else []
 
     def direct(self, a, b):
         """Every recorded game of a against b under the current protocol, from a's side (`oriented`): the games of
@@ -1042,7 +1087,7 @@ class Evaluator:
             return
         path = report_path(self.run, a, b)
         old = json.loads(path.read_text()) if path.exists() else None
-        if old and not same_protocol(old, self.settings):
+        if old and not self.current(old, b):
             kept = path.with_name(f'report-{int(old["created_at"])}-{dense_openings.report_id(old)}.json')
             path.replace(kept)
             log_event(self.run, 'evaluator', 'info', f'{a} vs {b}: the report played under another protocol is kept as '
@@ -1055,10 +1100,12 @@ class Evaluator:
     def start(self, pool, lane):
         """Start the next opening pair of lane (a, b, kind) in `pool`: both colours at once (`paired_games`), each
         side searching with its own settings (`side`)."""
-        a, b, _ = lane
+        a, b, kind = lane
         pair, self.next[a, b] = self.next[a, b], self.next[a, b]+1
-        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2, a, self.config, self.settings,
-                                    self.seal, self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
+        probe = kind == 'probe'  # every checkpoint probes the anchor on the same openings of probe_suite
+        pool.add(lane, paired_games(self.models[a], self.anchor_id if b == self.anchor_id else self.models[b], 2,
+                                    f'probe/{b}' if probe else a, self.config, self.settings,
+                                    self.seal, self.probe_openings if probe else self.openings, pair, (self.side(a), self.side(b)), candidate=a, opponent=b))
 
     def persist(self, a, b, kind, pair):
         """Append a completed colour pair to report a-vs-b and rewrite it (kind 'sprt' recomputes metrics.sprt,
@@ -1068,7 +1115,7 @@ class Evaluator:
         for name in (a, b):
             if name != self.anchor_id and name not in self.shas:
                 self.shas[name] = digest(self.weights(name))
-        report = make_report(a, b, records, self.shas, self.settings,
+        report = make_report(a, b, records, self.shas, self.protocol(b),
                              {name: self.overrides(name) for name in (a, b) if self.overrides(name)}, self.ids[a, b])
         if kind == 'sprt':
             result = self.test(records)
@@ -1076,7 +1123,8 @@ class Evaluator:
         path = report_path(self.run, a, b)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, report)
-        self.openings.record(pair, self.ids[a, b])
+        if kind != 'probe':
+            self.openings.record(pair, self.ids[a, b])
         for record in pair:
             if record['reason'] == 'span':
                 log_event(self.run, 'evaluator', 'error', f'{a} vs {b} pair {record["pair"]}: game counted as capped at ply '
@@ -1463,10 +1511,12 @@ class Evaluator:
 
     def inputs(self, cid, champion):
         """(ids, reports) of the `verdict` posterior on cid against the champion: the league's rated ids, the
-        champion, cid and Seal when it has a report among them; every protocol-matching report among those."""
+        champion, cid and Seal when it has a report among them; every protocol-matching report among those except
+        probes, which measure against the fixed anchor and never decide a promotion."""
         rated = [c['id'] for c in self.league['checkpoints']+self.variants() if c.get('elo') is not None and not c.get('skipped')]
         ids = list(dict.fromkeys(rated+[champion, cid]))
-        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[self.anchor_id] and r['opponent'] in ids+[self.anchor_id]]
+        reports = [r for r in load_reports(self.run, self.settings) if r['candidate'] in ids+[self.anchor_id]
+                   and r['opponent'] in ids+[self.anchor_id] and not probe_report(r)]
         if any(self.anchor_id in (r['candidate'], r['opponent']) for r in reports):
             ids.append(self.anchor_id)
         return ids, reports
@@ -1487,11 +1537,13 @@ class Evaluator:
         vs the previous champion (`met` of the champion) and vs Seal, the one whose `games` most reduce the
         posterior variance of delta (value of information, `Posterior.after`), when that beats as many direct
         games; only pairings whose report can grow (`rematch_pair`) and that are `close`. The decision posterior
-        also checks the score limit, including for a candidate whose league rating is not published yet."""
+        also checks the score limit, including for a candidate whose league rating is not published yet. With
+        probe_games the anchor plays probes only, so its reports keep the shared probe openings."""
         s, post, previous = self.settings, verdict['posterior'], self.met(champion)
         options = []
         for a, b in ((cid, previous), (champion, previous), (cid, self.anchor_id), (champion, self.anchor_id)):
-            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b):
+            if not b or b == a or (a, b, 'evidence', s.opening_book) in self.failed_seal or not self.close(a, b) \
+                    or b == self.anchor_id and s.probe_games:
                 continue
             if b == self.anchor_id:
                 path = report_path(self.run, a, self.anchor_id)
@@ -1812,6 +1864,43 @@ class Evaluator:
         write_league(self.run, self.league, self.config, self.settings.fill_top)
         print(f'{cid}: ' + ', '.join(f'vs {o} +{r["summary"]["wins"]} -{r["summary"]["losses"]} ={r["summary"]["capped"]}'
                                       for o, r in reports.items()) + (' -> champion' if promoted else f' ({decision})' if decision else ''), flush=True)
+        self.probe(cid)
+
+    def probe(self, cid):
+        """Play cid's missing probe_games against the external anchor (lane kind 'probe', the same openings for every
+        checkpoint) and record them; True when it played. Unlike the champion ladder, these scores share one fixed
+        opponent, so they compare checkpoints far apart. No Elo gate: a lopsided score still tracks progress."""
+        s, anchor = self.settings, self.anchor_id
+        if not s.probe_games:
+            return False
+
+        def want():
+            done = len(self.games(cid, anchor))
+            if done >= s.probe_games or (cid, anchor, 'probe', s.opening_book) in self.failed_seal:
+                return {}
+            return {(cid, anchor, 'probe'): even(min(s.pool_games, s.probe_games-done))}
+        if not want():
+            return False
+        self.filling(None)
+        self.session(want, s.probe_games)
+        path = report_path(self.run, cid, anchor)
+        if path.exists():
+            self.record(cid, anchor, json.loads(path.read_text()))
+        return True
+
+    def probe_due(self):
+        """The first checkpoint still owing probe games (after a restart, or when probes were switched on), else None:
+        the champion, then newest first every rated checkpoint from the earliest one with probe games under this anchor
+        (just the newest before any), so a probe cut short by a stop is resumed later even behind newer checkpoints."""
+        rated = [c['id'] for c in self.league['checkpoints'] if not c.get('skipped')]
+        played = [len(self.games(cid, self.anchor_id)) for cid in rated]
+        owed = lambda cid: len(self.games(cid, self.anchor_id)) < self.settings.probe_games
+        probed = [i for i, n in enumerate(played) if n]  # a started probe marks the boundary too
+        start = probed[0] if probed else len(rated)-1
+        for cid in dict.fromkeys([self.league['champion'], *rated[start:][::-1]]):
+            if cid and (cid, self.anchor_id, 'probe', self.settings.opening_book) not in self.failed_seal and owed(cid):
+                return cid
+        return None
 
     def sealed(self, cid):
         """The champion-vs-Seal report of cid, or None."""
@@ -1849,9 +1938,10 @@ class Evaluator:
         checkpoints rated during the reign (entries from `reign_from` on), counted against the games its Seal reports
         (`seal_reports`, every protocol) gained since reign_games, so an anchor owed when the protocol changes (a book
         refresh) is played under the new one. A newer champion supersedes the old one's unfinished anchor.
-        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents."""
+        Quotas apply only while the champion and Seal are `close`, as for other automatic opponents. Probes
+        (probe_games) replace these quotas."""
         s, champion = self.settings, self.entry(self.league['champion'])
-        if not s.anchor_games or champion is None or not self.close(champion['id'], self.anchor_id) \
+        if not s.anchor_games or s.probe_games or champion is None or not self.close(champion['id'], self.anchor_id) \
                 or (champion['id'], self.anchor_id, 'anchor', s.opening_book) in self.failed_seal:
             return None
         entries = self.league['checkpoints']
@@ -1928,7 +2018,7 @@ class Evaluator:
                         and len(models | {name for name in (a, b) if name != self.anchor_id}) > 3:
                     continue
                 if b == self.anchor_id:
-                    if s.anchor_target_halfwidth <= 0 or (a, b, 'fill', s.opening_book) in self.failed_seal:
+                    if s.anchor_target_halfwidth <= 0 or s.probe_games or (a, b, 'fill', s.opening_book) in self.failed_seal:
                         continue
                     pair = a, b
                 else:
@@ -2069,6 +2159,8 @@ class Evaluator:
                     self.trial(entry)
                     self.set_anchor_turn(True)
                     return True
+        if not anchor_task and (due := self.probe_due()):
+            return self.probe(due)
         task = anchor_task or self.anchor() or self.optional() or self.fill()
         self.filling(None if task is None or task[2] not in ('fill', 'generalization') else self.anchor_id if task[1] == self.anchor_id
                      else f'{"generalization " if task[2] == "generalization" else ""}{task[0]["id"]} vs {task[1]}')
