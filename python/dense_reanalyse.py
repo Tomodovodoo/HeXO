@@ -2,9 +2,10 @@
 extra policy rows (MuZero Reanalyze, restricted to value collapses).
 
 Selection. In each decisive own-model game of a new actor shard (validation games excepted), the loser's turn
-starts t with a searched root value v_t are scanned. t is a collapse point when v_t is inexact and >= `high` and
-one of the loser's next `turns` turn starts has a value <= `low` (an exact loss counts); a game gives its latest collapse point, the last turn
-the loser still thought it was fine. A shard gives at most `fraction` of its policy rows.
+starts t with a searched root value v_t are scanned. t is a collapse point when v_t is inexact (below 1, which
+marks an exact win) and >= `high`, t is not a tactical book position (its manual result stays with the source),
+and one of the loser's next `turns` turn starts has a value <= `low` (an exact loss counts); a game gives its latest
+collapse point, the last turn the loser still thought it was fine. A shard gives at most `fraction` of its policy rows.
 
 Search. The champion searches every point for `sims` simulations with `root_samples` (a transposition graph and
 the actors' tactics), `batch` trees at a time, and pauses while a phased learner trains (dense_selfplay.Yield).
@@ -63,12 +64,14 @@ def point(episode, settings, validation_fraction):
             or dense_data.holdout(episode, validation_fraction):
         return None
     loser = 1-episode['winner']
+    book = episode.get('book') or {}
+    labelled = book['ply'] if book.get('tactical') is not None else None  # keeps its manual result; not reanalysed
     starts = [(t, values[t]) for t in range(max(1, forced_plies(episode)), len(values))
               if t % 2 and player_at(t) == loser and values[t] is not None]
     found = None
     for i, (t, v) in enumerate(starts):
         later = [w for _, w in starts[i+1:i+1+settings.turns]]  # exact losses count as collapse evidence
-        if settings.high <= v < .999 and later and min(later) <= settings.low:
+        if settings.high <= v < 1 and t != labelled and later and min(later) <= settings.low:
             found = t
     return found
 
