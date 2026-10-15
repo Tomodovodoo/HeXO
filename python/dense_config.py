@@ -407,7 +407,7 @@ class EvaluationSettings:
             raise ValueError('external_name must be a distinct league ID; set --eval-external-name')
         if self.external_nodes < 0 or self.probe_games < 0 or self.probe_games % 2:
             raise ValueError('external_nodes must be nonnegative and probe_games a nonnegative even count')
-        if self.probe_games and (not self.external_engine or self.probe_suite == 'book'):
+        if self.probe_games and (not self.external_engine or self.probe_suite in ('', 'book')):
             raise ValueError('probe_games needs an external_engine to probe against and a frozen probe_suite')
 
 
