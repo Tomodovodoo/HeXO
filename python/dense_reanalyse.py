@@ -52,7 +52,7 @@ class ReanalysisSettings:
     poll_seconds: float = 30.
 
     def __post_init__(self):
-        if self.sims < 1 or not 1 <= self.root_samples <= 1024 or not -1 <= self.low < self.high <= 1 \
+        if self.sims < 1 or not 1 <= self.root_samples <= 1024 or not -1 <= self.low < self.high < 1 \
                 or self.turns < 1 or not 0 < self.fraction <= .1 or self.batch < 1 or self.limit < 1:
             raise ValueError('Invalid reanalysis settings')
 
