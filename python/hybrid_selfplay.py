@@ -539,6 +539,7 @@ class HybridGames:
                           proof_action=edges[edges[:,8].astype(bool),:2].astype(np.int64).tolist() if proven>0 else [])
             result['search'] = dict(source='native-root',model=model.sha,context=event['context'],
                                     requested_sims=game.budget,solver_free=game.solver_free,
+                                    deep=game.deep_side==game.game.player,
                                     token=event['token'],comparison_credits=int(edges[:,7].sum()),
                                     direct_max=int(edges[:,7].max()),shared_visits=int(edges[:,6].sum()),
                                     root_completed=event['root_completed'],completed=event['completed'],

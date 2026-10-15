@@ -730,10 +730,12 @@ class SelfPlayGame:
             raise ValueError('Hybrid self-play uses frontier slice settings, not legacy solver query budgets')
         self.learner, self.opponent = learner, opponent
         self.rng = np.random.default_rng(seed)
-        budget_seed, cohort_seed = np.random.SeedSequence(seed).spawn(2)
+        budget_seed, cohort_seed, deep_seed = np.random.SeedSequence(seed).spawn(3)
         self.budget_rng = np.random.default_rng(budget_seed)
         self.solver_free = bool(settings.solver_free_fraction and
                                 np.random.default_rng(cohort_seed).random()<settings.solver_free_fraction)
+        deep = np.random.default_rng(deep_seed)
+        self.deep_side = int(deep.integers(2)) if opponent is None and deep.random() < settings.deep_fraction else None
         if sum(start is not None for start in (restart, book, fork)) > 1:
             raise ValueError('A game starts from at most one of a restart, an opening book and a fork')
         self.restart, forced = (None, []) if restart is None else (restart[0], [[int(q), int(r)] for q, r in restart[1]])
@@ -746,6 +748,8 @@ class SelfPlayGame:
         self.random_plies = int(round(self.rng.exponential(settings.opening_random_plies))) \
             if settings.opening_random_plies > 0 and restart is None and book is None and fork is None else 0
         graph = settings.graph_nodes if hybrid else settings.game_graph
+        if self.deep_side is not None:
+            graph = int(graph*settings.deep_multiplier)  # the deep side's turns would evict mid-search at the usual cap
         self.trees = {model: model.tree([tuple(m) for m in forced], seed+k, settings.tactics, settings.search_graph,
                                         settings.q_range_floor, graph)
                       for k, model in enumerate(dict.fromkeys(sides))}
@@ -770,15 +774,17 @@ class SelfPlayGame:
     def plan(self):
         """Draw the next search's kind (full with probability full_fraction), budget and root samples, and set the
         side to move's root noise and sampling temperature: root_noise at root_noise_concentration and
-        root_temperature(ply) for a full search, 0 and 1 for a cheap one.
+        root_temperature(ply) for a full search, 0 and 1 for a cheap one. The deep side (deep_fraction) always
+        searches full, at deep_multiplier times full_sims.
         With full_turns, the second stone of a turn whose first stone this game searched keeps its kind and drawn budget.
         With pv_check a full search's budget is its first pass (neural_search.Recheck, run by `recheck`)."""
         s = self.settings
         ply = len(self.moves) if s.full_turns else 0
         repeated = ply and ply % 2 == 0 and ply > self.forced_plies
+        deep = getattr(self, 'deep_side', None) is not None and self.deep_side == self.game.player
         if not repeated:
-            self.is_full = bool(self.rng.random() < s.full_fraction)
-            center = s.full_sims if self.is_full else s.cheap_sims
+            self.is_full = bool(self.rng.random() < s.full_fraction) or deep
+            center = round(s.full_sims*s.deep_multiplier) if deep else s.full_sims if self.is_full else s.cheap_sims
             spread = int(center*s.search_budget_jitter)
             self.turn_budget = int(self.budget_rng.integers(center-spread,center+spread+1)) if spread else center
         self.budget = self.turn_budget
@@ -787,6 +793,8 @@ class SelfPlayGame:
         if self.check is not None:
             self.budget = self.check.budget
         self.samples = s.root_samples if self.is_full else min(s.root_samples, s.cheap_root_samples, s.cheap_sims)
+        if deep and s.deep_root_samples:
+            self.samples = s.deep_root_samples
         if s.search_budget_jitter:
             self.samples = min(self.samples,self.budget)
         if s.root_noise and not getattr(self, 'hybrid', False):
@@ -998,7 +1006,7 @@ class SelfPlayGame:
                        actors={str(c): m.sha for c, m in enumerate(self.sides)}, opponent=self.opponent,
                        trained_side=None if self.opponent is None else self.learner,
                        root_values=self.values, network_values=self.network_values, full_search=self.full,
-                       solver_free=self.solver_free,
+                       solver_free=self.solver_free, deep_side=self.deep_side,
                        origin='book' if self.book is not None else 'fork' if self.fork is not None
                        else 'restart' if self.restart else 'selfplay')
         if self.book is not None:
@@ -1526,7 +1534,8 @@ def worker(args):
                       evals_per_second=(engine.evals-since['evals'])/elapsed, process=args.worker, opponents=opponents)
         fields.update(book_games=sum(e.get('origin') == 'book' for e in episodes),
                       restart_games=sum(e.get('origin') == 'restart' for e in episodes),
-                      fork_games=sum(e.get('origin') == 'fork' for e in episodes))
+                      fork_games=sum(e.get('origin') == 'fork' for e in episodes),
+                      deep_games=sum(e.get('deep_side') is not None for e in episodes))
         # The writer thread owns these lists; the launcher keeps the GPU busy meanwhile. At most two
         # shards wait to be written, so a stalled disk holds back the main loop instead of memory.
         while len(writes) >= 2:
