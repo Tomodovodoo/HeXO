@@ -2,8 +2,8 @@
 extra policy rows (MuZero Reanalyze, restricted to value collapses).
 
 Selection. In each decisive own-model game of a new actor shard (validation games excepted), the loser's turn
-starts t with a searched, inexact root value v_t are scanned. t is a collapse point when v_t >= `high` and one of
-the loser's next `turns` turn starts has a value <= `low`; a game gives its latest collapse point, the last turn
+starts t with a searched root value v_t are scanned. t is a collapse point when v_t is inexact and >= `high` and
+one of the loser's next `turns` turn starts has a value <= `low` (an exact loss counts); a game gives its latest collapse point, the last turn
 the loser still thought it was fine. A shard gives at most `fraction` of its policy rows.
 
 Search. The champion searches every point for `sims` simulations with `root_samples` (a transposition graph and
@@ -64,11 +64,11 @@ def point(episode, settings, validation_fraction):
         return None
     loser = 1-episode['winner']
     starts = [(t, values[t]) for t in range(max(1, forced_plies(episode)), len(values))
-              if t % 2 and player_at(t) == loser and values[t] is not None and abs(values[t]) < .999]
+              if t % 2 and player_at(t) == loser and values[t] is not None]
     found = None
     for i, (t, v) in enumerate(starts):
-        later = [w for _, w in starts[i+1:i+1+settings.turns]]
-        if v >= settings.high and later and min(later) <= settings.low:
+        later = [w for _, w in starts[i+1:i+1+settings.turns]]  # exact losses count as collapse evidence
+        if settings.high <= v < .999 and later and min(later) <= settings.low:
             found = t
     return found
 
@@ -108,18 +108,24 @@ class Reanalysis:
         state = json.loads(self.path.read_text()) if self.path.exists() else {}
         self.done = list(state.get('done', []))
         self.stats = dict(dict(shards=0, points=0, rows=0, search_seconds=0.), **state.get('stats', {}))
-        self.model = None
+        self.model, self.origins = None, {}
 
     def save(self, stage):
         write_json(self.path, dict(stage=stage, updated_at=time.time(), settings=asdict(self.s), done=self.done[-RECENT:],
                                    checkpoint=self.model and self.model.checkpoint, stats=self.stats))
 
     def pending(self):
-        done, names = set(self.done), []
-        for p in dense_data.shard_dirs(self.run)[::-1][:self.s.limit]:
-            if p.name not in done and dense_data.origin(dense_data.manifest(p)) == 'actor':
-                names.append(p.name)
-        return names
+        """Of the newest `limit` actor shards, those not done, newest first."""
+        actors = []
+        for p in dense_data.shard_dirs(self.run)[::-1]:
+            if p.name not in self.origins:
+                self.origins[p.name] = dense_data.origin(dense_data.manifest(p))
+            if self.origins[p.name] == 'actor':
+                actors.append(p.name)
+                if len(actors) == self.s.limit:
+                    break
+        done = set(self.done)
+        return [n for n in actors if n not in done]
 
     def refresh_model(self):
         checkpoint, path = resolve(self.run, source='champion', variant=self.config.learner.variant)
@@ -130,7 +136,14 @@ class Reanalysis:
             self.model = Champion(checkpoint, sha, evaluator, EvaluationCache(self.config.actor.cache_positions))
 
     def shard(self, name):
-        """Reanalyse shard `name`; the number of rows published."""
+        """Reanalyse shard `name`; the number of rows published. An output already published for it (the service
+        stopped before recording the source as done) completes it as it is, whichever champion made it."""
+        path = self.run/'shards'/(name+'1')
+        if path.exists():
+            published = dense_data.verify(path)
+            if published['identity'].get('reanalysis_source') != name:
+                raise ValueError(f'Reanalysis shard collision: {path}')
+            return 0
         source = dense_data.verify(self.run/'shards'/name)
         episodes = json.loads((self.run/'shards'/name/'episodes.json').read_text(encoding='utf-8'))
         cap = int(self.s.fraction*source['counts']['policy_rows'])
@@ -165,12 +178,7 @@ class Reanalysis:
                         reanalysis_source_files=source['files'], reanalysis_settings=asdict(self.s),
                         reanalysis_checkpoint=model.checkpoint)
         identity.pop('process', None)
-        path = self.run/'shards'/(name+'1')
-        if path.exists():
-            if dense_data.verify(path)['identity'] != identity:
-                raise ValueError(f'Reanalysis shard collision: {path}')
-        else:
-            dense_data.write_shard(path, identity, out_episodes, rows, origin='reanalysis')
+        dense_data.write_shard(path, identity, out_episodes, rows, origin='reanalysis')
         return len(rows)
 
     def loop(self):
