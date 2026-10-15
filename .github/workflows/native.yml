@@ -1,16 +1,6 @@
 name: Native rules
 on:
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/*.cpp'
-      - 'tests/benchmark.py'
-      - 'tests/reference.py'
-      - 'tests/test_engine.py'
-      - 'tests/test_leaf_tactics.py'
-      - 'tools/tactical/**'
-      - 'CMakeLists.txt'
-      - '.github/workflows/native.yml'
+  # Manual only: pull requests run the seconds-long contracts check.
   workflow_dispatch:
 permissions:
   contents: read

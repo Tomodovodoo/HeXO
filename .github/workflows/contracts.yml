@@ -4,21 +4,23 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
-      - 'tests/web/**'
-      - 'tests/test_web_*.py'
-      - '.github/workflows/native.yml'
-      - '.github/workflows/web.yml'
-      - '.github/workflows/engines.yml'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  # The Python fast tier outside the browser tests (those run in the Browser engine workflow). A manual dispatch
-  # runs the slow tier too.
+  # Pull requests only byte-compile the Python sources (seconds, on the runner's own Python). The full fast tier
+  # outside the browser tests, and with a manual dispatch the slow tier too, runs by hand: local runs of the
+  # touched test modules cover a change before review.
   contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 10 || 30 }}
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: python3 -m compileall -q python tests tools
+  full:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -33,4 +35,4 @@ jobs:
       - run: python -m tests -j 4 '!test_web_*'
         env:
           OMP_NUM_THREADS: 2
-          HEXO_SLOW: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+          HEXO_SLOW: '1'

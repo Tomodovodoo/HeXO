@@ -1,13 +1,6 @@
 name: Engines
 on:
-  pull_request:
-    paths:
-      - 'python/engine_setup.py'
-      - 'tools/build_engines.py'
-      - 'tools/build_strix_learned.py'
-      - 'tools/engines.json'
-      - 'tools/strix_learned/**'
-      - '.github/workflows/engines.yml'
+  # Manual only: pull requests run the seconds-long contracts check.
   workflow_dispatch:
     inputs:
       tag:
