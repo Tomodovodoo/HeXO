@@ -41,6 +41,9 @@ class HexNetConfig:
     value_hidden: int = 128
     head_channels: int = 32
     aux_heads: bool = True
+    # 'pre': norm-act-conv blocks (Block) and a final trunk norm. 'post': conv-norm-act blocks (PostBlock) after a
+    # normed stem, whose eval norms fold into the convolutions, so a compiled engine runs one kernel per conv.
+    block: str = 'pre'
 
 
 def _line_kernel(length, taps):
@@ -324,6 +327,25 @@ class Block(nn.Module):
         return x+self.conv2(self.norm2(y, mask, cells, ceiling))
 
 
+class PostBlock(nn.Module):
+    """x -> act(x + norm2(conv2(y))), y = act(norm1(conv1(x))) plus, in a pooled block, act of y plus a bias from
+    y's masked mean and max. act is relu on the crop and 0 on padding (`act`), so x stays zero off the crop."""
+    def __init__(self, config, pooled):
+        super().__init__()
+        c = config.channels
+        self.conv1, self.norm1 = HexConv(c, c), MaskedNorm(c)
+        self.conv2, self.norm2 = HexConv(c, c), MaskedNorm(c)
+        self.pool = nn.Linear(2*c, c) if pooled else None
+        self.line = None
+
+    def forward(self, x, mask, ceiling, count, cells):
+        y = self.norm1(self.conv1(x), mask, cells, ceiling)
+        if self.pool is not None:
+            fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
+            y = act(y+self.pool(pool(y, count, None, fused))[:, :, None, None], ceiling)
+        return act(x+self.norm2(self.conv2(y), mask, cells), ceiling)
+
+
 AUX_PREFIXES = ('aux_spatial.', 'short_value.')
 
 
@@ -345,9 +367,12 @@ class HexNet(nn.Module):
             raise ValueError(f'Unknown future target: {future_target!r}')
         self.future_target = future_target
         self.config = c = config or HexNetConfig()
+        if c.block not in ('pre', 'post') or c.block == 'post' and c.line_length:
+            raise ValueError(f'block must be pre or post (post without line convolutions), not {c.block!r}')
         self.lines = LineFeatures()
         self.stem = HexConv(FEATURES, c.channels)
-        self.blocks = nn.ModuleList(Block(c, (i+1) % c.pool_every == 0) for i in range(c.blocks))
+        kind = PostBlock if c.block == 'post' else Block
+        self.blocks = nn.ModuleList(kind(c, (i+1) % c.pool_every == 0) for i in range(c.blocks))
         self.norm = MaskedNorm(c.channels)
         self.policy_hidden = nn.Conv2d(c.channels, c.head_channels, 1)
         self.policy = nn.Conv2d(c.head_channels, 1, 1)
@@ -385,9 +410,13 @@ class HexNet(nn.Module):
             # NCHW inference broadcasts over the outer channel dim at full speed; two fewer activations.
             mask = mask.to(x.dtype, memory_format=torch.contiguous_format)
         ceiling = torch.where(mask > 0, math.inf, 0).to(x.dtype)
+        post = self.config.block == 'post'
+        if post:  # `norm` normalizes the stem here instead of the trunk's output
+            x = self.norm(x, mask, cells, ceiling)
         for block in self.blocks:
             x = block(x, mask, ceiling, count, cells)
-        x = self.norm(x, mask, cells, ceiling)
+        if not post:
+            x = self.norm(x, mask, cells, ceiling)
         pooled = pool(x, count, fused=self.net_kernels == 'fused')
         hidden, value = F.relu(self.policy_hidden(x)), F.relu(self.value_hidden(pooled))
         out = dict(policy=self.policy(hidden).flatten(1).float(), far=self.far(pooled)[:, 0].float(),
