@@ -1119,6 +1119,20 @@ struct Tree {
   Restore restore(board);Node* node=root.get();Path path;path.leaf=node;std::vector<int> blocked;
   for(auto& u:board.history)path.history.push_back(u.c);
   if(shared)++clock;
+  // Round-barrier descents that end on another descent's pending node (a transposition, such as a turn's
+  // two stones in the other order) restart from the root instead of ending the gather: the edge now leads to
+  // a pending child, so selection takes another way. A root candidate that keeps meeting pending nodes is
+  // blocked for this request after `retry_limit` restarts, as when its subtree has no selectable edge.
+  constexpr int retry_limit=4;std::vector<std::pair<int,int>> retries;
+  auto restart=[&]{
+   const int candidate=path.edges.front().second;
+   auto found=std::find_if(retries.begin(),retries.end(),[&](const auto& r){return r.first==candidate;});
+   if(found==retries.end()){retries.emplace_back(candidate,0);found=retries.end()-1;}
+   if(++found->second>retry_limit)blocked.push_back(candidate);
+   for(size_t i=0;i<path.edges.size();++i)board.undo();
+   path.history.resize(path.history.size()-path.edges.size());path.edges.clear();node=root.get();path.leaf=node;
+  };
+  for(;;){
   while(node->expanded){
    if(graph && !shared)inherit_half_losses(*node);
    if(shared){current(*node);node->used=clock;}
@@ -1145,7 +1159,8 @@ struct Tree {
     blocked.push_back(path.edges.front().second);for(size_t i=0;i<path.edges.size();++i)board.undo();
     path.history.resize(path.history.size()-path.edges.size());path.edges.clear();node=root.get();path.leaf=node;continue;
    }
-   auto& edge=node->edges[chosen];if(edge.read().child && edge.read().child->pending)return 0;
+   auto& edge=node->edges[chosen];
+   if(edge.read().child && edge.read().child->pending){if(!round_barrier || path.edges.empty())return 0;restart();continue;}
    path.edges.emplace_back(node,chosen);board.make(edge.action);path.history.push_back(edge.action);
    if(!edge.read().child){if(shared)attach(*node,edge,child_here(node->history,true));else {edge.write().child=child_here();if(graph){node->track(edge);edge.read().child->parents.push_back(node->weak_from_this());}}}
    if(shared)reactivate(edge.read().child);
@@ -1157,7 +1172,9 @@ struct Tree {
    // A transposed child already holds more visits than this edge: take its value without evaluating (MCGS).
    if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,node->evaluation(),false);return -1;}
   }
-  if(node->pending)return 0;
+  if(node->pending){if(!round_barrier || path.edges.empty())return 0;restart();continue;}
+  break;
+  }
   node->pending=true;node->player=board.player;capture(path);
   for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;
   if(!path.edges.empty()){path.round_slot=reserve_root(path.edges.front().second);}
