@@ -612,7 +612,10 @@ class DenseEvaluator:
         self.staging = {}
         self.graph = None
         if cuda_graphs and self.cuda:
-            from hexnet_graphs import ActorGraph
+            if os.environ.get('HEXO_TENSORRT') == '1':  # experimental: hexnet_tensorrt.TensorRTGraph
+                from hexnet_tensorrt import TensorRTGraph as ActorGraph
+            else:
+                from hexnet_graphs import ActorGraph
             self.graph = ActorGraph(self.model)
 
     def predict(self, planes):
