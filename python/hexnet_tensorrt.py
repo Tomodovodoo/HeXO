@@ -46,6 +46,8 @@ def build_plan(graph, path, logger):
     if not parser.parse(graph):
         raise RuntimeError('; '.join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     config = builder.create_builder_config()
+    if hasattr(trt.BuilderFlag, 'FP16'):  # TensorRT 10 networks are weakly typed; 11 takes the graph's fp16 types
+        config.set_flag(trt.BuilderFlag.FP16)
     profile = builder.create_optimization_profile()
     channels = export_web.CHANNELS
     profile.set_shape('features', (1, channels, MIN_SIDE, MIN_SIDE), (64, channels, OPT_SIDE, OPT_SIDE),
@@ -107,13 +109,13 @@ class TensorRTGraph(ActorGraph):
             try:
                 return self._capture_here(side, capacity)
             except BaseException:
-                # A rejected first capture leaves no context using the scratch: release it and recount.
-                if not self.contexts and self.scratch is not None:
+                # Recount after any rejected capture; one that leaves no context also releases the scratch.
+                if not self.contexts:
                     self.scratch = None
-                    try:
-                        self._measure_memory()
-                    except MemoryError:
-                        pass
+                try:
+                    self._measure_memory()
+                except MemoryError:
+                    pass
                 raise
 
     def _capture_here(self, side, capacity):
