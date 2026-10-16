@@ -594,6 +594,16 @@ def vram():
     return dict(allocated_mb=round(torch.cuda.memory_allocated()/2**20), reserved_mb=round(torch.cuda.memory_reserved()/2**20))
 
 
+def graph_class():
+    """The CUDA graph backend: hexnet_graphs.ActorGraph, or with HEXO_TENSORRT=1 the experimental
+    hexnet_tensorrt.TensorRTGraph."""
+    if os.environ.get('HEXO_TENSORRT') == '1':
+        from hexnet_tensorrt import TensorRTGraph
+        return TensorRTGraph
+    from hexnet_graphs import ActorGraph
+    return ActorGraph
+
+
 class DenseEvaluator:
     """Frozen bf16 evaluator with the NeuralEvaluator contract consumed by neural_search.
 
@@ -612,11 +622,7 @@ class DenseEvaluator:
         self.staging = {}
         self.graph = None
         if cuda_graphs and self.cuda:
-            if os.environ.get('HEXO_TENSORRT') == '1':  # experimental: hexnet_tensorrt.TensorRTGraph
-                from hexnet_tensorrt import TensorRTGraph as ActorGraph
-            else:
-                from hexnet_graphs import ActorGraph
-            self.graph = ActorGraph(self.model)
+            self.graph = graph_class()(self.model)
 
     def predict(self, planes):
         with torch.autocast(self.device.type, torch.bfloat16, enabled=self.cuda):

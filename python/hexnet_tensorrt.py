@@ -133,5 +133,9 @@ class TensorRTGraph(ActorGraph):
         return self.graphs[side, capacity]
 
     def close(self):
+        """Drop the execution contexts and their tensors, after the stream drains, before ActorGraph empties the
+        CUDA cache, so their memory is returned too."""
+        with self.lock:
+            self.stream.synchronize()
+            self.contexts.clear()
         super().close()
-        self.contexts.clear()

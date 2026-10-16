@@ -677,9 +677,11 @@ class ActorEngine:
         self.paused = True
 
     def resume(self):
-        from hexnet_graphs import ActorGraph
+        # The backend selection that built the closed graphs (hexnet.graph_class) rebuilds them.
+        import hexnet
+        backend = hexnet.graph_class()
         for evaluator,memory,batch in self.captures:
-            evaluator.graph = ActorGraph(evaluator.model,max_incremental_bytes=memory,max_batch=batch)
+            evaluator.graph = backend(evaluator.model,max_incremental_bytes=memory,max_batch=batch)
         self.captures.clear()
         if self.engine is not None:
             self.engine.resume()
