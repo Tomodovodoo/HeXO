@@ -9,6 +9,7 @@ execution context shares one scratch allocation (USER_MANAGED), held as a tensor
 Install with the `tensorrt` extra (tensorrt and the onnx exporter). Post-activation networks (HexNetConfig.block 'post') are where it
 pays: their norms fold into the convolutions.
 """
+import hashlib
 from pathlib import Path
 import io
 import os
@@ -23,10 +24,8 @@ PLANS = Path.home()/'.cache'/'hexo-tensorrt'
 MIN_SIDE, OPT_SIDE, MAX_SIDE, MAX_ROWS = 24, 32, 40, 128  # wider canvases (rare) run the PyTorch fallback
 
 
-def build_plan(model, path, logger, device):
-    """Build and cache the plan on `device` (the current CUDA device). Concurrent builders each write their own
-    temporary file and atomically replace `path` with identical plans."""
-    import tensorrt as trt
+def export(model, device):
+    """The fp16 ONNX graph of export_web.WebNet(model) with dynamic batch and canvas, as bytes."""
     net = export_web.WebNet(model).half().to(device).eval()
     example = torch.zeros(1, export_web.CHANNELS, OPT_SIDE, OPT_SIDE, device=device, dtype=torch.float16)
     buffer = io.BytesIO()
@@ -34,10 +33,17 @@ def build_plan(model, path, logger, device):
                       dynamic_axes=dict(features={0: 'batch', 2: 'height', 3: 'width'},
                                         policy={0: 'batch', 1: 'cells'}, far={0: 'batch'}, value={0: 'batch'}),
                       opset_version=export_web.OPSET, dynamo=False, do_constant_folding=True)
+    return buffer.getvalue()
+
+
+def build_plan(graph, path, logger):
+    """Build the plan of ONNX `graph` on the current CUDA device and cache it at `path`. Concurrent builders each
+    write their own temporary file and atomically replace `path` with identical plans."""
+    import tensorrt as trt
     builder = trt.Builder(logger)
     network = builder.create_network(0)
     parser = trt.OnnxParser(network, logger)
-    if not parser.parse(buffer.getvalue()):
+    if not parser.parse(graph):
         raise RuntimeError('; '.join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     config = builder.create_builder_config()
     profile = builder.create_optimization_profile()
@@ -70,13 +76,21 @@ class TensorRTGraph(ActorGraph):
         with torch.cuda.device(self.device):
             gpu = '{}-sm{}{}'.format(torch.cuda.get_device_name(self.device).replace(' ', '_'),
                                      *torch.cuda.get_device_capability(self.device))
-            path = PLANS/f'{hexnet.model_digest(reference)}-{gpu}-b{MAX_ROWS}s{MAX_SIDE}-trt{trt.__version__}.plan'
+            # Keyed by the exported graph itself, so exporter changes cannot reuse a stale plan.
+            graph = export(reference, self.device)
+            path = PLANS/f'{hashlib.sha256(graph).hexdigest()}-{gpu}-b{MAX_ROWS}s{MAX_SIDE}-trt{trt.__version__}.plan'
             if not path.exists():
-                build_plan(reference, path, self.logger, self.device)
+                build_plan(graph, path, self.logger)
             self.runtime = trt.Runtime(self.logger)    # must outlive the engine
             self.engine = self.runtime.deserialize_cuda_engine(path.read_bytes())
         self.lines = model.lines
         self.contexts, self.scratch = [], None
+
+    def _measure_memory(self, candidate=()):
+        """ActorGraph's accounting plus every retained context's tensors and the shared scratch."""
+        retained = [t for _, features, outputs in getattr(self, 'contexts', ()) for t in (features, *outputs.values())]
+        scratch = getattr(self, 'scratch', None)
+        super()._measure_memory((*candidate, *retained, *([scratch] if scratch is not None else [])))
 
     @classmethod
     def supports(cls, canvas):
@@ -127,7 +141,7 @@ class TensorRTGraph(ActorGraph):
                                                       capture_error_mode='thread_local'):
             run()
         try:
-            self._measure_memory((template, static_input, static_packed, features, *outputs.values(), self.scratch))
+            self._measure_memory((template, static_input, static_packed, features, *outputs.values()))
         except MemoryError:
             del graph
             raise
