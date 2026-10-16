@@ -37,6 +37,8 @@ def export(model, device):
                       dynamic_axes=dict(features={0: 'batch', 2: 'height', 3: 'width'},
                                         policy={0: 'batch', 1: 'cells'}, far={0: 'batch'}, value={0: 'batch'}),
                       opset_version=export_web.OPSET, dynamo=False, do_constant_folding=True)
+    del net, example
+    torch.cuda.empty_cache()  # the exporter's copy must not hold VRAM that TensorRT's builder and scratch need
     return buffer.getvalue()
 
 
