@@ -69,3 +69,4 @@ tools = ["engines.json", "seal_adapter.cpp", "strix_learned/Cargo.toml", "strix_
 learning = {file = ["requirements/learning.txt"]}
 api = {file = ["requirements/api.txt"]}
 web = {file = ["requirements/web.txt"]}
+tensorrt = {file = ["requirements/tensorrt.txt"]}

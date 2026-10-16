@@ -4,7 +4,9 @@ TensorRTGraph keeps ActorGraph's capacities, segments, memory budget and replay 
 capture records, in one CUDA graph, HexNet's input line features (export_web.inputs), one execution of a TensorRT
 engine built from export_web.WebNet, and the packed [policy, far, value] copy. The engine has one dynamic-shape
 profile over every canvas ActorGraph captures; its plan is cached under PLANS by the model digest, the GPU and the
-TensorRT version, so a checkpoint builds once per GPU. Post-activation networks (HexNetConfig.block 'post') are where it
+TensorRT version, so a checkpoint builds once per GPU. Replays are serialized on ActorGraph's stream, so every
+execution context shares one scratch allocation (USER_MANAGED), held as a tensor the graph budget counts.
+Install with the `tensorrt` extra (tensorrt and the onnx exporter). Post-activation networks (HexNetConfig.block 'post') are where it
 pays: their norms fold into the convolutions.
 """
 from pathlib import Path
@@ -18,7 +20,7 @@ import hexnet
 from hexnet_graphs import ActorGraph
 
 PLANS = Path.home()/'.cache'/'hexo-tensorrt'
-MIN_SIDE, OPT_SIDE, MAX_SIDE, MAX_ROWS = 24, 32, 64, 128
+MIN_SIDE, OPT_SIDE, MAX_SIDE, MAX_ROWS = 24, 32, 40, 128  # wider canvases (rare) run the PyTorch fallback
 
 
 def build_plan(model, path, logger, device):
@@ -68,12 +70,14 @@ class TensorRTGraph(ActorGraph):
         with torch.cuda.device(self.device):
             gpu = '{}-sm{}{}'.format(torch.cuda.get_device_name(self.device).replace(' ', '_'),
                                      *torch.cuda.get_device_capability(self.device))
-            path = PLANS/f'{hexnet.model_digest(reference)}-{gpu}-trt{trt.__version__}.plan'
+            path = PLANS/f'{hexnet.model_digest(reference)}-{gpu}-b{MAX_ROWS}s{MAX_SIDE}-trt{trt.__version__}.plan'
             if not path.exists():
                 build_plan(reference, path, self.logger, self.device)
             self.engine = trt.Runtime(self.logger).deserialize_cuda_engine(path.read_bytes())
         self.lines = model.lines
         self.contexts = []
+        with torch.cuda.device(self.device):
+            self.scratch = torch.empty(self.engine.device_memory_size_v2, device=self.device, dtype=torch.uint8)
 
     @classmethod
     def supports(cls, canvas):
@@ -98,7 +102,8 @@ class TensorRTGraph(ActorGraph):
         template[:, 3, 0, 0] = 1
         static_input = template.clone(memory_format=torch.channels_last)
         static_packed = torch.empty((capacity, height*width+2), device=self.device, dtype=torch.float32)
-        context = self.engine.create_execution_context()
+        context = self.engine.create_execution_context(self.trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        context.set_device_memory(self.scratch.data_ptr(), self.scratch.numel())
         context.set_input_shape('features', (capacity, export_web.CHANNELS, height, width))
         features = torch.empty((capacity, export_web.CHANNELS, height, width), device=self.device, dtype=torch.float16)
         outputs = {name: torch.empty(tuple(context.get_tensor_shape(name)), device=self.device, dtype=torch.float32)
@@ -121,7 +126,7 @@ class TensorRTGraph(ActorGraph):
                                                       capture_error_mode='thread_local'):
             run()
         try:
-            self._measure_memory((template, static_input, static_packed, features, *outputs.values()))
+            self._measure_memory((template, static_input, static_packed, features, *outputs.values(), self.scratch))
         except MemoryError:
             del graph
             raise

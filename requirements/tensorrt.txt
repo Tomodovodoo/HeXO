@@ -1,0 +1,3 @@
+-r learning.txt
+onnx>=1.17
+tensorrt-cu12>=10.9
