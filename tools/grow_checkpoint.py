@@ -7,8 +7,9 @@ weights with blocks appended up to N; each new block's second convolution is zer
 nothing to its residual stream and the grown network's outputs equal the source's. Its manifest names the source as
 seed_source (dense_learn.is_seed): the learner trains from these weights with a fresh optimizer.
 With --adopt, RUN/live-variant.json then names VARIANT and its model settings, so the learner, actors, evaluator
-and reanalysis (dense_config.load) all follow the grown variant once restarted; without it, run the learner with
---variant VARIANT --model-blocks N for an experiment beside the live variant.
+and reanalysis (dense_config.load) all follow the grown variant once restarted; an --adopt retry after an
+interruption adopts the already published seed. Without --adopt, the tool prints the learner flags (--variant and
+every --model-* setting the grown network differs in) for an experiment beside the live variant.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -52,7 +53,12 @@ def main():
     step = int(args.source.split('/')[1])
     target = args.run/'checkpoints'/args.variant/f'{step:06d}'
     if target.exists():
-        raise SystemExit(f'{target} exists')
+        published = json.loads((target/'manifest.json').read_text(encoding='utf-8'))
+        if not (args.adopt and published.get('seed_source') == args.source
+                and published['model'].get('blocks') == args.blocks):
+            raise SystemExit(f'{target} exists')
+        adopt(args.run, args.variant, hexnet.load_model(target/'ema.pt').config)
+        return
     manifest = json.loads((origin/'manifest.json').read_text(encoding='utf-8'))
     source = hexnet.load_model(origin/'ema.pt', future_target=manifest['learner'].get('future_target', 'legacy'))
     model = grown(source, args.blocks)
@@ -76,11 +82,20 @@ def main():
     staging.rename(target)
     print(f'{target}: {model.config.blocks} blocks, max output change {worst:.2e}')
     if args.adopt:
-        live = args.run/dense_config.LIVE_VARIANT
-        pending = live.with_name(live.name+'.tmp')
-        pending.write_text(json.dumps(dict(variant=args.variant, model=asdict(model.config))), encoding='utf-8')
-        os.replace(pending, live)
-        print(f'{live}: live learner variant {args.variant}')
+        adopt(args.run, args.variant, model.config)
+    else:
+        live = asdict(dense_config.load(args.run).model)
+        flags = [f'--model-{k.replace("_", "-")} {v}' for k, v in asdict(model.config).items() if live.get(k) != v]
+        print('learner flags:', ' '.join([f'--variant {args.variant}', *flags]))
+
+
+def adopt(run, variant, config):
+    """Atomically make `variant`, with model settings `config`, the run's live learner variant."""
+    live = run/dense_config.LIVE_VARIANT
+    pending = live.with_name(live.name+'.tmp')
+    pending.write_text(json.dumps(dict(variant=variant, model=asdict(config))), encoding='utf-8')
+    os.replace(pending, live)
+    print(f'{live}: live learner variant {variant}')
 
 
 if __name__ == '__main__':
