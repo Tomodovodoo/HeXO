@@ -11,7 +11,7 @@ and reanalysis (dense_config.load) all follow the grown variant once restarted; 
 --variant VARIANT --model-blocks N for an experiment beside the live variant.
 """
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -78,7 +78,7 @@ def main():
     if args.adopt:
         live = args.run/dense_config.LIVE_VARIANT
         pending = live.with_name(live.name+'.tmp')
-        pending.write_text(json.dumps(dict(variant=args.variant, model=dict(blocks=args.blocks))), encoding='utf-8')
+        pending.write_text(json.dumps(dict(variant=args.variant, model=asdict(model.config))), encoding='utf-8')
         os.replace(pending, live)
         print(f'{live}: live learner variant {args.variant}')
 
