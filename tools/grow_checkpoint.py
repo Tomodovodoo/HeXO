@@ -5,18 +5,23 @@ python tools/grow_checkpoint.py RUN SOURCE VARIANT --blocks N
 SOURCE is a checkpoint id (variant/step). The new checkpoint RUN/checkpoints/VARIANT/<step> holds the source's EMA
 weights with blocks appended up to N; each new block's second convolution is zero, so every new block adds
 nothing to its residual stream and the grown network's outputs equal the source's. Its manifest names the source as
-seed_source (dense_learn.is_seed): the learner trains from these weights with a fresh optimizer. Run the learner
-with --variant VARIANT --model-blocks N.
+seed_source (dense_learn.is_seed): the learner trains from these weights with a fresh optimizer.
+With --adopt, RUN/live-variant.json then names VARIANT and its model settings, so the learner, actors, evaluator
+and reanalysis (dense_config.load) all follow the grown variant once restarted; without it, run the learner with
+--variant VARIANT --model-blocks N for an experiment beside the live variant.
 """
 import argparse
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'python'))
+import dense_config  # noqa: E402
 import hexnet  # noqa: E402
 
 
@@ -41,6 +46,7 @@ def main():
     parser.add_argument('source')
     parser.add_argument('variant')
     parser.add_argument('--blocks', type=int, required=True)
+    parser.add_argument('--adopt', action='store_true', help='make VARIANT the live learner variant of the run')
     args = parser.parse_args()
     origin = args.run/'checkpoints'/args.source
     step = int(args.source.split('/')[1])
@@ -58,6 +64,7 @@ def main():
     if worst > 1e-4:
         raise SystemExit(f'grown network differs from the source by {worst}')
     staging = target.with_name('.'+target.name+'.pending')
+    shutil.rmtree(staging, ignore_errors=True)  # an interrupted earlier attempt
     staging.mkdir(parents=True)
     for name in ('ema.pt', 'model.pt'):
         hexnet.save_model(staging/name, model)
@@ -68,6 +75,12 @@ def main():
     (staging/'manifest.json').write_text(json.dumps(manifest, indent=1), encoding='utf-8')
     staging.rename(target)
     print(f'{target}: {model.config.blocks} blocks, max output change {worst:.2e}')
+    if args.adopt:
+        live = args.run/dense_config.LIVE_VARIANT
+        pending = live.with_name(live.name+'.tmp')
+        pending.write_text(json.dumps(dict(variant=args.variant, model=dict(blocks=args.blocks))), encoding='utf-8')
+        os.replace(pending, live)
+        print(f'{live}: live learner variant {args.variant}')
 
 
 if __name__ == '__main__':
