@@ -3,12 +3,12 @@
 TensorRTGraph keeps ActorGraph's capacities, segments, memory budget and replay path; each (canvas, capacity)
 capture records, in one CUDA graph, HexNet's input line features (export_web.inputs), one execution of a TensorRT
 engine built from export_web.WebNet, and the packed [policy, far, value] copy. The engine has one dynamic-shape
-profile over every canvas ActorGraph captures; its plan is cached under PLANS by the exported graph, the host platform, the GPU and the
-TensorRT version, so a checkpoint builds once per GPU. Replays are serialized on ActorGraph's stream, so every
-execution context shares one scratch allocation (USER_MANAGED), held as a tensor the graph budget counts.
-Install with the `tensorrt` extra (TensorRT 11, whose networks take the graph's fp16 types and whose contexts bind
-user-managed memory with set_device_memory, and the onnx exporter). Post-activation networks (HexNetConfig.block 'post') are where it
-pays: their norms fold into the convolutions.
+profile over every canvas up to MAX_SIDE; its plan is cached under PLANS by the exported graph, the host platform,
+the GPU, the profile and the TensorRT version, so a checkpoint builds once per GPU. Replays are serialized on
+ActorGraph's stream, so every execution context shares one scratch allocation (USER_MANAGED), held as a tensor the
+graph budget counts. Install with the `tensorrt` extra: TensorRT 11.4 or newer (networks take the graph's fp16
+types; contexts bind user-managed memory with set_device_memory) and the onnx exporter. Post-activation networks
+(HexNetConfig.block 'post') are where it pays: their norms fold into the convolutions.
 """
 import hashlib
 from pathlib import Path
