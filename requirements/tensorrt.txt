@@ -1,3 +1,5 @@
--r learning.txt
-onnx>=1.17
+numpy>=1.26
+torch>=2.11
+scipy>=1.11
 tensorrt-cu12>=10.9
+onnx>=1.17

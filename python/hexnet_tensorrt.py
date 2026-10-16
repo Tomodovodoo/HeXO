@@ -73,11 +73,10 @@ class TensorRTGraph(ActorGraph):
             path = PLANS/f'{hexnet.model_digest(reference)}-{gpu}-b{MAX_ROWS}s{MAX_SIDE}-trt{trt.__version__}.plan'
             if not path.exists():
                 build_plan(reference, path, self.logger, self.device)
-            self.engine = trt.Runtime(self.logger).deserialize_cuda_engine(path.read_bytes())
+            self.runtime = trt.Runtime(self.logger)    # must outlive the engine
+            self.engine = self.runtime.deserialize_cuda_engine(path.read_bytes())
         self.lines = model.lines
-        self.contexts = []
-        with torch.cuda.device(self.device):
-            self.scratch = torch.empty(self.engine.device_memory_size_v2, device=self.device, dtype=torch.uint8)
+        self.contexts, self.scratch = [], None
 
     @classmethod
     def supports(cls, canvas):
@@ -102,6 +101,8 @@ class TensorRTGraph(ActorGraph):
         template[:, 3, 0, 0] = 1
         static_input = template.clone(memory_format=torch.channels_last)
         static_packed = torch.empty((capacity, height*width+2), device=self.device, dtype=torch.float32)
+        if self.scratch is None:
+            self.scratch = torch.empty(self.engine.device_memory_size_v2, device=self.device, dtype=torch.uint8)
         context = self.engine.create_execution_context(self.trt.ExecutionContextAllocationStrategy.USER_MANAGED)
         context.set_device_memory(self.scratch.data_ptr(), self.scratch.numel())
         context.set_input_shape('features', (capacity, export_web.CHANNELS, height, width))
@@ -143,4 +144,5 @@ class TensorRTGraph(ActorGraph):
         with self.lock:
             self.stream.synchronize()
             self.contexts.clear()
+            self.scratch = None
         super().close()
