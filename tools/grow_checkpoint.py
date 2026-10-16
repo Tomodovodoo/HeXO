@@ -85,8 +85,16 @@ def main():
         adopt(args.run, args.variant, model.config)
     else:
         live = asdict(dense_config.load(args.run).model)
-        flags = [f'--model-{k.replace("_", "-")} {v}' for k, v in asdict(model.config).items() if live.get(k) != v]
+        flags = [flag(k, v) for k, v in asdict(model.config).items() if live.get(k) != v]
         print('learner flags:', ' '.join([f'--variant {args.variant}', *flags]))
+
+
+def flag(name, value):
+    """The dense_learn flag setting model setting `name` to `value` (booleans use --model-x / --no-model-x)."""
+    option = 'model-'+name.replace('_', '-')
+    if isinstance(value, bool):
+        return f'--{option}' if value else f'--no-{option}'
+    return f'--{option} {value}'
 
 
 def adopt(run, variant, config):
