@@ -3,12 +3,13 @@
 TensorRTGraph keeps ActorGraph's capacities, segments, memory budget and replay path; each (canvas, capacity)
 capture records, in one CUDA graph, HexNet's input line features (export_web.inputs), one execution of a TensorRT
 engine built from export_web.WebNet, and the packed [policy, far, value] copy. The engine has one dynamic-shape
-profile over every canvas ActorGraph captures; its plan is cached under PLANS by the model digest and the TensorRT
-version, so a checkpoint builds once per machine. Post-activation networks (HexNetConfig.block 'post') are where it
+profile over every canvas ActorGraph captures; its plan is cached under PLANS by the model digest, the GPU and the
+TensorRT version, so a checkpoint builds once per GPU. Post-activation networks (HexNetConfig.block 'post') are where it
 pays: their norms fold into the convolutions.
 """
 from pathlib import Path
 import io
+import os
 
 import torch
 
@@ -20,10 +21,12 @@ PLANS = Path.home()/'.cache'/'hexo-tensorrt'
 MIN_SIDE, OPT_SIDE, MAX_SIDE, MAX_ROWS = 24, 32, 64, 128
 
 
-def build_plan(model, path, logger):
+def build_plan(model, path, logger, device):
+    """Build and cache the plan on `device` (the current CUDA device). Concurrent builders each write their own
+    temporary file and atomically replace `path` with identical plans."""
     import tensorrt as trt
-    net = export_web.WebNet(model).half().cuda().eval()
-    example = torch.zeros(1, export_web.CHANNELS, OPT_SIDE, OPT_SIDE, device='cuda', dtype=torch.float16)
+    net = export_web.WebNet(model).half().to(device).eval()
+    example = torch.zeros(1, export_web.CHANNELS, OPT_SIDE, OPT_SIDE, device=device, dtype=torch.float16)
     buffer = io.BytesIO()
     torch.onnx.export(net, (example,), buffer, input_names=['features'], output_names=['policy', 'far', 'value'],
                       dynamic_axes=dict(features={0: 'batch', 2: 'height', 3: 'width'},
@@ -44,7 +47,7 @@ def build_plan(model, path, logger):
     if plan is None:
         raise RuntimeError('TensorRT could not build the engine')
     path.parent.mkdir(parents=True, exist_ok=True)
-    pending = path.with_name(path.name+'.tmp')
+    pending = path.with_name(f'{path.name}.{os.getpid()}.tmp')
     pending.write_bytes(bytes(plan))
     pending.replace(path)
 
@@ -61,10 +64,14 @@ class TensorRTGraph(ActorGraph):
         reference = hexnet.HexNet(model.config, model.future_target)
         reference.load_state_dict({k: v.detach().cpu() for k, v in model.state_dict().items()})
         reference = reference.float().eval()
-        path = PLANS/f'{hexnet.model_digest(reference)}-trt{trt.__version__}.plan'
-        if not path.exists():
-            build_plan(reference, path, self.logger)
-        self.engine = trt.Runtime(self.logger).deserialize_cuda_engine(path.read_bytes())
+        # TensorRT objects belong to the current CUDA device: build, load and capture on the model's.
+        with torch.cuda.device(self.device):
+            gpu = '{}-sm{}{}'.format(torch.cuda.get_device_name(self.device).replace(' ', '_'),
+                                     *torch.cuda.get_device_capability(self.device))
+            path = PLANS/f'{hexnet.model_digest(reference)}-{gpu}-trt{trt.__version__}.plan'
+            if not path.exists():
+                build_plan(reference, path, self.logger, self.device)
+            self.engine = trt.Runtime(self.logger).deserialize_cuda_engine(path.read_bytes())
         self.lines = model.lines
         self.contexts = []
 
@@ -79,6 +86,10 @@ class TensorRTGraph(ActorGraph):
         return torch.nn.functional.pad(features, (0, 0, 0, 0, 0, export_web.CHANNELS-features.shape[1]))
 
     def _capture(self, side, capacity):
+        with torch.cuda.device(self.device):
+            return self._capture_here(side, capacity)
+
+    def _capture_here(self, side, capacity):
         if self.incremental_reserved_bytes >= self.max_incremental_bytes:
             raise MemoryError('actor graph memory budget exhausted')
         height, width = self.shape(side)
