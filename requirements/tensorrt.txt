@@ -1,5 +1,5 @@
 numpy>=1.26
 torch>=2.11
 scipy>=1.11
-tensorrt-cu12>=10.9
+tensorrt-cu12>=11.4
 onnx>=1.17

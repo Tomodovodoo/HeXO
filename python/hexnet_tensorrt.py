@@ -6,7 +6,8 @@ engine built from export_web.WebNet, and the packed [policy, far, value] copy. T
 profile over every canvas ActorGraph captures; its plan is cached under PLANS by the model digest, the GPU and the
 TensorRT version, so a checkpoint builds once per GPU. Replays are serialized on ActorGraph's stream, so every
 execution context shares one scratch allocation (USER_MANAGED), held as a tensor the graph budget counts.
-Install with the `tensorrt` extra (tensorrt and the onnx exporter). Post-activation networks (HexNetConfig.block 'post') are where it
+Install with the `tensorrt` extra (TensorRT 11, whose networks take the graph's fp16 types and whose contexts bind
+user-managed memory with set_device_memory, and the onnx exporter). Post-activation networks (HexNetConfig.block 'post') are where it
 pays: their norms fold into the convolutions.
 """
 import hashlib
@@ -40,14 +41,14 @@ def build_plan(graph, path, logger):
     """Build the plan of ONNX `graph` on the current CUDA device and cache it at `path`. Concurrent builders each
     write their own temporary file and atomically replace `path` with identical plans."""
     import tensorrt as trt
+    if int(trt.__version__.split('.')[0]) < 11:
+        raise RuntimeError(f'hexnet_tensorrt needs TensorRT 11 or newer, not {trt.__version__}')
     builder = trt.Builder(logger)
     network = builder.create_network(0)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse(graph):
         raise RuntimeError('; '.join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     config = builder.create_builder_config()
-    if hasattr(trt.BuilderFlag, 'FP16'):  # TensorRT 10 networks are weakly typed; 11 takes the graph's fp16 types
-        config.set_flag(trt.BuilderFlag.FP16)
     profile = builder.create_optimization_profile()
     channels = export_web.CHANNELS
     profile.set_shape('features', (1, channels, MIN_SIDE, MIN_SIDE), (64, channels, OPT_SIDE, OPT_SIDE),
