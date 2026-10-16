@@ -1064,8 +1064,11 @@ def main():
     parser.add_argument('--net-kernels', choices=['reference', 'fused'], default='reference',
                         help='opt-in CUDA masked norm fusion; fused training requires Triton')
     dense_config.add_arguments(parser, dense_config.LearnerSettings)
+    # A variant may train another network shape than config.json's (a grown seed, tools/grow_checkpoint.py).
+    dense_config.add_arguments(parser.add_argument_group('model'), dense_config.ModelSettings, prefix='model_')
     args = parser.parse_args()
     config = dense_config.load(args.run)
+    config = replace(config, model=dense_config.override(config.model, args, 'model_'))
     settings = dense_config.override(config.learner, args)
     overrides = {k: v for k, v in asdict(settings).items() if getattr(args, k, None) is not None}
     torch.manual_seed(config.seed)

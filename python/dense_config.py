@@ -4,7 +4,7 @@ config.json is written once. CLI overrides apply only to their process.
 Run files and launch commands are documented in docs/dense-training.md.
 """
 import argparse
-from dataclasses import dataclass, asdict, field, fields
+from dataclasses import dataclass, asdict, field, fields, replace
 import json
 from pathlib import Path
 import time
@@ -484,8 +484,20 @@ def section(name, values):
     return SECTIONS[name](**{renamed.get(k, k): v for k, v in values.items() if k not in RETIRED.get(name, ())})
 
 
+LIVE_VARIANT = 'live-variant.json'
+
+
 def load(run):
-    return from_dict(json.loads((Path(run)/'config.json').read_text(encoding='utf-8')))
+    """The run's configuration: config.json, which never changes, under <run>/live-variant.json when present:
+    {variant, model}, the learner variant every service follows and its model settings (a grown variant,
+    tools/grow_checkpoint.py --adopt)."""
+    config = from_dict(json.loads((Path(run)/'config.json').read_text(encoding='utf-8')))
+    live = Path(run)/LIVE_VARIANT
+    if live.exists():
+        data = json.loads(live.read_text(encoding='utf-8'))
+        config = replace(config, learner=replace(config.learner, variant=data['variant']),
+                         model=replace(config.model, **data.get('model', {})))
+    return config
 
 
 def save(run, config):
