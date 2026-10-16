@@ -3,7 +3,7 @@
 TensorRTGraph keeps ActorGraph's capacities, segments, memory budget and replay path; each (canvas, capacity)
 capture records, in one CUDA graph, HexNet's input line features (export_web.inputs), one execution of a TensorRT
 engine built from export_web.WebNet, and the packed [policy, far, value] copy. The engine has one dynamic-shape
-profile over every canvas ActorGraph captures; its plan is cached under PLANS by the model digest, the GPU and the
+profile over every canvas ActorGraph captures; its plan is cached under PLANS by the exported graph, the host platform, the GPU and the
 TensorRT version, so a checkpoint builds once per GPU. Replays are serialized on ActorGraph's stream, so every
 execution context shares one scratch allocation (USER_MANAGED), held as a tensor the graph budget counts.
 Install with the `tensorrt` extra (TensorRT 11, whose networks take the graph's fp16 types and whose contexts bind
@@ -14,6 +14,8 @@ import hashlib
 from pathlib import Path
 import io
 import os
+import platform
+import sys
 
 import torch
 
@@ -22,6 +24,7 @@ import hexnet
 from hexnet_graphs import ActorGraph
 
 PLANS = Path.home()/'.cache'/'hexo-tensorrt'
+MIN_TENSORRT = (11, 4)
 MIN_SIDE, OPT_SIDE, MAX_SIDE, MAX_ROWS = 24, 32, 40, 128  # wider canvases (rare) run the PyTorch fallback
 
 
@@ -41,8 +44,6 @@ def build_plan(graph, path, logger):
     """Build the plan of ONNX `graph` on the current CUDA device and cache it at `path`. Concurrent builders each
     write their own temporary file and atomically replace `path` with identical plans."""
     import tensorrt as trt
-    if int(trt.__version__.split('.')[0]) < 11:
-        raise RuntimeError(f'hexnet_tensorrt needs TensorRT 11 or newer, not {trt.__version__}')
     builder = trt.Builder(logger)
     network = builder.create_network(0)
     parser = trt.OnnxParser(network, logger)
@@ -68,6 +69,9 @@ class TensorRTGraph(ActorGraph):
 
     def __init__(self, model, max_incremental_bytes=384*1024*1024, max_batch=32):
         import tensorrt as trt
+        if tuple(int(v) for v in trt.__version__.split('.')[:2]) < MIN_TENSORRT:
+            raise RuntimeError(f'hexnet_tensorrt needs TensorRT {".".join(map(str, MIN_TENSORRT))} or newer, '
+                               f'not {trt.__version__}')
         super().__init__(model, max_incremental_bytes, max_batch)
         self.trt = trt
         self.logger = trt.Logger(trt.Logger.ERROR)
@@ -77,8 +81,9 @@ class TensorRTGraph(ActorGraph):
         reference = reference.float().eval()
         # TensorRT objects belong to the current CUDA device: build, load and capture on the model's.
         with torch.cuda.device(self.device):
-            gpu = '{}-sm{}{}'.format(torch.cuda.get_device_name(self.device).replace(' ', '_'),
-                                     *torch.cuda.get_device_capability(self.device))
+            gpu = '{}-{}-{}-sm{}{}'.format(sys.platform, platform.machine(),
+                                           torch.cuda.get_device_name(self.device).replace(' ', '_'),
+                                           *torch.cuda.get_device_capability(self.device))
             # Keyed by the exported graph itself, so exporter changes cannot reuse a stale plan.
             graph = export(reference, self.device)
             path = PLANS/f'{hashlib.sha256(graph).hexdigest()}-{gpu}-b{MAX_ROWS}s{MAX_SIDE}-trt{trt.__version__}.plan'
