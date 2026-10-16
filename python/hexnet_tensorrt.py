@@ -104,7 +104,17 @@ class TensorRTGraph(ActorGraph):
 
     def _capture(self, side, capacity):
         with torch.cuda.device(self.device):
-            return self._capture_here(side, capacity)
+            try:
+                return self._capture_here(side, capacity)
+            except BaseException:
+                # A rejected first capture leaves no context using the scratch: release it and recount.
+                if not self.contexts and self.scratch is not None:
+                    self.scratch = None
+                    try:
+                        self._measure_memory()
+                    except MemoryError:
+                        pass
+                raise
 
     def _capture_here(self, side, capacity):
         if self.incremental_reserved_bytes >= self.max_incremental_bytes:
