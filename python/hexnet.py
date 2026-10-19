@@ -175,6 +175,13 @@ class LineConv(nn.Module):
     def forward(self, x):
         return self.lines(x, self.matrices(x.shape[-2], x.dtype, x.shape[-1]))
 
+    def fused_inference(self, x):
+        """Whether the fused Triton kernel computes this inference call: CUDA, bf16 or fp32 under its autocast
+        dtype, channels-last."""
+        return (getattr(self, 'net_kernels', 'reference') == 'fused' and x.is_cuda and x.dtype in (torch.float32, torch.bfloat16)
+                and x.is_contiguous(memory_format=torch.channels_last)
+                and (not torch.is_autocast_enabled('cuda') or x.dtype == torch.get_autocast_dtype('cuda')))
+
     def add_to(self, x):
         """x += self(x) in place without autograd, in batch chunks of at most LINE_CHUNK_CELLS crop cells."""
         if (getattr(self, 'net_kernels', 'reference') == 'fused' and x.is_cuda
@@ -313,7 +320,11 @@ class Block(nn.Module):
         if self.pool is not None:
             fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
             y = y+self.pool(pool(y, count, ceiling, fused))[:, :, None, None]
-        if self.line is not None:
+        if self.line is not None and not torch.is_grad_enabled() and self.line.fused_inference(y):
+            from hexnet_kernels import line_add
+            # One kernel reads y and the crop mask: (y*mask) + LineConv(y*mask), no masked copy, no in-place copy back.
+            y = line_add(y, self.line.weight, mask)
+        elif self.line is not None:
             y = y*mask
             train_line = (getattr(self.line, 'net_kernels', 'reference') == 'fused' and
                           self.training and torch.is_grad_enabled() and y.is_cuda and
