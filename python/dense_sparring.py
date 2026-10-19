@@ -13,9 +13,12 @@ row, at max_plies (cap), or when a placement or one of the model's searches no l
 a game the engine fails is dropped. Sparring starts once the run has a checkpoint.
 
 Output. Every `shard_games` finished games form a shard of origin 'actor' (dense_data) whose episodes record the
-engine as `opponent` (`name`) and `trained_side`: the engine's plies keep rows without a policy, with a null root
-value and full_search False, so only the trained model's placements train, all of them as full searches. The
-episode's `sparring` records the engine's node budget. The model follows the actors' model_source, and the service
+engine as `opponent` (`name`). The model's placements are full searches with their improved policy. The engine's
+plies have a null root value and full_search False. With `imitate` they are policy targets too: one-hot on the
+engine's placement (search source 'engine' with its node budget), and the episode records no `trained_side`, so
+both colours' rows enter the replay window and the value targets of the engine's positions come from the result.
+Without `imitate` the episode records the model's `trained_side` and the engine's rows have no policy, so only the
+model's placements train. The episode's `sparring` records the engine's node budget. The model follows the actors' model_source, and the service
 pauses while a phased learner trains (dense_selfplay.Yield).
 <run>/sparring-status.json records counters.
 """
@@ -54,6 +57,7 @@ class SparringSettings:
     games: int = 16            # games in flight
     shard_games: int = 32
     seed: int = 0              # 0 draws fresh entropy
+    imitate: bool = True       # the engine's placements are one-hot policy targets
 
     def budgets(self):
         return [int(n) for n in self.nodes.split(',')]
@@ -78,8 +82,9 @@ class Model:
 class Match:
     """One game between `model` (colour `side`) and the engine at `nodes` per turn."""
 
-    def __init__(self, model, side, nodes, sims, random_plies, seed, max_plies, book=None):
+    def __init__(self, model, side, nodes, sims, random_plies, seed, max_plies, book=None, imitate=False):
         self.model, self.side, self.nodes, self.sims, self.seed, self.max_plies = model, side, nodes, sims, seed, max_plies
+        self.imitate = imitate
         self.rng = np.random.default_rng(seed)
         self.random_plies = int(round(self.rng.exponential(random_plies))) if random_plies > 0 else 0
         self.book, forced = (None, []) if book is None else (book[0], [[int(q), int(r)] for q, r in book[1]])
@@ -142,9 +147,16 @@ class Match:
             if self.over:
                 break
             history = np.asarray(self.moves, np.int64).reshape(-1, 2)
-            self.rows.append(dict(ply=len(self.moves), player=self.game.player, remaining=self.game.remaining,
-                                  legal_sha256=dense_data.legal_digest(hexcrop.legal_array(self.game, history)),
-                                  policy=None))
+            legal = hexcrop.legal_array(self.game, history)
+            row = dict(ply=len(self.moves), player=self.game.player, remaining=self.game.remaining,
+                       legal_sha256=dense_data.legal_digest(legal), policy=None)
+            if self.imitate:
+                hit = np.flatnonzero((legal == (q, r)).all(1))
+                if len(hit) == 1:
+                    row['policy'] = np.zeros(len(legal), np.float32)
+                    row['policy'][hit[0]] = 1.
+                    row['search'] = dict(source='engine', nodes=self.nodes)
+            self.rows.append(row)
             self.values.append(None)
             self.full.append(False)
             self.play(int(q), int(r))
@@ -155,7 +167,8 @@ class Match:
         sha = self.model.sha
         episode = dict(moves=self.moves, winner=winner, reason=self.reason or ('six-in-a-row' if winner >= 0 else 'cap'),
                     opening_plies=self.opening_plies, actor=sha,
-                    actors={str(self.side): sha, str(1-self.side): name}, opponent=name, trained_side=self.side,
+                    actors={str(self.side): sha, str(1-self.side): name}, opponent=name,
+                    trained_side=None if self.imitate else self.side,
                     root_values=self.values, network_values=[None]*len(self.moves), full_search=self.full,
                     sparring=dict(nodes=self.nodes, sims=self.sims), origin='book' if self.book else 'selfplay')
         if self.book:
@@ -190,7 +203,7 @@ class Sparring:
     def start(self):
         book = self.books.draw(self.rng) if self.rng.random() < self.s.book_fraction else None
         return Match(self.model, int(self.rng.integers(2)), int(self.rng.choice(self.s.budgets())), self.s.sims,
-                     self.s.random_plies, int(self.rng.integers(2**31)), self.config.actor.max_plies, book)
+                     self.s.random_plies, int(self.rng.integers(2**31)), self.config.actor.max_plies, book, self.s.imitate)
 
     def answer(self, matches):
         """The engine's turn in each of `matches`, in order; None for a game the engine failed."""
