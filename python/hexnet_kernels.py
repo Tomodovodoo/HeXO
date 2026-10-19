@@ -120,9 +120,9 @@ def _line_add(X,Weight,Y,C:tl.constexpr,H,W,S,L:tl.constexpr,K:tl.constexpr):
     tl.store(Y+plane*H*W+i,value,valid)
 
 
-@tr.jit(do_not_specialize=['N', 'H', 'W'])
+@tr.jit(do_not_specialize=['N', 'H', 'W', 'MS'])
 def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
-                   L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr):
+                   L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr,M=None,MS=(0,0,0,0),MASKED:tl.constexpr=False):
     p=tl.program_id(0)*P+tl.arange(0,P)
     c=tl.program_id(1)*CH+tl.arange(0,CH)
     x,y=p % W,p//W % H
@@ -137,15 +137,27 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
         wh=tl.load(Weight+(c*3)*L+tap,c<C,0).to(X.dtype.element_ty).to(tl.float32)
         wv=tl.load(Weight+(c*3+1)*L+tap,c<C,0).to(X.dtype.element_ty).to(tl.float32)
         wd=tl.load(Weight+(c*3+2)*L+tap,c<C,0).to(X.dtype.element_ty).to(tl.float32)
-        h=tl.load(X+at+d*C,valid&((x+d>=0)&(x+d<W))[:,None],0).to(tl.float32)
-        v=tl.load(X+at+d*W*C,valid&((y+d>=0)&(y+d<H))[:,None],0).to(tl.float32)
-        a=tl.load(X+at+dd*(1-W)*C,valid&((x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H))[:,None],0).to(tl.float32)
+        hm=valid&((x+d>=0)&(x+d<W))[:,None]
+        vm=valid&((y+d>=0)&(y+d<H))[:,None]
+        am=valid&((x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H))[:,None]
+        if MASKED:
+            # The block's input y*mask: masked-off cells read as zero (mask is 0 or 1, so this is exact).
+            b=p//(H*W)
+            hm=hm&(tl.load(M+b*MS[0]+y*MS[2]+(x+d)*MS[3],(p<N)&(x+d>=0)&(x+d<W),0)>0)[:,None]
+            vm=vm&(tl.load(M+b*MS[0]+(y+d)*MS[2]+x*MS[3],(p<N)&(y+d>=0)&(y+d<H),0)>0)[:,None]
+            am=am&(tl.load(M+b*MS[0]+(y-dd)*MS[2]+(x+dd)*MS[3],(p<N)&(x+dd>=0)&(x+dd<W)&(y-dd>=0)&(y-dd<H),0)>0)[:,None]
+        h=tl.load(X+at+d*C,hm,0).to(tl.float32)
+        v=tl.load(X+at+d*W*C,vm,0).to(tl.float32)
+        a=tl.load(X+at+dd*(1-W)*C,am,0).to(tl.float32)
         horizontal=tl.fma(h,wh[None,:],horizontal)
         vertical=tl.fma(v,wv[None,:],vertical)
         diagonal=tl.fma(a,wd[None,:],diagonal)
     hv=(horizontal.to(X.dtype.element_ty).to(tl.float32)+vertical).to(X.dtype.element_ty).to(tl.float32)
     line=(hv+diagonal.to(X.dtype.element_ty).to(tl.float32)).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(Y+at,line+tl.load(X+at,valid,0).to(tl.float32),valid)
+    centre=valid
+    if MASKED:
+        centre=centre&(tl.load(M+(p//(H*W))*MS[0]+y*MS[2]+x*MS[3],p<N,0)>0)[:,None]
+    tl.store(Y+at,line+tl.load(X+at,centre,0).to(tl.float32),valid)
 
 
 # Training kernels take channels-last tensors: element (n, c) of [B, C, H, W] sits at n*C+c for the position
@@ -233,11 +245,17 @@ def masked_pool(x,count,ceiling=None):
     return _MaskedPool.apply(x,count,ceiling)
 
 
-def line_add(x,weight):
+def line_add(x,weight,mask=None):
+    """x + LineConv(x), or with a [B, 1, H, W] 0/1 `mask` (channels-last x only) m + LineConv(m) for m = x*mask,
+    without materializing m. Equal to the unfused bf16 result bit for bit."""
     out=torch.empty_like(x)
     b,c,h,w=x.shape
     if x.is_contiguous(memory_format=torch.channels_last):
-        _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32)
+        extra=dict(M=mask,MS=mask.stride(),MASKED=True) if mask is not None else {}
+        _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32,
+                                                          num_warps=2,**extra)
+    elif mask is not None:
+        return line_add(x*mask,weight)
     else:
         _line_add[(b*c,tr.cdiv(h*w,256))](x,weight,out,c,h,w,x.stride(),weight.shape[-1],256)
     return out
