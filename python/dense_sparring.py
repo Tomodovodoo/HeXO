@@ -7,8 +7,9 @@ come from the evaluator's games against Six), played in a random orientation as 
 episode recording origin 'book' and `book` as actor book games do. The trained model searches every one of its
 placements for `sims` simulations with `root_samples` (a transposition graph and the actors' tactics), the games'
 searches batched together, and plays the highest improved policy, except that its first exponential(`random_plies`)
-own placements are sampled from that policy, so games against a near-deterministic engine differ. The engine
-answers each of its turns in one process, one game at a time, while the model searches. A game ends at six in a
+own placements are sampled from that policy, so games against a near-deterministic engine differ. `engines` engine
+processes answer the waiting games' turns in parallel (each a share of the games, one at a time) while the model
+searches. A game ends at six in a
 row, at max_plies (cap), or when a placement or one of the model's searches no longer fits the largest crop (span);
 a game the engine fails is dropped. Sparring starts once the run has a checkpoint.
 
@@ -58,6 +59,7 @@ class SparringSettings:
     shard_games: int = 32
     seed: int = 0              # 0 draws fresh entropy
     imitate: bool = True       # the engine's placements are one-hot policy targets
+    engines: int = 1           # engine processes answering the games' turns in parallel
 
     def budgets(self):
         return [int(n) for n in self.nodes.split(',')]
@@ -65,7 +67,7 @@ class SparringSettings:
     def __post_init__(self):
         if not self.engine or not self.name or self.sims < 1 or not 1 <= self.root_samples <= 1024 \
                 or self.random_plies < 0 or not 0 <= self.book_fraction <= 1 or self.games < 1 or self.shard_games < 1 \
-                or not self.budgets() or min(self.budgets()) < 1:
+                or not self.budgets() or min(self.budgets()) < 1 or not 1 <= self.engines <= 8:
             raise ValueError('Invalid sparring settings')
 
 
@@ -185,7 +187,7 @@ class Sparring:
         self.rng = np.random.default_rng(settings.seed or None)
         self.model, self.last_shard, self.finished = None, '', []
         self.books = BookStarts(self.run, config.actor.max_plies)
-        self.engine = SixEngine(shlex.split(settings.engine), timeout=60., startup=900.)
+        self.engines = [SixEngine(shlex.split(settings.engine), timeout=60., startup=900.) for _ in range(settings.engines)]
 
     def save(self, stage):
         write_json(self.path, dict(stage=stage, updated_at=time.time(), settings=asdict(self.s),
@@ -205,12 +207,12 @@ class Sparring:
         return Match(self.model, int(self.rng.integers(2)), int(self.rng.choice(self.s.budgets())), self.s.sims,
                      self.s.random_plies, int(self.rng.integers(2**31)), self.config.actor.max_plies, book, self.s.imitate)
 
-    def answer(self, matches):
-        """The engine's turn in each of `matches`, in order; None for a game the engine failed."""
+    def answer(self, matches, engine):
+        """`engine`'s turn in each of `matches`, in order; None for a game the engine failed."""
         turns = []
         for match in matches:
             try:
-                turns.append(self.engine(match.game, nodes=match.nodes))
+                turns.append(engine(match.game, nodes=match.nodes))
             except (ProtocolError, ValueError):
                 turns.append(None)
         return turns
@@ -273,7 +275,7 @@ class Sparring:
 
     def loop(self):
         pause = Yield(self.run, 1., 0., 1., 2., follow=True)
-        matches, engine = [], ThreadPoolExecutor(1)
+        matches, pool = [], ThreadPoolExecutor(len(self.engines))
         while True:
             while pause.paused():
                 self.save('paused')
@@ -286,12 +288,18 @@ class Sparring:
                 self.books.load()
             matches += [self.start() for _ in range(self.s.games-len(matches))]
             theirs = [m for m in matches if not m.ours]
-            pending = engine.submit(self.answer, theirs) if theirs else None
+            # Engine k answers every len(engines)-th waiting game; the turns are reassembled in order.
+            share = [theirs[k::len(self.engines)] for k in range(len(self.engines))]
+            pending = [(k, pool.submit(self.answer, part, engine))
+                       for k, (part, engine) in enumerate(zip(share, self.engines)) if part]
             ours = [m for m in matches if m.ours and not m.over]
             for model in {m.model for m in ours}:
                 self.searched([m for m in ours if m.model is model])
-            if pending is not None:
-                for match, turn in zip(theirs, pending.result()):
+            if pending:
+                turns = [None]*len(theirs)
+                for k, future in pending:
+                    turns[k::len(self.engines)] = future.result()
+                for match, turn in zip(theirs, turns):
                     if turn is None:
                         match.reason = 'dropped'
                     else:
