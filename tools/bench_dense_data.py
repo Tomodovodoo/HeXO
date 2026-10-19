@@ -48,7 +48,7 @@ def in_process(run, settings, count, policy_dir, seed=0, run_seed=0):
     stages = dict(sample=0., examples=0., collate=0.)
     for k in range(count+1):
         t0 = time.perf_counter()
-        refs = window.sample(rng, settings.batch, settings.recency)
+        refs = window.sample(rng, settings.batch, settings.recency, sparring=settings.sparring_weight)
         t1 = time.perf_counter()
         rendered = dense_data.examples(window, refs, rng, **options)
         t2 = time.perf_counter()
