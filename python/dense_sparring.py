@@ -7,9 +7,10 @@ come from the evaluator's games against Six), played in a random orientation as 
 episode recording origin 'book' and `book` as actor book games do. The trained model searches every one of its
 placements for `sims` simulations with `root_samples` (a transposition graph and the actors' tactics), the games'
 searches batched together, and plays the highest improved policy, except that its first exponential(`random_plies`)
-own placements are sampled from that policy, so games against a near-deterministic engine differ. The engine answers each of its turns in one process,
-one game at a time, while the model searches. A game ends at six in a row, at max_plies (cap) or when a position
-no longer fits the largest crop (span); a game the engine fails is dropped.
+own placements are sampled from that policy, so games against a near-deterministic engine differ. The engine
+answers each of its turns in one process, one game at a time, while the model searches. A game ends at six in a
+row, at max_plies (cap), or when a placement or one of the model's searches no longer fits the largest crop (span);
+a game the engine fails is dropped. Sparring starts once the run has a checkpoint.
 
 Output. Every `shard_games` finished games form a shard of origin 'actor' (dense_data) whose episodes record the
 engine as `opponent` (`name`) and `trained_side`: the engine's plies keep rows without a policy, with a null root
@@ -104,6 +105,8 @@ class Match:
         self.moves.append([q, r])
         if self.game.winner < 0 and len(self.moves) >= self.max_plies:
             self.reason = 'cap'
+        elif self.game.winner < 0:
+            self.fits()  # a placement beyond the largest crop ends the game before the next one
 
     @property
     def over(self):
@@ -176,9 +179,13 @@ class Sparring:
                                    checkpoint=self.model and self.model.checkpoint, stats=self.stats))
 
     def refresh_model(self):
-        checkpoint, _ = resolve(self.run, source=self.config.actor.model_source, variant=self.config.learner.variant)
+        """Follow the actors' model; False while the run has no checkpoint to play (sparring starts with the first)."""
+        checkpoint, path = resolve(self.run, source=self.config.actor.model_source, variant=self.config.learner.variant)
+        if path is None:
+            return False
         if self.model is None or self.model.checkpoint != checkpoint:
             self.model = Model(self.run, self.config)
+        return True
 
     def start(self):
         book = self.books.draw(self.rng) if self.rng.random() < self.s.book_fraction else None
@@ -206,6 +213,22 @@ class Sparring:
         finally:
             for tree in trees:
                 tree.close()
+
+    def searched(self, matches):
+        """Search and play the current placement of every match in `matches`. A search reaching a leaf beyond the
+        largest crop fails the batch; the matches are then searched one at a time and the failing ones end as
+        'span'."""
+        try:
+            results = self.search(matches)
+        except hexcrop.SpanError:
+            if len(matches) == 1:
+                matches[0].reason = 'span'
+                return
+            for match in matches:
+                self.searched([match])
+            return
+        for match, result in zip(matches, results):
+            match.searched(result)
 
     def finish(self, match):
         episode, rows = match.episode(self.s.name)
@@ -242,17 +265,18 @@ class Sparring:
             while pause.paused():
                 self.save('paused')
                 time.sleep(2.)
-            self.refresh_model()
+            if not self.refresh_model():
+                self.save('waiting-for-checkpoint')
+                time.sleep(30.)
+                continue
             if len(matches) < self.s.games:
                 self.books.load()
             matches += [self.start() for _ in range(self.s.games-len(matches))]
             theirs = [m for m in matches if not m.ours]
             pending = engine.submit(self.answer, theirs) if theirs else None
-            ours = [m for m in matches if m.ours and m.fits()]
+            ours = [m for m in matches if m.ours and not m.over]
             for model in {m.model for m in ours}:
-                group = [m for m in ours if m.model is model]
-                for match, result in zip(group, self.search(group)):
-                    match.searched(result)
+                self.searched([m for m in ours if m.model is model])
             if pending is not None:
                 for match, turn in zip(theirs, pending.result()):
                     if turn is None:
