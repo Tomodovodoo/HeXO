@@ -2512,6 +2512,28 @@ class DenseDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'surprise_weight'):
             dense_config.LearnerSettings(surprise_weight=.5, regret_fraction=.1)
 
+    def test_sparring_weight_draws_sparring_shard_rows_more_often(self):
+        moves, _ = random_game(np.random.default_rng(5), 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            episode, rows = episode_rows(moves, -1, [0.]*8, policy_every=1)
+            dense_data.write_shard(run/'shards'/'000001', dict(actor_sha256='a'*64, sparring=dict(name='six')), [episode], rows)
+            write_games(run/'shards'/'000002', [(moves, -1, [0.]*8)])
+            window = dense_data.ReplayWindow(run, capacity_rows=1000)
+            refs = [window.ref(*ref) for ref in window.index]
+            sparring = np.array([ref.shard == '000001' for ref in refs])
+            np.testing.assert_array_equal(window.sparring_rows(), sparring)
+            for kwargs in (dict(), dict(recency=1.), dict(surprise=.5)):
+                drawn = window.sample(np.random.default_rng(1), 40000, sparring=3., **kwargs)
+                base = window.sample(np.random.default_rng(1), 40000, **kwargs)
+                share = lambda refs: np.mean([r.shard == '000001' for r in refs])
+                odds = lambda p: p/(1-p)
+                self.assertAlmostEqual(odds(share(drawn))/odds(share(base)), 3., delta=.25)
+            held = window.sample(np.random.default_rng(1), 100, validation=True, sparring=3.) if len(window.validation) else []
+            self.assertTrue(all(r.shard in ('000001', '000002') for r in held))
+        with self.assertRaisesRegex(ValueError, 'sparring_weight'):
+            dense_config.LearnerSettings(sparring_weight=0.)
+
     def test_an_index_file_without_surprises_is_rebuilt_once_a_shard_stores_them(self):
         moves, _ = random_game(np.random.default_rng(4), 6)
         episode, rows = episode_rows(moves, -1, [0.]*6)
