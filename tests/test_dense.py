@@ -2533,6 +2533,8 @@ class DenseDataTests(unittest.TestCase):
             self.assertTrue(all(r.shard in ('000001', '000002') for r in held))
         with self.assertRaisesRegex(ValueError, 'sparring_weight'):
             dense_config.LearnerSettings(sparring_weight=0.)
+        with self.assertRaisesRegex(ValueError, 'sparring_weight'):
+            dense_config.LearnerSettings(sparring_weight=3., regret_fraction=.1)
 
     def test_an_index_file_without_surprises_is_rebuilt_once_a_shard_stores_them(self):
         moves, _ = random_game(np.random.default_rng(4), 6)

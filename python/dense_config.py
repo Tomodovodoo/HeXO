@@ -333,8 +333,8 @@ class LearnerSettings:
             raise ValueError('regret_fraction must lie in [0, 1]')
         if not 0 <= self.surprise_weight <= 1 or self.surprise_weight and self.regret_fraction:
             raise ValueError('surprise_weight must lie in [0, 1] and cannot combine with regret_fraction')
-        if not 0 < self.sparring_weight < float('inf'):
-            raise ValueError('sparring_weight must be positive and finite')
+        if not 0 < self.sparring_weight < float('inf') or self.sparring_weight != 1 and self.regret_fraction:
+            raise ValueError('sparring_weight must be positive and finite and cannot combine with regret_fraction')
 
 
 @dataclass(frozen=True)
