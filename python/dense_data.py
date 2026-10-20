@@ -1146,20 +1146,37 @@ class ReplayWindow:
                 out.append((s.roots[a:b], s.searched[a:b] if s.has_search[g] else None, int(s.winner[g])))
         return out
 
-    def sample(self, rng, n, recency=0., validation=False, regret_fraction=0., surprise=0.):
+    def sparring_rows(self):
+        """Bool mask over the training index: rows of sparring shards (manifest identity 'sparring'), and whether any
+        row is one; both cached until the index changes."""
+        names = self.index.names
+        if getattr(self, '_sparring_names', None) is not names:
+            flags = np.array([bool(self.manifests[name].get('identity', {}).get('sparring')) for name in names], bool)
+            self._sparring_mask = flags[self.index.shard] if len(names) else np.zeros(len(self.index), bool)
+            self._sparring_any = bool(self._sparring_mask.any())
+            self._sparring_names = names
+        return self._sparring_mask
+
+    def sample(self, rng, n, recency=0., validation=False, regret_fraction=0., surprise=0., sparring=1.):
         """n Refs drawn with replacement from the training (or validation) index; the k-th oldest of
-        W rows has weight ((k+1)/W)^recency, times surprise_weights(surprise) for training draws. Priority counts are
-        stochastic, with the capped expected share, so fewer than one expected priority draw per batch still samples
-        regret rows."""
+        W rows has weight ((k+1)/W)^recency, times surprise_weights(surprise) and, for rows of sparring shards,
+        `sparring` (sparring_rows) for training draws. Weighted training draws search a cumulative weight vector
+        cached until the window refreshes. Priority counts are stochastic, with the capped expected share, so fewer
+        than one expected priority draw per batch still samples regret rows."""
         index = self.validation if validation else self.index
         W = len(index)
         if not W:
             raise ValueError('Replay window is empty')
-        if surprise and not validation:
-            if (surprise, recency) not in self.surprise_cache:
-                weights = self.surprise_weights(surprise)*((np.arange(1, W+1)/W)**recency if recency else 1.)
-                self.surprise_cache[surprise, recency] = np.cumsum(weights)
-            cumulative = self.surprise_cache[surprise, recency]
+        boost = sparring != 1 and not validation and self.sparring_rows() is not None and self._sparring_any
+        if (surprise or boost) and not validation and not (regret_fraction and self.regret_rows):
+            key = (surprise, recency, sparring if boost else 1.)
+            if key not in self.surprise_cache:
+                weights = (self.surprise_weights(surprise) if surprise else np.ones(W))
+                weights = weights*((np.arange(1, W+1)/W)**recency if recency else 1.)
+                if boost:
+                    weights = weights*np.where(self._sparring_mask, sparring, 1.)
+                self.surprise_cache[key] = np.cumsum(weights)
+            cumulative = self.surprise_cache[key]
             picks = np.minimum(np.searchsorted(cumulative, rng.random(n)*cumulative[-1], side='right'), W-1)
         elif recency:
             w = (np.arange(1, W+1)/W)**recency
@@ -1675,7 +1692,8 @@ def batches(window, rng, batch_size, settings, validation=False, calibration=lam
     (recency and target_options)."""
     while True:
         s = settings()
-        refs = window.sample(rng, batch_size, s.recency, validation, s.regret_fraction, s.surprise_weight)
+        refs = window.sample(rng, batch_size, s.recency, validation, s.regret_fraction, s.surprise_weight,
+                             s.sparring_weight)
         yield collate_arrays(*examples(window, refs, rng, **target_options(s, calibration())))
 
 

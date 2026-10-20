@@ -265,6 +265,9 @@ class LearnerSettings:
     # KataGo's policy surprise weighting (dense_data.ReplayWindow.surprise_weights): this share of each game's
     # full-search sampling weight follows the rows' stored KL from the network prior to the search policy; 0 = off.
     surprise_weight: float = 0.
+    # Sampling weight of training rows from sparring shards (manifest identity 'sparring', dense_sparring) relative
+    # to every other row; with sparring imitation those rows carry the engine's placements as policy targets.
+    sparring_weight: float = 1.
     bootstrap_weight: float = 1.  # weight of TD(lambda) value rows from capped games; 0 = mask
     bootstrap_full_only: bool = False  # True: chain TD(lambda) through full-search root values only
     cheap_value_weight: float = .25    # value weight of cheap-search rows
@@ -330,6 +333,8 @@ class LearnerSettings:
             raise ValueError('regret_fraction must lie in [0, 1]')
         if not 0 <= self.surprise_weight <= 1 or self.surprise_weight and self.regret_fraction:
             raise ValueError('surprise_weight must lie in [0, 1] and cannot combine with regret_fraction')
+        if not 0 < self.sparring_weight < float('inf') or self.sparring_weight != 1 and self.regret_fraction:
+            raise ValueError('sparring_weight must be positive and finite and cannot combine with regret_fraction')
 
 
 @dataclass(frozen=True)

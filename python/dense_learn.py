@@ -818,7 +818,8 @@ class Learner:
         rng, s = np.random.default_rng([self.config.seed, 1]), self.settings
         with torch.no_grad():
             for _ in range(math.ceil(RECALIBRATION_ROWS/s.batch)):
-                refs = window.sample(rng, s.batch, s.recency, regret_fraction=s.regret_fraction, surprise=s.surprise_weight)
+                refs = window.sample(rng, s.batch, s.recency, regret_fraction=s.regret_fraction, surprise=s.surprise_weight,
+                                     sparring=s.sparring_weight)
                 batch = dense_data.collate(*dense_data.examples(window, refs, rng, **self.targets()))
                 batch_losses(self.ema, batch, None, self.device, self.memory_format, False)
         for m, momentum in zip(norms, momenta):

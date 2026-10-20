@@ -172,7 +172,7 @@ def prepare(args):
     (target/'status.json').write_text(json.dumps(status, indent=2), encoding='utf-8')
     for index in range(args.steps):
         refs = window.sample(rng, settings.batch, settings.recency,
-                             regret_fraction=settings.regret_fraction)
+                             regret_fraction=settings.regret_fraction, sparring=settings.sparring_weight)
         samples, targets = dense_data.examples(
             window, refs, rng, **dense_data.target_options(settings, calibration))
         batch = dense_data.tensors(dense_data.collate_arrays(samples, targets))
