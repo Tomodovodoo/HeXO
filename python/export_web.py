@@ -93,10 +93,13 @@ class WebNet(nn.Module):
         x = F.conv2d(features, self.stem, padding=1)
         if self.post:  # PostBlock trunk (hexnet): conv-norm-act blocks after a normed stem
             x = self.act(x, 'norm', mask)
-            for i, _, pooled in self.blocks:
+            for i, line, pooled in self.blocks:
                 y = self.act(F.conv2d(x, t(f'b{i}_conv1'), padding=1), f'b{i}_norm1', mask)
                 if pooled:
                     y = F.relu(y+F.linear(self.pool(y, scale), t(f'b{i}_pool_w'), t(f'b{i}_pool_b'))[:, :, None, None])*mask
+                if line:
+                    kernel = t(f'b{i}_line')
+                    y = (y+F.conv2d(y, kernel, padding=kernel.shape[-1]//2, groups=kernel.shape[0]))*mask
                 x = F.relu(x+self.norm(F.conv2d(y, t(f'b{i}_conv2'), padding=1), f'b{i}_norm2'))*mask
             return self.heads(x, scale)
         for i, line, pooled in self.blocks:

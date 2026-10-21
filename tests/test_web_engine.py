@@ -97,6 +97,14 @@ class Export(unittest.TestCase):
         x = np.zeros((1, 20, 24, 72), np.float32)
         np.testing.assert_array_equal(session.run(None, dict(features=x))[0], x+1)
 
+    def test_post_blocks_with_lines_match_the_reference_path(self):
+        model = random_model(block='post', blocks=3)
+        self.assertTrue(all(block.line is not None for block in model.blocks))
+        with tempfile.TemporaryDirectory() as folder:
+            export_web.export_onnx(model, Path(folder)/'post.onnx', False)
+            worst = export_web.parity(model, Path(folder)/'post.onnx', export_web.histories(every=13), False)
+            self.assertLess(max(worst.values()), 1e-4, worst)
+
     def test_graphs_match_the_reference_path(self):
         model = random_model()
         with tempfile.TemporaryDirectory() as folder:
