@@ -35,7 +35,7 @@ struct Owner {
   for(auto& [key,weak]:game->nodes)if(auto n=weak.lock())if(n->pending)throw std::runtime_error("Game has external pending neural work");
   for(auto& u:source.board.history)focus.push_back(u.c);views.reserve(max_views);
   View root;root.tree=std::make_unique<Tree>(rng(),game);root.tree->shared=root.tree->graph=true;
-  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;root.tree->root_concentration=source.root_concentration;root.tree->root_temperature=source.root_temperature;root.tree->round_barrier=source.round_barrier;
+  root.tree->scheduler_owned=true;root.tree->tactics=source.tactics;root.tree->range_floor=source.range_floor;root.tree->root_noise=source.root_noise;root.tree->root_concentration=source.root_concentration;root.tree->root_temperature=source.root_temperature;root.tree->round_barrier=source.round_barrier;root.tree->round_overlap=source.round_overlap;
   game->primary=root.tree.get();root.tree->root_at(focus);root.key=gumbel::keys(focus).second;root.history=focus;root.id=next_id++;views.push_back(std::move(root));++created;
   start(views[0]);game->scheduler_owner=this;
  }
@@ -173,7 +173,7 @@ struct Owner {
   auto history=c->history;double relevance=c->relevance;int depth=c->depth;c->last=allocations;
   if(slot<views.size()){hxgf_detach(feed,views[slot].tree.get());views[slot].tree->cancel();++retired;}
   View v;v.tree=std::make_unique<Tree>(rng(),game);v.tree->shared=v.tree->graph=true;
-  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->root_concentration=views[0].tree->root_concentration;v.tree->root_temperature=views[0].tree->root_temperature;v.tree->round_barrier=views[0].tree->round_barrier;
+  v.tree->scheduler_owned=true;v.tree->tactics=views[0].tree->tactics;v.tree->range_floor=views[0].tree->range_floor;v.tree->root_noise=views[0].tree->root_noise;v.tree->root_concentration=views[0].tree->root_concentration;v.tree->root_temperature=views[0].tree->root_temperature;v.tree->round_barrier=views[0].tree->round_barrier;v.tree->round_overlap=views[0].tree->round_overlap;
   v.tree->root_at(history);v.history=std::move(history);v.key=key;v.depth=depth;v.relevance=relevance;v.id=next_id++;++created;
   if(slot==views.size())views.push_back(std::move(v));else views[slot]=std::move(v);
   return start(views[slot])?int(slot):-1;

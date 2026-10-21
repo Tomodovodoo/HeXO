@@ -37,6 +37,7 @@ bind('hxg_root_noise', C.c_int, ptr, C.c_double)
 bind('hxg_root_concentration', C.c_int, ptr, C.c_double)
 bind('hxg_root_temperature', C.c_int, ptr, C.c_double)
 bind('hxg_round_barrier', C.c_int, ptr, C.c_int)
+bind('hxg_round_overlap', C.c_int, ptr, C.c_int)
 bind('hxg_census', C.c_int, ptr, ptr)
 bind('hxg_exact', C.c_int, ptr)
 bind('hxg_distance', C.c_int, ptr)
@@ -123,7 +124,7 @@ class NeuralSearch:
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None,
                  tactics=False, proof_solver=None, proof_ms=100, graph=False, q_range_floor=0., root_noise=0.,
                  root_concentration=0., limit=None, archive_bytes=0, archive_forward=False, round_barrier=False,
-                 root_temperature=1.):
+                 root_temperature=1., round_overlap=0):
         if not model_version:
             raise ValueError('A model version is required')
         self.evaluator, self.model_version = evaluator, model_version
@@ -147,6 +148,7 @@ class NeuralSearch:
             checked(native.hxg_root_concentration(self.ptr, root_concentration))
             checked(native.hxg_root_temperature(self.ptr, root_temperature))
             checked(native.hxg_round_barrier(self.ptr, int(round_barrier)))
+            checked(native.hxg_round_overlap(self.ptr, int(round_overlap)))
             for point in history:
                 self.advance(point)
         except Exception:
@@ -379,12 +381,12 @@ class GameGraph(NeuralSearch):
 
     def __init__(self, evaluator, model_version, history=(), seed=0, cache=None, tactics=False, proof_solver=None,
                  proof_ms=100, q_range_floor=0., root_noise=0., root_concentration=0., limit=GRAPH_LIMIT, archive_bytes=0,
-                 archive_forward=False, round_barrier=False, root_temperature=1.):
+                 archive_forward=False, round_barrier=False, root_temperature=1., round_overlap=0):
         super().__init__(evaluator, model_version, history, seed, cache, tactics, proof_solver, proof_ms,
                          q_range_floor=q_range_floor, root_noise=root_noise, root_concentration=root_concentration,
                          root_temperature=root_temperature,
                          limit=limit, archive_bytes=archive_bytes,
-                         archive_forward=archive_forward, round_barrier=round_barrier)
+                         archive_forward=archive_forward, round_barrier=round_barrier, round_overlap=round_overlap)
 
     def at(self, history):
         """Move the root to the position after `history`, keeping every node's statistics."""

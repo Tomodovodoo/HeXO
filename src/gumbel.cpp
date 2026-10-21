@@ -241,7 +241,7 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
 void materialized(Node* node,Edge& edge){node->activate(edge);}
 // A pending leaf: its history, its legal moves in sorted order and, with tactics, the side to move's completions
 // (own) and the opponent's (threats), both restricted to fully legal ones.
-struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1;std::vector<std::vector<Cell>> own,threats; };
+struct Path { Node* leaf=nullptr;std::vector<std::pair<Node*,int>> edges;std::vector<Cell> history,legal;int player=0,remaining=1,round_slot=-1,round_id=-1;std::vector<std::vector<Cell>> own,threats; };
 struct Summary { int n=0,count=1;double q=0,value=0;Key position;std::vector<uint64_t> excluded;std::vector<std::pair<int,uint64_t>> policy_credits;double policy_floor=0,policy_q=0; };
 struct ColouredCell {Cell cell;int player;bool operator==(const ColouredCell&)const=default;};
 struct ColouredHash {size_t operator()(const ColouredCell& c)const{return CellHash{}(c.cell)^mix(c.player+1);}};
@@ -394,6 +394,7 @@ struct Tree {
  std::map<Cell,double> defence;
  double range_floor=0;  // least Q range of the completed-Q rescale (transformed)
   bool round_barrier=false;RootRound round;
+  int round_overlap=0;  // a new halving round may start while at most this many root requests are pending (0: none)
   double root_noise=0;   // noise share of the root's candidate sampling distribution (sampling)
   double root_concentration=0;  // 0: uniform noise; > 0: shaped Dirichlet noise of this total concentration (draw_noise)
   double root_temperature=1;    // divides the logits the root's candidate sampling draws on (sampling, draw_noise)
@@ -947,7 +948,8 @@ struct Tree {
    auto better=[&](int a,int b){bool da=phase==0 && defence.contains(node.edges[a].action),db=phase==0 && defence.contains(node.edges[b].action);
     if(da!=db)return da;double x=score(a),y=score(b);return x!=y?x>y:a<b;};
    if(round.active!=phase){
-    if(!requests.empty())return -1;
+    // Pipelined halving: rank on the completed evidence while a few stragglers are still in flight.
+    if(int(requests.size())>round_overlap)return -1;
     std::vector<int> rank;
     if(round.active<0){for(int i=0;i<int(node.edges.size());++i)if(node.edges[i].read().eligible)rank.push_back(i);}
     else for(int i:round.members)if(i>=0 && node.edges[i].read().eligible)rank.push_back(i);
@@ -976,9 +978,11 @@ struct Tree {
     if(round.counts[slot]<least || (round.counts[slot]==least && (chosen<0 || better(i,chosen)))){least=round.counts[slot];chosen=i;}
    }return chosen;
   }
+  int reserved_round=-1;  // the round of the latest reserve_root, recorded on its path
   int reserve_root(int edge){
    ++root_edges[edge].epoch;++started;++issued;
    if(!round_barrier)return -1;
+   reserved_round=round.active;
    auto i=std::find(round.members.begin(),round.members.end(),edge);if(i==round.members.end())throw std::runtime_error("Root work outside its round");
    int slot=int(i-round.members.begin());++round.counts[slot];return slot;
   }
@@ -1168,16 +1172,16 @@ struct Tree {
    if(board.winner>=0 || edge.read().exact_winner>=0 || node->exact_winner>=0){
     if(board.winner>=0){node->exact_winner=board.winner;node->distance=0;node->bound=false;}
     else if(edge.read().exact_winner>=0 && node->exact_winner<0){node->exact_winner=edge.read().exact_winner;node->distance=edge.read().distance-1;node->bound=edge.read().bound;}
-    int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,winner==node->player?1:-1);return -1;}
+    int winner=node->exact_winner;for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);path.round_id=reserved_round;backup(path,winner==node->player?1:-1);return -1;}
    // A transposed child already holds more visits than this edge: take its value without evaluating (MCGS).
-   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);backup(path,node->evaluation(),false);return -1;}
+   if(graph && !shared && node->expanded && node->n>edge.read().visits){for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;path.round_slot=reserve_root(path.edges.front().second);path.round_id=reserved_round;backup(path,node->evaluation(),false);return -1;}
   }
   if(node->pending){if(!round_barrier || path.edges.empty())return 0;restart();continue;}
   break;
   }
   node->pending=true;node->player=board.player;capture(path);
   for(auto [parent,index]:path.edges)++parent->edges[index].write().pending;
-  if(!path.edges.empty()){path.round_slot=reserve_root(path.edges.front().second);}
+  if(!path.edges.empty()){path.round_slot=reserve_root(path.edges.front().second);path.round_id=reserved_round;}
   const bool immediate=!path.own.empty();
   int id=next_id++;requests.emplace(id,std::move(path));
   if(immediate){
@@ -1297,7 +1301,7 @@ struct Tree {
    for(auto& e:node->edges)if(e.action==witness){e.write().child=std::move(child);if(graph)node->track(e);break;}
   }
  }
- void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].write().pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;if(round_barrier && path.round_slot>=0)--round.counts[path.round_slot];}}requests.clear();}
+ void cancel(){for(auto& [id,path]:requests){path.leaf->pending=false;for(auto [node,index]:path.edges)--node->edges[index].write().pending;if(!path.edges.empty()){--root_edges[path.edges.front().second].epoch;--started;++cancelled;if(round_barrier && path.round_slot>=0 && path.round_id==round.active)--round.counts[path.round_slot];}}requests.clear();}
  void advance(Cell action){owner_access();if(!requests.empty()||!board.legal(action))throw std::runtime_error("Invalid advance");std::shared_ptr<Node> next;int winner=-1,distance=-1;bool bound=false;
   for(auto& e:root->edges)if(e.action==action){winner=e.read().exact_winner;distance=e.read().distance;bound=e.read().bound;next=shared?e.read().child:std::move(e.write().child);break;}
   save_root();auto before=root->history;board.make(action);root=next?std::move(next):child_here(std::move(before),true);reactivate(root);root->player=board.player;restore_root();
@@ -1437,6 +1441,7 @@ HX_API int hxg_q(void* p,double* out){auto& t=*static_cast<gumbel::Tree*>(p);aut
 HX_API int hxg_q_range_floor(void* p,double floor){if(!std::isfinite(floor) || floor<0){gumbel::error="Invalid Q range floor";return 0;}static_cast<gumbel::Tree*>(p)->range_floor=floor;return 1;}
 // Sets the uniform share of the root's candidate sampling (Tree::sampling; 0, the default, samples by the prior)
 // for every later search; 0 with no change unless 0 <= `noise` < 1.
+HX_API int hxg_round_overlap(void* p,int requests){if(requests<0){gumbel::error="Invalid round overlap";return 0;}static_cast<gumbel::Tree*>(p)->round_overlap=requests;return 1;}
 HX_API int hxg_round_barrier(void* p,int enabled){try{auto& t=*static_cast<gumbel::Tree*>(p);t.owner_access();
  if((enabled!=0 && enabled!=1) || t.started || !t.requests.empty())throw std::runtime_error("Configure rounds before search work");
  if(t.round_barrier!=bool(enabled))t.root_sessions.clear();t.round_barrier=enabled;if(t.budget)t.schedule(t.root->expanded?int(std::count_if(t.root->edges.begin(),t.root->edges.end(),[](const auto& e){return e.read().eligible;})):int(t.board.legal_moves().size()));return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
@@ -1564,7 +1569,7 @@ extern "C" HX_API void* hxg_view(void* source,const int64_t* history,int count,u
   auto& original=*static_cast<gumbel::Tree*>(source);
   if(!original.shared || count<0)throw std::runtime_error("View needs a shared graph and valid history");
   auto view=std::make_unique<gumbel::Tree>(seed,original.state);view->shared=view->graph=true;
-  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->root_concentration=original.root_concentration;view->root_temperature=original.root_temperature;view->round_barrier=original.round_barrier;
+  view->tactics=original.tactics;view->range_floor=original.range_floor;view->root_noise=original.root_noise;view->root_concentration=original.root_concentration;view->root_temperature=original.root_temperature;view->round_barrier=original.round_barrier;view->round_overlap=original.round_overlap;
   std::vector<Cell> h;for(int i=0;i<count;++i)h.push_back({history[2*i],history[2*i+1]});view->root_at(h);
   return view.release();
  }catch(const std::exception& e){gumbel::error=e.what();return nullptr;}
