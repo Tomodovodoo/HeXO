@@ -38,6 +38,7 @@ def proof_settings(solver):
     return workers, float(budget)
 
 
+READY_ROWS = 24  # queued rows at which a turn's owner stops gathering views and exports a batch
 SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'choice', 'views',
                         'pass_simulations', 'round_overlap'},
                 solver={'enabled', 'stamps', 'workers', 'budget'})
@@ -350,8 +351,10 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
         # while detached, before a new service takes exclusive ownership.
         pool.retarget(0, history, work=1)
         before = pool.proofs.stats() if pool.proofs is not None else None
+        # The views' leaves split into batches of about READY_ROWS, several in flight, so the GPU runs one batch
+        # while the producer installs another (Play turns at 1 s, quiet GPU: 3.3k -> 3.7k evaluations/s).
         service = InferenceService([pool], [player.evaluator], batch_size=128, quantum=min(128, max(64, passes)),
-                                   pending=2, flights=2, interleave_feedback=True, progress=True)
+                                   pending=4, flights=3, ready_rows=READY_ROWS, interleave_feedback=True, progress=True)
         service.start(continuous=True)
         # Inference collection may wait for a whole CPU/GPU batch. Keep it off
         # the turn thread so a ready root choice can be published immediately.

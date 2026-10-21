@@ -34,7 +34,7 @@ for name, result, args in (
     ('attach', C.c_int, [ptr, ptr, C.c_int]), ('start', C.c_int, [ptr, C.c_double]),
     ('detach', C.c_int, [ptr, C.c_int]), ('model_pending', C.c_int, [ptr, C.c_int]),
     ('workers', C.c_int, [ptr, C.c_int, C.c_int]),
-    ('flights', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
+    ('flights', C.c_int, [ptr, C.c_int]), ('ready_rows', C.c_int, [ptr, C.c_int]), ('flight_stats', None, [ptr, ptr]),
     ('profile', C.c_int, [ptr, C.c_int]), ('feedback', C.c_int, [ptr, C.c_int]), ('schedule_stats', None, [ptr, ptr]),
     ('progress', C.c_int, [ptr, C.c_int]), ('supply', None, [ptr, ptr]),
     ('progress_rows', C.c_int, [ptr, C.c_int, C.c_int, C.c_uint64, C.c_uint64, ptr, ptr, ptr]),
@@ -546,7 +546,8 @@ class InferenceService:
     available with ms=0; interactive comparisons use a common clock.
     """
     def __init__(self, pools, evaluators, *, batch_size=128, quantum=64, pending=2,
-                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False, progress=False):
+                 merge_cells=32768, latency_ms=.2, flights=2, profile=False, interleave_feedback=False, progress=False,
+                 ready_rows=0):
         if not pools or batch_size<1 or batch_size>1024:
             raise ValueError('Open pools and a valid inference batch size are required')
         self.pools, self.models = [], list(evaluators)
@@ -564,6 +565,7 @@ class InferenceService:
             checked(False)
         try:
             checked(native.hxb_flights(self._ptr, flights))
+            checked(native.hxb_ready_rows(self._ptr, ready_rows))
             checked(native.hxb_profile(self._ptr, bool(profile)))
             checked(native.hxb_feedback(self._ptr, self.interleave_feedback))
             checked(native.hxb_progress(self._ptr, bool(progress)))
