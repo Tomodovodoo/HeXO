@@ -98,13 +98,19 @@ class Export(unittest.TestCase):
         np.testing.assert_array_equal(session.run(None, dict(features=x))[0], x+1)
 
     def test_post_blocks_with_lines_match_the_reference_path(self):
-        for length in (11, 6):  # an even length exports through an odd kernel with a zero edge
-            model = random_model(block='post', blocks=3, line_length=length)
-            self.assertTrue(all(block.line is not None for block in model.blocks))
+        # An even length exports through an odd kernel with a zero edge; line_blocks keeps lines in some blocks only.
+        for length, lined, expected in ((11, '', [True]*3), (6, '', [True]*3), (11, '0,2', [True, False, True])):
+            model = random_model(block='post', blocks=3, line_length=length, line_blocks=lined)
+            self.assertEqual([block.line is not None for block in model.blocks], expected)
             with tempfile.TemporaryDirectory() as folder:
                 export_web.export_onnx(model, Path(folder)/'post.onnx', False)
                 worst = export_web.parity(model, Path(folder)/'post.onnx', export_web.histories(every=13), False)
-                self.assertLess(max(worst.values()), 1e-4, (length, worst))
+                self.assertLess(max(worst.values()), 1e-4, (length, lined, worst))
+        self.assertNotIn('line_blocks', hexnet.saved_config(hexnet.HexNetConfig()))
+        self.assertEqual(hexnet.saved_config(hexnet.HexNetConfig(line_blocks='1'))['line_blocks'], '1')
+        for bad in ('3', 'a', '0,'):
+            with self.assertRaises(ValueError):
+                hexnet.HexNet(hexnet.HexNetConfig(blocks=3, line_blocks=bad))
 
     def test_graphs_match_the_reference_path(self):
         model = random_model()
