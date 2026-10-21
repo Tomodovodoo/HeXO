@@ -39,7 +39,7 @@ def proof_settings(solver):
 
 
 SETTINGS = dict(search={'enabled', 'simulations', 'max_simulations', 'root_samples', 'q_range_floor', 'choice', 'views',
-                        'pass_simulations'},
+                        'pass_simulations', 'round_overlap'},
                 solver={'enabled', 'stamps', 'workers', 'budget'})
 
 
@@ -62,6 +62,9 @@ def check_settings(search, solver):
     views, passes = search.get('views', VIEWS), search.get('pass_simulations', PASS_SIMULATIONS)
     if type(views) is not int or not 1 <= views <= 64 or type(passes) is not int or not 4 <= passes <= 1 << 20:
         raise ValueError('search.views must lie in [1, 64] and search.pass_simulations in [4, 2^20]')
+    overlap = search.get('round_overlap', 0)
+    if type(overlap) is not int or not 0 <= overlap <= 1024:
+        raise ValueError('search.round_overlap must be an integer in [0, 1024]')
     if search.get('enabled', True) and solver.get('enabled', True):
         proof_settings(solver)
     elif {'workers', 'budget'} & solver.keys():
@@ -318,16 +321,18 @@ def hybrid_turn(player, history, limits, cancel, publish=lambda result: None):
             result['stop_reason'] = 'stop' if cancel.is_set() else 'deadline'
             return result
         views, passes = limits.get('views', VIEWS), limits.get('pass_simulations', PASS_SIMULATIONS)
+        overlap = limits.get('round_overlap', 0)
         signature = (player.model_sha256, player.options['solver'],
                      bool(getattr(player.prover, 'stamps', False)), limits.get('q_range_floor', 0.), workers, budget,
-                     views, passes)
+                     views, passes, overlap)
         kept = getattr(player, '_timed_hybrid', None)
         if kept is not None and kept[2] != signature:
             player.set_history(history)
             kept = None
         if kept is None:
             graph = GameGraph(player.evaluator, player.model_sha256, history, seed=1740,
-                              cache=player.cache, tactics=True, q_range_floor=signature[3], round_barrier=True)
+                              cache=player.cache, tactics=True, q_range_floor=signature[3], round_barrier=True,
+                              round_overlap=overlap)
             pool = None
             try:
                 pool = SearchPool([graph], quantum=passes, views=views, depth=8, work=1, seed=1740)
@@ -563,6 +568,7 @@ def _worker(connection, cancellation, config):
                                  root_samples=search.get('root_samples', 16),
                                  views=search.get('views', VIEWS),
                                  pass_simulations=search.get('pass_simulations', PASS_SIMULATIONS),
+                                 round_overlap=search.get('round_overlap', 0),
                                  choice=search.get('choice', 'gumbel'),
                                  q_range_floor=search.get('q_range_floor', 0.))
             search_limits['proof_workers'], search_limits['proof_budget'] = proof_settings(solver)
