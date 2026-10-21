@@ -1,5 +1,6 @@
 // Native placement-tree scheduling. Algorithm reference: DeepMind mctx.
 #include "hexo.cpp"
+#include "fastmath.hpp"
 #include <atomic>
 #include <memory>
 #include <memory_resource>
@@ -207,16 +208,16 @@ struct Node : std::enable_shared_from_this<Node> { int player=0,remaining=1,exac
    if(block.dirty){
     int begin=b*block_size,end=std::min(begin+block_size,int(edges.size()));block.best=-1;block.mass=0;
     for(int i=begin;i<end;++i)if(edges[i].read().empty && (block.best<0 || edges[i].logit>edges[block.best].logit))block.best=i;
-    if(block.best>=0){double factor=std::exp(-edges[block.best].logit);
+    if(block.best>=0){double factor=fastmath::exp(-edges[block.best].logit);
      for(int i=begin;i<end;++i)if(edges[i].read().empty){auto& e=edges[i];
-      block.mass+=e.weight>=std::numeric_limits<double>::min() && std::isfinite(factor)?e.weight*factor:std::exp(e.logit-edges[block.best].logit);
+      block.mass+=e.weight>=std::numeric_limits<double>::min() && std::isfinite(factor)?e.weight*factor:fastmath::exp(e.logit-edges[block.best].logit);
      }
     }
     block.dirty=false;
    }
    if(block.best>=0 && (cold_best<0 || edges[block.best].logit>edges[cold_best].logit))cold_best=block.best;
   }
-  if(cold_best>=0)for(auto& block:cold)if(block.best>=0)cold_mass+=block.mass*std::exp(edges[block.best].logit-edges[cold_best].logit);
+  if(cold_best>=0)for(auto& block:cold)if(block.best>=0)cold_mass+=block.mass*fastmath::exp(edges[block.best].logit-edges[cold_best].logit);
   cold_dirty=false;
  }
  // Synthetic proof expansions use a uniform policy; neural expansions retain
@@ -437,9 +438,9 @@ struct Tree {
   auto& edges=root->edges;double maximum=-1e300,total=0,mean=0,excess=0,sum=0;int n=0;
   for(auto& e:edges)if(e.read().eligible){maximum=std::max(maximum,e.logit/root_temperature);++n;}
   if(!n)return;
-  for(auto& e:edges)if(e.read().eligible)total+=std::exp(e.logit/root_temperature-maximum);
+  for(auto& e:edges)if(e.read().eligible)total+=fastmath::exp(e.logit/root_temperature-maximum);
   std::vector<double> shape(edges.size());
-  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,std::exp(edges[i].logit/root_temperature-maximum)/total)+1e-20);mean+=shape[i];}
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::log(std::min(.01,fastmath::exp(edges[i].logit/root_temperature-maximum)/total)+1e-20);mean+=shape[i];}
   mean/=n;
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible){shape[i]=std::max(0.,shape[i]-mean);excess+=shape[i];}
   // Gamma(a) draws as log Gamma(a + 1) + log(U) / a, normalized in log space: tiny shapes underflow as plain draws.
@@ -449,7 +450,7 @@ struct Tree {
    double u=std::max(std::generate_canonical<double,53>(rng),1e-300);
    shape[i]=std::log(std::gamma_distribution<double>(alpha+1,1.)(rng))+std::log(u)/alpha;top=std::max(top,shape[i]);
   }
-  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)sum+=root_edges[i].noise=std::exp(shape[i]-top);
+  for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)sum+=root_edges[i].noise=fastmath::exp(shape[i]-top);
   for(size_t i=0;i<edges.size();++i)if(edges[i].read().eligible)root_edges[i].noise/=sum;
  }
  // Keep shared evidence available for halving and reporting without feeding it into nomination.
@@ -861,7 +862,7 @@ struct Tree {
  std::vector<double> policy_current(Node& node,double comparison_max=-1,double policy_floor=-1,bool defence_bonus=true){
   auto weights=transformed(node,comparison_max,policy_floor);double maximum=-1e300,total=0;
   for(size_t i=0;i<weights.size();++i){weights[i]=node.edges[i].read().eligible?weights[i]+node.edges[i].logit+(defence_bonus?bonus(node.edges[i]):0.):-std::numeric_limits<double>::infinity();maximum=std::max(maximum,weights[i]);}
-  for(auto& w:weights){w=std::exp(w-maximum);total+=w;}
+  for(auto& w:weights){w=fastmath::exp(w-maximum);total+=w;}
   for(auto& w:weights)w/=total;return weights;
  }
  std::vector<double> policy(Node& node,double comparison_max=-1){if(shared)current(node);return policy_current(node,comparison_max);}
@@ -898,11 +899,11 @@ struct Tree {
   node.cold_summary();int visits=0;double maxlog=node.cold_best>=0?q.unknown()+node.edges[node.cold_best].logit:-std::numeric_limits<double>::infinity();
   for(int i:node.active){auto& e=node.edges[i];visits+=e.read().visits+e.read().pending;if(e.read().eligible)maxlog=std::max(maxlog,q[i]+e.logit);}
   if(!std::isfinite(maxlog))return -1;
-  double total=node.cold_best>=0?node.cold_mass*std::exp(q.unknown()+node.edges[node.cold_best].logit-maxlog):0;
-  for(int i:node.active)if(node.edges[i].read().eligible)total+=std::exp(q[i]+node.edges[i].logit-maxlog);
-  int chosen=node.cold_best;double best=chosen>=0?std::exp(q.unknown()+node.edges[chosen].logit-maxlog)/total:-std::numeric_limits<double>::infinity();
+  double total=node.cold_best>=0?node.cold_mass*fastmath::exp(q.unknown()+node.edges[node.cold_best].logit-maxlog):0;
+  for(int i:node.active)if(node.edges[i].read().eligible)total+=fastmath::exp(q[i]+node.edges[i].logit-maxlog);
+  int chosen=node.cold_best;double best=chosen>=0?fastmath::exp(q.unknown()+node.edges[chosen].logit-maxlog)/total:-std::numeric_limits<double>::infinity();
   for(int i:node.active){auto& e=node.edges[i];if(!e.read().eligible || (e.read().child && e.read().child->pending))continue;
-   double score=std::exp(q[i]+e.logit-maxlog)/total-double(e.read().visits+e.read().pending)/(1+visits);
+   double score=fastmath::exp(q[i]+e.logit-maxlog)/total-double(e.read().visits+e.read().pending)/(1+visits);
    if(score>best || (score==best && (chosen<0 || i<chosen))){best=score;chosen=i;}
   }
   return chosen;
@@ -918,9 +919,9 @@ struct Tree {
   for(auto& e:node.edges){out.push_back(e.logit/root_temperature);if(e.read().eligible){maximum=std::max(maximum,out.back());++n;}}
   if(root_noise<=0 || !n)return out;
   double mass=0;
-  for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible){total+=std::exp(out[i]-maximum);if(root_concentration>0)mass+=root_edges[i].noise;}
+  for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible){total+=fastmath::exp(out[i]-maximum);if(root_concentration>0)mass+=root_edges[i].noise;}
   for(size_t i=0;i<out.size();++i)if(node.edges[i].read().eligible)
-   out[i]=std::log((1-root_noise)*std::exp(out[i]-maximum)/total+root_noise*(mass>0?root_edges[i].noise/mass:1./n));
+   out[i]=std::log((1-root_noise)*fastmath::exp(out[i]-maximum)/total+root_noise*(mass>0?root_edges[i].noise/mass:1./n));
   return out;
  }
  // `last` is the simulation index where the final candidate count begins (the last halving boundary), or the
@@ -1221,7 +1222,7 @@ struct Tree {
   if(exact<0 && proof_closed(path)){requests.erase(found);return;}
   const auto& legal=path.legal;
   if(count!=int(legal.size())||count<1)throw std::runtime_error("Incomplete legal actions");
-  double maximum=-1e300;for(int i=0;i<count;++i){if(legal[i]!=Cell{actions[2*i],actions[2*i+1]}||!std::isfinite(logits[i])||!std::isfinite(values[i])||std::abs(values[i])>1)throw std::runtime_error("Invalid evaluation");maximum=std::max(maximum,logits[i]);}
+  double maximum=-1e300;for(int i=0;i<count;++i){if(legal[i]!=Cell{actions[2*i],actions[2*i+1]}||!fastmath::finite(logits[i])||!fastmath::finite(values[i])||std::abs(values[i])>1)throw std::runtime_error("Invalid evaluation");maximum=std::max(maximum,logits[i]);}
   // Another proof producer may have expanded this leaf already. A late certificate can tighten it but
   // must not append a duplicate action list or reset this view's root sampling record.
   if(exact>=0 && path.leaf->expanded){
@@ -1235,7 +1236,7 @@ struct Tree {
   // its mass, without a temporary weights array or a division for every action.
   if(at_root){root_edges.assign(count,{});root_prepared=true;}
   double total=0,weighted=0;node.edges.reserve(count);
-  for(int i=0;i<count;++i){Edge edge(&node.empty);edge.action=legal[i];edge.logit=logits[i]-maximum;edge.weight=std::exp(edge.logit);
+  for(int i=0;i<count;++i){Edge edge(&node.empty);edge.action=legal[i];edge.logit=logits[i]-maximum;edge.weight=fastmath::exp(edge.logit);
    total+=edge.weight;weighted+=edge.weight*values[i];
    if(at_root){double u=std::generate_canonical<double,53>(rng);root_edges[i].gumbel=-std::log(-std::log(std::clamp(u,1e-15,1-1e-15)));}
    node.edges.push_back(std::move(edge));

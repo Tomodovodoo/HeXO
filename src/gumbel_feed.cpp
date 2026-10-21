@@ -1,5 +1,6 @@
 #include "hexo.hpp"
 #include "gumbel_parallel.hpp"
+#include "fastmath.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -283,7 +284,7 @@ HX_API int hxgf_install(void* p,const uint64_t* ids,int count,const int64_t* off
  }
  if(offsets[count] && (!actions||!logits||!values))throw std::runtime_error("Missing feed predictions");
  for(int64_t i=0;i<offsets[count];++i)
-  if(!std::isfinite(logits[i]) || !std::isfinite(values[i]) || std::abs(values[i])>1)
+  if(!fastmath::finite(logits[i]) || !fastmath::finite(values[i]) || std::abs(values[i])>1)
    throw std::runtime_error("Invalid feed prediction");
  if(int(failures.size())>stopped_capacity)throw std::runtime_error("Feed stopped-tree buffer too small");
  int output=0;for(auto tree:failures){stopped[output++]=tree;f.detach(tree);}
