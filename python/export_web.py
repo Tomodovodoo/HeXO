@@ -35,13 +35,18 @@ def inputs(model, planes):
 
 
 def _line_kernel(weight):
-    """[C, 3, L] LineConv taps -> [C, 1, L, L] depthwise kernel with the same cross-correlation."""
+    """[C, 3, L] LineConv taps -> [C, 1, K, K] depthwise kernel with the same cross-correlation, K = 2*(L//2)+1.
+    The kernel is HexNet's own response to a centred impulse, flipped, so it follows LineConv's tap layout for
+    every length (an even L sets its diagonal taps one cell off the horizontal and vertical ones)."""
     c, _, length = weight.shape
-    kernel, centre = torch.zeros(c, 1, length, length), length//2
-    for a, (dx, dy) in enumerate(hexnet.AXES):
-        for i in range(length):
-            kernel[:, 0, centre+(i-centre)*dy, centre+(i-centre)*dx] += weight[:, a, i]
-    return kernel
+    half = length//2
+    line = hexnet.LineConv(c, length)
+    impulse = torch.zeros(1, c, 2*half+1, 2*half+1)
+    impulse[0, :, half, half] = 1
+    with torch.no_grad():
+        line.weight.copy_(weight)
+        response = line(impulse)[0]
+    return response.flip(-2, -1)[:, None].contiguous()
 
 
 class WebNet(nn.Module):
@@ -93,10 +98,13 @@ class WebNet(nn.Module):
         x = F.conv2d(features, self.stem, padding=1)
         if self.post:  # PostBlock trunk (hexnet): conv-norm-act blocks after a normed stem
             x = self.act(x, 'norm', mask)
-            for i, _, pooled in self.blocks:
+            for i, line, pooled in self.blocks:
                 y = self.act(F.conv2d(x, t(f'b{i}_conv1'), padding=1), f'b{i}_norm1', mask)
                 if pooled:
                     y = F.relu(y+F.linear(self.pool(y, scale), t(f'b{i}_pool_w'), t(f'b{i}_pool_b'))[:, :, None, None])*mask
+                if line:
+                    kernel = t(f'b{i}_line')
+                    y = (y+F.conv2d(y, kernel, padding=kernel.shape[-1]//2, groups=kernel.shape[0]))*mask
                 x = F.relu(x+self.norm(F.conv2d(y, t(f'b{i}_conv2'), padding=1), f'b{i}_norm2'))*mask
             return self.heads(x, scale)
         for i, line, pooled in self.blocks:

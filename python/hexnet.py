@@ -44,6 +44,18 @@ class HexNetConfig:
     # 'pre': norm-act-conv blocks (Block) and a final trunk norm. 'post': conv-norm-act blocks (PostBlock) after a
     # normed stem, whose eval norms fold into the convolutions, so a compiled engine runs one kernel per conv.
     block: str = 'pre'
+    # Comma-separated indices of the blocks with a line convolution ('' = every block, with line_length > 0).
+    # TensorRT runs the depthwise line kernel slowly, so a fast post net keeps lines in a few blocks only.
+    line_blocks: str = ''
+
+    def lined(self, index):
+        """Whether block `index` has a line convolution."""
+        return bool(self.line_length) and (not self.line_blocks or index in line_indices(self.line_blocks))
+
+
+def line_indices(text):
+    """The block indices of a line_blocks string."""
+    return {int(x) for x in text.split(',')}
 
 
 def _line_kernel(length, taps):
@@ -305,12 +317,29 @@ def pool(x, count, ceiling=None, fused=False):
     return torch.cat((x.sum((2, 3))/count, x.amax((2, 3))), 1)
 
 
+def add_lines(block, y, mask):
+    """(y*mask) + block.line(y*mask), not masked again: padding cells near the crop hold line output."""
+    if not torch.is_grad_enabled() and block.line.fused_inference(y):
+        from hexnet_kernels import line_add
+        # One kernel reads y and the crop mask: (y*mask) + LineConv(y*mask), no masked copy, no in-place copy back.
+        return line_add(y, block.line.weight, mask)
+    y = y*mask
+    train_line = (getattr(block.line, 'net_kernels', 'reference') == 'fused' and
+                  block.training and torch.is_grad_enabled() and y.is_cuda and
+                  y.dtype == torch.bfloat16 and y.is_contiguous(memory_format=torch.channels_last) and
+                  block.line.weight.dtype == torch.float32)
+    if train_line:
+        from hexnet_kernels import line_train_add
+        return line_train_add(y, block.line.weight)
+    return y+checkpoint(block.line, y, use_reentrant=False) if torch.is_grad_enabled() else block.line.add_to(y)
+
+
 class Block(nn.Module):
-    def __init__(self, config, pooled):
+    def __init__(self, config, pooled, lined=None):
         super().__init__()
         c = config.channels
         self.norm1, self.conv1 = MaskedNorm(c), HexConv(c, c)
-        self.line = LineConv(c, config.line_length) if config.line_length else None
+        self.line = LineConv(c, config.line_length) if (bool(config.line_length) if lined is None else lined) else None
         self.norm2, self.conv2 = MaskedNorm(c), HexConv(c, c)
         self.pool = nn.Linear(2*c, c) if pooled else None
 
@@ -320,40 +349,30 @@ class Block(nn.Module):
         if self.pool is not None:
             fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
             y = y+self.pool(pool(y, count, ceiling, fused))[:, :, None, None]
-        if self.line is not None and not torch.is_grad_enabled() and self.line.fused_inference(y):
-            from hexnet_kernels import line_add
-            # One kernel reads y and the crop mask: (y*mask) + LineConv(y*mask), no masked copy, no in-place copy back.
-            y = line_add(y, self.line.weight, mask)
-        elif self.line is not None:
-            y = y*mask
-            train_line = (getattr(self.line, 'net_kernels', 'reference') == 'fused' and
-                          self.training and torch.is_grad_enabled() and y.is_cuda and
-                          y.dtype == torch.bfloat16 and y.is_contiguous(memory_format=torch.channels_last) and
-                          self.line.weight.dtype == torch.float32)
-            if train_line:
-                from hexnet_kernels import line_train_add
-                y = line_train_add(y, self.line.weight)
-            else:
-                y = y+checkpoint(self.line, y, use_reentrant=False) if torch.is_grad_enabled() else self.line.add_to(y)
+        if self.line is not None:
+            y = add_lines(self, y, mask)
         return x+self.conv2(self.norm2(y, mask, cells, ceiling))
 
 
 class PostBlock(nn.Module):
     """x -> act(x + norm2(conv2(y))), y = act(norm1(conv1(x))) plus, in a pooled block, act of y plus a bias from
-    y's masked mean and max. act is relu on the crop and 0 on padding (`act`), so x stays zero off the crop."""
-    def __init__(self, config, pooled):
+    y's masked mean and max; with line_length, y then gains its line convolution (masked, `add_lines`). act is relu
+    on the crop and 0 on padding (`act`), so x stays zero off the crop."""
+    def __init__(self, config, pooled, lined=None):
         super().__init__()
         c = config.channels
         self.conv1, self.norm1 = HexConv(c, c), MaskedNorm(c)
         self.conv2, self.norm2 = HexConv(c, c), MaskedNorm(c)
         self.pool = nn.Linear(2*c, c) if pooled else None
-        self.line = None
+        self.line = LineConv(c, config.line_length) if (bool(config.line_length) if lined is None else lined) else None
 
     def forward(self, x, mask, ceiling, count, cells):
         y = self.norm1(self.conv1(x), mask, cells, ceiling)
         if self.pool is not None:
             fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
             y = act(y+self.pool(pool(y, count, None, fused))[:, :, None, None], ceiling)
+        if self.line is not None:
+            y = add_lines(self, y, mask)*mask
         return act(x+self.norm2(self.conv2(y), mask, cells), ceiling)
 
 
@@ -378,12 +397,20 @@ class HexNet(nn.Module):
             raise ValueError(f'Unknown future target: {future_target!r}')
         self.future_target = future_target
         self.config = c = config or HexNetConfig()
-        if c.block not in ('pre', 'post') or c.block == 'post' and c.line_length:
-            raise ValueError(f'block must be pre or post (post without line convolutions), not {c.block!r}')
+        if c.block not in ('pre', 'post'):
+            raise ValueError(f'block must be pre or post, not {c.block!r}')
+        if c.line_blocks:
+            try:
+                indices = line_indices(c.line_blocks)
+            except ValueError:
+                indices = None
+            if indices is None or not indices <= set(range(c.blocks)) or not c.line_length:
+                raise ValueError(f'line_blocks must list block indices below {c.blocks} with line_length > 0, '
+                                 f'not {c.line_blocks!r}')
         self.lines = LineFeatures()
         self.stem = HexConv(FEATURES, c.channels)
         kind = PostBlock if c.block == 'post' else Block
-        self.blocks = nn.ModuleList(kind(c, (i+1) % c.pool_every == 0) for i in range(c.blocks))
+        self.blocks = nn.ModuleList(kind(c, (i+1) % c.pool_every == 0, c.lined(i)) for i in range(c.blocks))
         self.norm = MaskedNorm(c.channels)
         self.policy_hidden = nn.Conv2d(c.channels, c.head_channels, 1)
         self.policy = nn.Conv2d(c.head_channels, 1, 1)
@@ -532,11 +559,13 @@ def memory_format(config, fused_cuda=False):
 
 
 def saved_config(config):
-    """asdict(config) without block 'pre', so pre-activation networks keep the config, and digest, they had
-    before the field existed."""
+    """asdict(config) without block 'pre' or an empty line_blocks, so networks keep the config, and digest, they had
+    before those fields existed."""
     out = asdict(config)
     if out.get('block') == 'pre':
         del out['block']
+    if not out.get('line_blocks'):
+        out.pop('line_blocks', None)
     return out
 
 

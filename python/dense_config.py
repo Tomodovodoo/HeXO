@@ -25,6 +25,7 @@ class ModelSettings:
     head_channels: int = 32
     aux_heads: bool = True
     block: str = 'pre'  # hexnet.HexNetConfig.block
+    line_blocks: str = ''  # hexnet.HexNetConfig.line_blocks
 
 
 # Expanded nodes a hybrid actor game keeps. Forward self-play never revisits
