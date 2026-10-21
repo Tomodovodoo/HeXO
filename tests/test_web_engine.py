@@ -98,12 +98,13 @@ class Export(unittest.TestCase):
         np.testing.assert_array_equal(session.run(None, dict(features=x))[0], x+1)
 
     def test_post_blocks_with_lines_match_the_reference_path(self):
-        model = random_model(block='post', blocks=3)
-        self.assertTrue(all(block.line is not None for block in model.blocks))
-        with tempfile.TemporaryDirectory() as folder:
-            export_web.export_onnx(model, Path(folder)/'post.onnx', False)
-            worst = export_web.parity(model, Path(folder)/'post.onnx', export_web.histories(every=13), False)
-            self.assertLess(max(worst.values()), 1e-4, worst)
+        for length in (11, 6):  # an even length exports through an odd kernel with a zero edge
+            model = random_model(block='post', blocks=3, line_length=length)
+            self.assertTrue(all(block.line is not None for block in model.blocks))
+            with tempfile.TemporaryDirectory() as folder:
+                export_web.export_onnx(model, Path(folder)/'post.onnx', False)
+                worst = export_web.parity(model, Path(folder)/'post.onnx', export_web.histories(every=13), False)
+                self.assertLess(max(worst.values()), 1e-4, (length, worst))
 
     def test_graphs_match_the_reference_path(self):
         model = random_model()

@@ -35,13 +35,18 @@ def inputs(model, planes):
 
 
 def _line_kernel(weight):
-    """[C, 3, L] LineConv taps -> [C, 1, L, L] depthwise kernel with the same cross-correlation."""
+    """[C, 3, L] LineConv taps -> [C, 1, K, K] depthwise kernel with the same cross-correlation, K = 2*(L//2)+1.
+    The kernel is HexNet's own response to a centred impulse, flipped, so it follows LineConv's tap layout for
+    every length (an even L sets its diagonal taps one cell off the horizontal and vertical ones)."""
     c, _, length = weight.shape
-    kernel, centre = torch.zeros(c, 1, length, length), length//2
-    for a, (dx, dy) in enumerate(hexnet.AXES):
-        for i in range(length):
-            kernel[:, 0, centre+(i-centre)*dy, centre+(i-centre)*dx] += weight[:, a, i]
-    return kernel
+    half = length//2
+    line = hexnet.LineConv(c, length)
+    impulse = torch.zeros(1, c, 2*half+1, 2*half+1)
+    impulse[0, :, half, half] = 1
+    with torch.no_grad():
+        line.weight.copy_(weight)
+        response = line(impulse)[0]
+    return response.flip(-2, -1)[:, None].contiguous()
 
 
 class WebNet(nn.Module):
