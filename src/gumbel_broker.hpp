@@ -107,6 +107,9 @@ struct Broker {
  std::deque<std::shared_ptr<Task>> ready;
  std::map<uint64_t,std::vector<std::shared_ptr<Task>>> flights;
  int quantum,pending,merge_cells,flight_limit=2;double latency_ms;
+ // Queued neural rows at which a producer's owner stops gathering views until it exports (0: 2*quantum). A low
+ // limit splits one round of view leaves into several smaller batches that can be in flight together.
+ int ready_row_limit=0;
  uint64_t flight_high_water=0;
  // Optional repeated admission observations and owner wall spans, not occupancy.
  bool profile_enabled=false,interleave_feedback=false,progress_enabled=false;std::array<uint64_t,38> schedule{};
@@ -221,7 +224,7 @@ struct Broker {
   if(auto found=models.find(model);found!=models.end() && found->second!=pool.model)
    throw std::runtime_error("Inference model identity conflict");
   auto producer=std::make_shared<Producer>(*this,pool,model,index);
-  if(started){pool.ready_limit=2*quantum;pool.stop();if(pool.proof_owner)hxp_resume(pool.proof_owner);}
+  if(started){pool.ready_limit=ready_row_limit?ready_row_limit:2*quantum;pool.stop();if(pool.proof_owner)hxp_resume(pool.proof_owner);}
   models[model]=pool.model;*vacant=producer;pool.inference_owner=this;
   if(pool.proof_listen)pool.proof_listen(pool.proof_owner,signal);
   try{if(started)producer->thread=std::thread([producer]{producer->run();});}
@@ -329,7 +332,7 @@ struct Broker {
   if(started || std::none_of(producers.begin(),producers.end(),[](const auto& p){return bool(p);}) || !std::isfinite(ms) || ms<0)throw std::runtime_error("Invalid inference service start");
   started=true;auto now=Clock::now();supply(now);
   try{
-   for(auto& p:producers)if(p){auto& pool=p->pool;pool.ready_limit=2*quantum;
+   for(auto& p:producers)if(p){auto& pool=p->pool;pool.ready_limit=ready_row_limit?ready_row_limit:2*quantum;
     if(continuous)pool.stop();
     if(ms)for(auto& game:pool.games){game->time_limit_ms=ms;game->work_limit=0;game->started=now;game->deadline=false;}
     if(pool.proof_owner)hxp_resume(pool.proof_owner);
@@ -804,6 +807,7 @@ inline RootEvent Producer::result(int index,uint64_t token,uint64_t sequence){
 }
 extern "C" {
 HX_API void* hxb_new(int quantum,int pending,int merge,double latency){try{return new inference::Broker(quantum,pending,merge,latency);}catch(const std::exception& e){gumbel::error=e.what();return nullptr;}}
+HX_API int hxb_ready_rows(void* p,int rows){try{auto& b=*static_cast<inference::Broker*>(p);if(b.started || rows<0 || rows>16384)throw std::runtime_error("Set the ready-row limit to 0..16384 before starting");b.ready_row_limit=rows;return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API int hxb_flights(void* p,int count){try{static_cast<inference::Broker*>(p)->configure_flights(count);return 1;}catch(const std::exception& e){gumbel::error=e.what();return 0;}}
 HX_API void hxb_flight_stats(void* p,uint64_t* out){auto& b=*static_cast<inference::Broker*>(p);std::lock_guard lock(b.mutex);
  std::array<uint64_t,3> values{uint64_t(b.flight_limit),b.flight_high_water,uint64_t(b.pending)};std::copy(values.begin(),values.end(),out);}
