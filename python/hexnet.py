@@ -306,9 +306,8 @@ def act(x, ceiling):
 
 def pool(x, count, ceiling=None, fused=False):
     """Masked mean and max of act(x, ceiling), or of x without a ceiling (then non-negative and zero off the crop):
-    [B, 2C]. `fused` runs hexnet_kernels.masked_pool on channels-last CUDA inputs while autograd records (training);
-    inference keeps these operations."""
-    if (fused and x.is_cuda and torch.is_grad_enabled() and x.is_contiguous(memory_format=torch.channels_last)
+    [B, 2C]. `fused` runs hexnet_kernels.masked_pool on channels-last CUDA inputs."""
+    if (fused and x.is_cuda and x.is_contiguous(memory_format=torch.channels_last)
             and x.dtype in (torch.float32, torch.bfloat16)
             and (ceiling is None or ceiling.stride()[2:] == (x.shape[3], 1))):
         from hexnet_kernels import masked_pool
