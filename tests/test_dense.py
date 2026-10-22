@@ -1118,6 +1118,25 @@ class FusedCudaTests(unittest.TestCase):
         self.assertLessEqual(float((a-b).norm()), tolerance*float(a.norm())+1e-5)
         self.assertLessEqual(float((a-b).abs().max()), tolerance*float(a.abs().max())+1e-4)
 
+    @torch.inference_mode()
+    def test_seven_tap_hex_convolution_matches_masked_convolution(self):
+        torch.manual_seed(3070)
+        layer = hexnet.HexConv(96, 96).cuda().to(memory_format=torch.channels_last).eval()
+        layer.net_kernels = 'fused'
+        layer.weight[..., 0, 0] = 20
+        layer.weight[..., 2, 2] = -20
+        for batch, height, width in ((1, 24, 24), (3, 25, 27), (16, 32, 32), (32, 24, 32), (33, 24, 24)):
+            x = torch.randn(batch, 96, height, width, device='cuda', dtype=torch.bfloat16)
+            x = x.contiguous(memory_format=torch.channels_last)
+            x[0].zero_()
+            with torch.autocast('cuda', torch.bfloat16):
+                expected = F.conv2d(x, layer.weight*layer.hex, padding=1)
+                actual = layer(x)
+            self.assertEqual(actual.dtype, expected.dtype)
+            self.assertTrue(actual.is_contiguous(memory_format=torch.channels_last))
+            torch.testing.assert_close(actual, expected, atol=.005, rtol=.005)
+            self.assertEqual(float(actual[0].abs().max()), 0.)
+
     def test_actor_graph_captures_while_another_thread_runs_cuda_work(self):
         # The actor's launcher thread captures new canvases while its main
         # thread may evaluate, load a model or read memory statistics.

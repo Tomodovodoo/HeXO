@@ -18,6 +18,47 @@ import triton.language as tl
 import triton.language.extra.cuda.libdevice as libdevice
 
 
+@tr.jit(do_not_specialize=['N', 'H', 'W'])
+def _hex_conv(X,Weight,Y,N,H,W,C:tl.constexpr,O:tl.constexpr,WS:tl.constexpr,
+              BM:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr):
+    p=tl.program_id(0)*BM+tl.arange(0,BM)
+    o=tl.program_id(1)*BN+tl.arange(0,BN)
+    kk=tl.arange(0,BK)
+    y,x=p//W % H,p % W
+    batch=p//(H*W)
+    acc=tl.full((BM,BN),0.,tl.float32)
+    # The two excluded corners are taps 0 and 8. Flatten only taps 1..7 into the reduction.
+    for start in range((7*C+BK-1)//BK):
+        k=start*BK+kk
+        tap=k//C+1
+        channel=k % C
+        yy=y[:,None]+(tap//3-1)[None,:]
+        xx=x[:,None]+(tap % 3-1)[None,:]
+        valid=(p<N)[:,None]&(k<7*C)[None,:]&(yy>=0)&(yy<H)&(xx>=0)&(xx<W)
+        a=tl.load(X+((batch[:,None]*H+yy)*W+xx)*C+channel[None,:],valid,0)
+        b=tl.load(Weight+o[None,:]*WS[0]+channel[:,None]*WS[1]
+                  +(tap//3)[:,None]*WS[2]+(tap % 3)[:,None]*WS[3],
+                  (k<7*C)[:,None]&(o<O)[None,:],0).to(X.dtype.element_ty)
+        acc=tl.dot(a,b,acc)
+    tl.store(Y+p[:,None]*O+o[None,:],acc,(p<N)[:,None]&(o<O)[None,:])
+
+
+def hex_conv(x,weight):
+    """Inference-only seven-tap convolution of channels-last bf16 inputs, with fp32 saved weights."""
+    b,c,h,w=x.shape
+    outputs=weight.shape[0]
+    out=torch.empty((b,outputs,h,w),device=x.device,dtype=x.dtype,memory_format=torch.channels_last)
+    # Bound each launch's activation working set. This retains the faster 128x32 tile for Play's small batches.
+    limit=max(1,16384//(h*w))
+    for start in range(0,b,limit):
+        part=x[start:start+limit]
+        target=out[start:start+limit]
+        n=len(part)*h*w
+        _hex_conv[(tr.cdiv(n,128),tr.cdiv(outputs,32))](
+            part,weight,target,n,h,w,c,outputs,weight.stride(),128,32,32,num_warps=4)
+    return out
+
+
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'OS', 'PS', 'MS'])
 def _windows(Own,Opp,Mask,Counts,N,H,W,
              OS,PS,MS,K:tl.constexpr):
