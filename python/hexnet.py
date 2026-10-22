@@ -116,6 +116,15 @@ class HexConv(nn.Conv2d):
         self.register_buffer('hex', mask, persistent=False)
 
     def forward(self, x):
+        if (getattr(self, 'net_kernels', 'reference') == 'fused' and not self.training
+                and not torch.is_grad_enabled() and x.is_cuda and x.dtype == torch.bfloat16
+                and self.in_channels == self.out_channels == 96 and len(x) <= 32
+                and x.shape[-2]*x.shape[-1] <= 1024 and self.weight.dtype == torch.float32
+                and x.is_contiguous(memory_format=torch.channels_last)
+                and torch.cuda.get_device_capability(x.device)[0] >= 8
+                and (not torch.is_autocast_enabled('cuda') or torch.get_autocast_dtype('cuda') == torch.bfloat16)):
+            from hexnet_kernels import hex_conv
+            return hex_conv(x, self.weight)
         return F.conv2d(x, self.weight*self.hex, None, 1, 1)
 
 
@@ -434,7 +443,7 @@ class HexNet(nn.Module):
             raise ValueError(f'Unknown net kernels: {mode!r}')
         self.net_kernels = mode
         for module in self.modules():
-            if isinstance(module, (LineFeatures, LineConv, MaskedNorm)):
+            if isinstance(module, (LineFeatures, LineConv, MaskedNorm, HexConv)):
                 module.net_kernels = mode
         return self
 
