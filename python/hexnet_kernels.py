@@ -179,10 +179,11 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
 # n = (b*H+y)*W+x, so a tile of positions by channels reads whole rows. Masks and ceilings are [B, 1, H, W].
 
 # Masked pooling: the mean and max of act(x) per sample and channel, read once forward and twice backward, with
-# the reference rounding of the bf16 sum, of the mean and max gradients and of their sum. Ties for the max share
+# the reference rounding of the sum (fp32 under inference autocast), the mean and max gradients and their sum. Ties for the max share
 # its gradient equally, as amax's does.
 @tr.jit(do_not_specialize=['N', 'CS'])
-def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr,CB:tl.constexpr):
+def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.constexpr,CB:tl.constexpr,
+          FP32_SUM:tl.constexpr=False):
     b=tl.program_id(0)
     c=tl.program_id(1)*CB+tl.arange(0,CB)
     total=tl.full((K,CB),0.,tl.float32)
@@ -196,7 +197,10 @@ def _pool(X,Ceiling,Count,Out,Top,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:tl.cons
         total+=tl.where(valid,v,0.)
         best=tl.maximum(best,tl.where(valid,v,float('-inf')))
     top=tl.max(best,0)
-    tl.store(Out+b*2*C+c,tl.sum(total,0).to(X.dtype.element_ty).to(tl.float32)/tl.load(Count+b),c<C)
+    summed=tl.sum(total,0)
+    if not FP32_SUM:
+        summed=summed.to(X.dtype.element_ty).to(tl.float32)
+    tl.store(Out+b*2*C+c,summed/tl.load(Count+b),c<C)
     tl.store(Out+b*2*C+C+c,top,c<C)
     tl.store(Top+b*C+c,top,c<C)
 
@@ -234,13 +238,13 @@ def _pool_grad(X,Ceiling,Count,Top,G,DX,N,CS,C:tl.constexpr,ACT:tl.constexpr,K:t
 
 class _MaskedPool(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,x,count,ceiling):
+    def forward(ctx,x,count,ceiling,fp32_sum):
         b,c,h,w=x.shape
         out=torch.empty((b,2*c),device=x.device,dtype=torch.float32)
         top=torch.empty(b*c,device=x.device,dtype=torch.float32)
         act=ceiling is not None
         source=ceiling if act else x
-        _pool[(b,tr.cdiv(c,32))](x,source,count,out,top,h*w,source.stride(0),c,act,32,32)
+        _pool[(b,tr.cdiv(c,32))](x,source,count,out,top,h*w,source.stride(0),c,act,32,32,fp32_sum)
         ctx.save_for_backward(x,count,top,source)
         ctx.act=act
         return out
@@ -251,13 +255,15 @@ class _MaskedPool(torch.autograd.Function):
         b,c,h,w=x.shape
         dx=torch.empty_like(x)
         _pool_grad[(b,tr.cdiv(c,32))](x,source,count,top,grad.contiguous(),dx,h*w,source.stride(0),c,ctx.act,32,32)
-        return dx,None,None
+        return dx,None,None,None
 
 
 def masked_pool(x,count,ceiling=None):
     """hexnet.pool for channels-last CUDA x, count [B, 1] fp32 and an optional ceiling [B, 1, H, W] whose planes are
     contiguous: [B, 2C] fp32."""
-    return _MaskedPool.apply(x,count,ceiling)
+    # Autocast promotes the reference inference sum to fp32. Keep the existing training rounding.
+    fp32_sum=not torch.is_grad_enabled() and torch.is_autocast_enabled('cuda')
+    return _MaskedPool.apply(x,count,ceiling,fp32_sum)
 
 
 def line_add(x,weight,mask=None,norm=None):

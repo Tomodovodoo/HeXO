@@ -1434,6 +1434,10 @@ class FusedCudaTests(unittest.TestCase):
                 self.assertEqual(outputs[1].dtype, outputs[0].dtype)
                 self.assert_bf16_close(*outputs)
                 self.assert_bf16_close(*gradients)
+                for autocast in (False, True):
+                    with torch.inference_mode(), torch.autocast('cuda', torch.bfloat16, enabled=autocast):
+                        torch.testing.assert_close(hexnet.pool(source, count, limit, True),
+                                                   hexnet.pool(source, count, limit, False), atol=1e-6, rtol=1e-6)
 
     def test_training_line_residual_gradients(self):
         from hexnet_kernels import line_train_add
