@@ -1375,6 +1375,7 @@ class FusedCudaTests(unittest.TestCase):
 
     @torch.inference_mode()
     def test_line_kernels_match_reference(self):
+        from hexnet_kernels import line_add, norm_eval
         torch.manual_seed(3070)
         features = hexnet.LineFeatures().cuda()
         fast = copy.deepcopy(features)
@@ -1400,6 +1401,17 @@ class FusedCudaTests(unittest.TestCase):
                     fused.add_to(b)
                     tol = .02 if dtype == torch.bfloat16 else 2e-5
                     torch.testing.assert_close(a, b, atol=tol, rtol=tol)
+                    if fmt == torch.channels_last:
+                        mask = planes[:, 3:4].to(dtype).clone()
+                        mask[1].zero_()  # Empty graph-padding rows must remain zero after the affine bias.
+                        norm = hexnet.MaskedNorm(8).cuda().eval()
+                        norm.running_mean.normal_()
+                        norm.running_var.uniform_(.1, 3)
+                        norm.weight.normal_()
+                        norm.bias.normal_()
+                        expected = norm_eval(norm, line_add(x, line.weight, mask), mask)
+                        actual = line_add(x, line.weight, mask, norm)
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_masked_pool_matches_reference(self):
         torch.manual_seed(3070)

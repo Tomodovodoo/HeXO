@@ -349,6 +349,11 @@ class Block(nn.Module):
         if self.pool is not None:
             fused = getattr(self.norm1, 'net_kernels', 'reference') == 'fused'
             y = y+self.pool(pool(y, count, ceiling, fused))[:, :, None, None]
+        if (self.line is not None and not self.norm2.training and not torch.is_grad_enabled()
+                and self.line.fused_inference(y) and getattr(self.norm2, 'net_kernels', 'reference') == 'fused'
+                and self.norm2.weight.dtype == torch.float32):
+            from hexnet_kernels import line_add
+            return x+self.conv2(line_add(y, self.line.weight, mask, self.norm2))
         if self.line is not None:
             y = add_lines(self, y, mask)
         return x+self.conv2(self.norm2(y, mask, cells, ceiling))
