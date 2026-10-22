@@ -15,6 +15,7 @@ os.environ.setdefault("TRITON_CACHE_DIR", str(Path.home()/".triton"/"cache"))
 import torch
 import triton as tr
 import triton.language as tl
+import triton.language.extra.cuda.libdevice as libdevice
 
 
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'OS', 'PS', 'MS'])
@@ -122,7 +123,8 @@ def _line_add(X,Weight,Y,C:tl.constexpr,H,W,S,L:tl.constexpr,K:tl.constexpr):
 
 @tr.jit(do_not_specialize=['N', 'H', 'W', 'MS'])
 def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
-                   L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr,M=None,MS=(0,0,0,0),MASKED:tl.constexpr=False):
+                   L:tl.constexpr,P:tl.constexpr,CH:tl.constexpr,M=None,MS=(0,0,0,0),MASKED:tl.constexpr=False,
+                   Mean=None,Var=None,Scale=None,Bias=None,EPS:tl.constexpr=0.,NORM:tl.constexpr=False):
     p=tl.program_id(0)*P+tl.arange(0,P)
     c=tl.program_id(1)*CH+tl.arange(0,CH)
     x,y=p % W,p//W % H
@@ -157,7 +159,20 @@ def _line_add_nhwc(X,Weight,Y,N,C:tl.constexpr,H,W,
     centre=valid
     if MASKED:
         centre=centre&(tl.load(M+(p//(H*W))*MS[0]+y*MS[2]+x*MS[3],p<N,0)>0)[:,None]
-    tl.store(Y+at,line+tl.load(X+at,centre,0).to(tl.float32),valid)
+    value=line+tl.load(X+at,centre,0).to(tl.float32)
+    if NORM:
+        # Retain the line output's store rounding before the following eval norm.
+        value=value.to(X.dtype.element_ty).to(tl.float32)
+        mean=tl.load(Mean+c,c<C,0)[None,:]
+        var=tl.load(Var+c,c<C,0)[None,:]
+        scale=tl.load(Scale+c,c<C,0)[None,:]
+        bias=tl.load(Bias+c,c<C,0)[None,:]
+        # Keep the norm's separate rounding without disabling FMA in the line convolution.
+        value=libdevice.mul_rn(libdevice.sub_rn(value,mean),tl.rsqrt(var+EPS))
+        value=libdevice.add_rn(libdevice.mul_rn(value,scale),bias)
+        value=value.to(X.dtype.element_ty).to(tl.float32)
+        value=tl.where(centre,tl.maximum(value,0.),0.)
+    tl.store(Y+at,value,valid)
 
 
 # Training kernels take channels-last tensors: element (n, c) of [B, C, H, W] sits at n*C+c for the position
@@ -245,13 +260,17 @@ def masked_pool(x,count,ceiling=None):
     return _MaskedPool.apply(x,count,ceiling)
 
 
-def line_add(x,weight,mask=None):
+def line_add(x,weight,mask=None,norm=None):
     """x + LineConv(x), or with a [B, 1, H, W] 0/1 `mask` (channels-last x only) m + LineConv(m) for m = x*mask,
-    without materializing m. Equal to the unfused bf16 result bit for bit."""
+    without materializing m. With `norm`, also apply its eval normalization and masked ReLU in the store
+    (channels-last with a mask only). Preserve the separate kernels' rounding."""
     out=torch.empty_like(x)
     b,c,h,w=x.shape
     if x.is_contiguous(memory_format=torch.channels_last):
         extra=dict(M=mask,MS=mask.stride(),MASKED=True) if mask is not None else {}
+        if norm is not None:
+            extra.update(Mean=norm.running_mean,Var=norm.running_var,Scale=norm.weight,Bias=norm.bias,
+                         EPS=norm.eps,NORM=True)
         _line_add_nhwc[(tr.cdiv(b*h*w,16),tr.cdiv(c,32))](x,weight,out,b*h*w,c,h,w,weight.shape[-1],16,32,
                                                           num_warps=2,**extra)
     elif mask is not None:
