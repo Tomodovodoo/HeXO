@@ -299,6 +299,35 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+    def test_v2_nested_order_and_completed_match_annotations(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+import {parseV2,writeV2,Study} from './web/engine/study.mjs';
+const s=await BrowserSession.create(null,{storage:new PlayStorage(null)});
+const record=parseV2('version[2];1.[1,0][0,1](1.[-1,0][0,-1];2.[1,-1][2,-1](2.[-1,1][-2,1];););2.[2,0][2,1];');
+const tree=Study.fromRecord(record,s.native);
+assert.deepEqual(tree.lines[1].slice(-2),[[1,-1],[2,-1]]);
+assert.deepEqual(parseV2(writeV2(tree.record()).text),record);
+s.load([[0,0],[1,0],[0,1]],true);
+s.match={id:'clocked',name:'Clocked',active:true,players:s.seats,games:1,completed:0,current:1,
+  wins:[0,0],capped:0,results:[],openings:[],timings:[],clock:{mode:'game',base_ms:5000,increment_ms:100}};
+s.clock={cross_ms:5000,circle_ms:4000,side:1,started:Date.now()-10};
+s.chargeTurn(1);
+const expected=structuredClone(s.tree.annotations);
+assert.match(expected['0,0;1,0;0,1'].info,/^\\{@[0-9]+\\}$/);
+await s.finishMatch(null,'capped');
+const saved=await s.savedReplay('clocked',1);
+assert.deepEqual(saved.study.annotations,expected);
+const [status,text]=await s.request('/matches/game?batch=clocked&game=1&format=htttx');
+assert.equal(status,200);assert.equal(parseV2(text).turns[0].moves[1].info,expected['0,0;1,0;0,1'].info);
+await s.openGame('clocked',1);assert.deepEqual(s.tree.annotations,expected);
+await s.saving;
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_v2_study_survives_branch_promotion_and_storage(self):
         source = """import assert from 'node:assert/strict';
 import {BrowserSession} from './web/engine/play-session.mjs';

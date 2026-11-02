@@ -29,6 +29,14 @@ def board(history):
 
 
 class OfficialNotation(unittest.TestCase):
+    def test_v2_nested_variations_keep_their_parent_continuations(self):
+        from notation_v2 import Study
+        record = loads('version[2];1.[1,0][0,1](1.[-1,0][0,-1];'
+                       '2.[1,-1][2,-1](2.[-1,1][-2,1];););2.[2,0][2,1];')
+        tree = Study.from_record(record)
+        self.assertEqual(tree.data['lines'][1][-2:], [[1, -1], [2, -1]])
+        self.assertEqual(loads(dumps(tree.record())), record)
+
     def test_v2_shared_prefix_keeps_clock_evaluation_and_visuals(self):
         from notation_v2 import Study
         record = loads('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[1,0][2,0];);')

@@ -904,7 +904,8 @@ export class BrowserSession extends OfflineSession {
   }
   async finishMatch(winner, reason) {
     const m = this.match, game = m.current, aWinner = winner == null ? null : game % 2 ? winner : 1 - winner, id = `${m.id}:${game}`;
-    const record = {id, format: 'bubble-replay', version: 1, game, history: copy(this.history), players: copy(this.seats), winner, reason,
+    this.tree.capture(this.history);
+    const record = {id, study: copy(this.tree), format: 'bubble-replay', version: 1, game, history: copy(this.history), players: copy(this.seats), winner, reason,
       evaluations: this.state().evaluations, records: this.records.slice(), timings: copy(m.timings), opening: copy(this.book.opening), saved_at: new Date().toISOString(),
       ...(m.clock.mode === 'fixed' ? {} : {clock: copy(m.clock), turns: copy(this.clockTurns)})};
     m.results.push({id, game, winner: aWinner, reason, placements: this.history.length, opening: Math.floor((game - 1) / 2)});

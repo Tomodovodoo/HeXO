@@ -80,6 +80,8 @@ export class Study {
     if (record.setup?.first === 'x' && !record.setup.x.length && !record.setup.o.length && !record.turns.length) return study;
     if (record.setup && (record.setup.first !== 'o' || record.setup.o.length || JSON.stringify(record.setup.x) !== '[[0,0]]')) throw Error('This board cannot analyse custom setups yet. The notation parser supports them.');
     function visit(turns, prefix) {
+      const index = study.lines.length;
+      study.lines.push(null); // Reserve the preferred continuation before visiting its descendants.
       let h = clone(prefix);
       for (const t of turns) {
         const before = clone(h);
@@ -94,12 +96,9 @@ export class Study {
         native.game(h);
         for (const v of t.variations) visit(v, before);
       }
-      study.lines.push(h);
+      study.lines[index] = h;
     }
     visit(record.turns, [[0, 0]]);
-    // Main line is first; recursive traversal above discovers side lines first.
-    const main = [[0, 0], ...record.turns.flatMap(t => t.moves.filter(m => m.stone).map(m => m.stone))];
-    study.lines = [main, ...study.lines.filter(h => positionKey(h) !== positionKey(main))];
     return study;
   }
   capture(history) {

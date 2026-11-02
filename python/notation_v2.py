@@ -177,6 +177,8 @@ class Study:
             return study
 
         def visit(turns, prefix):
+            index = len(study.data['lines'])
+            study.data['lines'].append(None)
             h = prefix[:]
             for turn in turns:
                 before = h[:]
@@ -191,10 +193,8 @@ class Study:
                             visuals=move['visuals'] or saved.get('visuals', [])))
                 for v in turn['variations']:
                     visit(v, before)
-            study.data['lines'].append(h)
+            study.data['lines'][index] = h
         visit(record.turns, [[0, 0]])
-        main = [list(p) for p in record.history]
-        study.data['lines'] = [main] + [h for h in study.data['lines'] if h != main]
         return study
 
     def record(self, lookup=lambda h: None):
