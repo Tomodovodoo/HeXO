@@ -1318,6 +1318,23 @@ class GraphAnalysis(unittest.TestCase):
 
 
 class Http(unittest.TestCase):
+    def test_v2_study_lines_survive_retry_promote_and_export(self):
+        from notation import loads
+        self.session.seats = [dict(engine='human'), dict(engine='human')]
+        self.session.analysis['auto'] = False
+        source = 'version[2]name[Study];1.[1,0]{@100:%-4}[0,1];2.[2,0][2,-1];'
+        self.post('/import', {'text': source})
+        self.post('/retry', {'ply': 3})
+        self.post('/play', {'q': -1, 'r': 1})
+        self.post('/play', {'q': -2, 'r': 2})
+        state = self.post('/variation', {'index': 1, 'promote': True})
+        self.assertEqual(len(state['study']['lines']), 2)
+        record = loads(json.loads(self.get('/export?format=htttx'))['text'])
+        self.assertEqual(record.history[-2:], [(-1, 1), (-2, 2)])
+        self.assertEqual(record.metadata['name'], 'Study')
+        self.assertEqual(record.turns[0]['moves'][0]['info'], '{@100:%-4}')
+        self.assertEqual(len(record.turns[1]['variations']), 1)
+
     def setUp(self):
         self.engines = FakeEngines()
         self.session = Session(entries(), self.engines, Evaluations())

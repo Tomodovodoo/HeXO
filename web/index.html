@@ -372,6 +372,13 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 @media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}.saved-game.freeplay .downloads{grid-column:1 / 3}}
+#variations{max-height:180px;overflow:auto;flex:none;font-size:12px;border-top:1px solid var(--line);padding-top:6px}
+#variations summary{cursor:pointer;color:var(--muted);padding:4px 0}
+#study-lines .study-line{display:flex;gap:6px;align-items:center;margin:4px 0}
+#study-lines button{font-size:11px;padding:4px 6px;white-space:nowrap}
+#study-lines .line-name{flex:1;overflow:hidden;text-overflow:ellipsis;text-align:left}
+#study-lines .selected{border-color:var(--x);color:var(--x)}
+#saved-annotation{font-size:12px;color:var(--muted);min-height:0}
 </style>
 <div id="app" data-tab="analysis">
   <nav id="tabs"><button data-tab="analysis" class="on">Analysis</button><button data-tab="review">Moves</button></nav>
@@ -420,6 +427,8 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
         <button class="btn" id="review-go"></button></div>
       <div id="accuracy"></div>
       <svg id="graph" class="empty" preserveAspectRatio="none"></svg>
+      <details id="variations" open><summary>Study lines</summary><div id="study-lines"></div></details>
+      <div id="saved-annotation" class="nums"></div>
       <div id="moves"></div>
       <div class="detail" id="detail"></div>
     </div>
@@ -430,7 +439,7 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 <div id="notation" class="glass"><div class="head row"><span id="notation-name"></span><span class="spacer"></span><button class="ib ghost" id="notation-copy" aria-label="Copy"></button></div><div class="code" id="notation-text"></div></div>
 <dialog id="import-dialog"><form method="dialog" class="stack">
   <div class="dialog-head">Import<span class="spacer"></span><button class="ib ghost" value="cancel" aria-label="Close" id="import-close"></button></div>
-  <textarea id="import-text" spellcheck="false" placeholder="version[1]; 1. [1,0][2,0];&#10;x, d @(0, 0) o A0 A1&#10;https://hexo.did.science/games/…&#10;https://hexo.tyto.cc/analysis#c=…"></textarea>
+  <textarea id="import-text" spellcheck="false" placeholder="version[2]; 1. [1,0][2,0];&#10;x, d @(0, 0) o A0 A1&#10;https://hexo.did.science/games/…&#10;https://hexo.tyto.cc/analysis#c=…"></textarea>
   <label class="hint">Choose a game or backup file <input id="import-file" type="file" accept=".htttx,.json,.txt,.gz"></label>
   <div class="row"><span class="spacer"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" id="import-go" value="ok">Load</button></div>
 </form></dialog>
@@ -530,6 +539,10 @@ function accept(data){
   if('history' in data){
     const live=!S||view>=S.history.length,before=S?S.history.length:null;
     S=data;
+    if(S.study)for(let ply=1;ply<=S.history.length;ply++){
+      const info=S.study.annotations?.[S.history.slice(0,ply).map(p=>p.join(',')).join(';')]?.info,m=info?.match(/%(-?\d+)/);
+      if(!S.evaluations[ply]&&m&&Math.abs(+m[1])<=100){const x=(+m[1]+100)/200;S.evaluations[ply]={value:playerAt(ply)===0?x:1-x,top:[],moves:[],threat:[],pv:[],imported:true}}
+    }
     if(live||view>S.history.length)view=S.history.length;
     const now=performance.now(),grown=before===null?0:S.history.length-before;
     if(grown>0&&grown<=2)for(let i=before;i<S.history.length;i++){const k=key(...S.history[i]);placing=placing.filter(p=>key(...p)!==k);if(!placed.delete(k))landed.set(k,now+(i-before)*110)}
@@ -707,6 +720,13 @@ function drawMarks(){
   if(overlay.width!==canvas.width||overlay.height!==canvas.height){overlay.width=canvas.width;overlay.height=canvas.height}
   mctx.setTransform(ratio,0,0,ratio,0,0);mctx.clearRect(0,0,w,h);
   const cell=CELL(),font=Math.max(9,Math.min(15,cam.size*.52)),badge=Math.max(6,cell*.27);
+  const annotation=S?.study?.annotations?.[S.history.slice(0,view).map(p=>p.join(',')).join(';')];
+  const visuals=view===1&&S?.study?.setup?.visuals||annotation?.visuals||[];
+  for(const token of visuals){const m=token.match(/^<(-?\d+),(-?\d+)(?::#([A-Z]?))?(?::\$([A-Z0-9]+))?>$/);if(!m)continue;
+    const[x,y]=screen(+m[1],+m[2]),color=m[3]==='X'?COLORS[0]:m[3]==='O'?COLORS[1]:'white';
+    if(m[3]!==undefined||!m[4]){hexPath(x,y,cell-2,mctx);mctx.strokeStyle=color;mctx.lineWidth=2;mctx.stroke()}
+    if(m[4]){mctx.fillStyle=color;mctx.font=`600 ${font}px monospace`;mctx.textAlign='center';mctx.textBaseline='middle';mctx.fillText(m[4],x,y)}
+  }
   const shown=marks.map(m=>[m,...screen(m.q,m.r)]).filter(([,x,y])=>x>=-cam.size&&y>=-cam.size&&x<=w+cam.size&&y<=h+cam.size);
   for(const[m,x,y]of shown){const b=m.body;
     if(b&&b.kind!=='better')ghost(x,y,cell,b);
@@ -727,7 +747,7 @@ function drawMarks(){
 }
 
 /* interaction */
-function canPlace(){return S&&view===S.history.length&&S.winner<0&&S.seats[S.player].engine==='human'&&placing.length<S.remaining}
+function canPlace(){return S&&!S.match?.active&&(view<S.history.length||S.winner<0&&S.seats[S.player].engine==='human'&&placing.length<S.remaining)}
 /* a person's stone is drawn at once and sent in order; the server's answer confirms it, a refusal takes it back with
    the stones queued after it */
 let sending=Promise.resolve();
@@ -736,6 +756,7 @@ function place(q,r){
   placing.push([q,r]);placed.add(k);landed.set(k,performance.now());draw();
   sending=sending.then(async()=>{
     if(!placing.some(p=>key(...p)===k))return;
+    if(view<S.history.length){if(!await post('/retry',{ply:view})){placing=[];draw();return}}
     const done=await post('/play',{q,r});placing=placing.filter(p=>key(...p)!==k);
     if(!done){for(const p of[[q,r],...placing]){placed.delete(key(...p));landed.delete(key(...p))}placing=[]}draw()});
 }
@@ -1066,7 +1087,26 @@ function renderGraph(){
     <line x1="${X(view)}" x2="${X(view)}" y1="0" y2="${H}" stroke="var(--muted)" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`;
 }
 $('graph').onclick=e=>{const b=$('graph').getBoundingClientRect();go(Math.round((e.clientX-b.left)/b.width*S.history.length))};
+function renderStudyLines(){
+  const tree=S.study,box=$('study-lines');$('variations').hidden=!tree;
+  if(!tree){box.replaceChildren();return}
+  const current=JSON.stringify(S.history),lines=tree.lines||[];
+  box.replaceChildren(...lines.map((h,i)=>{
+    let split=0;if(i)while(split<Math.min(h.length,lines[0].length)&&h[split].join(',')===lines[0][split].join(','))split++;
+    const turn=Math.max(1,Math.ceil(split/2)),label=i?`Line ${i}, turn ${turn}`:'Main line';
+    const button=el('button',{class:'btn line-name'+(current===JSON.stringify(h)?' selected':''),title:h.slice(Math.max(1,split)).map(p=>`[${p}]`).join(' ')},label+', '+Math.ceil((h.length-1)/2)+' turns');
+    button.onclick=async()=>{if(await post('/variation',{index:i}))showLivePosition()};
+    const row=el('div',{class:'study-line'},button);
+    if(i){const local=el('button',{class:'btn',title:'Promote within the closest parent line'},'Promote');local.onclick=async()=>{if(await post('/variation',{index:i,promote:'local'}))showLivePosition()};row.append(local);const promote=el('button',{class:'btn',title:'Make this line the main line; keep the previous main line'},'Make main');promote.onclick=async()=>{if(await post('/variation',{index:i,promote:true}))showLivePosition()};row.append(promote)}
+    const preview=el('details',{},el('summary',{},'Moves'));
+    const choices=el('div',{class:'study-line',style:'flex-wrap:wrap'},h.slice(Math.max(1,split)).map((p,j)=>{const ply=Math.max(1,split)+j+1,b=el('button',{class:'btn'},`${Math.ceil((ply-1)/2)}. [${p}]`);b.onclick=async()=>{if(await post('/variation',{index:i})){go(ply);fit()}};return b}));preview.append(choices);return el('div',{},row,preview)}));
+  const annotation=tree.annotations?.[S.history.slice(0,view).map(p=>p.join(',')).join(';')],info=annotation?.info;
+  $('saved-annotation').textContent=info?'Saved annotation: '+info.replace(/[{}]/g,'').replace(/@([0-9]+)/,(_,ms)=>clockText(+ms)).replace(/%(-?[0-9]+)/,(_,n)=>'X evaluation '+n).replace(/#(-?[0-9]+)/,(_,n)=>`${+n>=0?'X':'O'} wins in ${Math.abs(+n)} turns`):'';
+  const ev=shownEval(view),pv=ev?.pv?.length?ev.pv:ev?.moves;
+  if(pv?.length&&view>0){const keep=el('button',{class:'btn'},'Save engine line');keep.onclick=()=>post('/variation',{ply:view,moves:pv.map(p=>p.slice(0,2))});$('saved-annotation').append(' ',keep)}
+}
 function renderMoves(){
+  renderStudyLines();
   const box=$('moves'),sel=selectedTurn(),keep=box.scrollTop,atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-4;
   box.replaceChildren(...S.review.map((t,i)=>{
     const label=t.label&&LABEL[t.label],fresh=t.label&&seenLabels.has(t.ply)&&seenLabels.get(t.ply)!==t.label;
@@ -1190,7 +1230,7 @@ function renderJobs(){
 function showLivePosition(){view=S.history.length;fit();go(view)}
 $('new').onclick=async()=>{if(await post('/new'))showLivePosition()};$('undo').onclick=()=>post('/undo');
 $('pause').onclick=async()=>{const paused=!S.paused;if(await post('/pause',{paused})&&!paused)showLivePosition()};
-const FORMATS=[['htttx','HTTTX'],['rectilinear','Rectilinear'],['tyto','Tyto']];
+const FORMATS=[['htttx','HTTTX v2 study'],['rectilinear','Rectilinear'],['tyto','Tyto']];
 let shownNotation=null;
 async function exported(kind){
   if(kind==='game'){const res=await fetch(endpoint('/replay'));if(!res.ok)throw Error((await res.json()).error);return{text:await res.text(),spans:[]}}

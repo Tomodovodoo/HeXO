@@ -1,3 +1,4 @@
+import {parseV2, Study} from './study.mjs';
 /* The Play notations, in HTTTX coordinates. Legality is checked by the session's native rules. */
 const directions = [[1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1]], symbols = '>qp<bd';
 const site = ([q, r]) => [q + r, -r || 0], fromSite = ([x, y]) => [x + y, -y || 0];
@@ -236,6 +237,7 @@ export async function readGame(text, native, fetcher = fetch) {
       } catch (error) { throw Error(`Could not import this link: ${error.message}. You can paste its HTTTX or game file instead.`); }
     }
   } else if (/^[{[]/.test(text)) { const data = JSON.parse(text); history = data.history ?? data; }
+  else if (/^version\s*\[2\]/.test(text)) history = Study.fromRecord(parseV2(text), native).lines[0] || [];
   else if (text.includes(';') || /^version\s*\[/.test(text)) history = readHTTTX(text);
   else history = readRectilinear(text, native);
   if (!Array.isArray(history) || history.length > 4097 || history.some(p => !Array.isArray(p) || p.length !== 2 || p.some(v => !Number.isSafeInteger(v)))) throw Error('Expected at most 4097 integer coordinate pairs');

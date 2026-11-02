@@ -299,6 +299,31 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+    def test_v2_study_survives_branch_promotion_and_storage(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+import {parseV2} from './web/engine/study.mjs';
+const storage=new PlayStorage(null),s=await BrowserSession.create(null,{storage});
+s.seats=[{engine:'human'},{engine:'human'}];
+for(const [q,r] of [[0,0],[1,0],[0,1],[2,0],[2,-1]])s.apply('/play',{q,r});
+s.apply('/retry',{ply:3});
+s.apply('/play',{q:-1,r:1});s.apply('/play',{q:-2,r:2});
+assert.equal(s.tree.lines.length,2);
+assert.equal((await s.request('/variation',{index:1,promote:true},'POST'))[0],200);
+const [status,data]=await s.request('/export?format=htttx');assert.equal(status,200);
+const record=parseV2(data.text);assert.deepEqual(record.turns[1].moves[0].stone,[-1,1]);
+assert.equal(record.turns[1].variations.length,1);
+await s.saving;
+const cold=await BrowserSession.create(null,{storage});await cold.restore();
+assert.deepEqual(cold.tree.lines,s.tree.lines);
+assert.equal((await cold.request('/import',{text:data.text},'POST'))[0],200);
+assert.equal(cold.tree.lines.length,2);
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_padded_proof_bound_does_not_send_a_finished_board_to_the_solver(self):
         from tests.test_tactical_proof import IMMEDIATE
         source = """import {readFileSync} from 'node:fs';

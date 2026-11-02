@@ -16,3 +16,17 @@ The HTTP adapter accepts the origin turn, a half-turn remainder and a first-ston
 placements. Finished boards return 409. `python -m unittest tests.test_notation_api -v` covers the protocol.
 For dense models, enforced turn limits, WebSocket sessions and live clocks, use the
 [timed API](time-controls.md).
+
+## HTTTX v2 studies
+
+The Play page's HTTTX export saves the whole study in [HTTTX v2](https://github.com/hex-tic-tac-toe/htttx-notation/tree/50fd5c7cde0475a5d8dcae5644075946a14b16f6), including side lines, evaluations, recorded clocks and imported cell highlights and labels. The other text formats still export the shown history. JSON replay files and browser backups retain the study alongside the engine records. V1 import and the existing Python history-to-v1 API remain available.
+
+Play a different stone from an earlier position to create a side line. The previous continuation stays in Study lines. Select a line to inspect it, expand Moves to jump to an individual stone, or collapse the panel to leave more room for the move list. Promote moves a line ahead of its nearest parent continuation; Make main moves it ahead of every other line. Neither action deletes a line. Exploration changes both seats to Human and pauses play. The analysis engine remains available.
+
+Save engine line keeps the displayed principal variation or candidate turn as another study line. Position evaluations are associated with their placement prefixes, so switching lines also switches the graph, candidates and review to that line. Imported evaluations use X's perspective; native evaluations are converted on export. Closed evaluations remain annotations rather than locally verified solver proofs. Clocks are integer milliseconds.
+
+`notation.loads` dispatches on the version tag. V2 returns `notation_v2.StudyRecord`, with metadata, optional setup and a recursive list of turns. Each turn contains two moves and its replacement variations. A move contains a coordinate or final `[/]`, optional info and visuals. `notation.dumps` accepts that record; the command-line JSON conversion preserves it. Unknown future visual blocks are retained and ignored by the renderer.
+
+The notation parser and writer preserve arbitrary setup positions. The current play/search engine still requires a placement history, so the Play page refuses custom starting boards beyond the default origin or the empty board. It does not reconstruct or silently change them. Analysing those setups requires a separate engine position-loading change. Limits are 1 MB, 4096 explicit stones across all lines and 64 nested variation levels.
+
+The interaction follows [Lichess's analysis context menu](https://github.com/lichess-org/lila/blob/master/ui/analyse/src/treeView/contextMenu.ts), including separate local promotion and main-line promotion, with controls visible for touch users.

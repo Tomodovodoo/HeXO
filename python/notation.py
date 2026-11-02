@@ -44,6 +44,19 @@ def loads(text):
     """Parse a complete v1 record. Returned history includes the implicit origin."""
     if not isinstance(text, str) or len(text) > MAX_TEXT:
         raise ValueError("Notation must be text within the local size limit")
+    if re.match(r'\s*version\s*\[2\]', text):
+        from notation_v2 import loads as loads_v2
+        record = loads_v2(text)
+        if record.setup is None or (record.setup['first'] == 'o' and record.setup['x'] == [[0, 0]] and not record.setup['o']):
+            def validate(turns, history):
+                for turn in turns:
+                    before = history[:]
+                    history += [tuple(m['stone']) for m in turn['moves'] if m['stone'] is not None]
+                    _validate(history)
+                    for variation in turn['variations']:
+                        validate(variation, before[:])
+            validate(record.turns, [(0, 0)])
+        return record
     metadata, pos = {}, 0
     # Whitespace outside metadata values has no semantic meaning.
     while pos < len(text) and text[pos].isspace():
@@ -86,6 +99,9 @@ def loads(text):
 
 def dumps(record):
     """Export Record or a placement history; never add or discard placements."""
+    from notation_v2 import StudyRecord, dumps as dumps_v2
+    if isinstance(record, StudyRecord):
+        return dumps_v2(record)
     if isinstance(record, Record):
         history, metadata, threats = record.history, record.metadata, record.threats
     else:
@@ -135,4 +151,5 @@ if __name__ == '__main__':
         print(json.dumps(record.__dict__, ensure_ascii=False))
     else:
         data = json.loads(source)
-        print(dumps(Record(**data) if isinstance(data, dict) else data))
+        from notation_v2 import StudyRecord
+        print(dumps((StudyRecord(**data) if 'turns' in data else Record(**data)) if isinstance(data, dict) else data))

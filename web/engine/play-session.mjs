@@ -1,3 +1,4 @@
+import {Study, parseV2, writeV2} from './study.mjs';
 /* Static-host Play session. Engines register a turn callback; the session owns jobs, books, clocks and saves. */
 import {OfflineSession} from './offline.mjs';
 import {PlayStorage} from './storage.mjs';
@@ -142,7 +143,7 @@ export class BrowserSession extends OfflineSession {
     this.storage = new PlayStorage(null); this.id = 'live'; this.seats = [human(), human()];
     this.entries = new Map(); this.adapters = new Map(); this.cache = new Map(); this.index = new Map(); this.jobs = [];
     this.bookData = null; this.book = {enabled: false, mode: 'narrow', opening: null}; this.coverage = {};
-    this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
+    this.tree = new Study(); this.match = null; this.saved_game = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.clockTurns = []; this.outcome = null; this.flag = null; this.clockPartial = 0; this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.records = []; this.gameSignature = null;
     this.lanes = {move: null, analysis: null}; this.factories = new Map(); this.spares = new Map(); this.grant = null; this.heldSince = null; this.moveMs = null; this.queueWarnMs = QUEUE_WARN_MS; this.settling = {move: Promise.resolve(), analysis: Promise.resolve()}; this.importing = false; this.nextJob = 0; this.onchange = () => {}; this.saving = Promise.resolve(); this.storageError = null;
     this.storageToken = null; this.initializing = false; this.dirty = false; this.conflicted = false; this.evaluationsVersion = 0; this.studied = null; this.notice = null; this.lines = [uid(), uid()]; this.analysisLine = uid(); this.graph = {generation: null, searches: 0};
     this.dismissed = null;   // the dismissal() of the analysis a person cancelled, or null
@@ -268,7 +269,7 @@ export class BrowserSession extends OfflineSession {
   state() {
     const board = this.native.game(this.history), {player, remaining} = board, winner = board.winner >= 0 ? board.winner : this.outcome?.winner ?? -1;
     const {evaluations, review: turns} = this.study(winner);
-    return {instance: `browser:${this.id}`, revision: this.revision, history: copy(this.history), player, remaining, winner,
+    return {instance: `browser:${this.id}`, revision: this.revision, study: copy(this.tree), history: copy(this.history), player, remaining, winner,
       paused: this.paused, seats: copy(this.seats), analysis: copy(this.analysis), engines: [...this.entries.values()], match: this.match,
       clock: this.clockNow(), clock_spec: this.control(), outcome: this.outcome, saved_game: this.saved_game, models_folder: null, notice: this.notice, importing: this.importing, storage: {persistent: !!this.storage.db, error: this.storageError},
       book: {available: !!this.bookData, ...this.book, count: this.bookData?.nodes.length, on_policy: this.bookData?.pool('wide').length, refreshed_by: this.bookData?.data.refreshed_by},
@@ -279,12 +280,12 @@ export class BrowserSession extends OfflineSession {
         return {id, kind, status, done, total, error, ply: history.length, side, live: status === 'running' ? live : undefined, stage: status === 'queued' ? this.waiting(job) ?? job.stage : job.stage};
       })};
   }
-  static handles(path) { path = path.replace(/^\/study/, ''); return OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
+  static handles(path) { path = path.replace(/^\/study/, ''); return path === '/variation' || OfflineSession.handles(path) || ['/storage', '/openings', '/clock'].some(p => path === p || path.startsWith(p + '/')); }
   answer(path, body = {}) {
     try { this.apply(path.replace(/^\/study/, ''), body); return [200, this.state()]; }
     catch (error) { return [400, {error: error.message}]; }
   }
-  changed() { this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
+  changed() { this.tree.capture(this.history); this.revision++; this.runClock(); this.deepen(); this.onchange(this.state()); this.persist(); }
   /** The review's engine, checkpoint and strength: the analysis slot's, so every verdict compares one budget. */
   /** The analysis spec a review uses for every position; the solver preset reviews at Standard (python/play.py review_seat). */
   reviewSpec() {
@@ -328,7 +329,7 @@ export class BrowserSession extends OfflineSession {
     // Match metadata is mutable; its saved record versions are not.
     const match = this.match && copy({...this.match, position: this.match.position && {...this.match.position, records: []}});
     if (match?.position) match.position.records = this.match.position.records?.slice();
-    return {id: this.id, history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
+    return {id: this.id, study: copy(this.tree), history: copy(this.history), seats: copy(this.seats), analysis: copy(this.analysis), paused: this.paused,
       book: copy(this.book), match, saved_game: copy(this.saved_game), clock: this.clockNow(), timeControl: copy(this.timeControl),
       clockTurns: copy(this.clockTurns), clockPartial: this.clockPartial, outcome: copy(this.outcome), taken: Date.now(), gameId: this.gameId, gameCreated: this.gameCreated, records: this.records.slice()};
   }
@@ -362,8 +363,9 @@ export class BrowserSession extends OfflineSession {
     this.coverage = coverage?.counts || {};
     this.storageToken = saved?._write_token ?? null; this.conflicted = false; this.dirty = false; this.renewLines();
     if (saved) {
-      const {taken, ...fields} = saved;
+      const {taken, study, ...fields} = saved;
       this.native.game(saved.history); Object.assign(this, {...fields, paused: paused || Boolean(fields.paused) || Boolean(fields.clock)});
+      this.tree = new Study(saved.study || this.tree);
       if (this.match) { this.match.active = false; this.paused = true; }
       if (this.clock?.started != null && taken) {
         // The side was thinking when the page went away: the time since the snapshot counts against it.
@@ -380,7 +382,7 @@ export class BrowserSession extends OfflineSession {
   }
   editable() { if (this.conflicted) throw Error(this.storageError); if (this.match?.active) throw Error('Stop the match before changing its players or position'); }
   load(history, paused = false, opening = null) {
-    this.native.game(history); this.cancelJobs(); this.history = copy(history); this.records = []; this.proofs = new Proofs(); this.paused = paused; this.saved_game = null; this.renewLines();
+    this.native.game(history); this.cancelJobs(); this.tree = new Study(); this.tree.capture(history); this.history = copy(history); this.records = []; this.proofs = new Proofs(); this.paused = paused; this.saved_game = null; this.renewLines();
     this.gameId = uid(); this.gameCreated = new Date().toISOString(); this.gameSignature = null;
     this.book.opening = copy(opening); this.freshClock();
   }
@@ -397,7 +399,7 @@ export class BrowserSession extends OfflineSession {
   freeplay() {
     if (this.match || this.saved_game || !this.gameId) return null;
     const board = this.native.game(this.history).winner, winner = board >= 0 ? board : this.outcome?.winner ?? -1, players = this.seats.map(s => ({...s, name: this.entries.get(s.engine)?.name || 'Human'}));
-    const game = {id: this.gameId, format: 'bubble-replay', version: 1, history: copy(this.history), players, winner: winner < 0 ? null : winner,
+    const game = {study: copy(this.tree), id: this.gameId, format: 'bubble-replay', version: 1, history: copy(this.history), players, winner: winner < 0 ? null : winner,
       reason: this.outcome ? this.outcome.reason : winner >= 0 ? 'six' : 'saved', records: this.records.slice(),
       ...(this.timeControl.mode === 'fixed' ? {} : {clock: copy(this.timeControl), turns: copy(this.clockTurns)}), evaluations: this.state().evaluations, opening: copy(this.book.opening), created_at: this.gameCreated};
     const {records, evaluations, ...metadata} = game, signature = JSON.stringify(metadata);
@@ -437,7 +439,9 @@ export class BrowserSession extends OfflineSession {
       this.match = null; this.newGame(body.people);
     } else if (path === '/retry') {
       if (!Number.isInteger(body.ply) || body.ply < 0 || body.ply > this.history.length) throw Error('Invalid retry position');
-      this.load(this.history.slice(0, body.ply), false, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
+      const tree = this.tree, records = this.records;
+      this.load(this.history.slice(0, body.ply), true, body.ply >= this.book.opening?.ply ? this.book.opening : null); this.match = null;
+      this.tree = tree; this.records = records; this.seats = [human(), human()];
     } else if (path === '/seat') {
       if (![0, 1].includes(body.side)) throw Error('Invalid seat');
       if (body.preset === 'solver') throw Error('The solver preset is for analysis');
@@ -662,6 +666,7 @@ export class BrowserSession extends OfflineSession {
     delete c.started; delete c.side;
     if (left <= 0) { c[field] = 0; this.outcome = {winner: 1 - side, reason: 'time'}; }
     else c[field] = control.mode === 'move' ? control.ms : left + (c.increment_ms || 0);
+    if (this.history.length > 1) this.tree.annotations[position(this.history)] = {stone: this.history.at(-1), info: `{@${Math.max(0, Math.round(c[field]))}}`, visuals: []};
     this.clockTurns.push({ply: this.history.length, side, spent_ms: spent, cross_ms: c.cross_ms, circle_ms: c.circle_ms});
     return left > 0;
   }
@@ -932,6 +937,7 @@ export class BrowserSession extends OfflineSession {
     this.outcome = ['time', 'timeout'].includes(game.reason) && game.winner != null ? {winner: game.winner, reason: game.reason} : null;
     const last = this.clockTurns.at(-1), base = game.clock && (game.clock.mode === 'move' ? game.clock.ms : game.clock.base_ms);
     this.clock = game.clock ? {cross_ms: last?.cross_ms ?? base, circle_ms: last?.circle_ms ?? base, increment_ms: game.clock.increment_ms || 0} : null;
+    this.tree = new Study(game.study || this.tree);
     this.records = game.records || Object.values(game.evaluations || {});
     if (this.analysis) this.analysis.auto = false;
     this.changed();
@@ -950,7 +956,7 @@ export class BrowserSession extends OfflineSession {
       if (path === '/state' && method === 'GET' && q.has('since') && +q.get('since') === this.revision) {
         const state = this.state(); data = {instance: state.instance, revision: state.revision, jobs: state.jobs, clock: state.clock};
       } else if (path === '/matches' && method === 'GET') data = {matches: await this.catalogue()};
-      else if (path === '/matches/game') { data = await this.savedReplay(q.get('batch'), q.get('game')); if (q.get('format') === 'htttx') { data = htttx(data.history).text; type = 'text/plain'; } }
+      else if (path === '/matches/game') { data = await this.savedReplay(q.get('batch'), q.get('game')); if (q.get('format') === 'htttx') { const tree = new Study(data.study); tree.capture(data.history); data = writeV2(tree.record(h => data.records?.findLast(r => r.position === position(h)))).text; type = 'text/plain'; } }
       else if (path === '/matches/open') { await this.openGame(body.batch, body.game); data = {url: `?study=1&batch=${encodeURIComponent(body.batch)}&game=${body.game}`}; }
       else if (path === '/matches/delete') {
         if (this.match?.id === body.batch && this.match.active) throw Error('Stop the match before deleting it');
@@ -960,9 +966,31 @@ export class BrowserSession extends OfflineSession {
         const match = await this.storage.get('matches', body.batch);
         for (const r of match?.results || []) await this.storage.delete('games', r.id);
         await this.storage.delete('matches', body.batch); data = this.state();
-      } else if (path === '/export') data = exportGame(this.history.slice(0, q.has('ply') ? +q.get('ply') : this.history.length), q.get('format') || 'htttx');
+      } else if (path === '/variation') {
+        this.editable(); this.tree.capture(this.history);
+        if (body.moves) {
+          if (!Number.isInteger(body.ply) || body.ply < 1 || body.ply > this.history.length || !Array.isArray(body.moves) || body.moves.length > 4096) throw Error('Invalid engine line');
+          const h = [...this.history.slice(0, body.ply), ...body.moves]; this.native.game(h); this.tree.capture(h); this.changed(); data = this.state();
+        } else {
+        const index = body.index, h = this.tree.lines[index];
+        if (!Number.isInteger(index) || !h) throw Error('Unknown variation');
+        if (body.promote) {
+          let target = 0;
+          if (body.promote === 'local') {
+            let longest = -1;
+            this.tree.lines.slice(0, index).forEach((line, i) => {
+              let common = 0; while (common < Math.min(line.length, h.length) && position([line[common]]) === position([h[common]])) common++;
+              if (common > longest) { longest = common; target = i; }
+            });
+          }
+          this.tree.lines.splice(index, 1); this.tree.lines.splice(target, 0, h);
+        }
+        this.native.game(h); this.cancelJobs(); this.freezeClock(); this.history = copy(h); this.seats = [human(), human()]; this.paused = true; this.outcome = null; this.clock = null; this.timeControl = {mode: 'fixed'}; this.match = null; this.saved_game = null; this.renewLines(); this.changed(); data = this.state();
+        }
+      } else if (path === '/export' && (q.get('format') || 'htttx') === 'htttx') { this.tree.capture(this.history); data = writeV2(this.tree.record(h => this.lookup(h) || this.records.findLast(r => r.position === position(h)))); }
+      else if (path === '/export') data = exportGame(this.history.slice(0, q.has('ply') ? +q.get('ply') : this.history.length), q.get('format') || 'htttx');
       else if (path === '/htttx' || path === '/match/replay') { data = htttx(path === '/htttx' ? this.history : (await this.savedReplay(this.match.id, q.get('game'))).history).text; type = 'text/plain'; }
-      else if (path === '/replay') data = {format: 'bubble-replay', version: 1, history: this.history, players: this.seats.map(p => ({...p, name: this.entries.get(p.engine)?.name || 'Human'})), evaluations: this.state().evaluations, records: this.records, opening: this.book.opening};
+      else if (path === '/replay') data = {study: copy(this.tree), format: 'bubble-replay', version: 1, history: this.history, players: this.seats.map(p => ({...p, name: this.entries.get(p.engine)?.name || 'Human'})), evaluations: this.state().evaluations, records: this.records, opening: this.book.opening};
       else if (path === '/evaluations') { data = this.records.map(r => JSON.stringify(r)).join('\n'); type = 'application/x-ndjson'; }
       else if (path === '/storage/backup') { await this.saving; data = await this.storage.backup(); }
       else if (path === '/storage/save') { await this.saveGame(); data = this.state(); }
@@ -979,7 +1007,10 @@ export class BrowserSession extends OfflineSession {
           this.changed(); data = this.state();
         }
         else {
-          const history = await readGame(body.text, this.native); await this.saveGame(); this.match = null; this.load(history, true, json?.opening || null);
+          const imported = /^version\s*\[2\]/.test(body.text.trim()) ? Study.fromRecord(parseV2(body.text), this.native) : json?.study ? Study.fromRecord(parseV2(writeV2(new Study(json.study).record()).text), this.native) : null;
+          if (imported) for (const h of imported.lines) this.native.game(h);
+          const history = imported ? imported.lines[0] || [] : await readGame(body.text, this.native); await this.saveGame(); this.match = null; this.load(history, true, json?.opening || null);
+          if (imported) this.tree = imported;
           this.records = json?.records || Object.values(json?.evaluations || {});
           for (const r of this.records) if (r.id && r.engine_key) { this.indexRecord(r); await this.storage.put('evaluations', r); }
           this.changed(); data = this.state();

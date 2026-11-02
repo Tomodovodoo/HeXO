@@ -29,6 +29,31 @@ def board(history):
 
 
 class OfficialNotation(unittest.TestCase):
+    def test_v2_nested_lines_annotations_and_setup_roundtrip(self):
+        from notation_v2 import Study, loads as parse, dumps as write
+        source = ('version[2]name[Study with spaces];'
+                  '1.[1,0]{@1234:%-10}[0,1]<2,0:#X:$A>'
+                  '(1.[-1,0][0,-1];2.[1,-1][/] {#2};);'
+                  '2.[2,0][2,-1];')
+        record = loads(source)
+        self.assertEqual(loads(dumps(record)), record)
+        tree = Study.from_record(record)
+        self.assertEqual(len(tree.data['lines']), 2)
+        self.assertEqual(loads(write(tree.record())).history, record.history)
+        tree.data['lines'].reverse()
+        promoted = loads(write(tree.record()))
+        self.assertEqual(promoted.history[-1], (1, -1))
+        self.assertEqual(len(promoted.turns[0]['variations']), 1)
+        setup = parse('version[2];x[3,4]:o[-2,1]<3,4:$A>;')
+        self.assertEqual(parse(write(setup)), setup)
+        with self.assertRaisesRegex(ValueError, 'Custom setups'):
+            _ = setup.history
+        for bad in ('version[2];1.[1,0][/];2.[2,0][3,0];',
+                    'version[2];1.[1,0][2,0](2.[3,0][4,0];);',
+                    'version[2];1.[1,0][2,0](1.[0,0][4,0];);'):
+            with self.assertRaises(ValueError, msg=bad):
+                loads(bad)
+
     def test_official_example_and_metadata_roundtrip(self):
         source = ('name[GameName 0]platform[WebsiteXY 0]playercross[BlueWhale 0]'
                   'playercircle[GreenSnake 0]timecontrol[Fischer 60+5]endreason[win]'
