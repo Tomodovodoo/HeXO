@@ -156,6 +156,9 @@ class Study:
     def capture(self, history):
         if not history:
             return
+        setup = self.data['setup']
+        if setup and setup['first'] == 'x' and not setup['x'] and not setup['o']:
+            self.data['setup'] = dict(first='o', x=[[0, 0]], o=[], visuals=setup['visuals'])
         history = [list(p) for p in history]
         lines = self.data['lines']
         if any(h[:len(history)] == history for h in lines):
@@ -181,7 +184,11 @@ class Study:
                     if move['stone'] is not None:
                         h.append(move['stone'])
                     if move['stone'] is not None or move['info'] or move['visuals']:
-                        study.data['annotations'][position_key(h)] = copy.deepcopy(move | {'stone': h[-1]})
+                        key = position_key(h)
+                        saved = study.data['annotations'].get(key, {})
+                        study.data['annotations'][key] = copy.deepcopy(dict(
+                            stone=h[-1], info=move['info'] or saved.get('info'),
+                            visuals=move['visuals'] or saved.get('visuals', [])))
                 for v in turn['variations']:
                     visit(v, before)
             study.data['lines'].append(h)

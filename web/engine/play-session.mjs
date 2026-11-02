@@ -1009,7 +1009,7 @@ export class BrowserSession extends OfflineSession {
         else {
           const imported = /^version\s*\[2\]/.test(body.text.trim()) ? Study.fromRecord(parseV2(body.text), this.native) : json?.study ? Study.fromRecord(parseV2(writeV2(new Study(json.study).record()).text), this.native) : null;
           if (imported) for (const h of imported.lines) this.native.game(h);
-          const history = imported ? imported.lines[0] || [] : await readGame(body.text, this.native); await this.saveGame(); this.match = null; this.load(history, true, json?.opening || null);
+          const history = !json && imported ? imported.lines[0] || [] : await readGame(body.text, this.native); await this.saveGame(); this.match = null; this.load(history, true, json?.opening || null);
           if (imported) this.tree = imported;
           this.records = json?.records || Object.values(json?.evaluations || {});
           for (const r of this.records) if (r.id && r.engine_key) { this.indexRecord(r); await this.storage.put('evaluations', r); }

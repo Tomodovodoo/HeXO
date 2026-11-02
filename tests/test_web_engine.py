@@ -303,7 +303,7 @@ class BrowserProofs(unittest.TestCase):
         source = """import assert from 'node:assert/strict';
 import {BrowserSession} from './web/engine/play-session.mjs';
 import {PlayStorage} from './web/engine/storage.mjs';
-import {parseV2} from './web/engine/study.mjs';
+import {parseV2,writeV2,Study} from './web/engine/study.mjs';
 const storage=new PlayStorage(null),s=await BrowserSession.create(null,{storage});
 s.seats=[{engine:'human'},{engine:'human'}];
 for(const [q,r] of [[0,0],[1,0],[0,1],[2,0],[2,-1]])s.apply('/play',{q,r});
@@ -319,6 +319,25 @@ const cold=await BrowserSession.create(null,{storage});await cold.restore();
 assert.deepEqual(cold.tree.lines,s.tree.lines);
 assert.equal((await cold.request('/import',{text:data.text},'POST'))[0],200);
 assert.equal(cold.tree.lines.length,2);
+// JSON restores the selected side line and a truncated position, not the study's preferred continuation.
+await cold.request('/variation',{index:1},'POST');
+for(const partial of [false,true]) {
+  if(partial)cold.apply('/retry',{ply:3});
+  const selected=structuredClone(cold.history),lines=structuredClone(cold.tree.lines);
+  const replay=(await cold.request('/replay'))[1];
+  assert.equal((await cold.request('/import',{text:JSON.stringify(replay)},'POST'))[0],200);
+  assert.deepEqual(cold.history,selected);assert.deepEqual(cold.tree.lines,lines);
+}
+const shared=Study.fromRecord(parseV2('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[1,0][2,0];);'),cold.native);
+const annotated=parseV2(writeV2(shared.record()).text).turns[0].moves[0];
+assert.equal(annotated.info,'{@1234:%-10}');assert.deepEqual(annotated.visuals,['<2,0:#X:$A>']);
+assert.equal((await cold.request('/import',{text:'version[2];x:o;'},'POST'))[0],200);
+for(const [q,r] of [[0,0],[1,0],[0,1]]) {
+  cold.apply('/play',{q,r});
+  const selected=structuredClone(cold.history),text=(await cold.request('/export?format=htttx'))[1].text;
+  assert.equal((await cold.request('/import',{text},'POST'))[0],200);
+  assert.deepEqual(cold.history,selected);
+}
 console.log('ok');"""
         done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
                               capture_output=True, text=True)

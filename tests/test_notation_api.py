@@ -29,6 +29,25 @@ def board(history):
 
 
 class OfficialNotation(unittest.TestCase):
+    def test_v2_shared_prefix_keeps_clock_evaluation_and_visuals(self):
+        from notation_v2 import Study
+        record = loads('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[1,0][2,0];);')
+        restored = loads(dumps(Study.from_record(record).record()))
+        move = restored.turns[0]['moves'][0]
+        self.assertEqual(move['info'], '{@1234:%-10}')
+        self.assertEqual(move['visuals'], ['<2,0:#X:$A>'])
+        self.assertEqual(len(restored.turns[0]['variations']), 1)
+
+    def test_v2_empty_setup_becomes_default_after_play(self):
+        from notation_v2 import Study
+        tree = Study.from_record(loads('version[2];x:o;'))
+        self.assertEqual(loads(dumps(tree.record())).history, [])
+        for history in ([(0, 0)], [(0, 0), (1, 0)], [(0, 0), (1, 0), (0, 1)]):
+            tree.capture(history)
+            record = loads(dumps(tree.record()))
+            self.assertEqual(record.history, history)
+            self.assertEqual(Study.from_record(record).data['lines'][0], [list(p) for p in history])
+
     def test_v2_nested_lines_annotations_and_setup_roundtrip(self):
         from notation_v2 import Study, loads as parse, dumps as write
         source = ('version[2]name[Study with spaces];'

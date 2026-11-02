@@ -85,7 +85,11 @@ export class Study {
         const before = clone(h);
         for (const m of t.moves) {
           if (m.stone) h.push(m.stone);
-          if (m.stone || m.info || m.visuals.length) study.annotations[positionKey(h)] = clone(m.stone ? m : {...m, stone: h.at(-1)});
+          if (m.stone || m.info || m.visuals.length) {
+            const key = positionKey(h), saved = study.annotations[key];
+            study.annotations[key] = {stone: clone(h.at(-1)), info: m.info || saved?.info || null,
+              visuals: clone(m.visuals.length ? m.visuals : saved?.visuals || [])};
+          }
         }
         native.game(h);
         for (const v of t.variations) visit(v, before);
@@ -100,6 +104,9 @@ export class Study {
   }
   capture(history) {
     if (!history.length) return;
+    if (this.setup?.first === 'x' && !this.setup.x.length && !this.setup.o.length) {
+      this.setup = {first: 'o', x: [[0, 0]], o: [], visuals: this.setup.visuals};
+    }
     const key = positionKey(history);
     if (this.lines.some(h => positionKey(h) === key || positionKey(h).startsWith(key + ';'))) return;
     const i = this.lines.findIndex(h => key.startsWith(positionKey(h) + ';'));
