@@ -29,6 +29,58 @@ def board(history):
 
 
 class OfficialNotation(unittest.TestCase):
+    def test_v2_nested_variations_keep_their_parent_continuations(self):
+        from notation_v2 import Study
+        record = loads('version[2];1.[1,0][0,1](1.[-1,0][0,-1];'
+                       '2.[1,-1][2,-1](2.[-1,1][-2,1];););2.[2,0][2,1];')
+        tree = Study.from_record(record)
+        self.assertEqual(tree.data['lines'][1][-2:], [[1, -1], [2, -1]])
+        self.assertEqual(loads(dumps(tree.record())), record)
+
+    def test_v2_shared_prefix_keeps_clock_evaluation_and_visuals(self):
+        from notation_v2 import Study
+        record = loads('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[1,0][2,0];);')
+        restored = loads(dumps(Study.from_record(record).record()))
+        move = restored.turns[0]['moves'][0]
+        self.assertEqual(move['info'], '{@1234:%-10}')
+        self.assertEqual(move['visuals'], ['<2,0:#X:$A>'])
+        self.assertEqual(len(restored.turns[0]['variations']), 1)
+
+    def test_v2_empty_setup_becomes_default_after_play(self):
+        from notation_v2 import Study
+        tree = Study.from_record(loads('version[2];x:o;'))
+        self.assertEqual(loads(dumps(tree.record())).history, [])
+        for history in ([(0, 0)], [(0, 0), (1, 0)], [(0, 0), (1, 0), (0, 1)]):
+            tree.capture(history)
+            record = loads(dumps(tree.record()))
+            self.assertEqual(record.history, history)
+            self.assertEqual(Study.from_record(record).data['lines'][0], [list(p) for p in history])
+
+    def test_v2_nested_lines_annotations_and_setup_roundtrip(self):
+        from notation_v2 import Study, loads as parse, dumps as write
+        source = ('version[2]name[Study with spaces];'
+                  '1.[1,0]{@1234:%-10}[0,1]<2,0:#X:$A>'
+                  '(1.[-1,0][0,-1];2.[1,-1][/] {#2};);'
+                  '2.[2,0][2,-1];')
+        record = loads(source)
+        self.assertEqual(loads(dumps(record)), record)
+        tree = Study.from_record(record)
+        self.assertEqual(len(tree.data['lines']), 2)
+        self.assertEqual(loads(write(tree.record())).history, record.history)
+        tree.data['lines'].reverse()
+        promoted = loads(write(tree.record()))
+        self.assertEqual(promoted.history[-1], (1, -1))
+        self.assertEqual(len(promoted.turns[0]['variations']), 1)
+        setup = parse('version[2];x[3,4]:o[-2,1]<3,4:$A>;')
+        self.assertEqual(parse(write(setup)), setup)
+        with self.assertRaisesRegex(ValueError, 'Custom setups'):
+            _ = setup.history
+        for bad in ('version[2];1.[1,0][/];2.[2,0][3,0];',
+                    'version[2];1.[1,0][2,0](2.[3,0][4,0];);',
+                    'version[2];1.[1,0][2,0](1.[0,0][4,0];);'):
+            with self.assertRaises(ValueError, msg=bad):
+                loads(bad)
+
     def test_official_example_and_metadata_roundtrip(self):
         source = ('name[GameName 0]platform[WebsiteXY 0]playercross[BlueWhale 0]'
                   'playercircle[GreenSnake 0]timecontrol[Fischer 60+5]endreason[win]'

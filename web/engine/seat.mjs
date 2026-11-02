@@ -440,7 +440,9 @@ function install() {
   };
   page.post = (path, body = {}) => {
     const s = state();
+    const exploring = path === '/retry' || path === '/variation' && !body.moves;
     if (['/undo', '/new', '/book', '/import', '/retry', '/match'].includes(path)) renew();
+    if (path === '/variation' && exploring) renew();
     if (path === '/seat') renew(body.side);
     if (path === '/pause' && holding) holding.paused = !!body.paused;
     const fixed = id => ENGINES.has(id) && !ENGINES.get(id).entry.clocks ? ENGINES.get(id).entry.name : null;
@@ -482,6 +484,10 @@ function install() {
     if (['/undo', '/new', '/book'].includes(path) && s && config.seats.some(Boolean)) {
       return original.post(path, {...body, people: [0, 1].filter(side => s.seats[side].engine === 'human' && !config.seats[side])});
     }
+    if (exploring) return original.post(path, body).then(data => {
+      if (data) { config.seats = [null, null]; save(); page.renderPanels(); }
+      return data;
+    });
     return original.post(path, body);
   };
   page.shown = seat => {
@@ -495,7 +501,7 @@ function install() {
     const s = state(), side = s ? s.seats.indexOf(seat) : -1;
     return original.isHuman(seat) && !(side >= 0 && config.seats[side]);
   };
-  page.canPlace = () => original.canPlace() && !config.seats[state().player];
+  page.canPlace = () => original.canPlace() && (viewed() < state().history.length || !config.seats[state().player]);
   page.renderSeat = side => {
     original.renderSeat(side);
     const box = document.getElementById('seat' + side), s = state();

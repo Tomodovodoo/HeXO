@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 import formats
 from engine_setup import Setups
 from hexo import Game
+from notation_v2 import Study, StudyRecord, dumps as dumps_v2, position_key as notation_position
 from notation import NotationConflict, dumps, loads
 from process_tree import TreeProcess
 from time_control import Clock, TimeControl, duration, milliseconds
@@ -2331,6 +2332,7 @@ class Session:
         self.models_folder, self.opening_book, self.book_mode, self.opening = None, bool(book), 'narrow', None
         self.coverage = Coverage(Path(store.path).with_name('play-openings.jsonl') if store.path else None)
         self.lock, self.rescanning = threading.Condition(), threading.Lock()
+        self.tree = Study()
         self.history, self.revision, self.paused = [], 0, False
         self.proofs = Proofs()
         self.line_ids = itertools.count()
@@ -2518,7 +2520,7 @@ class Session:
             entries = [{k: e[k] for k in SHOWN if k in e} | dict(clocks=keeps_clock(e), device='Server ' + device_of(e, device))
                        | (dict(pace=TURN_MS[device_of(e, device)] | self.paces.get(e['id'], {})) if e['kind'] == 'bubble' else {})
                        for e in self.entries.values()]
-            return dict(instance=self.instance, revision=self.revision, history=[list(p) for p in history], **board,
+            return dict(instance=self.instance, revision=self.revision, study=self.tree.data, history=[list(p) for p in history], **board,
                         paused=self.paused, seats=self.seats, analysis=self.analysis, engines=entries,
                         match={k: v for k, v in self.match.items() if k not in ('results', 'openings', 'opening_selection')}
                         if self.match else None,
@@ -2565,6 +2567,7 @@ class Session:
 
     def changed(self):
         """Call with the lock held after any change: bumps the revision and queues the jobs the change calls for."""
+        self.tree.capture(self.history)
         self.revision += 1
         self.proofs.extend(self.store, self.history)
         game = replay(self.history)
@@ -2771,7 +2774,7 @@ class Session:
             if enabled and not self.history:
                 self.new_game(people)
 
-    def load(self, history, paused, saved_game=None):
+    def load(self, history, paused, saved_game=None, tree=None):
         """Replace the game with `history` (validated)."""
         replay(history).close()
         with self.lock:
@@ -2780,6 +2783,7 @@ class Session:
                 self.save_freeplay()
             self.freeplay_directory, self.freeplay_signature = None, None
             self.freeplay_records = {}
+            self.tree = tree or Study()
             self.history, self.paused, self.opening = [tuple(map(int, p)) for p in history], paused, None
             leaving, self.match = self.match is not None, None
             self.proofs = Proofs()
@@ -2965,8 +2969,9 @@ class Session:
                 bare = key.split(':')[0] + ':none'
                 keys.update((key, key + ':kept', bare, bare + ':kept'))
         with self.store.lock:
-            for ply in range(len(self.history) + 1):
-                position = self.store.key(self.history[:ply])
+            prefixes = {tuple(map(tuple, h[:ply])) for h in self.tree.data['lines'] for ply in range(len(h)+1)}
+            for prefix in prefixes:
+                position = self.store.key(prefix)
                 for key in sorted(keys):
                     for budget in sorted(self.store.by_position.get((position, key), ())):
                         self.freeplay_records[(position, key, budget)] = self.store.order[(position, key, budget)]
@@ -2974,7 +2979,7 @@ class Session:
         reason = 'six' if winner is not None else 'saved'
         if winner is None and self.outcome:
             winner, reason = self.outcome['winner'], self.outcome['reason']
-        record = dict(format='bubble-replay', version=1, game=1, history=list(self.history), players=players,
+        record = dict(study=self.tree.data, format='bubble-replay', version=1, game=1, history=list(self.history), players=players,
                       winner=winner, reason=reason, opening=self.opening)
         if self.clock_spec['mode'] != 'fixed':
             record.update(clock=self.clock_spec, turns=self.clock_turns)
@@ -3032,6 +3037,9 @@ class Session:
             raise ValueError('No such saved game')
         directory = self.saved_matches[ident]
         game = saved_ids(json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8')))
+        tree = Study(game.get('study'))
+        tree.add_clocks(game['history'], game.get('turns', []))
+        game['study'] = tree.data
         return directory, game
 
     def open_saved_game(self, ident, number):
@@ -3068,7 +3076,7 @@ class Session:
                                 proven.append((record, line.strip()))
                         except (ValueError, KeyError, TypeError):
                             continue
-            study.load(game['history'], True, saved_game=dict(batch=ident, name=directory.name, game=number,
+            study.load(game['history'], True, tree=Study(game.get('study')), saved_game=dict(batch=ident, name=directory.name, game=number,
                        players=[p['name'] for p in game['players']], winner=game['winner'], reason=game['reason']))
             study.outcome = dict(winner=game['winner'], reason='time') if game['reason'] == 'time' else None
             study.clock_spec = clock_spec(game.get('clock'))
@@ -3251,6 +3259,7 @@ class Session:
                     job.cancelled = True
             if self.analysis:
                 self.analysis = self.analysis | dict(auto=False)
+            self.tree = Study()
             self.history = [tuple(p) for p in openings[0]]
             self.seats = [{k: v for k, v in s.items() if k not in ('name', 'source')} for s in seats]
             self.new_lines()
@@ -3275,8 +3284,9 @@ class Session:
 
     def save_match_position(self):
         if self.match:
+            self.tree.add_clocks(self.history, self.match['turns'])
             self.write_match(self.match, 'current.json', dict(game=self.match['current'], history=list(self.history),
-                             seats=self.seats, turns=self.match['turns'],
+                             study=self.tree.data, seats=self.seats, turns=self.match['turns'],
                              partial_spent_ms=self.match.get('partial_spent_ms', 0),
                              balances=self.game_clock.remaining() if self.game_clock else None))
 
@@ -3368,7 +3378,14 @@ class Session:
         balances = clock.json()
         self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
                                      cross_ms=round(balances['cross_ms']), circle_ms=round(balances['circle_ms'])))
+        self.annotate_clock(side, balances['circle_ms' if side else 'cross_ms'])
         return not expired
+
+    def annotate_clock(self, side, milliseconds):
+        """Record a balance only when the charged side placed the last stone."""
+        if len(self.history) > 1 and player_at(len(self.history) - 1) == side:
+            self.tree.data['annotations'][notation_position(self.history)] = dict(
+                stone=list(self.history[-1]), info='{@' + str(max(0, round(milliseconds))) + '}', visuals=[])
 
     def balances(self, flagged=None):
         """Both clock balances in whole ms for a turn record, the side that ran out of time (`flagged`) at zero."""
@@ -3392,6 +3409,7 @@ class Session:
         self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
                                      cross_ms=0 if side == 0 else round(balances['cross_ms']),
                                      circle_ms=0 if side == 1 else round(balances['circle_ms'])))
+        self.annotate_clock(side, 0)
         self.stop_moves()
         self.changed()
 
@@ -3425,7 +3443,9 @@ class Session:
                     game = json.loads(path.read_text(encoding='utf-8'))
                     notation = path.with_suffix('.htttx')
                     temporary = notation.with_suffix('.htttx.tmp')
-                    temporary.write_text(dumps([tuple(p) for p in game['history']]), encoding='utf-8')
+                    tree = Study(game.get('study'))
+                    tree.add_clocks(game['history'], game.get('turns', []))
+                    temporary.write_text(dumps_v2(tree.record()), encoding='utf-8')
                     temporary.replace(notation)
                     winner = game['winner']
                     player = (winner if number % 2 else 1-winner) if winner is not None else None
@@ -3474,7 +3494,9 @@ class Session:
                 if self.game_clock and continuing and saved.get('balances'):
                     self.game_clock.balances = saved['balances']
                 self.store = Evaluations(directory / 'evaluations.jsonl')
+                self.tree = Study(saved.get('study') if continuing else None)
                 self.history = list(map(tuple, history))
+                self.tree.add_clocks(self.history, match['turns'])
                 order = [0, 1] if number % 2 else [1, 0]
                 self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')} for i in order]
                 self.stop_moves()
@@ -3553,7 +3575,8 @@ class Session:
                         continue
                     number = match['current']
                     order = [0, 1] if number % 2 else [1, 0]
-                    result = dict(format='bubble-replay', version=1, game=number,
+                    self.tree.add_clocks(self.history, match['turns'])
+                    result = dict(study=self.tree.data, format='bubble-replay', version=1, game=number,
                                   players=[match['players'][i] for i in order], history=list(self.history),
                                   winner=winner if winner >= 0 else None, reason='win' if winner >= 0 else 'capped',
                                   clock=match['clock'], turns=match['turns'])
@@ -3563,7 +3586,7 @@ class Session:
                     result['opening'] = (match['opening_selection']['nodes'][opening_index] if match['opening_selection']
                                          else dict(moves=match['openings'][opening_index]))
                     self.write_match(match, f'game-{number:04d}.json', result)
-                    (Path(match['output']) / f'game-{number:04d}.htttx').write_text(dumps(self.history), encoding='utf-8')
+                    (Path(match['output']) / f'game-{number:04d}.htttx').write_text(dumps_v2(self.tree.record(self.lookup)), encoding='utf-8')
                     if winner >= 0:
                         match['wins'][order[winner]] += 1
                     else:
@@ -3597,6 +3620,7 @@ class Session:
                     match['outcome'], match['turns'] = None, []
                     match['partial_spent_ms'] = 0
                     self.game_clock = self.new_game_clock()
+                    self.tree = Study()
                     self.history = [tuple(p) for p in match['openings'][(number // 2) % len(match['openings'])]]
                     order = [0, 1] if match['current'] % 2 else [1, 0]
                     self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')}
@@ -3770,6 +3794,7 @@ class Session:
                             if freeplay:
                                 self.clock_turn(job.side, job.received)
                         if self.match and self.match['active']:
+                            self.match['turns'][-1]['end_ply'] = len(self.history)
                             self.match['error'] = None
                             self.save_match_position()
                 try:
@@ -4257,7 +4282,9 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(url.query)
                 _, game = session.saved_replay(query['batch'][0], int(query['game'][0]))
                 if query.get('format') == ['htttx']:
-                    return self.respond(200, dumps([tuple(p) for p in game['history']]), 'text/plain; charset=utf-8',
+                    tree = Study(game.get('study'))
+                    tree.capture(game['history'])
+                    return self.respond(200, dumps_v2(tree.record(session.lookup)), 'text/plain; charset=utf-8',
                                         [('Content-Disposition', f'attachment; filename="game-{game["game"]:04d}.htttx"')])
                 return self.respond(200, game)
             except (ValueError, KeyError, TypeError, OSError) as error:
@@ -4292,12 +4319,16 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(url.query)
                 history = list(session.history)
                 ply = int(query.get('ply', [len(history)])[0])
+                if query.get('format', ['htttx'])[0] == 'htttx':
+                    with session.lock:
+                        session.tree.capture(history)
+                        return self.respond(200, dict(text=dumps_v2(session.tree.record(session.lookup)), spans=[]))
                 return self.respond(200, export(history[:max(0, ply)], query.get('format', ['htttx'])[0]))
             except ValueError as error:
                 return self.respond(409 if isinstance(error, NotationConflict) else 400, dict(error=str(error)))
         if url.path == '/replay':
             names = [seat['engine'] for seat in session.seats]
-            body = dict(format='bubble-replay', version=1, players=names, history=[list(p) for p in session.history])
+            body = dict(study=session.tree.data, format='bubble-replay', version=1, players=names, history=[list(p) for p in session.history])
             return self.respond(200, json.dumps(body), headers=[('Content-Disposition', 'attachment; filename="game.json"')])
         if url.path == '/evaluations':
             return self.respond(200, session.store.export(), 'application/x-ndjson',
@@ -4353,9 +4384,43 @@ class Handler(BaseHTTPRequestHandler):
                 ply = args['ply']
                 if type(ply) is not int or not 0 <= ply <= len(session.history):
                     raise ValueError('No such position')
-                session.load(session.history[:ply], False)
+                session.load(session.history[:ply], True, tree=session.tree)
+                session.seats = [dict(engine='human'), dict(engine='human')]
+            elif self.path == '/variation':
+                with session.lock:
+                    session.match_editable()
+                    session.tree.capture(session.history)
+                    if 'moves' in args:
+                        ply = args['ply']
+                        if type(ply) is not int or not 1 <= ply <= len(session.history) or not isinstance(args['moves'], list) or len(args['moves']) > 4096:
+                            raise ValueError('Invalid engine line')
+                        history = session.history[:ply] + [tuple(p) for p in args['moves']]
+                        replay(history).close()
+                        session.tree.capture(history)
+                        session.changed()
+                        return self.respond(200, session.state())
+                    index = args['index']
+                    lines = session.tree.data['lines']
+                    if type(index) is not int or not 0 <= index < len(lines):
+                        raise ValueError('Unknown variation')
+                    history = lines[index]
+                    if args.get('promote'):
+                        target = 0
+                        if args['promote'] == 'local' and index:
+                            def common(line):
+                                return next((i for i, (a, b) in enumerate(zip(line, history)) if a != b), min(len(line), len(history)))
+                            target = max(range(index), key=lambda i: common(lines[i]))
+                        lines.insert(target, lines.pop(index))
+                    session.load(history, True, tree=session.tree)
+                    session.seats = [dict(engine='human'), dict(engine='human')]
+                    session.changed()
             elif self.path == '/import':
-                session.load(read_game(args['text']), True)
+                text = args['text'].strip()
+                record = loads(text) if re.match(r'version\s*\[2\]', text) else None
+                tree = Study.from_record(record) if isinstance(record, StudyRecord) else Study(json.loads(text).get('study')) if text.startswith('{') else None
+                if tree is not None:
+                    tree = Study.from_record(loads(dumps_v2(tree.record())))
+                session.load(read_game(text), True, tree=tree)
             elif self.path == '/seat':
                 if args.get('side') not in (0, 1):
                     raise ValueError('Side must be 0 or 1')

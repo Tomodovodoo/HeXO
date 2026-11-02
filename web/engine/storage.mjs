@@ -136,6 +136,7 @@ export class PlayStorage {
       for (const row of data[name]) {
         if (typeof row.id !== 'string') throw Error('Invalid saved record');
         if (row.history) native.game(row.history);
+        if (row.study) for (const history of row.study.lines) native.game(history);
       }
     }
     for (const name of ['sessions', 'games', 'matches', 'evaluations', 'coverage']) for (const row of data[name])

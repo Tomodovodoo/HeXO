@@ -1318,6 +1318,23 @@ class GraphAnalysis(unittest.TestCase):
 
 
 class Http(unittest.TestCase):
+    def test_v2_study_lines_survive_retry_promote_and_export(self):
+        from notation import loads
+        self.session.seats = [dict(engine='human'), dict(engine='human')]
+        self.session.analysis['auto'] = False
+        source = 'version[2]name[Study];1.[1,0]{@100:%-4}[0,1];2.[2,0][2,-1];'
+        self.post('/import', {'text': source})
+        self.post('/retry', {'ply': 3})
+        self.post('/play', {'q': -1, 'r': 1})
+        self.post('/play', {'q': -2, 'r': 2})
+        state = self.post('/variation', {'index': 1, 'promote': True})
+        self.assertEqual(len(state['study']['lines']), 2)
+        record = loads(json.loads(self.get('/export?format=htttx'))['text'])
+        self.assertEqual(record.history[-2:], [(-1, 1), (-2, 2)])
+        self.assertEqual(record.metadata['name'], 'Study')
+        self.assertEqual(record.turns[0]['moves'][0]['info'], '{@100:%-4}')
+        self.assertEqual(len(record.turns[1]['variations']), 1)
+
     def setUp(self):
         self.engines = FakeEngines()
         self.session = Session(entries(), self.engines, Evaluations())
@@ -1960,6 +1977,43 @@ class Matches(unittest.TestCase):
                 self.assertEqual(self.session.match['wins'], [1, 0])
                 self.assertIsNone(self.session.match['error'])
 
+    def test_clocked_tournament_saves_and_exports_study_annotations(self):
+        from notation_v2 import loads, Study, dumps
+        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
+            engine.return_value.identity = dict(kind='fake')
+            engine.return_value.turn.return_value = dict(moves=[[1, 0], [0, 1]], elapsed_ms=1)
+            self.session.start_match(['Drip', 'Other'], games=1, output=self.output,
+                                     max_placements=3, clock=dict(mode='game', tc='5+1'))
+            wait(lambda: not self.session.match_worker.is_alive())
+        self.assertIsNone(self.session.match['error'])
+        path = self.output / 'game-0001.json'
+        game = json.loads(path.read_text())
+        key = '0,0;1,0;0,1'
+        info = '{@' + str(game['turns'][-1]['circle_ms']) + '}'
+        self.assertEqual(game['study']['annotations'][key]['info'], info)
+        self.assertEqual(loads((self.output / 'game-0001.htttx').read_text()).turns[0]['moves'][1]['info'], info)
+        ident = next(m['id'] for m in self.session.match_catalogue() if m['name'] == 'match')
+        # Older saves have turn balances but no study. The download/open path reconstructs them too.
+        del game['study']
+        for turn in game['turns']:
+            turn.pop('end_ply', None)
+        path.write_text(json.dumps(game))
+        _, replay = self.session.saved_replay(ident, 1)
+        tree = Study(replay['study'])
+        self.assertEqual(loads(dumps(tree.record())).turns[0]['moves'][1]['info'], info)
+        handler = type('H', (Handler,), dict(session=self.session))
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urlopen(f'http://127.0.0.1:{server.server_port}/matches/game?batch={ident}&game=1&format=htttx') as response:
+                downloaded = loads(response.read().decode())
+            self.assertEqual(downloaded.turns[0]['moves'][1]['info'], info)
+        finally:
+            server.shutdown()
+            server.server_close()
+        opened = self.session.open_saved_game(ident, 1)
+        self.assertEqual(opened.tree.data['annotations'][key]['info'], info)
+
     def test_a_batch_cannot_take_over_an_unfinished_human_game(self):
         self.session.configure_seat(1, 'human')
         self.session.play(0, 0)
@@ -1989,6 +2043,40 @@ class FreeplayClock(unittest.TestCase):
         self.addCleanup(self.session.close)
         self.session.configure_analysis('bubble:fake', auto=False)
         self.session.configure_seat(1, 'human')
+
+    def test_flagging_without_a_stone_keeps_the_previous_players_annotation(self):
+        from unittest.mock import patch
+        self.session.set_clock(dict(mode='game', tc='5'))
+        self.session.load([(0, 0), (1, 0), (0, 1)], True)
+        previous = dict(stone=[0, 1], info='{@4000}', visuals=[])
+        self.session.tree.data['annotations']['0,0;1,0;0,1'] = previous.copy()
+        self.session.game_clock.start(0)
+        with patch.object(self.session.game_clock, 'expired', return_value=True):
+            self.session.clock_turn(0)
+        self.assertEqual(self.session.tree.data['annotations'], {'0,0;1,0;0,1': previous})
+
+    def test_deadline_check_saves_the_flagging_players_partial_turn_clock(self):
+        from unittest.mock import patch
+        from notation_v2 import dumps, loads
+        self.session.set_clock(dict(mode='game', tc='5'))
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                history = [(0, 0), (1, 0), (0, 1)] + ([(2, 0)] if partial else [])
+                self.session.load(history, True)
+                previous = dict(stone=[0, 1], info='{@4000}', visuals=[])
+                self.session.tree.data['annotations']['0,0;1,0;0,1'] = previous.copy()
+                self.session.paused = False
+                self.session.game_clock.start(0)
+                with patch.object(self.session.game_clock, 'expired', return_value=True):
+                    state = self.session.state()  # Real deadline path calls check_time, not clock_turn.
+                self.assertEqual(state['outcome'], dict(winner=1, reason='time'))
+                self.assertEqual(self.session.clock_turns[-1]['cross_ms'], 0)
+                self.assertEqual(self.session.tree.data['annotations']['0,0;1,0;0,1'], previous)
+                record = loads(dumps(self.session.tree.record()))
+                move = record.turns[-1]['moves'][0 if partial else 1]
+                self.assertEqual(move['info'], '{@0}' if partial else '{@4000}')
+                saved = json.loads((self.session.freeplay_directory / 'game-0001.json').read_text())
+                self.assertEqual(saved['study']['annotations'], self.session.tree.data['annotations'])
 
     def test_people_play_on_a_fischer_clock_and_lose_on_time(self):
         self.session.set_clock(dict(mode='game', tc='0.4+1'))

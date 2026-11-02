@@ -134,6 +134,35 @@ def page(job):
 
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
+    def test_browser_seats_allow_retrospective_edits_and_clear_on_exploration(self):
+        source = """import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const source=readFileSync('web/engine/seat.mjs','utf8');
+const install=source.slice(source.indexOf('function install() {'),source.indexOf('async function serverless()'));
+let state={history:[[0,0],[1,0],[0,1]],player:0,paused:true},view=1,allowed=true,success=true;
+const choice={engine:'browser:test'},config={seats:[choice,null],analysis:null},page={},posts=[];
+const noop=()=>{};
+const context={page,config,notices:{addEventListener:noop},openMenu:noop,pickItems:noop,
+  original:{canPlace:()=>allowed,post:async(path,body)=>{posts.push([path,body]);return success?state:null;},renderPanels:noop},
+  state:()=>state,viewed:()=>view,adopt:noop,schedule:noop,renew:noop,save:noop,
+  ENGINES:new Map(),document:{getElementById:()=>null},holding:null};
+vm.runInNewContext(install+';install();',context);
+for(const paused of [true,false]) {
+  state.paused=paused;view=1;assert.equal(page.canPlace(),true);
+  view=3;assert.equal(page.canPlace(),false);
+}
+view=1;allowed=false;assert.equal(page.canPlace(),false);allowed=true;
+await page.post('/variation',{ply:1,moves:[[2,0]]});assert.equal(config.seats[0],choice);
+success=false;await page.post('/retry',{ply:1});assert.equal(config.seats[0],choice);
+success=true;await page.post('/retry',{ply:1});assert.deepEqual(Array.from(config.seats),[null,null]);
+config.seats=[choice,null];await page.post('/variation',{index:1});assert.deepEqual(Array.from(config.seats),[null,null]);
+assert.deepEqual(posts.at(-1),['/variation',{index:1}]);
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
     def follow(self, steps, enabled=True, available=True, stored=None, together=False):
         return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
@@ -299,6 +328,101 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+    def test_v2_timeout_only_annotates_the_flagging_players_stone(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+for(const partial of [false,true]) {
+  const s=await BrowserSession.create(null,{storage:new PlayStorage(null)});
+  s.load([[0,0],[1,0],[0,1]],true);
+  s.clock={cross_ms:5000,circle_ms:4000,side:1,started:Date.now()-10};s.chargeTurn(1);
+  const previous=structuredClone(s.tree.annotations['0,0;1,0;0,1']);
+  if(partial){s.history.push([2,0]);s.tree.capture(s.history);}
+  s.clock={cross_ms:1,circle_ms:4000,side:0,started:Date.now()-100};await s.checkTime();
+  assert.deepEqual(s.tree.annotations['0,0;1,0;0,1'],previous);
+  assert.equal(s.outcome.winner,1);
+  if(partial)assert.equal(s.tree.annotations['0,0;1,0;0,1;2,0'].info,'{@0}');
+  else assert.equal(Object.keys(s.tree.annotations).length,1);
+  await s.saving;
+}
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_v2_nested_order_and_completed_match_annotations(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+import {parseV2,writeV2,Study} from './web/engine/study.mjs';
+const s=await BrowserSession.create(null,{storage:new PlayStorage(null)});
+const record=parseV2('version[2];1.[1,0][0,1](1.[-1,0][0,-1];2.[1,-1][2,-1](2.[-1,1][-2,1];););2.[2,0][2,1];');
+const tree=Study.fromRecord(record,s.native);
+assert.deepEqual(tree.lines[1].slice(-2),[[1,-1],[2,-1]]);
+assert.deepEqual(parseV2(writeV2(tree.record()).text),record);
+s.load([[0,0],[1,0],[0,1]],true);
+s.match={id:'clocked',name:'Clocked',active:true,players:s.seats,games:1,completed:0,current:1,
+  wins:[0,0],capped:0,results:[],openings:[],timings:[],clock:{mode:'game',base_ms:5000,increment_ms:100}};
+s.clock={cross_ms:5000,circle_ms:4000,side:1,started:Date.now()-10};
+s.chargeTurn(1);
+const expected=structuredClone(s.tree.annotations);
+assert.match(expected['0,0;1,0;0,1'].info,/^\\{@[0-9]+\\}$/);
+await s.finishMatch(null,'capped');
+const saved=await s.savedReplay('clocked',1);
+assert.deepEqual(saved.study.annotations,expected);
+const [status,text]=await s.request('/matches/game?batch=clocked&game=1&format=htttx');
+assert.equal(status,200);assert.equal(parseV2(text).turns[0].moves[1].info,expected['0,0;1,0;0,1'].info);
+await s.openGame('clocked',1);assert.deepEqual(s.tree.annotations,expected);
+await s.saving;
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_v2_study_survives_branch_promotion_and_storage(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+import {parseV2,writeV2,Study} from './web/engine/study.mjs';
+const storage=new PlayStorage(null),s=await BrowserSession.create(null,{storage});
+s.seats=[{engine:'human'},{engine:'human'}];
+for(const [q,r] of [[0,0],[1,0],[0,1],[2,0],[2,-1]])s.apply('/play',{q,r});
+s.apply('/retry',{ply:3});
+s.apply('/play',{q:-1,r:1});s.apply('/play',{q:-2,r:2});
+assert.equal(s.tree.lines.length,2);
+assert.equal((await s.request('/variation',{index:1,promote:true},'POST'))[0],200);
+const [status,data]=await s.request('/export?format=htttx');assert.equal(status,200);
+const record=parseV2(data.text);assert.deepEqual(record.turns[1].moves[0].stone,[-1,1]);
+assert.equal(record.turns[1].variations.length,1);
+await s.saving;
+const cold=await BrowserSession.create(null,{storage});await cold.restore();
+assert.deepEqual(cold.tree.lines,s.tree.lines);
+assert.equal((await cold.request('/import',{text:data.text},'POST'))[0],200);
+assert.equal(cold.tree.lines.length,2);
+// JSON restores the selected side line and a truncated position, not the study's preferred continuation.
+await cold.request('/variation',{index:1},'POST');
+for(const partial of [false,true]) {
+  if(partial)cold.apply('/retry',{ply:3});
+  const selected=structuredClone(cold.history),lines=structuredClone(cold.tree.lines);
+  const replay=(await cold.request('/replay'))[1];
+  assert.equal((await cold.request('/import',{text:JSON.stringify(replay)},'POST'))[0],200);
+  assert.deepEqual(cold.history,selected);assert.deepEqual(cold.tree.lines,lines);
+}
+const shared=Study.fromRecord(parseV2('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[1,0][2,0];);'),cold.native);
+const annotated=parseV2(writeV2(shared.record()).text).turns[0].moves[0];
+assert.equal(annotated.info,'{@1234:%-10}');assert.deepEqual(annotated.visuals,['<2,0:#X:$A>']);
+assert.equal((await cold.request('/import',{text:'version[2];x:o;'},'POST'))[0],200);
+for(const [q,r] of [[0,0],[1,0],[0,1]]) {
+  cold.apply('/play',{q,r});
+  const selected=structuredClone(cold.history),text=(await cold.request('/export?format=htttx'))[1].text;
+  assert.equal((await cold.request('/import',{text},'POST'))[0],200);
+  assert.deepEqual(cold.history,selected);
+}
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_padded_proof_bound_does_not_send_a_finished_board_to_the_solver(self):
         from tests.test_tactical_proof import IMMEDIATE
         source = """import {readFileSync} from 'node:fs';
@@ -1769,6 +1893,8 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['after']['history'], result['before']['history'])
         self.assertEqual(result['after']['timings'], result['before']['timings'])
         self.assertEqual(result['after']['turns'], result['before']['turns'])
+        self.assertEqual(result['after']['study'], result['before']['study'])
+        self.assertTrue(result['after']['study']['annotations'])
         self.assertGreater(result['before']['turns'], 0)
         self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
         self.assertGreater(result['after']['clock']['circle_ms'], 180000)
