@@ -2018,6 +2018,29 @@ class FreeplayClock(unittest.TestCase):
             self.session.clock_turn(0)
         self.assertEqual(self.session.tree.data['annotations'], {'0,0;1,0;0,1': previous})
 
+    def test_deadline_check_saves_the_flagging_players_partial_turn_clock(self):
+        from unittest.mock import patch
+        from notation_v2 import dumps, loads
+        self.session.set_clock(dict(mode='game', tc='5'))
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                history = [(0, 0), (1, 0), (0, 1)] + ([(2, 0)] if partial else [])
+                self.session.load(history, True)
+                previous = dict(stone=[0, 1], info='{@4000}', visuals=[])
+                self.session.tree.data['annotations']['0,0;1,0;0,1'] = previous.copy()
+                self.session.paused = False
+                self.session.game_clock.start(0)
+                with patch.object(self.session.game_clock, 'expired', return_value=True):
+                    state = self.session.state()  # Real deadline path calls check_time, not clock_turn.
+                self.assertEqual(state['outcome'], dict(winner=1, reason='time'))
+                self.assertEqual(self.session.clock_turns[-1]['cross_ms'], 0)
+                self.assertEqual(self.session.tree.data['annotations']['0,0;1,0;0,1'], previous)
+                record = loads(dumps(self.session.tree.record()))
+                move = record.turns[-1]['moves'][0 if partial else 1]
+                self.assertEqual(move['info'], '{@0}' if partial else '{@4000}')
+                saved = json.loads((self.session.freeplay_directory / 'game-0001.json').read_text())
+                self.assertEqual(saved['study']['annotations'], self.session.tree.data['annotations'])
+
     def test_people_play_on_a_fischer_clock_and_lose_on_time(self):
         self.session.set_clock(dict(mode='game', tc='0.4+1'))
         state = self.session.state()

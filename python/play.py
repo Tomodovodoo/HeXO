@@ -3374,9 +3374,14 @@ class Session:
         balances = clock.json()
         self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
                                      cross_ms=round(balances['cross_ms']), circle_ms=round(balances['circle_ms'])))
-        if len(self.history) > 1 and player_at(len(self.history) - 1) == side:
-            self.tree.data['annotations'][notation_position(self.history)] = dict(stone=list(self.history[-1]), info='{@' + str(max(0, round(balances['circle_ms' if side else 'cross_ms']))) + '}', visuals=[])
+        self.annotate_clock(side, balances['circle_ms' if side else 'cross_ms'])
         return not expired
+
+    def annotate_clock(self, side, milliseconds):
+        """Record a balance only when the charged side placed the last stone."""
+        if len(self.history) > 1 and player_at(len(self.history) - 1) == side:
+            self.tree.data['annotations'][notation_position(self.history)] = dict(
+                stone=list(self.history[-1]), info='{@' + str(max(0, round(milliseconds))) + '}', visuals=[])
 
     def balances(self, flagged=None):
         """Both clock balances in whole ms for a turn record, the side that ran out of time (`flagged`) at zero."""
@@ -3400,6 +3405,7 @@ class Session:
         self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
                                      cross_ms=0 if side == 0 else round(balances['cross_ms']),
                                      circle_ms=0 if side == 1 else round(balances['circle_ms'])))
+        self.annotate_clock(side, 0)
         self.stop_moves()
         self.changed()
 
