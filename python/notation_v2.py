@@ -169,6 +169,26 @@ class Study:
                 return
         lines.append(history)
 
+    def add_clocks(self, history, turns):
+        """Attach saved turn balances to their last placement, excluding timeouts without a stone."""
+        self.capture(history)
+        for turn in turns:
+            ply, side = turn.get('end_ply', turn['ply']), turn['side']
+            # Older tournament logs use the turn's starting ply; freeplay logs use its ending ply.
+            if 'end_ply' not in turn and 'clock_spent_ms' in turn:
+                ply = min(len(history), ply + (2 if ply % 2 else 1))
+            if not 1 < ply <= len(history) or (ply // 2) % 2 != side:
+                continue
+            balance = turn.get('circle_ms' if side else 'cross_ms')
+            if balance is None:
+                continue
+            prefix = history[:ply]
+            key = position_key(prefix)
+            saved = self.data['annotations'].get(key, {})
+            evaluation = re.search(r'[%#]-?[0-9]+', saved.get('info') or '')
+            info = '{@' + str(max(0, round(balance))) + (':' + evaluation[0] if evaluation else '') + '}'
+            self.data['annotations'][key] = dict(stone=list(prefix[-1]), info=info, visuals=saved.get('visuals', []))
+
     @classmethod
     def from_record(cls, record):
         record.history  # Refuse to invent a history for an arbitrary setup.

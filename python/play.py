@@ -3037,6 +3037,9 @@ class Session:
             raise ValueError('No such saved game')
         directory = self.saved_matches[ident]
         game = saved_ids(json.loads((directory / f'game-{number:04d}.json').read_text(encoding='utf-8')))
+        tree = Study(game.get('study'))
+        tree.add_clocks(game['history'], game.get('turns', []))
+        game['study'] = tree.data
         return directory, game
 
     def open_saved_game(self, ident, number):
@@ -3281,8 +3284,9 @@ class Session:
 
     def save_match_position(self):
         if self.match:
+            self.tree.add_clocks(self.history, self.match['turns'])
             self.write_match(self.match, 'current.json', dict(game=self.match['current'], history=list(self.history),
-                             seats=self.seats, turns=self.match['turns'],
+                             study=self.tree.data, seats=self.seats, turns=self.match['turns'],
                              partial_spent_ms=self.match.get('partial_spent_ms', 0),
                              balances=self.game_clock.remaining() if self.game_clock else None))
 
@@ -3439,7 +3443,9 @@ class Session:
                     game = json.loads(path.read_text(encoding='utf-8'))
                     notation = path.with_suffix('.htttx')
                     temporary = notation.with_suffix('.htttx.tmp')
-                    temporary.write_text(dumps([tuple(p) for p in game['history']]), encoding='utf-8')
+                    tree = Study(game.get('study'))
+                    tree.add_clocks(game['history'], game.get('turns', []))
+                    temporary.write_text(dumps_v2(tree.record()), encoding='utf-8')
                     temporary.replace(notation)
                     winner = game['winner']
                     player = (winner if number % 2 else 1-winner) if winner is not None else None
@@ -3488,8 +3494,9 @@ class Session:
                 if self.game_clock and continuing and saved.get('balances'):
                     self.game_clock.balances = saved['balances']
                 self.store = Evaluations(directory / 'evaluations.jsonl')
-                self.tree = Study()
+                self.tree = Study(saved.get('study') if continuing else None)
                 self.history = list(map(tuple, history))
+                self.tree.add_clocks(self.history, match['turns'])
                 order = [0, 1] if number % 2 else [1, 0]
                 self.seats = [{k: v for k, v in match['players'][i].items() if k not in ('name', 'source')} for i in order]
                 self.stop_moves()
@@ -3568,7 +3575,8 @@ class Session:
                         continue
                     number = match['current']
                     order = [0, 1] if number % 2 else [1, 0]
-                    result = dict(format='bubble-replay', version=1, game=number,
+                    self.tree.add_clocks(self.history, match['turns'])
+                    result = dict(study=self.tree.data, format='bubble-replay', version=1, game=number,
                                   players=[match['players'][i] for i in order], history=list(self.history),
                                   winner=winner if winner >= 0 else None, reason='win' if winner >= 0 else 'capped',
                                   clock=match['clock'], turns=match['turns'])
@@ -3578,7 +3586,7 @@ class Session:
                     result['opening'] = (match['opening_selection']['nodes'][opening_index] if match['opening_selection']
                                          else dict(moves=match['openings'][opening_index]))
                     self.write_match(match, f'game-{number:04d}.json', result)
-                    (Path(match['output']) / f'game-{number:04d}.htttx').write_text(dumps(self.history), encoding='utf-8')
+                    (Path(match['output']) / f'game-{number:04d}.htttx').write_text(dumps_v2(self.tree.record(self.lookup)), encoding='utf-8')
                     if winner >= 0:
                         match['wins'][order[winner]] += 1
                     else:
@@ -3786,6 +3794,7 @@ class Session:
                             if freeplay:
                                 self.clock_turn(job.side, job.received)
                         if self.match and self.match['active']:
+                            self.match['turns'][-1]['end_ply'] = len(self.history)
                             self.match['error'] = None
                             self.save_match_position()
                 try:

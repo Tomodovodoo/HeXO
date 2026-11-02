@@ -1977,6 +1977,43 @@ class Matches(unittest.TestCase):
                 self.assertEqual(self.session.match['wins'], [1, 0])
                 self.assertIsNone(self.session.match['error'])
 
+    def test_clocked_tournament_saves_and_exports_study_annotations(self):
+        from notation_v2 import loads, Study, dumps
+        with unittest.mock.patch('timed_engine.TimedEngine') as engine:
+            engine.return_value.identity = dict(kind='fake')
+            engine.return_value.turn.return_value = dict(moves=[[1, 0], [0, 1]], elapsed_ms=1)
+            self.session.start_match(['Drip', 'Other'], games=1, output=self.output,
+                                     max_placements=3, clock=dict(mode='game', tc='5+1'))
+            wait(lambda: not self.session.match_worker.is_alive())
+        self.assertIsNone(self.session.match['error'])
+        path = self.output / 'game-0001.json'
+        game = json.loads(path.read_text())
+        key = '0,0;1,0;0,1'
+        info = '{@' + str(game['turns'][-1]['circle_ms']) + '}'
+        self.assertEqual(game['study']['annotations'][key]['info'], info)
+        self.assertEqual(loads((self.output / 'game-0001.htttx').read_text()).turns[0]['moves'][1]['info'], info)
+        ident = next(m['id'] for m in self.session.match_catalogue() if m['name'] == 'match')
+        # Older saves have turn balances but no study. The download/open path reconstructs them too.
+        del game['study']
+        for turn in game['turns']:
+            turn.pop('end_ply', None)
+        path.write_text(json.dumps(game))
+        _, replay = self.session.saved_replay(ident, 1)
+        tree = Study(replay['study'])
+        self.assertEqual(loads(dumps(tree.record())).turns[0]['moves'][1]['info'], info)
+        handler = type('H', (Handler,), dict(session=self.session))
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urlopen(f'http://127.0.0.1:{server.server_port}/matches/game?batch={ident}&game=1&format=htttx') as response:
+                downloaded = loads(response.read().decode())
+            self.assertEqual(downloaded.turns[0]['moves'][1]['info'], info)
+        finally:
+            server.shutdown()
+            server.server_close()
+        opened = self.session.open_saved_game(ident, 1)
+        self.assertEqual(opened.tree.data['annotations'][key]['info'], info)
+
     def test_a_batch_cannot_take_over_an_unfinished_human_game(self):
         self.session.configure_seat(1, 'human')
         self.session.play(0, 0)
