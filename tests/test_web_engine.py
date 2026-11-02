@@ -134,6 +134,35 @@ def page(job):
 
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
+    def test_browser_seats_allow_retrospective_edits_and_clear_on_exploration(self):
+        source = """import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const source=readFileSync('web/engine/seat.mjs','utf8');
+const install=source.slice(source.indexOf('function install() {'),source.indexOf('async function serverless()'));
+let state={history:[[0,0],[1,0],[0,1]],player:0,paused:true},view=1,allowed=true,success=true;
+const choice={engine:'browser:test'},config={seats:[choice,null],analysis:null},page={},posts=[];
+const noop=()=>{};
+const context={page,config,notices:{addEventListener:noop},openMenu:noop,pickItems:noop,
+  original:{canPlace:()=>allowed,post:async(path,body)=>{posts.push([path,body]);return success?state:null;},renderPanels:noop},
+  state:()=>state,viewed:()=>view,adopt:noop,schedule:noop,renew:noop,save:noop,
+  ENGINES:new Map(),document:{getElementById:()=>null},holding:null};
+vm.runInNewContext(install+';install();',context);
+for(const paused of [true,false]) {
+  state.paused=paused;view=1;assert.equal(page.canPlace(),true);
+  view=3;assert.equal(page.canPlace(),false);
+}
+view=1;allowed=false;assert.equal(page.canPlace(),false);allowed=true;
+await page.post('/variation',{ply:1,moves:[[2,0]]});assert.equal(config.seats[0],choice);
+success=false;await page.post('/retry',{ply:1});assert.equal(config.seats[0],choice);
+success=true;await page.post('/retry',{ply:1});assert.deepEqual(Array.from(config.seats),[null,null]);
+config.seats=[choice,null];await page.post('/variation',{index:1});assert.deepEqual(Array.from(config.seats),[null,null]);
+assert.deepEqual(posts.at(-1),['/variation',{index:1}]);
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     """The opening-book default follows the seats as the page shows them until the person touches the switch."""
     def follow(self, steps, enabled=True, available=True, stored=None, together=False):
         return page(dict(kind='follow', steps=steps, enabled=enabled, available=available, stored=stored, together=together))
