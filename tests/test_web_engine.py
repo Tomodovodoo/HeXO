@@ -299,6 +299,28 @@ class Overlay(unittest.TestCase):
 
 @unittest.skipUnless(BUILT, 'needs node and a built web/engine (python tools/build_web.py wasm)')
 class BrowserProofs(unittest.TestCase):
+    def test_v2_timeout_only_annotates_the_flagging_players_stone(self):
+        source = """import assert from 'node:assert/strict';
+import {BrowserSession} from './web/engine/play-session.mjs';
+import {PlayStorage} from './web/engine/storage.mjs';
+for(const partial of [false,true]) {
+  const s=await BrowserSession.create(null,{storage:new PlayStorage(null)});
+  s.load([[0,0],[1,0],[0,1]],true);
+  s.clock={cross_ms:5000,circle_ms:4000,side:1,started:Date.now()-10};s.chargeTurn(1);
+  const previous=structuredClone(s.tree.annotations['0,0;1,0;0,1']);
+  if(partial){s.history.push([2,0]);s.tree.capture(s.history);}
+  s.clock={cross_ms:1,circle_ms:4000,side:0,started:Date.now()-100};await s.checkTime();
+  assert.deepEqual(s.tree.annotations['0,0;1,0;0,1'],previous);
+  assert.equal(s.outcome.winner,1);
+  if(partial)assert.equal(s.tree.annotations['0,0;1,0;0,1;2,0'].info,'{@0}');
+  else assert.equal(Object.keys(s.tree.annotations).length,1);
+  await s.saving;
+}
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_v2_nested_order_and_completed_match_annotations(self):
         source = """import assert from 'node:assert/strict';
 import {BrowserSession} from './web/engine/play-session.mjs';
@@ -1842,6 +1864,8 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['after']['history'], result['before']['history'])
         self.assertEqual(result['after']['timings'], result['before']['timings'])
         self.assertEqual(result['after']['turns'], result['before']['turns'])
+        self.assertEqual(result['after']['study'], result['before']['study'])
+        self.assertTrue(result['after']['study']['annotations'])
         self.assertGreater(result['before']['turns'], 0)
         self.assertEqual(result['after']['clock']['circle_ms'], result['before']['clock']['circle_ms'])
         self.assertGreater(result['after']['clock']['circle_ms'], 180000)

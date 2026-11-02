@@ -3374,7 +3374,7 @@ class Session:
         balances = clock.json()
         self.clock_turns.append(dict(ply=len(self.history), side=side, spent_ms=round(spent),
                                      cross_ms=round(balances['cross_ms']), circle_ms=round(balances['circle_ms'])))
-        if len(self.history) > 1:
+        if len(self.history) > 1 and player_at(len(self.history) - 1) == side:
             self.tree.data['annotations'][notation_position(self.history)] = dict(stone=list(self.history[-1]), info='{@' + str(max(0, round(balances['circle_ms' if side else 'cross_ms']))) + '}', visuals=[])
         return not expired
 

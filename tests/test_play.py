@@ -2007,6 +2007,17 @@ class FreeplayClock(unittest.TestCase):
         self.session.configure_analysis('bubble:fake', auto=False)
         self.session.configure_seat(1, 'human')
 
+    def test_flagging_without_a_stone_keeps_the_previous_players_annotation(self):
+        from unittest.mock import patch
+        self.session.set_clock(dict(mode='game', tc='5'))
+        self.session.load([(0, 0), (1, 0), (0, 1)], True)
+        previous = dict(stone=[0, 1], info='{@4000}', visuals=[])
+        self.session.tree.data['annotations']['0,0;1,0;0,1'] = previous.copy()
+        self.session.game_clock.start(0)
+        with patch.object(self.session.game_clock, 'expired', return_value=True):
+            self.session.clock_turn(0)
+        self.assertEqual(self.session.tree.data['annotations'], {'0,0;1,0;0,1': previous})
+
     def test_people_play_on_a_fischer_clock_and_lose_on_time(self):
         self.session.set_clock(dict(mode='game', tc='0.4+1'))
         state = self.session.state()
