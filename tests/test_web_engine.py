@@ -134,6 +134,27 @@ def page(job):
 
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
+    def test_recursive_score_preserves_turn_branches_and_annotations(self):
+        source = """import assert from 'node:assert/strict';
+import {Study,parseV2} from './web/engine/study.mjs';
+import {scoreTree,annotationText} from './web/engine/study-score.mjs';
+const record=parseV2('version[2];1.[1,0]{@1234:%-10}<2,0:#X:$A>[0,1](1.[-1,0][0,-1];2.[1,-1][2,-1](2.[-1,1][-2,1];3.[2,-2][3,-3](3.[-2,2][/];);););2.[2,0][2,1];');
+const study=Study.fromRecord(record,{game(){}}),roots=scoreTree(study);
+assert.equal(roots.length,2);assert.equal(roots[1].children.length,2);
+const nested=roots[1].children[1].children;
+assert.equal(nested.length,2);assert.deepEqual(nested[1].stones,[[-2,2]]);
+assert.deepEqual(study.lines[nested[1].lineIndex],nested[1].history);
+assert.equal(nested[1].start,5);
+assert.deepEqual(roots[0].stones,[[1,0],[0,1]]);
+assert.equal(annotationText('{@1234:%-10}'),'X -10 · 0:01.2');
+assert.equal(annotationText('{#-3}'),'O wins in 3 turns');
+assert.equal(annotationText(null),'');
+assert.equal(study.annotations['0,0;1,0'].visuals[0],'<2,0:#X:$A>');
+console.log('ok');"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_browser_seats_allow_retrospective_edits_and_clear_on_exploration(self):
         source = """import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
