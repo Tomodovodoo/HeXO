@@ -372,13 +372,23 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 @media (max-width:420px){#t-tabs{order:3;width:100%;margin-left:0}.saved-game .downloads{grid-column:2 / 4;justify-self:end}.saved-game.freeplay .downloads{grid-column:1 / 3}}
-#variations{max-height:180px;overflow:auto;flex:none;font-size:12px;border-top:1px solid var(--line);padding-top:6px}
-#variations summary{cursor:pointer;color:var(--muted);padding:4px 0}
-#study-lines .study-line{display:flex;gap:6px;align-items:center;margin:4px 0}
-#study-lines button{font-size:11px;padding:4px 6px;white-space:nowrap}
-#study-lines .line-name{flex:1;overflow:hidden;text-overflow:ellipsis;text-align:left}
-#study-lines .selected{border-color:var(--x);color:var(--x)}
-#saved-annotation{font-size:12px;color:var(--muted);min-height:0}
+#saved-annotation{font-size:12px;line-height:16px;color:var(--muted)}
+.score-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 4px;color:var(--muted);font-size:12px;line-height:16px}
+.score-location{margin-right:auto}
+.score-action,.score-fold,.score-summary{border:0;background:transparent;color:var(--muted);font:inherit;cursor:pointer;padding:4px}
+.score-action:hover,.score-fold:hover,.score-summary:hover{color:var(--text);background:var(--raise)}
+.study-score{font-size:14px;line-height:28px;padding:4px;overflow-wrap:anywhere}
+.score-turn{display:inline}.score-main{font-weight:600}
+.score-number{color:var(--muted);font-size:12px;white-space:nowrap;font-weight:400}
+.score-stone{display:inline}.score-move{font:inherit;border:0;background:transparent;color:var(--stone-color,var(--text));padding:4px;border-radius:4px;cursor:pointer;white-space:nowrap}
+.score-move:hover{background:var(--raise-2)}.score-move.current{background:var(--x);color:var(--bg)}
+.score-info{font-size:12px;font-weight:400;color:var(--muted);margin-right:4px;white-space:nowrap}
+.score-grade{font-size:12px;margin-right:4px}.score-marks{font-size:12px;font-weight:400;color:var(--dim);margin-right:4px}
+.score-variation{display:flex;gap:4px;margin:4px 0 4px 8px;padding:4px;border-radius:4px;background:var(--bg);font-weight:400}
+.score-variation.active-line{box-shadow:inset 0 0 0 1px var(--line-2)}
+.score-fold{align-self:flex-start;flex:none;min-width:24px;line-height:20px}
+.score-variation.deep{display:block;margin-left:0;padding-left:0}.score-variation.deep>.score-branch{display:inline}
+.score-branch{min-width:0;flex:1}.score-summary{text-align:left;font-size:12px}
 </style>
 <div id="app" data-tab="analysis">
   <nav id="tabs"><button data-tab="analysis" class="on">Analysis</button><button data-tab="review">Moves</button></nav>
@@ -427,7 +437,6 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
         <button class="btn" id="review-go"></button></div>
       <div id="accuracy"></div>
       <svg id="graph" class="empty" preserveAspectRatio="none"></svg>
-      <details id="variations" open><summary>Study lines</summary><div id="study-lines"></div></details>
       <div id="saved-annotation" class="nums"></div>
       <div id="moves"></div>
       <div class="detail" id="detail"></div>
@@ -1087,20 +1096,18 @@ function renderGraph(){
     <line x1="${X(view)}" x2="${X(view)}" y1="0" y2="${H}" stroke="var(--muted)" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`;
 }
 $('graph').onclick=e=>{const b=$('graph').getBoundingClientRect();go(Math.round((e.clientX-b.left)/b.width*S.history.length))};
+let scoreView=null;
+import('./engine/study-score.mjs').then(module=>{scoreView=module.createScoreView();if(S)renderMoves()}).catch(error=>toast(error.message));
+async function selectScoreMove(index,ply){
+  const line=S.study.lines[index];
+  if(JSON.stringify(line)!==JSON.stringify(S.history)){
+    if(!await post('/variation',{index}))return;
+  }
+  go(ply);fit();
+}
+async function promoteScore(index,promote){const ply=view;if(await post('/variation',{index,promote}))go(ply)}
 function renderStudyLines(){
-  const tree=S.study,box=$('study-lines');$('variations').hidden=!tree;
-  if(!tree){box.replaceChildren();return}
-  const current=JSON.stringify(S.history),lines=tree.lines||[];
-  box.replaceChildren(...lines.map((h,i)=>{
-    let split=0;if(i)while(split<Math.min(h.length,lines[0].length)&&h[split].join(',')===lines[0][split].join(','))split++;
-    const turn=Math.max(1,Math.ceil(split/2)),label=i?`Line ${i}, turn ${turn}`:'Main line';
-    const button=el('button',{class:'btn line-name'+(current===JSON.stringify(h)?' selected':''),title:h.slice(Math.max(1,split)).map(p=>`[${p}]`).join(' ')},label+', '+Math.ceil((h.length-1)/2)+' turns');
-    button.onclick=async()=>{if(await post('/variation',{index:i}))showLivePosition()};
-    const row=el('div',{class:'study-line'},button);
-    if(i){const local=el('button',{class:'btn',title:'Promote within the closest parent line'},'Promote');local.onclick=async()=>{if(await post('/variation',{index:i,promote:'local'}))showLivePosition()};row.append(local);const promote=el('button',{class:'btn',title:'Make this line the main line; keep the previous main line'},'Make main');promote.onclick=async()=>{if(await post('/variation',{index:i,promote:true}))showLivePosition()};row.append(promote)}
-    const preview=el('details',{},el('summary',{},'Moves'));
-    const choices=el('div',{class:'study-line',style:'flex-wrap:wrap'},h.slice(Math.max(1,split)).map((p,j)=>{const ply=Math.max(1,split)+j+1,b=el('button',{class:'btn'},`${Math.ceil((ply-1)/2)}. [${p}]`);b.onclick=async()=>{if(await post('/variation',{index:i})){go(ply);fit()}};return b}));preview.append(choices);return el('div',{},row,preview)}));
-  const annotation=tree.annotations?.[S.history.slice(0,view).map(p=>p.join(',')).join(';')],info=annotation?.info;
+  const annotation=S.study?.annotations?.[S.history.slice(0,view).map(p=>p.join(',')).join(';')],info=annotation?.info;
   $('saved-annotation').textContent=info?'Saved annotation: '+info.replace(/[{}]/g,'').replace(/@([0-9]+)/,(_,ms)=>clockText(+ms)).replace(/%(-?[0-9]+)/,(_,n)=>'X evaluation '+n).replace(/#(-?[0-9]+)/,(_,n)=>`${+n>=0?'X':'O'} wins in ${Math.abs(+n)} turns`):'';
   const ev=shownEval(view),pv=ev?.pv?.length?ev.pv:ev?.moves;
   if(pv?.length&&view>0){const keep=el('button',{class:'btn'},'Save engine line');keep.onclick=()=>post('/variation',{ply:view,moves:pv.map(p=>p.slice(0,2))});$('saved-annotation').append(' ',keep)}
@@ -1108,7 +1115,19 @@ function renderStudyLines(){
 function renderMoves(){
   renderStudyLines();
   const box=$('moves'),sel=selectedTurn(),keep=box.scrollTop,atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-4;
-  box.replaceChildren(...S.review.map((t,i)=>{
+  if(S.study&&scoreView){
+    scoreView.render(box,S.study,{history:S.history,ply:view,onSelect:selectScoreMove,onPromote:promoteScore,
+      info:prefix=>{if(JSON.stringify(prefix)!==JSON.stringify(S.history.slice(0,prefix.length)))return null;
+        const ev=S.evaluations[prefix.length];if(ev?.value==null||ev.imported)return null;
+        const x=playerAt(prefix.length)===0?ev.value:1-ev.value,clock=S.study.annotations?.[prefix.map(p=>p.join(',')).join(';')]?.info?.match(/@\d+/)?.[0];
+        return `{${clock?clock+':':''}%${Math.round(100*(2*x-1))}}`},
+      grade:prefix=>{if(JSON.stringify(prefix)!==JSON.stringify(S.history.slice(0,prefix.length)))return null;
+        const t=S.review.find(t=>t.ply<prefix.length&&t.ply+t.stones.length>=prefix.length),label=t?.grades?.[prefix.length-t.ply-1]?.label;
+        return label&&LABEL[label]?{symbol:LABEL[label][0],color:`var(${LABEL[label][1]})`,label}:null},
+      turnGrade:prefix=>{if(JSON.stringify(prefix)!==JSON.stringify(S.history.slice(0,prefix.length)))return null;
+        const t=S.review.find(t=>t.ply+t.stones.length===prefix.length),label=t?.label;
+        return label&&LABEL[label]?{symbol:LABEL[label][0],color:`var(${LABEL[label][1]})`,label}:null}});
+  }else box.replaceChildren(...S.review.map((t,i)=>{
     const label=t.label&&LABEL[t.label],fresh=t.label&&seenLabels.has(t.ply)&&seenLabels.get(t.ply)!==t.label;
     const row=el('div',{class:'turn'+(t===sel?' sel':''),style:`--c:${COLORS[t.player]}`},el('span',{class:'n'},i+1),
       el('span',{class:'st'},t.stones.map((p,j)=>{const at=t.ply+j,s=el('span',{class:t===sel?(at===view-1?'on':at>=view?'off':''):''},p[0]+','+p[1],...stoneMark(t,j));
@@ -1123,7 +1142,7 @@ function renderMoves(){
     return counts.length?[el('span',{class:'tally'},el('i',{class:'hexdot',style:`--c:${COLORS[p]}`}),
       counts.map(([l,n])=>el('span',{},el('span',{class:'glyph',style:`--c:var(${LABEL[l][1]})`},LABEL[l][0]),n)))]:[]}));
   if(atEnd&&view===S.history.length)box.scrollTop=box.scrollHeight;else box.scrollTop=keep;
-  const s=box.querySelector('.sel');if(s&&renderMoves.view!==view)s.scrollIntoView({block:'nearest'});renderMoves.view=view;
+  const s=box.querySelector('.score-move.current,.sel');if(s&&renderMoves.view!==view)s.scrollIntoView({block:'nearest'});renderMoves.view=view;
 }
 /* a stone's own grade as a small badge, unless the stone is the whole graded turn */
 function stoneMark(t,j){const g=(t.stones.length>1||!t.label)&&t.grades?.[j]?.label;
