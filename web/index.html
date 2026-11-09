@@ -377,18 +377,24 @@ dialog textarea{width:100%;height:170px;font:12px var(--mono);resize:none}dialog
 .score-location{margin-right:auto}
 .score-action,.score-fold,.score-summary{border:0;background:transparent;color:var(--muted);font:inherit;cursor:pointer;padding:4px}
 .score-action:hover,.score-fold:hover,.score-summary:hover{color:var(--text);background:var(--raise)}
-.study-score{font-size:14px;line-height:28px;padding:4px;overflow-wrap:anywhere}
+.study-score{font-size:1rem;line-height:1.7;padding:4px;overflow-wrap:anywhere}
 .score-turn{display:inline}.score-main{font-weight:600}
 .score-number{color:var(--muted);font-size:12px;white-space:nowrap;font-weight:400}
 .score-stone{display:inline}.score-move{font:inherit;border:0;background:transparent;color:var(--stone-color,var(--text));padding:4px;border-radius:4px;cursor:pointer;white-space:nowrap}
 .score-move:hover{background:var(--raise-2)}.score-move.current{background:var(--x);color:var(--bg)}
-.score-info{font-size:12px;font-weight:400;color:var(--muted);margin-right:4px;white-space:nowrap}
+.score-info{font-size:.857rem;font-weight:400;color:var(--muted);margin-right:4px;white-space:normal}
 .score-grade{font-size:12px;margin-right:4px}.score-marks{font-size:12px;font-weight:400;color:var(--dim);margin-right:4px}
-.score-variation{display:flex;gap:4px;margin:4px 0 4px 8px;padding:4px;border-radius:4px;background:var(--bg);font-weight:400}
-.score-variation.active-line{box-shadow:inset 0 0 0 1px var(--line-2)}
-.score-fold{align-self:flex-start;flex:none;min-width:24px;line-height:20px}
+.score-variation{display:flex;gap:2px;margin:4px 0 4px 4px;padding:2px;box-shadow:inset 1px 0 var(--line);font-weight:400}
+.score-variation.active-line{box-shadow:inset 2px 0 var(--line-2)}
+.score-fold{align-self:flex-start;flex:none;min-width:20px;line-height:20px}
 .score-variation.deep{display:block;margin-left:0;padding-left:0}.score-variation.deep>.score-branch{display:inline}
 .score-branch{min-width:0;flex:1}.score-summary{text-align:left;font-size:12px}
+.score-menu{position:fixed;z-index:30;display:grid;min-width:min(220px,calc(100vw - 16px));padding:4px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel);box-shadow:0 8px 24px #0008;overflow:auto;font-size:1rem}
+.score-menu-title{padding:8px 12px;color:var(--muted);font-size:.857rem;overflow-wrap:anywhere}
+.score-menu-item{border:0;background:transparent;text-align:left;padding:8px 12px;border-radius:4px;cursor:pointer}
+.score-menu-item:hover,.score-menu-item:focus-visible{background:var(--raise-2)}.score-menu-item:disabled{color:var(--dim);cursor:default}
+#study,#review{min-width:0}#detail{max-height:20dvh;overflow:auto}#graph{height:clamp(40px,10dvh,84px)}
+@media(min-width:760px) and (min-height:500px){#analysis{flex:0 1 auto;max-height:45%;overflow:auto}#review{min-height:0}}
 </style>
 <div id="app" data-tab="analysis">
   <nav id="tabs"><button data-tab="analysis" class="on">Analysis</button><button data-tab="review">Moves</button></nav>
@@ -1105,7 +1111,7 @@ async function selectScoreMove(index,ply){
   }
   go(ply);fit();
 }
-async function promoteScore(index,promote){const ply=view;if(await post('/variation',{index,promote}))go(ply)}
+async function promoteScore(index,promote,ply=view){if(await post('/variation',{index,promote}))go(ply)}
 function renderStudyLines(){
   const annotation=S.study?.annotations?.[S.history.slice(0,view).map(p=>p.join(',')).join(';')],info=annotation?.info;
   $('saved-annotation').textContent=info?'Saved annotation: '+info.replace(/[{}]/g,'').replace(/@([0-9]+)/,(_,ms)=>clockText(+ms)).replace(/%(-?[0-9]+)/,(_,n)=>'X evaluation '+n).replace(/#(-?[0-9]+)/,(_,n)=>`${+n>=0?'X':'O'} wins in ${Math.abs(+n)} turns`):'';

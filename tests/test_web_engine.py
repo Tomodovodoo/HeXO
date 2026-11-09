@@ -134,6 +134,50 @@ def page(job):
 
 @unittest.skipUnless(NODE, 'needs node')
 class PlayPage(unittest.TestCase):
+    def test_score_context_menu_targets_clicked_move_and_fits_viewport(self):
+        source = """import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';import {readFileSync} from 'node:fs';import http from 'node:http';
+const require=createRequire(import.meta.url);let chromium;
+try{({chromium}=require('playwright'));}catch{console.log('SKIP: Playwright unavailable');process.exit(0);}
+let browser;try{browser=await chromium.launch({channel:'chrome',headless:true});}catch{console.log('SKIP: Chrome unavailable');process.exit(0);}
+const style=readFileSync('web/index.html','utf8').match(/<style>([\\s\\S]*?)<\\/style>/)[1];
+const server=http.createServer((req,res)=>{
+ if(req.url==='/'){res.setHeader('Content-Type','text/html');res.end(`<style>${style}</style><div id="score"></div>`);}
+ else if(['/engine/study-score.mjs','/engine/study.mjs'].includes(req.url)){res.setHeader('Content-Type','text/javascript');res.end(readFileSync('web'+req.url));}
+ else{res.statusCode=404;res.end();}
+});await new Promise(r=>server.listen(0,'127.0.0.1',r));
+try{
+ const page=await browser.newPage({viewport:{width:640,height:400}});await page.goto(`http://127.0.0.1:${server.address().port}`);
+ await page.evaluate(async()=>{
+  const {Study,parseV2}=await import('/engine/study.mjs'),{createScoreView}=await import('/engine/study-score.mjs');
+  const study=Study.fromRecord(parseV2('version[2];1.[1,0][0,1](1.[-1,0][0,-1];2.[1,-1][2,-1](2.[-1,1][-2,1];););'),{game(){}});
+  window.actions=[];window.scoreView=createScoreView();window.study=study;
+  window.options={history:study.lines[0],ply:3,onSelect:(...args)=>actions.push(['select',...args]),onPromote:(...args)=>actions.push(['promote',...args])};
+  scoreView.render(document.querySelector('#score'),study,options);
+ });
+ const target=page.locator('.score-move').filter({hasText:'[-2,1]'});
+ await target.click({button:'right'});await page.getByRole('menuitem',{name:'Make main line',exact:true}).click();
+ assert.deepEqual(await page.evaluate(()=>actions),[['promote',2,true,5]]);
+ await target.focus();await page.keyboard.press('Shift+F10');
+ await page.evaluate(()=>scoreView.render(document.querySelector('#score'),study,options));
+ assert.equal(await page.getByRole('menu').count(),1); // Evaluation redraws must not dismiss the menu.
+ await page.keyboard.press('Escape');assert.equal(await page.getByRole('menu').count(),0);
+ assert.equal(await target.evaluate(e=>e===document.activeElement),true);
+ const main=page.locator('.score-move').filter({hasText:'[0,1]'});await main.click({button:'right'});
+ assert.equal(await page.getByRole('menuitem',{name:'Make main line',exact:true}).isDisabled(),true);await page.keyboard.press('Escape');
+ for(const size of [{width:320,height:200},{width:320,height:400},{width:640,height:400}]){
+  await page.setViewportSize(size);await target.click({button:'right'});
+  const rect=await page.getByRole('menu').boundingBox();assert(rect.x>=0&&rect.y>=0&&rect.x+rect.width<=size.width+1&&rect.y+rect.height<=size.height+1);
+  await page.keyboard.press('Escape');
+ }
+ console.log('ok');
+}finally{await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}"""
+        done = subprocess.run([NODE, '--input-type=module', '-e', source], cwd=ROOT,
+                              capture_output=True, text=True, encoding='utf-8', timeout=60)
+        if done.returncode == 0 and done.stdout.startswith('SKIP:'):
+            self.skipTest(done.stdout.strip())
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_score_keeps_aggregate_turn_grades_without_intermediate_evaluations(self):
         source = """import assert from 'node:assert/strict';
 import vm from 'node:vm';
