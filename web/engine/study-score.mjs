@@ -97,6 +97,15 @@ export function createScoreView() {
           turn.append(make('span', 'score-number', `${number}. ${side} `));
           for (let j = 0; j < node.stones.length; j++) turn.append(move(node.stones[j], node.history.slice(0, node.start + j + 1), node.start + j, node.lineIndex));
           if (node.stones.length === 1) turn.append(make('span', 'score-end', ' [/]'));
+          const grade = options.turnGrade?.(node.history);
+          if (grade) {
+            const badge = button(`${grade.symbol} ${grade.label}`, () => options.onSelect(node.lineIndex, node.history.length), 'score-action score-turn-grade');
+            badge.title = `Whole turn ${number}: ${grade.label}`;
+            badge.dataset.focus = 'turn:' + node.id;
+            badge.setAttribute('aria-label', badge.title);
+            badge.style.color = grade.color;
+            turn.append(badge);
+          }
           container.append(turn, doc.createTextNode(' '));
           for (const alternative of alternatives) {
             const branch = make('div', 'score-variation' + (depth >= 3 ? ' deep' : '') + (active(alternative) ? ' active-line' : ''));

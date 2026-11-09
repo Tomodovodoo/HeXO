@@ -1123,6 +1123,9 @@ function renderMoves(){
         return `{${clock?clock+':':''}%${Math.round(100*(2*x-1))}}`},
       grade:prefix=>{if(JSON.stringify(prefix)!==JSON.stringify(S.history.slice(0,prefix.length)))return null;
         const t=S.review.find(t=>t.ply<prefix.length&&t.ply+t.stones.length>=prefix.length),label=t?.grades?.[prefix.length-t.ply-1]?.label;
+        return label&&LABEL[label]?{symbol:LABEL[label][0],color:`var(${LABEL[label][1]})`,label}:null},
+      turnGrade:prefix=>{if(JSON.stringify(prefix)!==JSON.stringify(S.history.slice(0,prefix.length)))return null;
+        const t=S.review.find(t=>t.ply+t.stones.length===prefix.length),label=t?.label;
         return label&&LABEL[label]?{symbol:LABEL[label][0],color:`var(${LABEL[label][1]})`,label}:null}});
   }else box.replaceChildren(...S.review.map((t,i)=>{
     const label=t.label&&LABEL[t.label],fresh=t.label&&seenLabels.has(t.ply)&&seenLabels.get(t.ply)!==t.label;
